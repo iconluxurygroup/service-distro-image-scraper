@@ -497,11 +497,11 @@ async def generate_download_file(file_id):
     failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
     print(f"failed rows: {failed_rows}")
     #if failed_rows != []:
-    if failed_img_urls:
-        print(failed_img_urls)
-        #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-        #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
-        logger.error(f"Failed to write images for rows: {failed_rows}")
+    # if failed_img_urls:
+    #     print(failed_img_urls)
+    #     #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
+    #     #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
+    #     logger.error(f"Failed to write images for rows: {failed_rows}")
         # logger.error(f"Failed rows added to excel: {fail_rows_written})")
         
     logger.info("Uploading file to space")
