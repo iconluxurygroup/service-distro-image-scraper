@@ -18,6 +18,6 @@ up:
 	docker run myapp
 
 down:
-	docker-compose down
+	docker stop myapp
 
 all: install lint test build
