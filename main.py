@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 logger.info("Informational message")
 logger.error("Error message")
 from sqlalchemy import create_engine
-
+import urllib.parse
 import pyodbc
 from dotenv import load_dotenv
 import pandas as pd
@@ -39,108 +39,84 @@ import base64,zlib
 from threading import Thread
 def get_spaces_client():
     logger.info("Creating spaces client")
-    session = boto3.session.Session()
-    client = session.client('s3',
-                            region_name='nyc3',
-                            endpoint_url=os.getenv('SPACES_ENDPOINT'),
+    # session = boto3.session.Session()
+    client = boto3.client(service_name='s3',
+                            region_name=os.getenv('REGION'),
                             aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
                             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     logger.info("Spaces client created successfully")
     return client
 
-def upload_file_to_space(file_src, save_as, is_public, content_type, meta=None):
+def upload_file_to_space(file_src, save_as, is_public):
     spaces_client = get_spaces_client()
     space_name = 'iconluxurygroup-s3'  # Your space name
-    print('Content Type')
-    print(content_type)
-    if not content_type:
-        content_type_guess = mimetypes.guess_type(file_src)[0]
-        if not content_type_guess:
-            raise Exception("Content type could not be guessed. Please specify it directly.")
-        content_type = content_type_guess
 
-    extra_args = {'ACL': 'public-read' if is_public else 'private', 'ContentType': content_type}
-    if meta:
-        extra_args['Metadata'] = meta
-
-    spaces_client.upload_file(
-        Filename=file_src,
-        Bucket=space_name,
-        Key=save_as,
-        ExtraArgs=extra_args
-    )
+    # if not content_type:
+    #     content_type_guess = mimetypes.guess_type(file_src)[0]
+    #     if not content_type_guess:
+    #         raise Exception("Content type could not be guessed. Please specify it directly.")
+    #     content_type = content_type_guess
+    spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
     print(f"File uploaded successfully to {space_name}/{save_as}")
     # Generate and return the public URL if the file is public
     if is_public:
-        upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
+        # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
+        upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
         print(f"Public URL: {upload_url}")
         return upload_url
 
 
 
-def send_email(to_emails, subject, download_url, excel_file_path,execution_time,message="Total Rows:\nFilename:\nBatch ID:\nLocation:\nUploaded File:"):
+def send_email(to_emails, subject, download_url,jobId):
     # Encode the URL if necessary (example shown, adjust as needed)
     # from urllib.parse import quote
     # download_url = quote(download_url, safe='')
-    execution_time_timedelta = datetime.timedelta(seconds=execution_time)
 
-
-
-    message_with_breaks = message.replace("\n", "<br>")
 
     html_content = f"""
 <html>
 <body>
 <div class="container">
     <p>Your file is ready for download.</p>
-    <p>Total Elapsed Time: {str(execution_time_timedelta)}</p>
-    <p>Message details:<br>{message_with_breaks}</p>
-    <a href="{download_url}" class="download-button">Download File</a>
-    <p>CMS:v1</p>
+     <a href="{download_url}" class="download-button">Download File</a>
+
+    <p><br>Please use the link below to modify the file<br></p
+    <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
+    <br>  
+    
+    <p>--</p>
+    <p>CMS:v1.1</p>
 </div>
 </body>
 </html>
 """
-
-
-
-
-#     html_content = f"""
-# <html>
-# <body>
-# <div class="container">
-#     <p>Your file is ready for download.</p>
-#     <p>Total Elapsed Time: {str(execution_time_timedelta)}</p>
-#     <a href="{download_url}" class="download-button">Download File</a>
-# </div>
-# </body>
-# </html>
-# """
     message = Mail(
-        from_email='distrotool@iconluxurygroup.com',
+        from_email='nik@iconluxurygroup.com',
         subject=subject,
         html_content=html_content
     )
-    # Read and encode the Excel file
-    with open(excel_file_path, 'rb') as f:
-        excel_data = f.read()
-    encoded_excel_data = b64encode(excel_data).decode()
+    # # Read and encode the Excel file
+    # with open(excel_file_path, 'rb') as f:
+    #     excel_data = f.read()
+    # encoded_excel_data = b64encode(excel_data).decode()
 
-    attachment = Attachment(
-        FileContent(encoded_excel_data),
-        FileName(excel_file_path.split('/')[-1]),
-        FileType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
-        Disposition('attachment')
-    )
-    message.attachment = attachment
+    # attachment = Attachment(
+    #     FileContent(encoded_excel_data),
+    #     FileName(excel_file_path.split('/')[-1]),
+    #     FileType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+    #     Disposition('attachment')
+    # )
+    # message.attachment = attachment
     
     cc_recipient = 'notifications@popovtech.com'
     personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
+    # personalization.add_cc(Cc(cc_recipient))
     personalization.add_to(To(to_emails))
     message.add_personalization(personalization)
+    print("trying")
     try:
-        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+        #os.environ.get('SENDGRID_API_KEY')
+        sg = SendGridAPIClient(api_key='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')
         response = sg.send(message)
         print(response.status_code)
         print(response.body)
@@ -188,8 +164,8 @@ def send_message_email(to_emails, subject,message):
 async def create_temp_dirs(unique_id):
     loop = asyncio.get_running_loop()  # Get the current loop directly
     base_dir = os.path.join(os.getcwd(), 'temp_files')
-    temp_images_dir = os.path.join(base_dir, 'images', unique_id)
-    temp_excel_dir = os.path.join(base_dir, 'excel', unique_id)
+    temp_images_dir = os.path.join(base_dir, 'images', str(unique_id))
+    temp_excel_dir = os.path.join(base_dir, 'excel', str(unique_id))
 
     await loop.run_in_executor(None, lambda: os.makedirs(temp_images_dir, exist_ok=True))
     await loop.run_in_executor(None, lambda: os.makedirs(temp_excel_dir, exist_ok=True))
@@ -208,11 +184,11 @@ conn = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=lu
 global engine
 engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
 app = FastAPI()
-def insert_file_db (file_name,file_source):
+def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
-    insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl) OUTPUT INSERTED.Id VALUES (?, ?)"
-    values = (file_name, file_source)
+    insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl,UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
+    values = (file_name, file_source,send_to_email)
 
     cursor.execute(insert_query, values)
 
@@ -474,6 +450,28 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
     # Close the connection
     connection.close()
     print('completed update sort order')
+def get_send_to_email(file_id_db):
+    
+    query = f"Select UserEmail from utb_ImageScraperFiles where ID = {file_id_db}"
+    connection = pyodbc.connect(conn)
+    cursor = connection.cursor()
+
+    # Execute the update query
+    cursor.execute(query)
+    send_to_email = cursor.fetchone()
+    # Commit the changes
+    connection.commit()
+
+    # Close the connection
+    connection.close()
+    if send_to_email:
+        (send_to_email,) = send_to_email
+        print(send_to_email)
+    else:
+
+        send_to_email = "No Email Found"
+    return send_to_email  
+
 async def generate_download_file(file_id):
     preferred_image_method = 'append'
     
@@ -487,6 +485,8 @@ async def generate_download_file(file_id):
     print(selected_image_list)
     
     provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location,file_id )
+    decoded_string = urllib.parse.unquote(provided_file_path)
+    print(provided_file_path,' ',decoded_string)
     file_name = provided_file_path.split('/')[-1]
     temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
     local_filename = os.path.join(temp_excel_dir, file_name)
@@ -513,12 +513,20 @@ async def generate_download_file(file_id):
     logger.info("Uploading file to space")
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
     is_public = True
-    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, local_filename,is_public,contenttype)  
+    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name,is_public)  
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
+  
+    subject_line = f"{file_name} Job Notification"
+    print(subject_line)
     
-    end_time = time.time()
-    execution_time = end_time - start_time
+    
+    
+    
+    send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id)
+    await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email,subject_line,public_url,file_id)
+    print('Sending email:\n',send_to_email)
+
     #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, 'Your File Is Ready', public_url, local_filename)
     if os.listdir(temp_images_dir) !=[]:
         logger.info("Sending email")
@@ -642,7 +650,30 @@ def get_lm_products(file_id):
     # Commit the changes
     connection.commit()
     connection.close()
+    
+def process_restart_batch(file_id_db):
+    search_df = get_records_to_search(file_id_db, engine)
+    print(search_df)
+    search_list=list(search_df.T.to_dict().values())
+    ####
+    start = datetime.datetime.now()
+    print(f"Start of whole process: {start}")
+    BATCH_SIZE=100
+    batches=[search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
+    print(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+    futures=[process_batch.remote(batch) for batch in batches]
+    ray.get(futures)
+    end = datetime.datetime.now()
+    print("executing generate in restart")
+    asyncio.run(generate_download_file(file_id_db))
+    
 
+    
+    print(f"End of whole process: {end}")
+    print(f"It took {end - start} to complete")
+    #####
+    update_sort_order(file_id_db)
+    
 def process_image_batch(payload: dict):
     logger.info(f"Processing started for payload: {payload}")
     rows = payload.get('rowData', [])
@@ -650,8 +681,9 @@ def process_image_batch(payload: dict):
     logger.info("Received request to process image batch")
     file_name = provided_file_path.split('/')[-1]
     send_to_email = payload.get('sendToEmail', 'nik@iconluxurygroup.com')
+    print(f"Send To: {send_to_email}")
     preferred_image_method = payload.get('preferredImageMethod', 'append')
-    file_id_db = insert_file_db(file_name, provided_file_path)
+    file_id_db = insert_file_db(file_name, provided_file_path,send_to_email)
     print(file_id_db)
     load_payload_db(rows, file_id_db)
     get_lm_products(file_id_db)
@@ -667,11 +699,19 @@ def process_image_batch(payload: dict):
     futures=[process_batch.remote(batch) for batch in batches]
     ray.get(futures)
     end = datetime.datetime.now()
+    print("executing generate")
+    asyncio.run(generate_download_file(file_id_db))
     print(f"End of whole process: {end}")
     print(f"It took {end - start} to complete")
     #####
     update_sort_order(file_id_db)
-
+    
+@app.post("/restart-failed-batch/")
+async def process_restart(background_tasks: BackgroundTasks, file_id_db: str):
+    logger.info("Received request to process image batch")
+    background_tasks.add_task(process_restart_batch, file_id_db)
+    #await process_image_batch(payload)
+    return {"message": "Processing started successfully. You will be notified upon completion."}
 
 @app.post("/process-image-batch/")
 async def process_payload(background_tasks: BackgroundTasks, payload: dict):
@@ -1081,7 +1121,7 @@ if __name__ == "__main__":
     logger.info("Starting Uvicorn server")
     print(os.environ)
     #uvicorn.run("main:app", port=8080, host='0.0.0.0', reload=True)
-    uvicorn.run("main:app", port=8080, host='0.0.0.0')
+    uvicorn.run("main:app", port=8000, host='0.0.0.0',reload=True)
     if ray.is_initialized():
         ray.shutdown()
     ray.init(address='auto')
