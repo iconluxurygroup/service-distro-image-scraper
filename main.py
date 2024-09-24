@@ -664,7 +664,14 @@ def process_restart_batch(file_id_db):
     futures=[process_batch.remote(batch) for batch in batches]
     ray.get(futures)
     end = datetime.datetime.now()
+    
+    
     print("executing generate in restart")
+    
+    
+    
+    update_sort_order(file_id_db)
+    
     asyncio.run(generate_download_file(file_id_db))
     
 
@@ -672,7 +679,7 @@ def process_restart_batch(file_id_db):
     print(f"End of whole process: {end}")
     print(f"It took {end - start} to complete")
     #####
-    update_sort_order(file_id_db)
+
     
 def process_image_batch(payload: dict):
     logger.info(f"Processing started for payload: {payload}")
@@ -700,11 +707,13 @@ def process_image_batch(payload: dict):
     ray.get(futures)
     end = datetime.datetime.now()
     print("executing generate")
+
+    #####
+    update_sort_order(file_id_db)
+    
     asyncio.run(generate_download_file(file_id_db))
     print(f"End of whole process: {end}")
     print(f"It took {end - start} to complete")
-    #####
-    update_sort_order(file_id_db)
     
 @app.post("/restart-failed-batch/")
 async def process_restart(background_tasks: BackgroundTasks, file_id_db: str):
@@ -1120,8 +1129,8 @@ def write_excel_image(local_filename, temp_dir,preferred_image_method):
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server")
     print(os.environ)
-    #uvicorn.run("main:app", port=8080, host='0.0.0.0', reload=True)
-    uvicorn.run("main:app", port=8000, host='0.0.0.0',reload=True)
+    #uvicorn.run("main:app", port=8000, host='0.0.0.0', reload=True)
+    uvicorn.run("main:app", port=8080, host='0.0.0.0')
     if ray.is_initialized():
         ray.shutdown()
     ray.init(address='auto')

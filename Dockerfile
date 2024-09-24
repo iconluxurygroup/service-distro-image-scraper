@@ -39,16 +39,13 @@ COPY main.py .
 COPY install_sql_server_dev.sh .
 
 # Make the install script executable and run it
-RUN chmod +x install_sql_server_dev.sh
-RUN ./install_sql_server_dev.sh
+# RUN chmod +x install_sql_server_dev.sh
+# RUN ./install_sql_server_dev.sh
 
 # Verify ODBC installation
 RUN odbcinst -j
 # Upgrade all Python packages to the latest versions
 #RUN pip list --outdated --format=columns | tail -n +3 | awk '{print $1}' | xargs -n1 pip install -U
-
-# Label for Datadog logs
-LABEL "com.datadoghq.ad.logs"='[<LOGS_CONFIG>]'
 
 # Make port 8080 available to the world outside this container
 EXPOSE 8080
