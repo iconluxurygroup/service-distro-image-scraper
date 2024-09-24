@@ -115,8 +115,8 @@ def send_email(to_emails, subject, download_url,jobId):
     message.add_personalization(personalization)
     print("trying")
     try:
-        #os.environ.get('SENDGRID_API_KEY')
-        sg = SendGridAPIClient(api_key='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')
+        #
+        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
         response = sg.send(message)
         print(response.status_code)
         print(response.body)
