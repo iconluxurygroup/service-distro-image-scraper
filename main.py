@@ -108,9 +108,12 @@ def send_email(to_emails, subject, download_url,jobId):
     # )
     # message.attachment = attachment
     
-    cc_recipient = 'notifications@popovtech.com'
+    cc_recipient = 'nik@iconluxurygroup.com'
+    if to_emails == cc_recipient:
+        cc_recipient = 'notifications@popovtech.com'
+    
     personalization = Personalization()
-    # personalization.add_cc(Cc(cc_recipient))
+    personalization.add_cc(Cc(cc_recipient))
     personalization.add_to(To(to_emails))
     message.add_personalization(personalization)
     print("trying")
