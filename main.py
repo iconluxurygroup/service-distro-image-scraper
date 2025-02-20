@@ -332,17 +332,18 @@ def unpack_content(encoded_content):
 def process_search_row(search_string, endpoint, entry_id):
     if 'No google' in search_string:
         return None
+    
     if "azurewebsites" in endpoint:
-        # Ensure the query parameter is updated correctly
-            if "&query=" in endpoint:
-                base_url = endpoint.split("&query=")[0]  # Remove existing query parameter
-            else:
-                base_url = endpoint  # Use the endpoint as is
-
-            search_url = f"{base_url}&query={search_string}"
+        # Remove existing query parameter if present
+        if "&query=" in endpoint:
+            base_url = endpoint.split("&query=")[0]  
+        else:
+            base_url = endpoint  # Keep the original base URL
+        
+        search_url = f"{base_url}&query={search_string}"
     else:
-            search_url = f"{endpoint}?query={search_string}"
-    search_url = f"{endpoint}?query={search_string}"
+        search_url = f"{endpoint}?query={search_string}"
+
     print(search_url)
     try:
         response = requests.get(search_url, timeout=60)
