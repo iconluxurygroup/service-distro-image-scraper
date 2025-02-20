@@ -18,7 +18,6 @@ from urllib3.util.retry import Retry
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition,Personalization,Cc,To
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import aiohttp
 from aiohttp import ClientTimeout
 from aiohttp_retry import RetryClient, ExponentialRetry
@@ -36,7 +35,6 @@ from dotenv import load_dotenv
 import pandas as pd
 load_dotenv()
 import base64,zlib
-from threading import Thread
 def get_spaces_client():
     logger.info("Creating spaces client")
     session = boto3.session.Session()
@@ -262,7 +260,6 @@ def get_endpoint():
      if endpoint_url:
          (endpoint,) = endpoint_url
          print(endpoint_url)
-         print(datetime.datetime.now())
      else:
          print("No EndpointURL")
          endpoint = "No EndpointURL"
@@ -283,18 +280,26 @@ def unpack_content(encoded_content):
         #     file.write(str(original_content))
         return original_content # Return as binary data
     return None
-def process_search_row(search_string,endpoint,entry_id):
-        search_url = f"{endpoint}?query={search_string}"
-        print(search_url)
+async def process_search_row(search_string,endpoint,entry_id):
 
+        if "azurewebsites" in endpoint:
+        # Ensure the query parameter is updated correctly
+            if "&query=" in endpoint:
+                base_url = endpoint.split("&query=")[0]  # Remove existing query parameter
+            else:
+                base_url = endpoint  # Use the endpoint as is
+
+            search_url = f"{base_url}&query={search_string}"
+        else:
+            search_url = f"{endpoint}?query={search_string}"
         try:
             response = requests.get(search_url, timeout=60)
             print(response.status_code)
             if response.status_code != 200 or response.json().get('body') is None:
                 print('trying again 1')
                 remove_endpoint(endpoint)
-                n_endpoint = get_endpoint()
-                return process_search_row(search_string,n_endpoint,entry_id)  # Add return here
+                n_endpoint = remove_endpoint()
+                return await process_search_row(search_string,n_endpoint,entry_id)  # Add return here
             else:
                 response_json = response.json()
                 result = response_json.get('body', None)
@@ -306,13 +311,12 @@ def process_search_row(search_string,endpoint,entry_id):
                         print('trying again 2')
                         remove_endpoint(endpoint)
                         n_endpoint = get_endpoint()
-                        return process_search_row(search_string,n_endpoint,entry_id)  # Add return here
-                    if type(parsed_data)==list:
-                        if parsed_data[0][0] == 'No start_tag or end_tag':
-                            print('trying again 3')
-                            remove_endpoint(endpoint)
-                            n_endpoint = get_endpoint()
-                            return process_search_row(search_string,n_endpoint,entry_id)
+                        return await process_search_row(search_string,n_endpoint,entry_id)  # Add return here
+                    if parsed_data[0][0] == 'No start_tag or end_tag':
+                        print('trying again 3')
+                        remove_endpoint(endpoint)
+                        n_endpoint = get_endpoint()
+                        return await process_search_row(search_string,n_endpoint,entry_id)
                     else:
                         print('parsed data!')
                         image_url = parsed_data[0]
@@ -350,16 +354,15 @@ def process_search_row(search_string,endpoint,entry_id):
                                     connection.close()
                         else:
                             print('trying again 4')
-
                             remove_endpoint(endpoint)
                             n_endpoint = get_endpoint()
-                            return process_search_row(search_string,n_endpoint,entry_id)
+                            return await process_search_row(search_string,n_endpoint,entry_id)
         except requests.RequestException as e:
             print('trying again 5')
             remove_endpoint(endpoint)
             n_endpoint = get_endpoint()
             print(f"Error making request: {e}\nTrying Again: {n_endpoint}")
-            return process_search_row(search_string,n_endpoint,entry_id)
+            return await process_search_row(search_string,n_endpoint,entry_id)
         
         
 def update_file_generate_complete(file_id):
@@ -434,7 +437,6 @@ Order by s.ExcelRowID"""
     return df
 
 def update_sort_order(file_id):
-    print('executing update sort order')
     query = """with toupdate as (
 select t.*,
 row_number() over (partition by t.EntryID order by t.ResultID) as seqnum
@@ -446,7 +448,7 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
 
-    # Execute the update queryf
+    # Execute the update query
     cursor.execute(query)
 
     # Commit the changes
@@ -473,7 +475,7 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
 
     # Close the connection
     connection.close()
-    print('completed update sort order')
+
 async def generate_download_file(file_id):
     preferred_image_method = 'append'
     
@@ -503,12 +505,12 @@ async def generate_download_file(file_id):
     failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
     print(f"failed rows: {failed_rows}")
     #if failed_rows != []:
-    if failed_img_urls:
-        print(failed_img_urls)
-        #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-        fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
-        logger.error(f"Failed to write images for rows: {failed_rows}")
-        logger.error(f"Failed rows added to excel: {fail_rows_written})")
+    # if failed_img_urls:
+    #     print(failed_img_urls)
+    #     #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
+    #     #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
+    #     logger.error(f"Failed to write images for rows: {failed_rows}")
+        # logger.error(f"Failed rows added to excel: {fail_rows_written})")
         
     logger.info("Uploading file to space")
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
@@ -628,8 +630,6 @@ async def generate_download_file(file_id):
 #          return {"error": f"An unexpected error occurred during processing. Error: {e}"}
 #
 import asyncio
-import ray
-
 def get_lm_products(file_id):
 
     connection = pyodbc.connect(conn)
@@ -657,22 +657,32 @@ def process_image_batch(payload: dict):
     get_lm_products(file_id_db)
     search_df = get_records_to_search(file_id_db, engine)
     print(search_df)
-    search_list=list(search_df.T.to_dict().values())
-    ####
-    start = datetime.datetime.now()
-    print(f"Start of whole process: {start}")
-    BATCH_SIZE=100
-    batches=[search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-    print(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
-    futures=[process_batch.remote(batch) for batch in batches]
-    ray.get(futures)
-    end = datetime.datetime.now()
-    print(f"End of whole process: {end}")
-    print(f"It took {end - start} to complete")
-    #####
-    update_sort_order(file_id_db)
 
+    semaphore = asyncio.Semaphore(int(os.environ.get('MAX_THREAD')))  # Limit concurrent tasks to avoid overloading
 
+    async def run_tasks():
+        try:
+            # send_message_email(send_to_email, f'Started {file_name}',f'Total Rows: {len(rows)}\nFilename: {file_name}\nDB_file_id: {file_id_db}\nUploaded File: {provided_file_path}')
+
+            tasks = [process_with_semaphore(row, semaphore, file_id_db) for _, row in search_df.iterrows()]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, update_sort_order, file_id_db)
+
+            # return {"message": "Processing completed successfully.", "results": results, "public_url": public_url}
+
+        except Exception as e:
+            logger.exception("An unexpected error occurred during processing: %s", e)
+
+            async def send_email_task():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, send_message_email, send_to_email, f'Started {file_name}',
+                                           f"An unexpected error occurred during processing.\nError: {str(e)}")
+
+            asyncio.create_task(send_email_task())
+
+    asyncio.run(run_tasks())
 @app.post("/process-image-batch/")
 async def process_payload(background_tasks: BackgroundTasks, payload: dict):
     logger.info("Received request to process image batch")
@@ -686,21 +696,17 @@ async def process_file(background_tasks: BackgroundTasks, file_id: int):
     #await generate_download_file((str(file_id)))
     return {"message": "Processing started successfully. You will be notified upon completion."}
 
-@ray.remote
-def process_db_row(row):
-    entry_id = row['EntryID']
-    searchString = row['SearchString']
-    print(f"Entry Id: {entry_id}\nSearch String {searchString}")
-    endpoint = get_endpoint()
-    process_search_row(searchString, endpoint, entry_id)
-@ray.remote
-def process_batch(batch):
-    # Process each item in the batch in parallel
-    futures = [process_db_row.remote(data) for data in batch]
-    print(futures)
-    results = ray.get(futures)
-    return results
-
+async def process_with_semaphore(row, semaphore,fileid):
+    print('ROWWWWWWW')
+    print(row)
+    print(len(row))
+    print('ROWWWWWWW END')
+    async with semaphore:
+        entry_id = row['EntryID']
+        searchString = row['SearchString']
+        print(f"Entry Id: {entry_id}\nSearch String {searchString}")
+        endpoint = get_endpoint()
+        await process_search_row(searchString,endpoint,entry_id)  # Assuming process_row is an async function you've defined elsewhere
 
 
 def highlight_cell(excel_file, cell_reference):
@@ -1082,7 +1088,3 @@ if __name__ == "__main__":
     print(os.environ)
     #uvicorn.run("main:app", port=8080, host='0.0.0.0', reload=True)
     uvicorn.run("main:app", port=8080, host='0.0.0.0')
-    if ray.is_initialized():
-        ray.shutdown()
-    ray.init(address='auto')
-
