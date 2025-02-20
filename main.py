@@ -341,7 +341,7 @@ def process_search_row(search_string, endpoint, entry_id):
     else:
         search_url = f"{endpoint}?query={search_string}"
 
-    print(search_url)
+    print(f"Requesting: {search_url}")
 
     try:
         response = requests.get(search_url, timeout=60)
