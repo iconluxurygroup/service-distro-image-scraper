@@ -331,7 +331,6 @@ def unpack_content(encoded_content):
 import re
 import requests
 import pandas as pd
-import pyodbc
 import json
 
 MAX_RETRIES = 3  # Prevent infinite recursion
