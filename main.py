@@ -431,7 +431,8 @@ def process_search_row(search_string, endpoint, entry_id):
                         # except Exception as e:
                         #     print(e)
                         # send_email()
-                        if not results_df.empty:
+                        if results_df is not None and not results_df.empty:
+        
                             if 'EntryId' not in results_df.columns:
                                 results_df.insert(0, 'EntryId', entry_id)
 
