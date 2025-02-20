@@ -283,7 +283,7 @@ def unpack_content(encoded_content):
 import logging
 import requests
 import pandas as pd
-from your_database_module import engine, remove_endpoint, get_endpoint, unpack_content, GP, pyodbc
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
