@@ -18,3 +18,8 @@ pandas
 chardet
 ray
 transformers 
+torch
+torchvision
+torchaudio
+tensorflow
+flax
