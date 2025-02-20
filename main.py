@@ -289,7 +289,7 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 5  # Max retries to avoid infinite recursion
+MAX_RETRIES = 5000  # Max retries to avoid infinite recursion
 
 async def process_search_row(search_string, endpoint, entry_id, attempt=1):
     if "azurewebsites" in endpoint:
