@@ -6,7 +6,7 @@ from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
-import datetime
+import datetime,re
 import boto3
 import logging,json,os
 from io import BytesIO
@@ -330,21 +330,19 @@ def unpack_content(encoded_content):
 
 
 def process_search_row(search_string, endpoint, entry_id):
+
     if 'No google' in search_string:
         return None
-    
+
     if "azurewebsites" in endpoint:
-        # Remove existing query parameter if present
-        if "&query=" in endpoint:
-            base_url = endpoint.split("&query=")[0]  
-        else:
-            base_url = endpoint  # Keep the original base URL
-        
+        # Remove any existing query parameter and keep only the base URL
+        base_url = re.sub(r'(&query=[^&]*)', '', endpoint)  # Removes existing query=...
         search_url = f"{base_url}&query={search_string}"
     else:
         search_url = f"{endpoint}?query={search_string}"
 
     print(search_url)
+
     try:
         response = requests.get(search_url, timeout=60)
         print(response.status_code)
