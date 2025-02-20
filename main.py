@@ -290,7 +290,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 5000  # Max retries to avoid infinite recursion
-
 async def process_search_row(search_string, endpoint, entry_id, attempt=1):
     if "azurewebsites" in endpoint:
         base_url = re.sub(r'(&query=[^&]*)', '', endpoint)  # Removes existing query param
@@ -302,8 +301,52 @@ async def process_search_row(search_string, endpoint, entry_id, attempt=1):
         response = requests.get(search_url, timeout=60)
         logger.info(f"Attempt {attempt}: Received response with status code {response.status_code}")
 
-        if response.status_code != 200 or response.json().get('body') is None:
-            logger.warning('Response not successful or body is None, retrying...')
+        # Log the raw response for inspection
+        logger.debug(f"Full Response: {response.text}")
+
+        if response.status_code != 200:
+            logger.warning(f"Received non-200 status code: {response.status_code}")
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            if attempt < MAX_RETRIES:
+                return await process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
+            else:
+                logger.error("Max retries reached, giving up.")
+                return
+
+        # Try to parse the response JSON
+        try:
+            response_json = response.json()
+        except ValueError as e:
+            logger.error(f"Error parsing JSON response: {e}")
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            if attempt < MAX_RETRIES:
+                return await process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
+            else:
+                logger.error("Max retries reached, giving up.")
+                return
+
+        logger.debug(f"Parsed JSON: {response_json}")
+
+        result = response_json.get('body', None)
+        if not result:
+            logger.warning("Body is None or empty, retrying...")
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            if attempt < MAX_RETRIES:
+                return await process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
+            else:
+                logger.error("Max retries reached, giving up.")
+                return
+
+        unpacked_html = unpack_content(result)
+
+        # Assuming unpacked_html should be processed into parsed_data
+        parsed_data = GP(unpacked_html)  # Assuming `GP` is a function for parsing
+
+        if parsed_data is None:
+            logger.warning('Parsed data is None, retrying...')
             remove_endpoint(endpoint)
             n_endpoint = get_endpoint()
             if attempt < MAX_RETRIES:
@@ -312,59 +355,42 @@ async def process_search_row(search_string, endpoint, entry_id, attempt=1):
                 logger.error('Max retries reached, giving up.')
                 return
 
-        response_json = response.json()
-        result = response_json.get('body', None)
-        if result:
-            unpacked_html = unpack_content(result)
-            logger.info(f"Unpacked HTML size: {len(unpacked_html)}")
-            parsed_data = GP(unpacked_html)
+        if parsed_data[0][0] == 'No start_tag or end_tag':
+            logger.warning('No start_tag or end_tag, retrying...')
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            if attempt < MAX_RETRIES:
+                return await process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
+            else:
+                logger.error('Max retries reached, giving up.')
+                return
 
-            if parsed_data is None:
-                logger.warning('Parsed data is None, retrying...')
-                remove_endpoint(endpoint)
-                n_endpoint = get_endpoint()
-                if attempt < MAX_RETRIES:
-                    return await process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
-                else:
-                    logger.error('Max retries reached, giving up.')
-                    return
+        logger.info('Parsed data successfully!')
+        image_url = parsed_data[0]
+        image_desc = parsed_data[1]
+        image_source = parsed_data[2]
+        image_thumb = parsed_data[3]
 
-            if parsed_data[0][0] == 'No start_tag or end_tag':
-                logger.warning('No start_tag or end_tag, retrying...')
-                remove_endpoint(endpoint)
-                n_endpoint = get_endpoint()
-                if attempt < MAX_RETRIES:
-                    return await process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
-                else:
-                    logger.error('Max retries reached, giving up.')
-                    return
+        logger.info(f"Image URL: {type(image_url)} {image_url}\nImage Desc: {type(image_desc)} {image_desc}\nImage Source: {type(image_source)} {image_source}")
 
-            logger.info('Parsed data successfully!')
-            image_url = parsed_data[0]
-            image_desc = parsed_data[1]
-            image_source = parsed_data[2]
-            image_thumb = parsed_data[3]
+        if image_url:
+            df = pd.DataFrame({
+                'ImageUrl': image_url,
+                'ImageDesc': image_desc,
+                'ImageSource': image_source,
+                'ImageUrlThumbnail': image_thumb,
+            })
 
-            logger.info(f"Image URL: {type(image_url)} {image_url}\nImage Desc: {type(image_desc)} {image_desc}\nImage Source: {type(image_source)} {image_source}")
+            if not df.empty:
+                df.insert(0, 'EntryId', entry_id)
+                df.to_sql(name='utb_ImageScraperResult', con=engine, index=False, if_exists='append')
 
-            if image_url:
-                df = pd.DataFrame({
-                    'ImageUrl': image_url,
-                    'ImageDesc': image_desc,
-                    'ImageSource': image_source,
-                    'ImageUrlThumbnail': image_thumb,
-                })
-
-                if not df.empty:
-                    df.insert(0, 'EntryId', entry_id)
-                    df.to_sql(name='utb_ImageScraperResult', con=engine, index=False, if_exists='append')
-
-                    sql_query = f"UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = {entry_id}"
-                    connection = pyodbc.connect(conn)
-                    cursor = connection.cursor()
-                    cursor.execute(sql_query)
-                    connection.commit()
-                    connection.close()
+                sql_query = f"UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = {entry_id}"
+                connection = pyodbc.connect(conn)
+                cursor = connection.cursor()
+                cursor.execute(sql_query)
+                connection.commit()
+                connection.close()
 
             else:
                 logger.warning('No image URL, retrying...')
@@ -386,8 +412,6 @@ async def process_search_row(search_string, endpoint, entry_id, attempt=1):
             logger.error('Max retries reached, giving up.')
             return
 
-        
-        
 def update_file_generate_complete(file_id):
     query = f'update utb_ImageScraperFiles set CreateFileCompleteTime = getdate() Where ID = {file_id}'       
     connection = pyodbc.connect(conn)
