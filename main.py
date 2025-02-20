@@ -328,143 +328,125 @@ def unpack_content(encoded_content):
         return original_content  # Return as binary data
     return None
 
+import re
+import requests
+import pandas as pd
+import pyodbc
+import json
 
-def process_search_row(search_string, endpoint, entry_id):
+MAX_RETRIES = 3  # Prevent infinite recursion
 
+def process_search_row(search_string, endpoint, entry_id, attempt=1):
     if 'No google' in search_string:
         return None
 
+    if attempt > MAX_RETRIES:
+        print(f"Max retries reached for {search_string}. Skipping...")
+        return None  # Avoid infinite recursion
+
     if "azurewebsites" in endpoint:
-        # Remove any existing query parameter and keep only the base URL
-        base_url = re.sub(r'(&query=[^&]*)', '', endpoint)  # Removes existing query=...
+        # Remove any existing query parameter properly
+        base_url = re.sub(r'(&query=[^&]*)', '', endpoint)
         search_url = f"{base_url}&query={search_string}"
     else:
         search_url = f"{endpoint}?query={search_string}"
 
-    print(f"Requesting: {search_url}")
+    print(f"Attempt {attempt}: Requesting {search_url}")
 
     try:
         response = requests.get(search_url, timeout=60)
-        print(response.status_code)
-        if response.status_code != 200 or response.json().get('body') is None:
-            print('trying again 1')
+        print(f"Response Code: {response.status_code}")
+
+        if response.status_code != 200:
+            print(f"Trying again {attempt} - bad response")
             remove_endpoint(endpoint)
             n_endpoint = get_endpoint()
-            return process_search_row(search_string, n_endpoint, entry_id)  # Add return here
-        else:
+            return process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
+
+        try:
             response_json = response.json()
-            result = response_json.get('body', None)
-            if result:
-                unpacked_html = unpack_content(result)
-                print(len(unpacked_html))
-                parsed_data = GP(unpacked_html)
-                if parsed_data is None:
-                    print('trying again 2')
-                    remove_endpoint(endpoint)
-                    n_endpoint = get_endpoint()
-                    return process_search_row(search_string, n_endpoint, entry_id)  # Add return here
-                if type(parsed_data) == list:
-                    if parsed_data[0][0] == 'No start_tag or end_tag':
-                        print('trying again 3')
-                        remove_endpoint(endpoint)
-                        n_endpoint = get_endpoint()
-                        return process_search_row(search_string, n_endpoint, entry_id)
-                else:
-                    print('parsed data!')
-                    image_url = parsed_data[0]
-                    image_desc = parsed_data[1]
-                    image_source = parsed_data[2]
-                    image_thumb = parsed_data[3]
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from {search_url}. Retrying...")
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
 
-                    print(
-                        f'Image URL: {type(image_url)} {image_url}\nImage Desc:  {type(image_desc)} {image_desc}\nImage Source:{type(image_source)}  {image_source}')
-                    if image_url:
-                        results_df = pd.DataFrame()
-                        for i in range(len(image_url)):
-                            # Check for consistent list lengths
-                            try:
-                                # Extract data for each image
-                                img_url = image_url[i]
-                                img_desc = image_desc[i]
-                                img_source = image_source[i]
-                                img_thumb = image_thumb[i]
+        result = response_json.get('body', None)
+        if not result:
+            print(f"Trying again {attempt} - No result in response")
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
 
-                                # Perform classification and get JSON string and highest caption
-                                results_json, highest_caption = zero_shot_classify(img_thumb)
+        unpacked_html = unpack_content(result)
+        parsed_data = GP(unpacked_html)
 
-                                # Handle or store results as needed
-                                # e.g., print, append to a list, or further processing
-                                print(f"Image {i + 1}:")
-                                print(f"URL: {img_url}")
-                                print(f"Description: {img_desc}")
-                                print(f"Source: {img_source}")
-                                print(f"Results JSON: {results_json}")
-                                print(f"Highest Caption: {highest_caption}")
+        if parsed_data is None or (isinstance(parsed_data, list) and parsed_data[0][0] == 'No start_tag or end_tag'):
+            print(f"Trying again {attempt} - Parsing issue")
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
 
-                            except IndexError as e:
-                                print(f"Error: List index out of range at position {i}. Check your list lengths.")
-                                break
+        # Extract image-related information
+        image_url, image_desc, image_source, image_thumb = parsed_data
 
-                            print(highest_caption)
-                            json_str = json.dumps(results_json)
+        if not image_url:
+            print(f"Trying again {attempt} - No image found")
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
 
-                            # Append the data to the results DataFrame
-                            temp_df = pd.DataFrame({
-                                'EntryId': [entry_id],  # Add EntryId for each row
-                                'ImageUrl': [img_url],
-                                'ImageDesc': [img_desc],
-                                'ImageSource': [img_source],
-                                'ImageUrlThumbnail': [img_thumb],
-                                'AiCaption': [highest_caption],
-                                'AiJson': [json_str]
-                            })
+        # Create DataFrame for results
+        results_df = pd.DataFrame()
+        for i in range(len(image_url)):
+            try:
+                img_url = image_url[i]
+                img_desc = image_desc[i]
+                img_source = image_source[i]
+                img_thumb = image_thumb[i]
 
-                            # Concatenate the temporary DataFrame to the results DataFrame
-                            results_df = pd.concat([results_df, temp_df], ignore_index=True)
-                        # df = pd.DataFrame({
-                        #     'ImageUrl': image_url,
-                        #     'ImageDesc': image_desc,
-                        #     'ImageSource': image_source,
-                        #     'ImageUrlThumbnail':image_thumb,
-                        # })
+                # Perform classification
+                results_json, highest_caption = zero_shot_classify(img_thumb)
 
-                        # except Exception as e:
-                        #     print(e)
-                        # send_email()
-                        if results_df is not None and not results_df.empty:
+                # Append data to results DataFrame
+                temp_df = pd.DataFrame({
+                    'EntryId': [entry_id],
+                    'ImageUrl': [img_url],
+                    'ImageDesc': [img_desc],
+                    'ImageSource': [img_source],
+                    'ImageUrlThumbnail': [img_thumb],
+                    'AiCaption': [highest_caption],
+                    'AiJson': [json.dumps(results_json)]
+                })
+
+                results_df = pd.concat([results_df, temp_df], ignore_index=True)
+
+            except IndexError:
+                print(f"Error: List index out of range at position {i}")
+                break
+
+        if not results_df.empty:
+            # Ensure EntryId exists
+            if 'EntryId' not in results_df.columns:
+                results_df.insert(0, 'EntryId', entry_id)
+
+            results_df.to_sql(name='utb_ImageScraperResult', con=engine, index=False, if_exists='append')
+
+            sql_query = "UPDATE utb_ImageScraperRecords SET Step1 = getdate() WHERE EntryID = ?"
+
+            # Safe database update
+            with pyodbc.connect(conn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(sql_query, (entry_id,))
+                    connection.commit()
         
-                            if 'EntryId' not in results_df.columns:
-                                results_df.insert(0, 'EntryId', entry_id)
+        return results_df
 
-                            results_df.to_sql(name='utb_ImageScraperResult', con=engine, index=False,
-                                      if_exists='append')
-
-                            sql_query = f"update utb_ImageScraperRecords set  Step1 = getdate() where EntryID = {entry_id}"
-
-                            # Create a cursor from the connection
-                            connection = pyodbc.connect(conn)
-                            cursor = connection.cursor()
-
-                            # Execute the update query
-                            cursor.execute(sql_query)
-
-                            # Commit the changes
-                            connection.commit()
-
-                            # Close the connection
-                            connection.close()
-                    else:
-                        print('trying again 4')
-
-                        remove_endpoint(endpoint)
-                        n_endpoint = get_endpoint()
-                        return process_search_row(search_string, n_endpoint, entry_id)
     except requests.RequestException as e:
-        print('trying again 5')
+        print(f"Trying again {attempt} - Request failed: {e}")
         remove_endpoint(endpoint)
         n_endpoint = get_endpoint()
-        print(f"Error making request: {e}\nTrying Again: {n_endpoint}")
-        return process_search_row(search_string, n_endpoint, entry_id)
+        return process_search_row(search_string, n_endpoint, entry_id, attempt + 1)
 
 
 def update_file_generate_complete(file_id):
