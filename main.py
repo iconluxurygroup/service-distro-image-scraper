@@ -918,7 +918,7 @@ async def download_all_images(data, save_path):
                 logger.error(f"Trying again with :{str(data[index][2])}")
                 print(f"Download task generated an exception: {result}")
                 print(f"Trying again with :{str(data[index][2])}")
-                await thumbnail_download(semaphore, str(data[index][2]),str(data[index][0]), save_path, session, fallback_formats=None)
+                await thumbnail_download(semaphore, str(data[index][2]),str(data[index][0]), save_path, session)
                 #THUMBNAIL DOWNLOAD ON FAIL
                 failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
             else:
@@ -973,8 +973,7 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
                         return False
                 else:
                     logger.error(f"Download failed with status code {response.status} for URL: {url}")
-                    await thumbnail_download(semaphore, thumbnail, image_name, save_path, session,
-                                             fallback_formats=None)
+                    await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
                     return False
 
         except TimeoutError as exc:
@@ -1033,6 +1032,7 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
                                     return True
                             except Exception as fallback_exc:
                                 logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                    return False
                 else:
                     logger.error(f"Download failed with status code {response.status} for URL: {url}")
 
