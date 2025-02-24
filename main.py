@@ -10,6 +10,8 @@ import datetime
 import boto3
 import logging
 from io import BytesIO
+import urllib.parse
+
 from openpyxl.utils import get_column_letter
 from icon_image_lib.google_parser import get_original_images as GP
 from requests.adapters import HTTPAdapter
@@ -522,10 +524,16 @@ async def generate_download_file(file_id):
     logger.info("Uploading file to space")
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
     is_public = True
+
+# Get just the base file name and decode it.
+    key = urllib.parse.unquote(os.path.basename(local_filename))
     public_url = await loop.run_in_executor(
-        ThreadPoolExecutor(), 
-        upload_file_to_space, 
-        local_filename, os.path.basename(local_filename), is_public, contenttype
+        ThreadPoolExecutor(),
+        upload_file_to_space,
+        local_filename,  # File source remains the full local path
+        key,            # S3 key is now just the base name (unquoted)
+        is_public,
+        contenttype
     )
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
