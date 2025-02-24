@@ -666,6 +666,7 @@ hg_client = InferenceClient(
 # -------------------------------------------------------------------
 # 1. Database Connection (adjust or remove if not needed)
 # -------------------------------------------------------------------
+# -------------------------------------------------------------------
 def update_database(result_id, aijson, aicaption):
     """
     Update the database with the AI JSON and AI-generated caption.
@@ -704,7 +705,7 @@ def fetch_image_data(file_id):
         return pd.DataFrame()  # Return empty DataFrame on error
 
 # -------------------------------------------------------------------
-# 3. Detect All Features (via InferenceClient)
+# 2. Detect All Features (via InferenceClient)
 # -------------------------------------------------------------------
 def detect_all_features_llama(image_url):
     """
@@ -712,7 +713,7 @@ def detect_all_features_llama(image_url):
     to 'detect' features and return a JSON string.
     
     The prompt requests the model to produce valid JSON with
-    'labels', 'logos', 'text', 'image_properties', and 'web_entities'.
+    'labels', 'logos', 'text', 'image_properties', 'web_entities'.
     """
     try:
         # Prompt for JSON-based analysis:
@@ -739,27 +740,24 @@ def detect_all_features_llama(image_url):
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": user_text
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_url
-                        }
-                    }
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}}
                 ]
             }
         ]
 
-        # Make the inference call (not streaming)
+        # Inference call (non-streaming)
         response = hg_client.chat.completions.create(
             model="meta-llama/Llama-3.2-11B-Vision-Instruct",
             messages=messages,
             max_tokens=500,
             stream=False
         )
+
+        # Validate 'choices' in response
+        if not response.choices:
+            logging.error("No 'choices' in the response for feature detection.")
+            return ""
 
         # Extract the text from the first choice
         text_output = response.choices[0].message.content.strip()
@@ -782,7 +780,7 @@ def detect_all_features_llama(image_url):
         return ""
 
 # -------------------------------------------------------------------
-# 4. Generate Caption (via InferenceClient)
+# 3. Generate Caption (via InferenceClient)
 # -------------------------------------------------------------------
 def generate_caption_llama(image_url, aijson):
     """
@@ -798,7 +796,7 @@ def generate_caption_llama(image_url, aijson):
             "### INSTRUCTIONS ###\n"
             "Analyze the data above and the image, then extract:\n"
             "1) Short Description (1-2 words)\n"
-            "2) Category (e.g., 'Shoe', 'Bag', 'Laptop'...)\n"
+            "2) Category (e.g., 'Shoe', 'Bag', 'Laptop')\n"
             "3) Brand (e.g., 'Nike', 'Gucci', or 'NaN' if unknown)\n"
             "4) Color (e.g., 'Black', 'Blue', or 'NaN')\n\n"
             "### OUTPUT FORMAT ###\n"
@@ -811,21 +809,12 @@ def generate_caption_llama(image_url, aijson):
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": user_text
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_url
-                        }
-                    }
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}}
                 ]
             }
         ]
 
-        # Call the HF InferenceClient again
         response = hg_client.chat.completions.create(
             model="meta-llama/Llama-3.2-11B-Vision-Instruct",
             messages=messages,
@@ -833,28 +822,32 @@ def generate_caption_llama(image_url, aijson):
             stream=False
         )
 
-        # Extract the caption text
+        # Validate 'choices' in response
+        if not response.choices:
+            logging.error("No 'choices' in the response for caption generation.")
+            return "Item NaN NaN NaN"
+
         caption = response.choices[0].message.content.strip()
-        return caption or "Item NaN NaN NaN"
+        return caption if caption else "Item NaN NaN NaN"
 
     except Exception as e:
         logging.error(f"Error generating caption: {e}")
         return "Item NaN NaN NaN"
 
 # -------------------------------------------------------------------
-# 5. Main Loop
+# 4. Main Loop
 # -------------------------------------------------------------------
 def process_images(file_id):
     """
     1) Fetch image data from DB.
     2) For each image:
-       - Use detect_all_features_llama() to get structured JSON.
-       - Use generate_caption_llama() to get a final product-like caption.
+       - Use detect_all_features_llama() for JSON.
+       - Use generate_caption_llama() for caption.
        - Update DB with results.
     """
     df = fetch_image_data(file_id)
     if df.empty:
-        logging.warning("No records found.")
+        logging.warning("No records found for FileID=%s", file_id)
         return
 
     for _, row in df.iterrows():
@@ -862,22 +855,23 @@ def process_images(file_id):
             image_url = row["ImageURL"]
             result_id = row["ResultID"]
 
-            # 5.1. "Detect all features"
+            # 1) Detect all features
             llama_features_json = detect_all_features_llama(image_url)
             if not llama_features_json:
                 logging.warning(f"LLaMA returned empty result for URL={image_url}")
                 continue
 
-            # 5.2. Generate short caption
+            # 2) Generate short caption
             ai_caption = generate_caption_llama(image_url, llama_features_json)
 
-            # 5.3. Update DB
+            # 3) Update DB
             update_database(result_id, llama_features_json, ai_caption)
             logging.info(f"Record {result_id} processed. Caption: {ai_caption}")
 
         except Exception as e:
             logging.error(f"Error processing record {row.get('ResultID')}: {e}")
             continue
+
 
 
 def get_lm_products(file_id):
