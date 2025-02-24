@@ -828,23 +828,26 @@ def process_images(file_id):
         return
 
     for _, row in df.iterrows():
-        image_url = row["ImageURL"]
-        result_id = row["ResultID"]
-        brand = row["ProductBrand"]
-        category = row["ProductCategory"]
-        color = row["ProductColor"]
+        try:
+            image_url = row["ImageURL"]
+            result_id = row["ResultID"]
+            brand = row["ProductBrand"]
+            category = row["ProductCategory"]
+            color = row["ProductColor"]
 
-        # Process image with Google Vision API
-        vision_result_json = detect_all_features(image_url)
+            # Process image with Google Vision API
+            vision_result_json = detect_all_features(image_url)
 
-        if vision_result_json:
-            # Generate caption using AI model
-            ai_caption = generate_caption(vision_result_json)
+            if vision_result_json:
+                # Generate caption using AI model
+                ai_caption = generate_caption(vision_result_json)
 
-            # ✅ Update database with AI JSON and caption
-            update_database(result_id, vision_result_json, ai_caption)
-
-    logging.info(f"Processing complete. AI JSON and captions stored in DB for FileID {file_id}")
+                # Update database with AI JSON and caption
+                update_database(result_id, vision_result_json, ai_caption)
+                logging.info(f"Processing record {row.get('ResultID', 'Unknown')}: {ai_caption}")
+        except Exception as e:
+            logging.error(f"Error processing record {row.get('ResultID', 'Unknown')}: {e}")
+            continue  # Skip to the next record
 
 
 def get_lm_products(file_id):
