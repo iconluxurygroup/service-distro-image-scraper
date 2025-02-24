@@ -903,7 +903,7 @@ async def download_all_images(data, save_path):
 
         logger.info("Scheduling image downloads")
         tasks = [
-            image_download(semaphore, str(item[1]),str(item[2]), str(item[0]), save_path, session, index)
+            image_download(semaphore, str(item[1]),str(item[2]), str(item[0]), save_path, session)
             for index, item in enumerate(data, start=1)
         ]
 
