@@ -707,7 +707,7 @@ def fetch_image_data(file_id):
     try:
         with pyodbc.connect(conn_str) as conn:
             df = pd.read_sql(query, conn, params=[file_id])
-            logging.error(f"DF info: {df.info()}")
+            logging.error(f"DF info: {df}")
         return df
     except Exception as e:
         print(f"Database error: {e}")
