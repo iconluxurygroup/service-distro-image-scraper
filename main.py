@@ -970,23 +970,28 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
                                     return True
                             except Exception as fallback_exc:
                                 logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                        return False
                 else:
                     logger.error(f"Download failed with status code {response.status} for URL: {url}")
                     await thumbnail_download(semaphore, thumbnail, image_name, save_path, session,
                                              fallback_formats=None)
+                    return False
 
         except TimeoutError as exc:
             # Handle the timeout specifically
             logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
             print('timeout error inside the downlaod function')
+            print(exc)
             # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
             # return False
-            return exc
+            return False
+
         except Exception as exc:
             logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
             # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
             # return False
-            return exc
+            print(exc)
+            return False
 async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
