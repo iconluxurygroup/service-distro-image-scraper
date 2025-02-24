@@ -10,8 +10,6 @@ import datetime
 import boto3
 import logging
 from io import BytesIO
-import urllib.parse
-
 from openpyxl.utils import get_column_letter
 from icon_image_lib.google_parser import get_original_images as GP
 from requests.adapters import HTTPAdapter
@@ -21,7 +19,7 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition,Personalization,Cc,To
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import aiohttp,os
+import aiohttp
 from aiohttp import ClientTimeout
 from aiohttp_retry import RetryClient, ExponentialRetry
 #logging.basicConfig(level=logging.INFO)
@@ -48,32 +46,23 @@ def get_spaces_client():
                             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     logger.info("Spaces client created successfully")
     return client
-def upload_file_to_space(file_src, save_as, is_public, content_type, meta=None):
+def upload_file_to_space(file_src, save_as, is_public):
     spaces_client = get_spaces_client()
-    bucket_name = 'iconluxurygroup-s3'
-    if not content_type:
-        content_type_guess = mimetypes.guess_type(file_src)[0]
-        if not content_type_guess:
-            raise Exception("Content type could not be guessed. Please specify it directly.")
-        content_type = content_type_guess
+    space_name = 'iconluxurygroup-s3'  # Your space name
 
-    extra_args = {'ACL': 'public-read' if is_public else 'private', 'ContentType': content_type}
-    if meta:
-        extra_args['Metadata'] = meta
-
-    spaces_client.upload_file(
-        Filename=file_src,
-        Bucket=bucket_name,
-        Key=save_as,
-        ExtraArgs=extra_args
-    )
-    logger.info(f"File uploaded successfully to {bucket_name}/{save_as}")
+    # if not content_type:
+    #     content_type_guess = mimetypes.guess_type(file_src)[0]
+    #     if not content_type_guess:
+    #         raise Exception("Content type could not be guessed. Please specify it directly.")
+    #     content_type = content_type_guess
+    spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
+    print(f"File uploaded successfully to {space_name}/{save_as}")
+    # Generate and return the public URL if the file is public
     if is_public:
-        region = os.getenv('REGION', 'us-east-2')
-        public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{save_as}"
-        logger.info(f"Public URL: {public_url}")
-        return public_url
-
+        # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
+        upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
+        print(f"Public URL: {upload_url}")
+        return upload_url
 
 def send_email(to_emails, subject, download_url,jobId):
     # Encode the URL if necessary (example shown, adjust as needed)
@@ -524,17 +513,8 @@ async def generate_download_file(file_id):
     logger.info("Uploading file to space")
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
     is_public = True
+    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name,is_public)  
 
-# Get just the base file name and decode it.
-    key = urllib.parse.unquote(os.path.basename(local_filename))
-    public_url = await loop.run_in_executor(
-        ThreadPoolExecutor(),
-        upload_file_to_space,
-        local_filename,  # File source remains the full local path
-        key,            # S3 key is now just the base name (unquoted)
-        is_public,
-        contenttype
-    )
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
   
