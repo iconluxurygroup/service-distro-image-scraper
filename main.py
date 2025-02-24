@@ -40,12 +40,17 @@ from threading import Thread
 def get_spaces_client():
     logger.info("Creating spaces client")
     # session = boto3.session.Session()
+    # client = boto3.client(service_name='s3',
+    #                         region_name=os.getenv('REGION'),
+    #                         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    #                         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     client = boto3.client(service_name='s3',
-                            region_name='us-east-2',
-                            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
+                               region_name=os.getenv('REGION'),
+                             aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     logger.info("Spaces client created successfully")
     return client
+
 def upload_file_to_space(file_src, save_as, is_public):
     spaces_client = get_spaces_client()
     space_name = 'iconluxurygroup-s3'  # Your space name
@@ -63,6 +68,9 @@ def upload_file_to_space(file_src, save_as, is_public):
         upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
         print(f"Public URL: {upload_url}")
         return upload_url
+
+
+
 
 def send_email(to_emails, subject, download_url,jobId):
     # Encode the URL if necessary (example shown, adjust as needed)
