@@ -67,7 +67,7 @@ def upload_file_to_space(file_src, save_as, is_public, content_type, meta=None):
     )
     logger.info(f"File uploaded successfully to {bucket_name}/{save_as}")
     if is_public:
-        region = os.getenv('REGION', 'us-east-1')
+        region = os.getenv('REGION', 'us-east-2')
         public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{save_as}"
         logger.info(f"Public URL: {public_url}")
         return public_url
