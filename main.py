@@ -51,24 +51,44 @@ def get_spaces_client():
     logger.info("Spaces client created successfully")
     return client
 
+# def upload_file_to_space(file_src, save_as, is_public):
+#     spaces_client = get_spaces_client()
+#     space_name = 'iconluxurygroup-s3'  # Your space name
+
+#     # if not content_type:
+#     #     content_type_guess = mimetypes.guess_type(file_src)[0]
+#     #     if not content_type_guess:
+#     #         raise Exception("Content type could not be guessed. Please specify it directly.")
+#     #     content_type = content_type_guess
+#     spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
+#     print(f"File uploaded successfully to {space_name}/{save_as}")
+#     # Generate and return the public URL if the file is public
+#     if is_public:
+#         # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
+#         upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
+#         print(f"Public URL: {upload_url}")
+#         return upload_url
 def upload_file_to_space(file_src, save_as, is_public):
     spaces_client = get_spaces_client()
-    space_name = 'iconluxurygroup-s3'  # Your space name
-
-    # if not content_type:
-    #     content_type_guess = mimetypes.guess_type(file_src)[0]
-    #     if not content_type_guess:
-    #         raise Exception("Content type could not be guessed. Please specify it directly.")
-    #     content_type = content_type_guess
-    spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
-    print(f"File uploaded successfully to {space_name}/{save_as}")
-    # Generate and return the public URL if the file is public
-    if is_public:
-        # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
-        upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
-        print(f"Public URL: {upload_url}")
-        return upload_url
-
+    bucket_name = 'iconluxurygroup-s3'
+    
+    try:
+        spaces_client.upload_file(
+            file_src, 
+            bucket_name,
+            save_as,
+            ExtraArgs={'ACL': 'public-read'}
+        )
+        print(f"File uploaded successfully to {bucket_name}/{save_as}")
+        
+        if is_public:
+            upload_url = f"https://{bucket_name}.s3.us-east-2.amazonaws.com/{save_as}"
+            print(f"Public URL: {upload_url}")
+            return upload_url
+    except Exception as e:
+        print(f"Upload error: {str(e)}")
+        # You might want to log the error or handle it differently
+        raise
 
 
 
