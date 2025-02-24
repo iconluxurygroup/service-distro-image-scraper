@@ -656,7 +656,7 @@ import json
 import os
 from google.cloud import vision
 from google.oauth2 import service_account
-GOOGLE_APPLICATION_CREDENTIALS="image-scraper-451516-ed43869c27fd.json"
+GOOGLE_APPLICATION_CREDENTIALS="image-scraper-451516-321d2430b17e.json"
 # Google Vision API credentials
 # Set the path to your service account key file
 service_account_path = GOOGLE_APPLICATION_CREDENTIALS  # Replace this with your actual path
