@@ -37,6 +37,7 @@ import pandas as pd
 #load_dotenv()
 import base64,zlib
 from threading import Thread
+from botocore.config import Config
 def get_spaces_client():
     logger.info("Creating spaces client")
     # session = boto3.session.Session()
@@ -45,9 +46,10 @@ def get_spaces_client():
     #                         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
     #                         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     client = boto3.client('s3',
-                                region_name='us-east-2', 
+                            region_name='us-east-2', 
                              aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
+                             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        config=Config(signature_version='s3v4'))
     logger.info("Spaces client created successfully")
     return client
 
