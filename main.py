@@ -45,7 +45,7 @@ def get_spaces_client():
     #                         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
     #                         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     client = boto3.client('s3',
-                               region_name=os.getenv('REGION'),
+                                region_name='us-east-2', 
                              aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
                              aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     logger.info("Spaces client created successfully")
