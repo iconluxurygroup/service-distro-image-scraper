@@ -691,7 +691,8 @@ def update_database(result_id, aijson, aicaption):
             cursor = conn.cursor()
             cursor.execute(query, (aijson, aicaption, result_id))
             conn.commit()
-            logging.info(f"Database updated successfully for ResultID {result_id}")
+            logging.info(f"Database updated successfully for ResultID {result_id}, rows affected: {cursor.rowcount}")
+
     except Exception as e:
         logging.error(f"Error updating database for ResultID {result_id}: {e}")
 
