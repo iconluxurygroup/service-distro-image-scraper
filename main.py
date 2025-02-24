@@ -658,16 +658,14 @@ import os
 import pandas as pd
 import torch
 from PIL import Image
-from huggingface_hub import login
-
-login(token="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")
-# For LLaMA-based Vision model
-from transformers import MllamaForConditionalGeneration, AutoProcessor
-
+from huggingface_hub import InferenceClient
+hg_client = InferenceClient(
+	provider="sambanova",
+	api_key="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"
+)
 # -------------------------------------------------------------------
 # 1. Database Connection (adjust or remove if not needed)
 # -------------------------------------------------------------------
-
 def update_database(result_id, aijson, aicaption):
     """
     Update the database with the AI JSON and AI-generated caption.
@@ -689,7 +687,6 @@ def update_database(result_id, aijson, aicaption):
 def fetch_image_data(file_id):
     """
     Fetch image data along with brand, category, and color from the database.
-    Adjust the table/column names to match your schema.
     """
     query = """
         SELECT rr.ResultID, rr.EntryID, rr.ImageURL, 
@@ -707,36 +704,18 @@ def fetch_image_data(file_id):
         return pd.DataFrame()  # Return empty DataFrame on error
 
 # -------------------------------------------------------------------
-# 2. Load LLaMA 3.2 Vision Model
-# -------------------------------------------------------------------
-# Example model_id — replace with a *real* model from Hugging Face:
-model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-
-# Load model and processor
-# (Be sure your hardware can handle the model size.)
-model = MllamaForConditionalGeneration.from_pretrained(
-    model_id,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-)
-processor = AutoProcessor.from_pretrained(model_id)
-
-# -------------------------------------------------------------------
-# 3. "Detect All Features" with LLaMA (replacing Google Vision)
+# 3. Detect All Features (via InferenceClient)
 # -------------------------------------------------------------------
 def detect_all_features_llama(image_url):
     """
-    Use the LLaMA-based model to 'detect' features (labels, logos, text, colors, etc.)
-    and return a JSON string to mimic the old Google Vision structure.
+    Use a remote LLaMA-based model via Hugging Face InferenceClient
+    to 'detect' features and return a JSON string.
     
-    In practice, the model may be less accurate at certain tasks like text detection or logos.
+    The prompt requests the model to produce valid JSON with
+    'labels', 'logos', 'text', 'image_properties', and 'web_entities'.
     """
     try:
-        # 3.1. Fetch the image
-        response = requests.get(image_url, stream=True, timeout=10)
-        img = Image.open(response.raw).convert("RGB")
-        
-        # 3.2. Prompt the model to produce structured JSON
+        # Prompt for JSON-based analysis:
         user_text = (
             "You are an image analysis AI. Describe the following image with:\n"
             "1) labels - main objects or concepts\n"
@@ -752,69 +731,67 @@ def detect_all_features_llama(image_url):
             "  'image_properties': [],\n"
             "  'web_entities': []\n"
             "}\n\n"
-            "Now analyze the image and provide the JSON."
+            "Analyze the image and provide that JSON."
         )
-        
-        # Prepare the "messages" for MLLama (or any LLaMA-based chat)
+
+        # Messages structure for the HF Inference endpoint
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": user_text}
+                    {
+                        "type": "text",
+                        "text": user_text
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url
+                        }
+                    }
                 ]
             }
         ]
-        # Some checkpoints use a "chat template" approach. 
-        input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
-        
-        # Tokenize the image + text
-        inputs = processor(
-            img,
-            input_text,
-            add_special_tokens=False,
-            return_tensors="pt"
-        ).to(model.device)
-        
-        # Generate
-        output = model.generate(**inputs, max_new_tokens=512)
-        decoded = processor.decode(output[0], skip_special_tokens=False)
-        
-        # Clean up extraneous tokens
-        decoded = decoded.replace("<s>", "").replace("</s>", "").strip()
-        
+
+        # Make the inference call (not streaming)
+        response = hg_client.chat.completions.create(
+            model="meta-llama/Llama-3.2-11B-Vision-Instruct",
+            messages=messages,
+            max_tokens=500,
+            stream=False
+        )
+
+        # Extract the text from the first choice
+        text_output = response.choices[0].message.content.strip()
+
         # Attempt to parse as JSON
-        # If the model doesn't produce valid JSON, you may need more robust parsing or a re-prompt
         try:
-            parsed = json.loads(decoded)
-            # If keys are missing, fix them:
+            parsed = json.loads(text_output)
+            # Ensure all keys exist
             for key in ["labels", "logos", "text", "image_properties", "web_entities"]:
                 if key not in parsed:
                     parsed[key] = []
-            # Return as a pretty-printed JSON string
+            # Return a nicely formatted JSON string
             return json.dumps(parsed, indent=4)
         except json.JSONDecodeError:
-            logging.warning("Model did not return valid JSON. Storing raw text instead.")
-            return decoded
-    
+            logging.warning("Model did not return valid JSON. Returning raw text.")
+            return text_output
+
     except Exception as e:
         logging.error(f"Error analyzing image with LLaMA: {e}")
         return ""
 
 # -------------------------------------------------------------------
-# 4. Generate Caption with LLaMA
+# 4. Generate Caption (via InferenceClient)
 # -------------------------------------------------------------------
 def generate_caption_llama(image_url, aijson):
     """
-    Generate a short caption from the LLaMA-based model, using the 'aijson' as context.
-    For example, the final format might be "<Short Description> <Category> <Brand> <Color>".
+    Generate a short product-like caption from the remote LLaMA model.
+    Example format: "<Short Description> <Category> <Brand> <Color>"
+    If unknown, use 'NaN'.
     """
     try:
-        # 4.1. Fetch the image
-        response = requests.get(image_url, stream=True, timeout=10)
-        img = Image.open(response.raw).convert("RGB")
-        
-        # 4.2. Prompt for a structured product-like caption
+        # Build prompt with the AI JSON context + instructions
         user_text = (
             "### AI Image Analysis Data ###\n"
             f"{aijson}\n\n"
@@ -829,41 +806,51 @@ def generate_caption_llama(image_url, aijson):
             "If any field is unknown, replace it with 'NaN'.\n"
             "No extra text, no explanation."
         )
-        
+
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": user_text}
+                    {
+                        "type": "text",
+                        "text": user_text
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url
+                        }
+                    }
                 ]
             }
         ]
-        input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
-        
-        # Tokenize
-        inputs = processor(img, input_text, return_tensors="pt", add_special_tokens=False).to(model.device)
-        
-        # Generate
-        output = model.generate(**inputs, max_new_tokens=80)
-        decoded = processor.decode(output[0], skip_special_tokens=False)
-        
-        # Clean up extraneous tokens
-        decoded = decoded.replace("<s>", "").replace("</s>", "").strip()
-        
-        return decoded
-    
+
+        # Call the HF InferenceClient again
+        response = hg_client.chat.completions.create(
+            model="meta-llama/Llama-3.2-11B-Vision-Instruct",
+            messages=messages,
+            max_tokens=500,
+            stream=False
+        )
+
+        # Extract the caption text
+        caption = response.choices[0].message.content.strip()
+        return caption or "Item NaN NaN NaN"
+
     except Exception as e:
         logging.error(f"Error generating caption: {e}")
         return "Item NaN NaN NaN"
 
 # -------------------------------------------------------------------
-# 5. Main Loop (No Google, just LLaMA for everything)
+# 5. Main Loop
 # -------------------------------------------------------------------
 def process_images(file_id):
     """
-    Fetch image data, analyze each image with LLaMA, generate captions with LLaMA,
-    then store results in the database.
+    1) Fetch image data from DB.
+    2) For each image:
+       - Use detect_all_features_llama() to get structured JSON.
+       - Use generate_caption_llama() to get a final product-like caption.
+       - Update DB with results.
     """
     df = fetch_image_data(file_id)
     if df.empty:
@@ -875,7 +862,7 @@ def process_images(file_id):
             image_url = row["ImageURL"]
             result_id = row["ResultID"]
 
-            # 5.1. "Detect all features" with LLaMA
+            # 5.1. "Detect all features"
             llama_features_json = detect_all_features_llama(image_url)
             if not llama_features_json:
                 logging.warning(f"LLaMA returned empty result for URL={image_url}")
@@ -890,7 +877,8 @@ def process_images(file_id):
 
         except Exception as e:
             logging.error(f"Error processing record {row.get('ResultID')}: {e}")
-            continue  # skip to next record
+            continue
+
 
 def get_lm_products(file_id):
 
