@@ -8,6 +8,7 @@ import logging
 from dotenv import load_dotenv
 load_dotenv()
 #from mysql.connector import pooling
+PRODUCTAPIENDPOINT="https://image-backend-cms-icon-7.popovtech.com"
 
 from concurrent.futures import ThreadPoolExecutor
 from asyncio.exceptions import TimeoutError
@@ -24,14 +25,14 @@ logger = logging.getLogger(__name__)
 #     password=os.getenv('DBPASS'),
 #     port=25060
 # )
-
+POLL_INTERVAL=30
 async def create_image_task(dataset_split):
     try:
         print(dataset_split)
         logger.info("Attempting to create an image task")
         async with httpx.AsyncClient(timeout=None) as client:
-            print(f"{str(os.environ.get('PRODUCTAPIENDPOINT'))}/api/v1/image/create")
-            response = await client.post(f"{str(os.environ.get('PRODUCTAPIENDPOINT'))}/api/v1/image/create", json={"dataset_split": dataset_split})
+            print(f"{str(PRODUCTAPIENDPOINT)}/api/v1/image/create")
+            response = await client.post(f"{str(PRODUCTAPIENDPOINT)}/api/v1/image/create", json={"dataset_split": dataset_split})
             result = response.json()
             print(result)
             logger.info(f"Image task created successfully with response: {result}")
@@ -60,7 +61,7 @@ async def poll_task_status(task_id, timeout=5000):
                     logger.error(f"Task {task_id} failed or encountered an error with data: {data}")
                     return {'error': 'Task failed or encountered an error'}
                 else:
-                    await asyncio.sleep(int(os.environ.get('POLL_INTERVAL'))) # Poll every 60 seconds
+                    await asyncio.sleep(int(POLL_INTERVAL)) # Poll every 60 seconds
     except Exception as e:
         logger.exception(f"Exception occurred while polling task {task_id} Exception: {e}")
         raise

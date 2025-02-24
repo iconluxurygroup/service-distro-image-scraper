@@ -7,6 +7,7 @@ WORKDIR /app
 # Copy the requirements file first to leverage Docker cache
 COPY requirements.txt .
 
+COPY image-scraper-451516-ed43869c27fd.json .
 # Install Python dependencies
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt

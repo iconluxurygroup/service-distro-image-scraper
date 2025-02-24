@@ -6,7 +6,7 @@ from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
-import datetime
+import datetime,re
 import boto3
 import logging
 from io import BytesIO
@@ -40,7 +40,7 @@ from threading import Thread
 AWS_ACCESS_KEY_ID='AKIAZQ3DSIQ5BGLY355N'
 AWS_SECRET_ACCESS_KEY='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'
 REGION='us-east-2'
-
+MSSQLS_PWD="Ftu5675FDG54hjhiuu$"
 def get_spaces_client():
     logger.info("Creating spaces client")
     # session = boto3.session.Session()
@@ -188,9 +188,9 @@ async def cleanup_temp_dirs(directories):
     loop = asyncio.get_running_loop()  # Get the current loop directly
     for dir_path in directories:
         await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
-
-pwd_value = str(os.environ.get('MSSQLS_PWD'))
-pwd_str =f"Pwd={pwd_value};"
+pwd_str =f"Pwd={MSSQLS_PWD};"
+#pwd_value = str(os.environ.get('MSSQLS_PWD'))
+conn_str = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
 global conn
 conn = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
 global engine
@@ -216,7 +216,6 @@ def get_records_to_search(file_id,engine):
     print(sql_query)
     df = pd.read_sql_query(sql_query, con=engine)
     return df
-
 def load_payload_db(rows, file_id):
     # Create DataFrame from list of dictionaries (rows)
     df = pd.DataFrame(rows)
@@ -650,6 +649,201 @@ async def generate_download_file(file_id):
 #
 import asyncio
 import ray
+import pyodbc
+import pandas as pd
+import requests
+import json
+import os
+from google.cloud import vision
+from google.oauth2 import service_account
+GOOGLE_APPLICATION_CREDENTIALS="image-scraper-451516-ed43869c27fd.json"
+# Google Vision API credentials
+# Set the path to your service account key file
+service_account_path = GOOGLE_APPLICATION_CREDENTIALS  # Replace this with your actual path
+#
+# Load the service account credentials
+credentials = service_account.Credentials.from_service_account_file(service_account_path)
+
+client = vision.ImageAnnotatorClient(credentials=credentials)
+
+import json
+import logging
+import openai
+import pyodbc
+
+
+def update_database(result_id, aijson, aicaption):
+    """
+    Update the database with the AI JSON and AI-generated caption.
+
+    Parameters:
+        result_id (int): The ID of the result entry to update.
+        aijson (str): JSON string containing AI-generated image analysis.
+        aicaption (str): Generated caption describing the image.
+    """
+    query = """
+        UPDATE utb_ImageScraperResult
+        SET aijson = ?, aicaption = ?
+        WHERE ResultID = ?
+    """
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, (aijson, aicaption, result_id))
+            conn.commit()
+            logging.info(f"Database updated successfully for ResultID {result_id}")
+    except Exception as e:
+        logging.error(f"Error updating database for ResultID {result_id}: {e}")
+
+
+def fetch_image_data(file_id):
+    """Fetch image data along with brand, category, and color from the database."""
+    query = """
+        SELECT rr.ResultID, rr.EntryID, rr.ImageURL, r.ProductBrand, r.ProductCategory, r.ProductColor
+        FROM utb_ImageScraperRecords r
+        INNER JOIN utb_ImageScraperResult rr ON r.EntryID = rr.EntryID
+        WHERE r.FileID = ?
+    """
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            df = pd.read_sql(query, conn, params=[file_id])
+        return df
+    except Exception as e:
+        print(f"Database error: {e}")
+        return pd.DataFrame()  # Return an empty DataFrame on error
+
+def detect_all_features(image_url):
+    """Detect multiple image features using Google Vision API."""
+    try:
+        response = requests.get(image_url)
+        image = vision.Image(content=response.content)
+
+        result_data = {
+            "labels": [],
+            "logos": [],
+            "text": [],
+            "image_properties": [],
+            "web_entities": [],
+        }
+
+        # Label Detection
+        response = client.label_detection(image=image)
+        result_data["labels"] = [{"label": label.description} for label in response.label_annotations[:5]]
+
+        # Logo Detection
+        response = client.logo_detection(image=image)
+        result_data["logos"] = [{"logo": logo.description} for logo in response.logo_annotations]
+
+        # Text Detection
+        response = client.text_detection(image=image)
+        result_data["text"] = [text.description for text in response.text_annotations]
+
+        # Image Properties
+        response = client.image_properties(image=image)
+        result_data["image_properties"] = [
+            {"color": f"RGB({color.color.red}, {color.color.green}, {color.color.blue})"}
+            for color in response.image_properties_annotation.dominant_colors.colors
+        ]
+
+        # Web Detection
+        response = client.web_detection(image=image)
+        result_data["web_entities"] = [{"entity": entity.description} for entity in response.web_detection.web_entities]
+
+        return json.dumps(result_data, indent=4)  # Store as JSON string
+    except Exception as e:
+        print(f"Error processing {image_url}: {e}")
+
+# Initialize OpenAI API key
+openai_api_key = 'sk-svcacct-rOasnB9w-_OVCIv1_eDwJR4GvFBT-gnK5mC_E93rKqExtPF8hYXkrvIqXCTXRdIfk0T3BlbkFJ3srk7jtYtSBee49EF-qh42x1Ym5JZr7jmJsOO6Bg9QLFesBWSBlVcoya5CqwJZT4YA'  # Replace this with your API ke
+
+openai_client = openai.OpenAI(api_key=openai_api_key)
+
+def generate_caption(aijson):
+    """
+    Generate a structured caption using OpenAI API with full AI JSON context.
+    The format is: "<Short Description> <Category> <Brand> <Color>"
+    
+    Parameters:
+        aijson (str): JSON string from AI analysis (includes labels, web entities, text, etc.)
+        
+    Returns:
+        str: A structured product caption.
+    """
+    try:
+        # Prepare a detailed prompt with full AI JSON context.
+        prompt = (
+            f"### AI Image Analysis Data ###\n{aijson}\n\n"
+            f"### INSTRUCTIONS ###\n"
+            f"Analyze the provided AI image data and extract:\n"
+            f"1️⃣ **Short Description** (1-2 words summarizing the item)\n"
+            f"2️⃣ **Category** (e.g., 'Shoe', 'Bag', 'Laptop')\n"
+            f"3️⃣ **Brand** (e.g., 'Nike', 'Gucci', or 'NaN' if unknown)\n"
+            f"4️⃣ **Color** (e.g., 'Black', 'Blue', 'Red', or 'NaN' if unknown) - Color is least important.\n\n"
+            f"### OUTPUT FORMAT ###\n"
+            f"Return only the final caption, formatted as:\n"
+            f"**<Short Description> <Category> <Brand> <Color>**\n"
+            f"Example outputs:\n"
+            f"- **Sneaker Shoe Nike Black**\n"
+            f"- **Handbag Bag Gucci Green**\n"
+            f"- **MacBook Laptop Apple Silver**\n"
+            f"- **Item NaN NaN NaN** (if no relevant data found)\n\n"
+            f"### IMPORTANT ###\n"
+            f"- Do not add explanations, just return the final caption.\n"
+            f"- If any field is unknown, use 'NaN'.\n"
+            f"- Be as precise as possible, but avoid uncertainty."
+        )
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "You are an AI product categorization expert."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2800,  # Allow enough tokens for full context processing
+            temperature=0.3
+        )
+        
+        # Extract the generated caption
+        caption = response.choices[0].message.content.strip()
+        return caption
+
+    except Exception as e:
+        logging.error(f"Error generating caption: {e}")
+        return "Item NaN NaN NaN"
+
+
+def process_images(file_id):
+    """
+    Fetch image data, process each image with Google Vision API, generate captions, and store results in the database.
+
+    Parameters:
+        file_id (int): The ID of the file containing images to process.
+    """
+    df = fetch_image_data(file_id)
+
+    if df is None or df.empty:
+        logging.warning("No records found.")
+        return
+
+    for _, row in df.iterrows():
+        image_url = row["ImageURL"]
+        result_id = row["ResultID"]
+        brand = row["ProductBrand"]
+        category = row["ProductCategory"]
+        color = row["ProductColor"]
+
+        # Process image with Google Vision API
+        vision_result_json = detect_all_features(image_url)
+
+        if vision_result_json:
+            # Generate caption using AI model
+            ai_caption = generate_caption(vision_result_json)
+
+            # ✅ Update database with AI JSON and caption
+            update_database(result_id, vision_result_json, ai_caption)
+
+    logging.info(f"Processing complete. AI JSON and captions stored in DB for FileID {file_id}")
+
 
 def get_lm_products(file_id):
 
@@ -684,7 +878,7 @@ def process_restart_batch(file_id_db):
     
     
     update_sort_order(file_id_db)
-    
+    process_images(file_id_db)
     asyncio.run(generate_download_file(file_id_db))
     
 
@@ -723,7 +917,7 @@ def process_image_batch(payload: dict):
 
     #####
     update_sort_order(file_id_db)
-    
+    process_images(file_id_db)
     asyncio.run(generate_download_file(file_id_db))
     print(f"End of whole process: {end}")
     print(f"It took {end - start} to complete")
