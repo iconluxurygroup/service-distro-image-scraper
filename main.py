@@ -654,32 +654,21 @@ import pandas as pd
 import requests
 import json
 import os
-from google.cloud import vision
-from google.oauth2 import service_account
-GOOGLE_APPLICATION_CREDENTIALS="image-scraper-451516-321d2430b17e.json"
-# Google Vision API credentials
-# Set the path to your service account key file
-service_account_path = GOOGLE_APPLICATION_CREDENTIALS  # Replace this with your actual path
-#
-# Load the service account credentials
-credentials = service_account.Credentials.from_service_account_file(service_account_path)
 
-client = vision.ImageAnnotatorClient(credentials=credentials)
+import pandas as pd
+import torch
+from PIL import Image
 
-import json
-import logging
-import openai
-import pyodbc
+# For LLaMA-based Vision model
+from transformers import MllamaForConditionalGeneration, AutoProcessor
 
+# -------------------------------------------------------------------
+# 1. Database Connection (adjust or remove if not needed)
+# -------------------------------------------------------------------
 
 def update_database(result_id, aijson, aicaption):
     """
     Update the database with the AI JSON and AI-generated caption.
-
-    Parameters:
-        result_id (int): The ID of the result entry to update.
-        aijson (str): JSON string containing AI-generated image analysis.
-        aicaption (str): Generated caption describing the image.
     """
     query = """
         UPDATE utb_ImageScraperResult
@@ -691,16 +680,18 @@ def update_database(result_id, aijson, aicaption):
             cursor = conn.cursor()
             cursor.execute(query, (aijson, aicaption, result_id))
             conn.commit()
-            logging.info(f"Database updated successfully for ResultID {result_id}, rows affected: {cursor.rowcount}")
-
+            logging.info(f"Database updated for ResultID={result_id}, rows affected: {cursor.rowcount}")
     except Exception as e:
         logging.error(f"Error updating database for ResultID {result_id}: {e}")
 
-
 def fetch_image_data(file_id):
-    """Fetch image data along with brand, category, and color from the database."""
+    """
+    Fetch image data along with brand, category, and color from the database.
+    Adjust the table/column names to match your schema.
+    """
     query = """
-        SELECT rr.ResultID, rr.EntryID, rr.ImageURL, r.ProductBrand, r.ProductCategory, r.ProductColor
+        SELECT rr.ResultID, rr.EntryID, rr.ImageURL, 
+               r.ProductBrand, r.ProductCategory, r.ProductColor
         FROM utb_ImageScraperRecords r
         INNER JOIN utb_ImageScraperResult rr ON r.EntryID = rr.EntryID
         WHERE r.FileID = ?
@@ -708,122 +699,172 @@ def fetch_image_data(file_id):
     try:
         with pyodbc.connect(conn_str) as conn:
             df = pd.read_sql(query, conn, params=[file_id])
-            logging.error(f"DF info: {df}")
-        return df
+            return df
     except Exception as e:
-        print(f"Database error: {e}")
-        return pd.DataFrame()  # Return an empty DataFrame on error
+        logging.error(f"Database error: {e}")
+        return pd.DataFrame()  # Return empty DataFrame on error
 
-def detect_all_features(image_url):
-    """Detect multiple image features using Google Vision API."""
-    try:
-        response = requests.get(image_url)
-        image = vision.Image(content=response.content)
+# -------------------------------------------------------------------
+# 2. Load LLaMA 3.2 Vision Model
+# -------------------------------------------------------------------
+# Example model_id — replace with a *real* model from Hugging Face:
+model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 
-        result_data = {
-            "labels": [],
-            "logos": [],
-            "text": [],
-            "image_properties": [],
-            "web_entities": [],
-        }
+# Load model and processor
+# (Be sure your hardware can handle the model size.)
+model = MllamaForConditionalGeneration.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+processor = AutoProcessor.from_pretrained(model_id)
 
-        # Label Detection
-        response = client.label_detection(image=image)
-        result_data["labels"] = [{"label": label.description} for label in response.label_annotations[:5]]
-
-        # Logo Detection
-        response = client.logo_detection(image=image)
-        result_data["logos"] = [{"logo": logo.description} for logo in response.logo_annotations]
-
-        # Text Detection
-        response = client.text_detection(image=image)
-        result_data["text"] = [text.description for text in response.text_annotations]
-
-        # Image Properties
-        response = client.image_properties(image=image)
-        result_data["image_properties"] = [
-            {"color": f"RGB({color.color.red}, {color.color.green}, {color.color.blue})"}
-            for color in response.image_properties_annotation.dominant_colors.colors
-        ]
-
-        # Web Detection
-        response = client.web_detection(image=image)
-        result_data["web_entities"] = [{"entity": entity.description} for entity in response.web_detection.web_entities]
-
-        return json.dumps(result_data, indent=4)  # Store as JSON string
-    except Exception as e:
-        print(f"Error processing {image_url}: {e}")
-
-# Initialize OpenAI API key
-openai_api_key = 'sk-svcacct-rOasnB9w-_OVCIv1_eDwJR4GvFBT-gnK5mC_E93rKqExtPF8hYXkrvIqXCTXRdIfk0T3BlbkFJ3srk7jtYtSBee49EF-qh42x1Ym5JZr7jmJsOO6Bg9QLFesBWSBlVcoya5CqwJZT4YA'  # Replace this with your API ke
-
-openai_client = openai.OpenAI(api_key=openai_api_key)
-
-def generate_caption(aijson):
+# -------------------------------------------------------------------
+# 3. "Detect All Features" with LLaMA (replacing Google Vision)
+# -------------------------------------------------------------------
+def detect_all_features_llama(image_url):
     """
-    Generate a structured caption using OpenAI API with full AI JSON context.
-    The format is: "<Short Description> <Category> <Brand> <Color>"
+    Use the LLaMA-based model to 'detect' features (labels, logos, text, colors, etc.)
+    and return a JSON string to mimic the old Google Vision structure.
     
-    Parameters:
-        aijson (str): JSON string from AI analysis (includes labels, web entities, text, etc.)
-        
-    Returns:
-        str: A structured product caption.
+    In practice, the model may be less accurate at certain tasks like text detection or logos.
     """
     try:
-        # Prepare a detailed prompt with full AI JSON context.
-        prompt = (
-            f"### AI Image Analysis Data ###\n{aijson}\n\n"
-            f"### INSTRUCTIONS ###\n"
-            f"Analyze the provided AI image data and extract:\n"
-            f"1️⃣ **Short Description** (1-2 words summarizing the item)\n"
-            f"2️⃣ **Category** (e.g., 'Shoe', 'Bag', 'Laptop')\n"
-            f"3️⃣ **Brand** (e.g., 'Nike', 'Gucci', or 'NaN' if unknown)\n"
-            f"4️⃣ **Color** (e.g., 'Black', 'Blue', 'Red', or 'NaN' if unknown) - Color is least important.\n\n"
-            f"### OUTPUT FORMAT ###\n"
-            f"Return only the final caption, formatted as:\n"
-            f"**<Short Description> <Category> <Brand> <Color>**\n"
-            f"Example outputs:\n"
-            f"- **Sneaker Shoe Nike Black**\n"
-            f"- **Handbag Bag Gucci Green**\n"
-            f"- **MacBook Laptop Apple Silver**\n"
-            f"- **Item NaN NaN NaN** (if no relevant data found)\n\n"
-            f"### IMPORTANT ###\n"
-            f"- Do not add explanations, just return the final caption.\n"
-            f"- If any field is unknown, use 'NaN'.\n"
-            f"- Be as precise as possible, but avoid uncertainty."
+        # 3.1. Fetch the image
+        response = requests.get(image_url, stream=True, timeout=10)
+        img = Image.open(response.raw).convert("RGB")
+        
+        # 3.2. Prompt the model to produce structured JSON
+        user_text = (
+            "You are an image analysis AI. Describe the following image with:\n"
+            "1) labels - main objects or concepts\n"
+            "2) logos - brand or trademark if any\n"
+            "3) text - any readable text\n"
+            "4) colors - main color or palette\n"
+            "5) web_entities - other relevant or similar concepts\n\n"
+            "Format your answer strictly as valid JSON with keys:\n"
+            "{\n"
+            "  'labels': [],\n"
+            "  'logos': [],\n"
+            "  'text': [],\n"
+            "  'image_properties': [],\n"
+            "  'web_entities': []\n"
+            "}\n\n"
+            "Now analyze the image and provide the JSON."
         )
         
-        response = openai_client.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[
-                {"role": "system", "content": "You are an AI product categorization expert."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=2800,  # Allow enough tokens for full context processing
-            temperature=0.3
-        )
+        # Prepare the "messages" for MLLama (or any LLaMA-based chat)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": user_text}
+                ]
+            }
+        ]
+        # Some checkpoints use a "chat template" approach. 
+        input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
         
-        # Extract the generated caption
-        caption = response.choices[0].message.content.strip()
-        return caption
+        # Tokenize the image + text
+        inputs = processor(
+            img,
+            input_text,
+            add_special_tokens=False,
+            return_tensors="pt"
+        ).to(model.device)
+        
+        # Generate
+        output = model.generate(**inputs, max_new_tokens=512)
+        decoded = processor.decode(output[0], skip_special_tokens=False)
+        
+        # Clean up extraneous tokens
+        decoded = decoded.replace("<s>", "").replace("</s>", "").strip()
+        
+        # Attempt to parse as JSON
+        # If the model doesn't produce valid JSON, you may need more robust parsing or a re-prompt
+        try:
+            parsed = json.loads(decoded)
+            # If keys are missing, fix them:
+            for key in ["labels", "logos", "text", "image_properties", "web_entities"]:
+                if key not in parsed:
+                    parsed[key] = []
+            # Return as a pretty-printed JSON string
+            return json.dumps(parsed, indent=4)
+        except json.JSONDecodeError:
+            logging.warning("Model did not return valid JSON. Storing raw text instead.")
+            return decoded
+    
+    except Exception as e:
+        logging.error(f"Error analyzing image with LLaMA: {e}")
+        return ""
 
+# -------------------------------------------------------------------
+# 4. Generate Caption with LLaMA
+# -------------------------------------------------------------------
+def generate_caption_llama(image_url, aijson):
+    """
+    Generate a short caption from the LLaMA-based model, using the 'aijson' as context.
+    For example, the final format might be "<Short Description> <Category> <Brand> <Color>".
+    """
+    try:
+        # 4.1. Fetch the image
+        response = requests.get(image_url, stream=True, timeout=10)
+        img = Image.open(response.raw).convert("RGB")
+        
+        # 4.2. Prompt for a structured product-like caption
+        user_text = (
+            "### AI Image Analysis Data ###\n"
+            f"{aijson}\n\n"
+            "### INSTRUCTIONS ###\n"
+            "Analyze the data above and the image, then extract:\n"
+            "1) Short Description (1-2 words)\n"
+            "2) Category (e.g., 'Shoe', 'Bag', 'Laptop'...)\n"
+            "3) Brand (e.g., 'Nike', 'Gucci', or 'NaN' if unknown)\n"
+            "4) Color (e.g., 'Black', 'Blue', or 'NaN')\n\n"
+            "### OUTPUT FORMAT ###\n"
+            "Return ONLY the final caption, like: \"<Short Description> <Category> <Brand> <Color>\"\n"
+            "If any field is unknown, replace it with 'NaN'.\n"
+            "No extra text, no explanation."
+        )
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": user_text}
+                ]
+            }
+        ]
+        input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
+        
+        # Tokenize
+        inputs = processor(img, input_text, return_tensors="pt", add_special_tokens=False).to(model.device)
+        
+        # Generate
+        output = model.generate(**inputs, max_new_tokens=80)
+        decoded = processor.decode(output[0], skip_special_tokens=False)
+        
+        # Clean up extraneous tokens
+        decoded = decoded.replace("<s>", "").replace("</s>", "").strip()
+        
+        return decoded
+    
     except Exception as e:
         logging.error(f"Error generating caption: {e}")
         return "Item NaN NaN NaN"
 
-
+# -------------------------------------------------------------------
+# 5. Main Loop (No Google, just LLaMA for everything)
+# -------------------------------------------------------------------
 def process_images(file_id):
     """
-    Fetch image data, process each image with Google Vision API, generate captions, and store results in the database.
-
-    Parameters:
-        file_id (int): The ID of the file containing images to process.
+    Fetch image data, analyze each image with LLaMA, generate captions with LLaMA,
+    then store results in the database.
     """
     df = fetch_image_data(file_id)
-
-    if df is None or df.empty:
+    if df.empty:
         logging.warning("No records found.")
         return
 
@@ -831,24 +872,23 @@ def process_images(file_id):
         try:
             image_url = row["ImageURL"]
             result_id = row["ResultID"]
-            brand = row["ProductBrand"]
-            category = row["ProductCategory"]
-            color = row["ProductColor"]
 
-            # Process image with Google Vision API
-            vision_result_json = detect_all_features(image_url)
+            # 5.1. "Detect all features" with LLaMA
+            llama_features_json = detect_all_features_llama(image_url)
+            if not llama_features_json:
+                logging.warning(f"LLaMA returned empty result for URL={image_url}")
+                continue
 
-            if vision_result_json:
-                # Generate caption using AI model
-                ai_caption = generate_caption(vision_result_json)
+            # 5.2. Generate short caption
+            ai_caption = generate_caption_llama(image_url, llama_features_json)
 
-                # Update database with AI JSON and caption
-                update_database(result_id, vision_result_json, ai_caption)
-                logging.info(f"Processing record {row.get('ResultID', 'Unknown')}: {ai_caption}")
+            # 5.3. Update DB
+            update_database(result_id, llama_features_json, ai_caption)
+            logging.info(f"Record {result_id} processed. Caption: {ai_caption}")
+
         except Exception as e:
-            logging.error(f"Error processing record {row.get('ResultID', 'Unknown')}: {e}")
-            continue  # Skip to the next record
-
+            logging.error(f"Error processing record {row.get('ResultID')}: {e}")
+            continue  # skip to next record
 
 def get_lm_products(file_id):
 

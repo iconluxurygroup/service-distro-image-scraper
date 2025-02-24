@@ -17,9 +17,7 @@ sqlalchemy
 pandas
 chardet
 ray
-chardet
-sqlalchemy
-pyodbc
-google-cloud-vision
-google-auth
-openai
+transformers
+accelerate
+safetensors
+torch
