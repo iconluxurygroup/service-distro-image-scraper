@@ -658,10 +658,11 @@ import os
 import pandas as pd
 import torch
 from PIL import Image
-from huggingface_hub import InferenceClient
-hg_client = InferenceClient(
-	provider="sambanova",
-	api_key="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"
+from openai import OpenAI
+
+hg_client = OpenAI(
+		base_url = "https://j1o1wtb04ya9z0qz.us-east-1.aws.endpoints.huggingface.cloud/v1/",
+	    api_key="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"
 )
 # -------------------------------------------------------------------
 # 1. Database Connection (adjust or remove if not needed)
@@ -748,7 +749,7 @@ def detect_all_features_llama(image_url):
 
         # Inference call (non-streaming)
         response = hg_client.chat.completions.create(
-            model="meta-llama/Llama-3.2-11B-Vision-Instruct",
+            model="tgi",
             messages=messages,
             max_tokens=500,
             stream=True

@@ -21,4 +21,4 @@ transformers
 accelerate
 safetensors
 torch
-huggingface-hub
+openai
