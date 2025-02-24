@@ -47,24 +47,33 @@ def get_spaces_client():
     logger.info("Spaces client created successfully")
     return client
 
-def upload_file_to_space(file_src, save_as, is_public):
+def upload_file_to_space(file_src, save_as, is_public, content_type, meta=None):
     spaces_client = get_spaces_client()
     space_name = 'iconluxurygroup-s3'  # Your space name
+    print('Content Type')
+    print(content_type)
+    if not content_type:
+        content_type_guess = mimetypes.guess_type(file_src)[0]
+        if not content_type_guess:
+            raise Exception("Content type could not be guessed. Please specify it directly.")
+        content_type = content_type_guess
 
-    # if not content_type:
-    #     content_type_guess = mimetypes.guess_type(file_src)[0]
-    #     if not content_type_guess:
-    #         raise Exception("Content type could not be guessed. Please specify it directly.")
-    #     content_type = content_type_guess
-    spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
+    extra_args = {'ACL': 'public-read' if is_public else 'private', 'ContentType': content_type}
+    if meta:
+        extra_args['Metadata'] = meta
+
+    spaces_client.upload_file(
+        Filename=file_src,
+        Bucket=space_name,
+        Key=save_as,
+        ExtraArgs=extra_args
+    )
     print(f"File uploaded successfully to {space_name}/{save_as}")
     # Generate and return the public URL if the file is public
     if is_public:
-        # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
-        upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
+        upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
         print(f"Public URL: {upload_url}")
         return upload_url
-
 
 
 def send_email(to_emails, subject, download_url,jobId):
@@ -516,7 +525,7 @@ async def generate_download_file(file_id):
     logger.info("Uploading file to space")
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
     is_public = True
-    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name,is_public)  
+    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, local_filename,is_public,contenttype)  
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
   
