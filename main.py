@@ -658,7 +658,9 @@ import os
 import pandas as pd
 import torch
 from PIL import Image
+from huggingface_hub import login
 
+login(token="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")
 # For LLaMA-based Vision model
 from transformers import MllamaForConditionalGeneration, AutoProcessor
 
