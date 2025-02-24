@@ -46,12 +46,9 @@ def get_spaces_client():
                             aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
     logger.info("Spaces client created successfully")
     return client
-
 def upload_file_to_space(file_src, save_as, is_public, content_type, meta=None):
     spaces_client = get_spaces_client()
-    space_name = 'iconluxurygroup-s3'  # Your space name
-    print('Content Type')
-    print(content_type)
+    bucket_name = 'iconluxurygroup-s3'
     if not content_type:
         content_type_guess = mimetypes.guess_type(file_src)[0]
         if not content_type_guess:
@@ -64,16 +61,16 @@ def upload_file_to_space(file_src, save_as, is_public, content_type, meta=None):
 
     spaces_client.upload_file(
         Filename=file_src,
-        Bucket=space_name,
+        Bucket=bucket_name,
         Key=save_as,
         ExtraArgs=extra_args
     )
-    print(f"File uploaded successfully to {space_name}/{save_as}")
-    # Generate and return the public URL if the file is public
+    logger.info(f"File uploaded successfully to {bucket_name}/{save_as}")
     if is_public:
-        upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
-        print(f"Public URL: {upload_url}")
-        return upload_url
+        region = os.getenv('REGION', 'us-east-1')
+        public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{save_as}"
+        logger.info(f"Public URL: {public_url}")
+        return public_url
 
 
 def send_email(to_emails, subject, download_url,jobId):
