@@ -751,20 +751,31 @@ def detect_all_features_llama(image_url):
             model="meta-llama/Llama-3.2-11B-Vision-Instruct",
             messages=messages,
             max_tokens=500,
-            stream=False
+            stream=True
         )
 
         # Validate 'choices' in response
-        if not response.choices:
+        if not response:
             logging.error("No 'choices' in the response for feature detection.")
             return ""
 
-        # Extract the text from the first choice
-        text_output = response.choices[0].message.content.strip()
+        # List to collect chunks
+        chunks_list = []
 
+        # Iterate over the stream
+        for chunk in response:
+            # Make sure the chunk has the 'delta' and 'content' keys before using them
+            if "choices" in chunk and len(chunk["choices"]) > 0:
+                delta_content = chunk["choices"][0]["delta"].get("content", "")
+                if delta_content:
+                    # Append the chunk content to your list
+                    chunks_list.append(delta_content)
+
+        # Now you can join them if you want the full text
+        full_response = "".join(chunks_list)
         # Attempt to parse as JSON
         try:
-            parsed = json.loads(text_output)
+            parsed = json.loads(full_response)
             # Ensure all keys exist
             for key in ["labels", "logos", "text", "image_properties", "web_entities"]:
                 if key not in parsed:
@@ -773,7 +784,7 @@ def detect_all_features_llama(image_url):
             return json.dumps(parsed, indent=4)
         except json.JSONDecodeError:
             logging.warning("Model did not return valid JSON. Returning raw text.")
-            return text_output
+            return full_response
 
     except Exception as e:
         logging.error(f"Error analyzing image with LLaMA: {e}")
@@ -819,16 +830,33 @@ def generate_caption_llama(image_url, aijson):
             model="meta-llama/Llama-3.2-11B-Vision-Instruct",
             messages=messages,
             max_tokens=500,
-            stream=False
+            stream=True
         )
 
         # Validate 'choices' in response
-        if not response.choices:
+        if not response:
             logging.error("No 'choices' in the response for caption generation.")
             return "Item NaN NaN NaN"
 
-        caption = response.choices[0].message.content.strip()
-        return caption if caption else "Item NaN NaN NaN"
+
+        # List to collect chunks
+        chunks_list = []
+
+        # Iterate over the stream
+        for chunk in response:
+            # Make sure the chunk has the 'delta' and 'content' keys before using them
+            if "choices" in chunk and len(chunk["choices"]) > 0:
+                delta_content = chunk["choices"][0]["delta"].get("content", "")
+                if delta_content:
+                    # Append the chunk content to your list
+                    chunks_list.append(delta_content)
+
+        # Now you can join them if you want the full text
+        full_response = "".join(chunks_list)
+
+
+
+        return full_response if full_response else "Item NaN NaN NaN"
 
     except Exception as e:
         logging.error(f"Error generating caption: {e}")
