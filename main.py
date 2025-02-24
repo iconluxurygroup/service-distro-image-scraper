@@ -19,7 +19,7 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition,Personalization,Cc,To
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import aiohttp
+import aiohttp,os
 from aiohttp import ClientTimeout
 from aiohttp_retry import RetryClient, ExponentialRetry
 #logging.basicConfig(level=logging.INFO)
@@ -522,7 +522,11 @@ async def generate_download_file(file_id):
     logger.info("Uploading file to space")
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
     is_public = True
-    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, local_filename,is_public,contenttype)  
+    public_url = await loop.run_in_executor(
+        ThreadPoolExecutor(), 
+        upload_file_to_space, 
+        local_filename, os.path.basename(local_filename), is_public, contenttype
+    )
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
   
