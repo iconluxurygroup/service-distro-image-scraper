@@ -407,39 +407,39 @@ def get_records_to_search(file_id):
     except Exception as e:
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
-import pyodbc
-import json
-import logging
 
-import pyodbc
-import json
-import logging
+
 
 def clean_json(value):
     """
-    Cleans JSON text by replacing invalid entries like NaN and arrays with NULL-safe values.
+    Cleans JSON text by replacing invalid values like NaN, undefined, or incorrect formatting.
     """
-    if not value or value.strip() in ["None", "null", "NaN"]:
-        return None
+    if not value or value.strip() in ["None", "null", "NaN", "undefined"]:
+        return None  # Convert invalid JSON to NULL
+
     try:
         parsed = json.loads(value)
         if not isinstance(parsed, dict):
-            return None  # Skip non-dict JSON (e.g., arrays)
+            return None  # Skip non-dict JSON (e.g., lists or malformed JSON)
+
+        # Replace 'NaN' or None with actual NULL values
         if parsed.get("linesheet_score") in [None, "NaN"]:
-            parsed["linesheet_score"] = None  # Replace with NULL
+            parsed["linesheet_score"] = None
         if parsed.get("match_score") in [None, "NaN"]:
             parsed["match_score"] = None
-        return json.dumps(parsed)  # Return valid JSON
+
+        return json.dumps(parsed)  # Return cleaned JSON as a string
+
     except json.JSONDecodeError:
-        return None
-    return value
+        return None  # Return NULL for invalid JSON
+
 
 def update_sort_order(file_id):
     """
-    Updates the SortOrder column for images based on `linesheet_score`, assigning:
-    - `SortOrder = 1` to the best-ranked image
-    - Sequential `SortOrder` (2, 3, 4...) for remaining images
-    - Handles invalid JSON issues
+    Updates the SortOrder column for images:
+    - `SortOrder = 1` for best image
+    - Sequential `SortOrder` (2, 3, 4...) for others
+    - Cleans invalid JSON before processing
     """
     try:
         connection = pyodbc.connect(conn)
@@ -447,17 +447,17 @@ def update_sort_order(file_id):
 
         logging.info(f"🔄 Updating sort order for FileID: {file_id}")
 
-        # Step 1: Clean Invalid JSON
+        # Step 1: Identify and Fix Invalid JSON
         fetch_invalid_json = """
             SELECT ResultID, aijson FROM utb_ImageScraperResult
-            WHERE ISJSON(aijson) = 0 OR JSON_VALUE(aijson, '$.linesheet_score') = 'NaN'
+            WHERE ISJSON(aijson) = 0 OR JSON_VALUE(aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
         """
         cursor.execute(fetch_invalid_json)
         invalid_rows = cursor.fetchall()
 
         if invalid_rows:
             logging.warning(f"⚠️ Found {len(invalid_rows)} invalid JSON entries in aijson column!")
-            for row in invalid_rows[:5]:  # Log only first 5 to avoid spamming
+            for row in invalid_rows[:5]:  # Log first 5 entries to avoid spamming logs
                 logging.warning(f"❌ Invalid JSON for ResultID={row[0]}: {row[1]}")
 
             # Fix invalid JSON
@@ -481,18 +481,18 @@ def update_sort_order(file_id):
                 -- Convert JSON safely, replacing NaN with NULL
                 CASE 
                     WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL 
-                    OR JSON_VALUE(t.aijson, '$.linesheet_score') = 'NaN' 
+                    OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined') 
                     THEN NULL 
-                    ELSE CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) 
+                    ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT) 
                 END AS linesheet_score,
                 ROW_NUMBER() OVER (
                     PARTITION BY t.EntryID 
                     ORDER BY 
                         CASE 
                             WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL 
-                            OR JSON_VALUE(t.aijson, '$.linesheet_score') = 'NaN' 
+                            OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined') 
                             THEN -1 
-                            ELSE CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) 
+                            ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT) 
                         END DESC
                 ) AS rank
             FROM utb_ImageScraperResult t 
@@ -520,6 +520,7 @@ def update_sort_order(file_id):
     finally:
         cursor.close()
         connection.close()
+
 
 
 
