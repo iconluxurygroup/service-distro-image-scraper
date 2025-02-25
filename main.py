@@ -1296,6 +1296,39 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
 import json
 import logging
 import pyodbc
+def fetch_missing_images(file_id=None, limit=8):
+    """
+    Fetch images with missing or NaN JSON fields from the database.
+    """
+    try:
+        connection = pyodbc.connect(conn)
+        query_params = []
+
+        # Base SQL query to find missing images
+        query = """
+        SELECT t.ResultID, t.EntryID, t.ImageURL, r.ProductBrand, r.ProductCategory, r.ProductColor
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE (ISJSON(t.aijson) = 0 OR JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL)
+        """
+
+        # Add FileID filter if provided
+        if file_id:
+            query += " AND r.FileID = ?"
+            query_params.append(file_id)
+
+        # Limit number of results
+        query += " ORDER BY r.EntryID ASC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY"
+        query_params.append(limit)
+
+        # Fetch data
+        df = pd.read_sql_query(query, connection, params=query_params)
+        connection.close()
+        return df
+
+    except Exception as e:
+        logging.error(f"Error fetching missing images: {e}")
+        return pd.DataFrame()
 
 def batch_process_images(file_id=None, limit=8):
     """
@@ -1310,7 +1343,7 @@ def batch_process_images(file_id=None, limit=8):
     """
     try:
         # Fetch only images with missing or NaN JSON fields
-        df = fetch_pending_images(file_id, limit)
+        df = fetch_missing_images(file_id, limit)
 
         if df.empty:
             logging.info("No images to process (all have valid data)")
