@@ -410,11 +410,14 @@ def get_records_to_search(file_id):
 import pyodbc
 import logging
 
+import pyodbc
+import logging
+
 def update_sort_order(file_id):
     """
-    Update the sort order for images associated with a FileID.
+    Updates the SortOrder for images associated with a FileID.
     - The highest `linesheet_score` gets `SortOrder = 0`.
-    - Invalid JSON or `NaN` scores are skipped.
+    - Invalid JSON or NaN scores are skipped.
     - If no valid scores exist, the first image is set to `SortOrder = 0`.
 
     Args:
@@ -449,12 +452,21 @@ def update_sort_order(file_id):
                 t.ResultID, 
                 t.EntryID, 
                 r.FileID,
-                -- Convert JSON value safely, ignoring NaN and NULL
-                NULLIF(TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL), 'NaN') AS linesheet_score,
+                -- Convert JSON value safely, handling NULLs correctly
+                CASE 
+                    WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL 
+                    OR JSON_VALUE(t.aijson, '$.linesheet_score') = 'NaN' 
+                    THEN NULL 
+                    ELSE CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) 
+                END AS linesheet_score,
                 ROW_NUMBER() OVER (
                     PARTITION BY t.EntryID 
                     ORDER BY 
-                        NULLIF(TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL), 'NaN') DESC NULLS LAST
+                        CASE 
+                            WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL OR JSON_VALUE(t.aijson, '$.linesheet_score') = 'NaN' 
+                            THEN -1 
+                            ELSE CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) 
+                        END DESC
                 ) AS rank
             FROM utb_ImageScraperResult t 
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
@@ -515,6 +527,7 @@ def update_sort_order(file_id):
     finally:
         cursor.close()
         connection.close()
+
 
 
 
