@@ -513,11 +513,15 @@ def clean_json(value):
             "linesheet_score": None,
             "reasoning_linesheet": ""
         })
-
 def update_sort_order(file_id):
     """
-    Updates the SortOrder column for images with improved performance and logging.
-    Includes robust error handling and JSON cleaning for problematic data.
+    Updates the SortOrder column for images with improved debugging and validation.
+    
+    Args:
+        file_id: The file ID to update sort order for
+        
+    Returns:
+        List of sorted results for verification
     """
     start_time = time.time()
     try:
@@ -526,9 +530,41 @@ def update_sort_order(file_id):
         cursor = connection.cursor()
 
         logging.info(f"🔄 Updating sort order for FileID: {file_id}")
-        step_time = time.time()
+        
+        # Step 1: Verify current sort order before making changes
+        current_order_query = """
+        SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS match_score,
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS linesheet_score
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
+        ORDER BY t.EntryID, t.SortOrder
+        """
+        
+        cursor.execute(current_order_query, (file_id,))
+        current_order = cursor.fetchall()
+        logging.info(f"Current sort order (first 20 records):")
+        for record in current_order:
+            logging.info(f"EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[3]}, LinesheetScore: {record[4]}")
 
-        # Step 1: Get a count of records to process
+        # Step 2: Get a count of records to process
         count_query = """
             SELECT COUNT(*) 
             FROM utb_ImageScraperResult t 
@@ -542,81 +578,31 @@ def update_sort_order(file_id):
         if record_count == 0:
             logging.warning(f"⚠️ No records found for FileID: {file_id}")
             return []
-            
-        # Step 2: Find all records with potentially problematic JSON
-        fetch_all_json_query = """
-            SELECT TOP 1000 ResultID, aijson 
-            FROM utb_ImageScraperResult t
-            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE r.FileID = ? AND (
-                t.aijson IS NULL
-                OR ISJSON(t.aijson) = 0 
-                OR t.aijson = ''
-                OR LEFT(t.aijson, 1) = '.'
-                OR LEFT(t.aijson, 1) = ','
-                OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
-                OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
-            )
+        
+        # Step 3: Use a more robust query for updating sort order
+        logging.info("Updating sort order using robust query")
+        
+        # Begin transaction
+        cursor.execute("BEGIN TRANSACTION")
+        
+        # First reset all SortOrder values to ensure clean update
+        reset_query = """
+        UPDATE utb_ImageScraperResult
+        SET SortOrder = NULL
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
         """
         
         try:
-            cursor.execute(fetch_all_json_query, (file_id,))
-            problematic_rows = cursor.fetchall()
-            logging.info(f"Found {len(problematic_rows)} potentially problematic JSON entries")
-        except Exception as e:
-            # If the query itself fails (likely due to badly malformed JSON), use a simpler query
-            logging.warning(f"Error querying for problematic JSON: {e}, using simplified query")
-            simplified_query = """
-                SELECT TOP 1000 ResultID, aijson 
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = ?
-            """
-            cursor.execute(simplified_query, (file_id,))
-            problematic_rows = cursor.fetchall()
-            logging.info(f"Retrieved {len(problematic_rows)} rows using simplified query")
-        
-        # Step 3: Attempt to clean and fix all JSON in batches
-        batch_size = min(500, max(50, len(problematic_rows)))
-        updated_count = 0
-        
-        for i in range(0, len(problematic_rows), batch_size):
-            batch = problematic_rows[i:i+batch_size]
-            updates = []
+            cursor.execute(reset_query, (file_id,))
+            logging.info(f"Reset all SortOrder values to NULL for FileID {file_id}")
+        except Exception as reset_error:
+            logging.error(f"Error resetting SortOrder values: {reset_error}")
+            cursor.execute("ROLLBACK")
+            return None
             
-            for row in batch:
-                result_id, aijson_value = row
-                cleaned_json = clean_json(aijson_value)
-                if cleaned_json:
-                    updates.append((cleaned_json, result_id))
-            
-            if updates:
-                try:
-                    cursor.executemany(
-                        "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
-                        updates
-                    )
-                    connection.commit()
-                    updated_count += len(updates)
-                    logging.info(f"Batch updated {len(updates)} JSON entries (total: {updated_count})")
-                except Exception as batch_error:
-                    logging.error(f"Error updating batch: {batch_error}")
-                    # If batch update fails, try individual updates
-                    for cleaned_json, result_id in updates:
-                        try:
-                            cursor.execute(
-                                "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
-                                (cleaned_json, result_id)
-                            )
-                            connection.commit()
-                            updated_count += 1
-                        except Exception as individual_error:
-                            logging.error(f"Error updating individual row {result_id}: {individual_error}")
-        
-        logging.info(f"Total JSON entries updated: {updated_count}")
-        
-        # Step 4: Use a more robust query for updating sort order
-        logging.info("Updating sort order using robust query")
+        # Now run the robust sort order update
         safe_sort_query = """
         WITH CleanedResults AS (
             SELECT 
@@ -656,12 +642,15 @@ def update_sort_order(file_id):
         
         try:
             cursor.execute(safe_sort_query, (file_id,))
-            connection.commit()
+            cursor.execute("COMMIT")
             logging.info(f"✅ Successfully updated sort order")
         except Exception as sort_error:
             logging.error(f"Error updating sort order: {sort_error}")
+            cursor.execute("ROLLBACK")
+            
             # If the main query fails, try with a basic ranking approach
             try:
+                cursor.execute("BEGIN TRANSACTION")
                 basic_sort_query = """
                 WITH BasicRank AS (
                     SELECT 
@@ -678,19 +667,92 @@ def update_sort_order(file_id):
                 INNER JOIN BasicRank br ON t.ResultID = br.ResultID;
                 """
                 cursor.execute(basic_sort_query, (file_id,))
-                connection.commit()
+                cursor.execute("COMMIT")
                 logging.info(f"✅ Updated sort order using basic ranking as fallback")
             except Exception as basic_sort_error:
                 logging.error(f"Even basic sort update failed: {basic_sort_error}")
+                cursor.execute("ROLLBACK")
                 return None
         
-        # Step 5: Return a sample of the sort order
+        # Step 4: Verify the sort order has actually changed
+        verify_query = """
+        SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS match_score,
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS linesheet_score
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
+        ORDER BY t.EntryID, t.SortOrder
+        """
+        
+        cursor.execute(verify_query, (file_id,))
+        updated_order = cursor.fetchall()
+        
+        logging.info(f"Updated sort order (first 20 records):")
+        for record in updated_order:
+            logging.info(f"EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[3]}, LinesheetScore: {record[4]}")
+            
+        # Step 5: Check for any NULL SortOrder values that might have been missed
+        null_check_query = """
+        SELECT COUNT(*) 
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ? AND t.SortOrder IS NULL
+        """
+        
+        cursor.execute(null_check_query, (file_id,))
+        null_count = cursor.fetchone()[0]
+        
+        if null_count > 0:
+            logging.warning(f"⚠️ Found {null_count} records with NULL SortOrder values after update")
+            
+            # Try to fix any remaining NULL values
+            fix_null_query = """
+            WITH NullFix AS (
+                SELECT 
+                    t.ResultID, 
+                    t.EntryID,
+                    ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS rank
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ? AND t.SortOrder IS NULL
+            )
+            UPDATE utb_ImageScraperResult
+            SET SortOrder = nf.rank + 100  -- Adding 100 to distinguish from regular rankings
+            FROM utb_ImageScraperResult t
+            INNER JOIN NullFix nf ON t.ResultID = nf.ResultID;
+            """
+            
+            try:
+                cursor.execute(fix_null_query, (file_id,))
+                connection.commit()
+                logging.info(f"✅ Fixed {null_count} NULL SortOrder values")
+            except Exception as null_fix_error:
+                logging.error(f"Error fixing NULL SortOrder values: {null_fix_error}")
+        
+        # Step 6: Return a sample of the sort order
         fetch_sort_order_query = """
-       SELECT TOP 100 t.ResultID, t.EntryID, t.SortOrder 
-FROM utb_ImageScraperResult t
-INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-WHERE r.FileID = ?
-ORDER BY t.EntryID, t.SortOrder;
+        SELECT TOP 100 t.ResultID, t.EntryID, t.SortOrder 
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
+        ORDER BY t.EntryID, t.SortOrder;
         """
         
         cursor.execute(fetch_sort_order_query, (file_id,))
@@ -706,7 +768,6 @@ ORDER BY t.EntryID, t.SortOrder;
     except Exception as e:
         total_time = time.time() - start_time
         logging.error(f"❌ Error during sort order update after {total_time:.2f} seconds: {e}")
-    
         logging.error(traceback.format_exc())
         return None
 
@@ -715,7 +776,6 @@ ORDER BY t.EntryID, t.SortOrder;
             cursor.close()
         if 'connection' in locals():
             connection.close()
-
 
 def update_file_generate_complete(file_id):
     """
