@@ -410,29 +410,30 @@ def get_records_to_search(file_id):
 def update_sort_order(file_id):
     """
     Update the sort order based on the highest linesheet score.
+    Handles JSON formatting errors.
     """
     try:
         connection = pyodbc.connect(conn)
         cursor = connection.cursor()
 
-        # SQL to update sort order with highest-scoring result set to 0
+        # SQL to update sort order while avoiding JSON errors
         update_query = """
         WITH ranked_results AS (
             SELECT 
                 t.ResultID, 
                 t.EntryID, 
                 CASE 
-                    WHEN ISJSON(t.aijson) = 1 THEN 
-                        TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
-                    ELSE -1 -- Default to -1 if NULL or invalid
+                    WHEN ISJSON(t.aijson) = 1 
+                    THEN TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
+                    ELSE NULL -- Skip invalid JSON
                 END AS linesheet_score,
                 ROW_NUMBER() OVER (
                     PARTITION BY t.EntryID 
                     ORDER BY 
                         CASE 
-                            WHEN ISJSON(t.aijson) = 1 THEN 
-                                TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
-                            ELSE -1 -- Ensure NULLs are not ignored
+                            WHEN ISJSON(t.aijson) = 1 
+                            THEN TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
+                            ELSE NULL
                         END DESC
                 ) AS row_num
             FROM utb_ImageScraperResult t 
@@ -442,7 +443,7 @@ def update_sort_order(file_id):
         UPDATE utb_ImageScraperResult 
         SET SortOrder = 
             CASE 
-                WHEN rr.row_num = 1 AND rr.linesheet_score >= 0 THEN 0 -- Set top result
+                WHEN rr.row_num = 1 AND rr.linesheet_score IS NOT NULL THEN 0 
                 ELSE 15 
             END
         FROM utb_ImageScraperResult t
@@ -459,8 +460,15 @@ def update_sort_order(file_id):
 
         logging.info(f"Updated sort order for FileID: {file_id}")
 
+    except pyodbc.Error as e:
+        error_msg = str(e)
+        if "Msg 13609" in error_msg or "JSON text is not properly formatted" in error_msg:
+            logging.warning(f"Skipping invalid JSON for FileID {file_id}: {error_msg}")
+        else:
+            logging.error(f"Database error updating sort order for FileID {file_id}: {error_msg}")
+
     except Exception as e:
-        logging.error(f"Error updating sort order: {e}")
+        logging.error(f"Unexpected error updating sort order for FileID {file_id}: {e}")
         import traceback
         logging.error(f"Detailed error traceback: {traceback.format_exc()}")
 
