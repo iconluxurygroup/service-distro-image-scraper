@@ -408,7 +408,6 @@ def get_records_to_search(file_id):
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
 
-
 def update_sort_order(file_id):
     """
     Update the sort order of image results with filtering and sorting by linesheet score.
@@ -417,7 +416,45 @@ def update_sort_order(file_id):
         file_id (int): The FileID to update sort order for
     """
     try:
-        query = """
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        
+        # First, diagnose the JSON content
+        diagnostic_query = """
+        SELECT TOP 10 
+            ResultID, 
+            aijson,
+            LEN(aijson) as JsonLength
+        FROM utb_ImageScraperResult t 
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+        WHERE r.FileID = ?
+        """
+        
+        cursor.execute(diagnostic_query, (file_id,))
+        diagnostic_results = cursor.fetchall()
+        
+        # Log detailed diagnostic information
+        for row in diagnostic_results:
+            result_id, raw_json, json_length = row
+            logging.info(f"Diagnostic - ResultID: {result_id}, JSON Length: {json_length}")
+            
+            # Attempt to sanitize the JSON
+            try:
+                # Try to parse the full JSON string
+                import json
+                parsed_json = json.loads(raw_json)
+                logging.info(f"Successfully parsed JSON for ResultID {result_id}")
+            except Exception as parse_error:
+                logging.error(f"Failed to parse JSON for ResultID {result_id}: {parse_error}")
+                logging.error(f"Problematic JSON snippet: {raw_json[:500]}...")
+        
+        # If no diagnostic results, log a warning
+        if not diagnostic_results:
+            logging.warning(f"No results found for FileID {file_id}")
+            return
+
+        # SQL to safely update sort order
+        update_query = """
         WITH ranked_results AS (
             SELECT 
                 t.ResultID, 
@@ -458,30 +495,8 @@ def update_sort_order(file_id):
         WHERE rec.FileID = ?
         """
         
-        connection = pyodbc.connect(conn)
-        cursor = connection.cursor()
-        
-        # First, log some diagnostic information
-        diagnostic_query = """
-        SELECT TOP 5 
-            ResultID, 
-            aijson,
-            ISJSON(aijson) as IsValidJson,
-            JSON_VALUE(aijson, '$.linesheet_score') as LineSheetScore
-        FROM utb_ImageScraperResult t 
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-        WHERE r.FileID = ?
-        """
-        
-        cursor.execute(diagnostic_query, (file_id,))
-        diagnostic_results = cursor.fetchall()
-        
-        # Log diagnostic information
-        for row in diagnostic_results:
-            logging.info(f"Diagnostic - ResultID: {row[0]}, IsValidJson: {row[1]}, LineSheetScore: {row[2]}")
-        
-        # Execute the main update query
-        cursor.execute(query, (file_id, file_id))
+        # Execute the update
+        cursor.execute(update_query, (file_id, file_id))
         connection.commit()
         
         # Mark image processing as complete
@@ -495,6 +510,11 @@ def update_sort_order(file_id):
         logging.info(f"Updated sort order for FileID: {file_id}")
     except Exception as e:
         logging.error(f"Error updating sort order: {e}")
+        
+        # Additional error handling to provide more context
+        import traceback
+        logging.error(f"Detailed error traceback: {traceback.format_exc()}")
+        
         raise
 
 
