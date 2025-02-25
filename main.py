@@ -421,17 +421,32 @@ def update_sort_order(file_id):
                 t.ResultID, 
                 t.EntryID, 
                 t.ImageUrl,
-                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) AS linesheet_score,
+                CASE 
+                    WHEN ISJSON(t.aijson) = 1 
+                    THEN 
+                        TRY_CONVERT(DECIMAL(10,2), 
+                            JSON_VALUE(t.aijson, '$.linesheet_score')
+                        )
+                    ELSE NULL 
+                END AS linesheet_score,
                 ROW_NUMBER() OVER (
                     PARTITION BY t.EntryID 
                     ORDER BY 
-                        CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) DESC
+                        CASE 
+                            WHEN ISJSON(t.aijson) = 1 
+                            THEN 
+                                TRY_CONVERT(DECIMAL(10,2), 
+                                    JSON_VALUE(t.aijson, '$.linesheet_score')
+                                )
+                            ELSE 0 
+                        END DESC
                 ) AS row_num
             FROM utb_ImageScraperResult t 
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
             WHERE 
                 r.FileID = ? AND 
-                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) >= 33
+                ISJSON(t.aijson) = 1 AND
+                TRY_CONVERT(DECIMAL(10,2), JSON_VALUE(t.aijson, '$.linesheet_score')) >= 33
         )
         UPDATE utb_ImageScraperResult 
         SET SortOrder = r.row_num
@@ -443,6 +458,27 @@ def update_sort_order(file_id):
         
         connection = pyodbc.connect(conn)
         cursor = connection.cursor()
+        
+        # First, log some diagnostic information
+        diagnostic_query = """
+        SELECT TOP 5 
+            ResultID, 
+            aijson,
+            ISJSON(aijson) as IsValidJson,
+            JSON_VALUE(aijson, '$.linesheet_score') as LineSheetScore
+        FROM utb_ImageScraperResult t 
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+        WHERE r.FileID = ?
+        """
+        
+        cursor.execute(diagnostic_query, (file_id,))
+        diagnostic_results = cursor.fetchall()
+        
+        # Log diagnostic information
+        for row in diagnostic_results:
+            logging.info(f"Diagnostic - ResultID: {row[0]}, IsValidJson: {row[1]}, LineSheetScore: {row[2]}")
+        
+        # Execute the main update query
         cursor.execute(query, (file_id, file_id))
         connection.commit()
         
