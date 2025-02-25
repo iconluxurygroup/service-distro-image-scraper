@@ -408,30 +408,34 @@ def get_records_to_search(file_id):
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
 
-
+import json
+import math
 
 def clean_json(value):
     """
     Cleans JSON text by replacing invalid values like NaN, undefined, or incorrect formatting.
+    Ensures that JSON remains properly formatted and SQL Server compatible.
     """
     if not value or value.strip() in ["None", "null", "NaN", "undefined"]:
         return None  # Convert invalid JSON to NULL
 
     try:
         parsed = json.loads(value)
+        
         if not isinstance(parsed, dict):
             return None  # Skip non-dict JSON (e.g., lists or malformed JSON)
 
-        # Replace 'NaN' or None with actual NULL values
-        if parsed.get("linesheet_score") in [None, "NaN"]:
+        # Ensure numeric values are not NaN
+        if isinstance(parsed.get("linesheet_score"), float) and math.isnan(parsed["linesheet_score"]):
             parsed["linesheet_score"] = None
-        if parsed.get("match_score") in [None, "NaN"]:
+        if isinstance(parsed.get("match_score"), float) and math.isnan(parsed["match_score"]):
             parsed["match_score"] = None
 
-        return json.dumps(parsed)  # Return cleaned JSON as a string
+        return json.dumps(parsed)  # Return fixed JSON string
 
     except json.JSONDecodeError:
         return None  # Return NULL for invalid JSON
+
 
 
 def update_sort_order(file_id):
