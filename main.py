@@ -409,7 +409,7 @@ def get_records_to_search(file_id):
         return pd.DataFrame()
 def update_sort_order(file_id):
     """
-    Update the sort order of image results with filtering and sorting by linesheet score.
+    Update the sort order of image results, setting top result to 1 and others to 0.
     
     Args:
         file_id (int): The FileID to update sort order for
@@ -418,7 +418,7 @@ def update_sort_order(file_id):
         connection = pyodbc.connect(conn)
         cursor = connection.cursor()
         
-        # SQL to safely update sort order with deduplication
+        # SQL to update sort order with top result marked as 1
         update_query = """
         WITH ranked_results AS (
             SELECT 
@@ -437,52 +437,25 @@ def update_sort_order(file_id):
                 ISJSON(t.aijson) = 1 AND
                 CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) >= 33
         )
-        DELETE FROM utb_ImageScraperResult
-        WHERE ResultID IN (
-            SELECT ResultID 
-            FROM ranked_results 
-            WHERE row_num > 1
-        )
-        """
-        
-        # Execute the delete to remove duplicates
-        cursor.execute(update_query, (file_id,))
-        delete_count = cursor.rowcount
-        connection.commit()
-        
-        # Update the remaining results with sort order
-        sort_query = """
-        WITH ranked_results AS (
-            SELECT 
-                t.ResultID, 
-                ROW_NUMBER() OVER (
-                    ORDER BY 
-                        CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) DESC
-                ) AS row_num
-            FROM utb_ImageScraperResult t 
-            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-            WHERE 
-                r.FileID = ? AND 
-                ISJSON(t.aijson) = 1 AND
-                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) >= 33
-        )
         UPDATE utb_ImageScraperResult 
-        SET SortOrder = r.row_num
+        SET SortOrder = CASE 
+                            WHEN rr.row_num = 1 THEN 1 
+                            ELSE 0 
+                        END
         FROM utb_ImageScraperResult t
-        INNER JOIN ranked_results r ON t.ResultID = r.ResultID
+        INNER JOIN ranked_results rr ON t.ResultID = rr.ResultID
+        INNER JOIN utb_ImageScraperRecords rec ON rec.EntryID = t.EntryID
+        WHERE rec.FileID = ?
         """
         
-        # Execute the sort order update
-        cursor.execute(sort_query, (file_id,))
+        # Execute the update
+        cursor.execute(update_query, (file_id, file_id))
         connection.commit()
         
         # Mark image processing as complete
         complete_query = "UPDATE utb_ImageScraperFiles SET ImageCompleteTime = GETDATE() WHERE ID = ?"
         cursor.execute(complete_query, (file_id,))
         connection.commit()
-        
-        # Log the number of duplicates removed
-        logging.info(f"Removed {delete_count} duplicate entries for FileID: {file_id}")
         
         cursor.close()
         connection.close()
