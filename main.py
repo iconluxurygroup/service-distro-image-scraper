@@ -1373,6 +1373,7 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
         50: Clear product-only shot (no models, mannequins, hands, or props)
         25: Product displayed with a model or mannequin but still fully visible
         5: Product is partially obstructed by hands, accessories, or other objects
+        1: Product is barely not in natural state, is opened - This describes a situation where the product has been slightly altered from its original state or packaging (perhaps opened for display).
 
     IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
     {
