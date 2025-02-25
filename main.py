@@ -407,74 +407,114 @@ def get_records_to_search(file_id):
     except Exception as e:
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
+import pyodbc
+import logging
+
 def update_sort_order(file_id):
     """
-    Update the sort order based on the highest linesheet score.
-    Handles JSON formatting errors.
+    Update the sort order for images associated with a FileID.
+    - The highest `linesheet_score` gets `SortOrder = 0`.
+    - Invalid JSON or `NaN` scores are skipped.
+    - If no valid scores exist, the first image is set to `SortOrder = 0`.
+
+    Args:
+        file_id (int): The FileID to update.
     """
     try:
         connection = pyodbc.connect(conn)
         cursor = connection.cursor()
 
-        # SQL to update sort order while avoiding JSON errors
-        update_query = """
- WITH ranked_results AS (
-    SELECT 
-        t.ResultID, 
-        t.EntryID, 
-        CASE 
-            WHEN ISJSON(t.aijson) = 1 THEN 
-                TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
-            ELSE NULL
-        END AS linesheet_score,
-        ROW_NUMBER() OVER (
-            PARTITION BY t.EntryID 
-            ORDER BY 
-                CASE 
-                    WHEN ISJSON(t.aijson) = 1 THEN 
-                        TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
-                    ELSE NULL
-                END DESC
-        ) AS row_num
-    FROM utb_ImageScraperResult t 
-    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-    WHERE 
-        r.FileID = ?
-)
-UPDATE utb_ImageScraperResult 
-SET SortOrder = 
-    CASE 
-        WHEN rr.row_num = 1 AND rr.linesheet_score IS NOT NULL THEN 0 
-        ELSE 15 
-    END
-FROM utb_ImageScraperResult t
-INNER JOIN ranked_results rr ON t.ResultID = rr.ResultID
-INNER JOIN utb_ImageScraperRecords rec ON rec.EntryID = t.EntryID
-WHERE rec.FileID = ?
-AND rr.linesheet_score IS NOT NULL; -- 🔥 SKIPS ROWS WHERE linesheet_score IS NULL
+        logging.info(f"🔄 Updating sort order for FileID: {file_id}")
 
+        # Step 1: Identify invalid JSON rows or missing scores
+        invalid_json_query = """
+            SELECT ResultID, aijson 
+            FROM utb_ImageScraperResult 
+            WHERE ISJSON(aijson) = 0 
+            OR JSON_VALUE(aijson, '$.linesheet_score') IS NULL 
+            OR JSON_VALUE(aijson, '$.linesheet_score') = 'NaN';
+        """
+        cursor.execute(invalid_json_query)
+        invalid_rows = cursor.fetchall()
+
+        if invalid_rows:
+            logging.warning(f"⚠️ Found {len(invalid_rows)} invalid JSON entries in aijson column!")
+            for row in invalid_rows[:5]:  # Log first 5 invalid entries
+                logging.warning(f"❌ Invalid JSON for ResultID={row[0]}: {row[1]}")
+
+        # Step 2: Update SortOrder for valid images
+        update_query = """
+        WITH RankedResults AS (
+            SELECT 
+                t.ResultID, 
+                t.EntryID, 
+                r.FileID,
+                -- Convert JSON value safely, ignoring NaN and NULL
+                NULLIF(TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL), 'NaN') AS linesheet_score,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.EntryID 
+                    ORDER BY 
+                        NULLIF(TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL), 'NaN') DESC NULLS LAST
+                ) AS rank
+            FROM utb_ImageScraperResult t 
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+            WHERE r.FileID = ?
+        )
+        UPDATE utb_ImageScraperResult
+        SET SortOrder = 
+            CASE 
+                WHEN rr.rank = 1 AND rr.linesheet_score IS NOT NULL THEN 0
+                ELSE 15
+            END
+        FROM utb_ImageScraperResult t
+        INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID
+        WHERE rr.FileID = ?
+        AND rr.linesheet_score IS NOT NULL;
         """
 
-        # Execute the update
         cursor.execute(update_query, (file_id, file_id))
         connection.commit()
-        cursor.close()
-        connection.close()
 
-        logging.info(f"Updated sort order for FileID: {file_id}")
+        # Step 3: Ensure at least one image per EntryID has SortOrder = 0
+        fallback_query = """
+        WITH RankedResults AS (
+            SELECT 
+                t.ResultID, 
+                t.EntryID, 
+                r.FileID,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.EntryID 
+                    ORDER BY t.ResultID ASC
+                ) AS rank
+            FROM utb_ImageScraperResult t 
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+            WHERE r.FileID = ?
+        )
+        UPDATE utb_ImageScraperResult
+        SET SortOrder = 0
+        FROM utb_ImageScraperResult t
+        INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID
+        WHERE rr.FileID = ?
+        AND NOT EXISTS (
+            SELECT 1 FROM utb_ImageScraperResult sub 
+            WHERE sub.EntryID = rr.EntryID AND sub.SortOrder = 0
+        )
+        AND rr.rank = 1;
+        """
 
-    except pyodbc.Error as e:
-        error_msg = str(e)
-        if "Msg 13609" in error_msg or "JSON text is not properly formatted" in error_msg:
-            logging.warning(f"Skipping invalid JSON for FileID {file_id}: {error_msg}")
-        else:
-            logging.error(f"Database error updating sort order for FileID {file_id}: {error_msg}")
+        cursor.execute(fallback_query, (file_id, file_id))
+        connection.commit()
+
+        logging.info(f"✅ Successfully updated sort order for FileID: {file_id}")
 
     except Exception as e:
-        logging.error(f"Unexpected error updating sort order for FileID {file_id}: {e}")
+        logging.error(f"❌ Error updating sort order: {e}")
         import traceback
-        logging.error(f"Detailed error traceback: {traceback.format_exc()}")
+        logging.error(traceback.format_exc())
 
+    finally:
+        cursor.close()
+        connection.close()
 
 
 
