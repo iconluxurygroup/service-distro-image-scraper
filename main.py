@@ -407,24 +407,34 @@ def get_records_to_search(file_id):
     except Exception as e:
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
-
 def update_sort_order(file_id):
     """
-    Update the sort order of image results.
+    Update the sort order of image results with filtering and sorting by linesheet score.
     
     Args:
         file_id (int): The FileID to update sort order for
     """
     try:
         query = """
-            WITH toupdate AS (
-                SELECT t.*,
-                ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS seqnum
-                FROM utb_ImageScraperResult t 
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-                WHERE r.FileID = ?
-            ) 
-            UPDATE toupdate SET SortOrder = seqnum
+        WITH ranked_results AS (
+            SELECT 
+                t.ResultID, 
+                t.EntryID, 
+                t.ImageUrl,
+                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) AS linesheet_score,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.EntryID 
+                    ORDER BY 
+                        CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) DESC
+                ) AS row_num
+            FROM utb_ImageScraperResult t 
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+            WHERE 
+                r.FileID = ? AND 
+                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) >= 33
+        )
+        UPDATE ranked_results 
+        SET SortOrder = row_num
         """
         
         connection = pyodbc.connect(conn)
@@ -444,7 +454,7 @@ def update_sort_order(file_id):
     except Exception as e:
         logging.error(f"Error updating sort order: {e}")
         raise
-
+    
 def update_file_generate_complete(file_id):
     """
     Update file generation completion time.
