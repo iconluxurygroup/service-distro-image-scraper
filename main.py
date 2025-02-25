@@ -673,73 +673,677 @@ def unpack_content(encoded_content):
     except Exception as e:
         logging.error(f"Error unpacking content: {e}")
         return None
+import requests
+import json
+import re
+from collections import OrderedDict
+import math
+import base64
+from PIL import Image
+import io
+from typing import Dict, Any, Optional, Union, Tuple
+from urllib.parse import urlparse
+import logging
 
-def process_image(image_url, product_details, headers):
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Expected JSON schemas
+match_schema = {
+    "type": "object",
+    "properties": {
+        "description": {"type": "string"},
+        "user_provided": {
+            "type": "object",
+            "properties": {
+                "brand": {"type": "string"},
+                "category": {"type": "string"},
+                "color": {"type": "string"}
+            },
+            "required": ["brand", "category", "color"]
+        },
+        "extracted_features": {
+            "type": "object",
+            "properties": {
+                "brand": {"type": "string"},
+                "category": {"type": "string"},
+                "color": {"type": "string"}
+            },
+            "required": ["brand", "category", "color"]
+        },
+        "match_score": {"type": "number"},
+        "reasoning_match": {"type": "string"}
+    },
+    "required": ["description", "user_provided", "extracted_features", "match_score", "reasoning_match"]
+}
+
+linesheet_schema = {
+    "type": "object",
+    "properties": {
+        "linesheet_score": {"type": "number"},
+        "reasoning_linesheet": {"type": "string"}
+    },
+    "required": ["linesheet_score", "reasoning_linesheet"]
+}
+
+
+def get_image_data(image_path_or_url: str) -> bytes:
     """
-    Process an image using the image analysis API.
+    Gets image data from either a local path or a URL.
+    Returns the image data as bytes.
+    """
+    # Check if the input is a URL
+    parsed_url = urlparse(image_path_or_url)
+    is_url = bool(parsed_url.scheme and parsed_url.netloc)
+    
+    if is_url:
+        # Handle URL
+        try:
+            response = requests.get(image_path_or_url, timeout=30, 
+                                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download image from URL: {e}")
+            raise
+    else:
+        # Handle local file path
+        try:
+            with open(image_path_or_url, 'rb') as img_file:
+                return img_file.read()
+        except IOError as e:
+            logger.error(f"Failed to read local image file: {e}")
+            raise
+
+
+def create_default_result(product_brand: str = "", product_category: str = "", product_color: str = "") -> Dict[str, Any]:
+    """
+    Creates a default result dictionary with NaN values for numerical fields and 
+    provided product details for user_provided fields.
+    """
+    return {
+        "description": "",
+        "user_provided": {
+            "brand": product_brand,
+            "category": product_category,
+            "color": product_color
+        },
+        "extracted_features": {
+            "brand": "",
+            "category": "",
+            "color": ""
+        },
+        "match_score": float('nan'),
+        "reasoning_match": "",
+        "linesheet_score": float('nan'),
+        "reasoning_linesheet": ""
+    }
+
+
+def extract_json(text: str, schema_type: str = 'generic') -> Dict[str, Any]:
+    """
+    Extracts a valid JSON object from raw text using multiple fallback methods.
     
     Args:
-        image_url (str): URL of the image to process
-        product_details (dict): Dictionary containing product brand, category, and color
-        headers (dict): API request headers
+        text (str): The text to extract JSON from
+        schema_type (str): Either 'match' or 'linesheet' to enable schema-specific extraction
         
     Returns:
-        dict: Analysis results
+        Dict[str, Any]: Extracted data or a dictionary with extraction_failed=True
+    """
+    if not text or not text.strip():
+        return {"extraction_failed": True}
+    
+    # First attempt: direct JSON parsing
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Direct JSON parsing failed, trying regex")
+        
+        # Second attempt: regex to find JSON between outermost curly braces
+        try:
+            match = re.search(r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}', text, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("JSON extraction using regex failed, trying line-by-line approach")
+            
+            # Third attempt: reconstruct JSON from lines
+            try:
+                json_lines = []
+                capture = False
+                for line in text.split('\n'):
+                    if '{' in line and not capture:
+                        capture = True
+                    if capture:
+                        json_lines.append(line)
+                    if '}' in line and capture:
+                        break
+                
+                reconstructed = ' '.join(json_lines)
+                # Clean up any markdown or extra text
+                reconstructed = re.sub(r'```json|```', '', reconstructed)
+                return json.loads(reconstructed)
+            except Exception as e:
+                logger.warning(f"JSON reconstruction failed: {str(e)}, trying format-specific parsing")
+                
+                # Fourth attempt: schema-specific parsing
+                if schema_type == 'linesheet':
+                    return extract_linesheet_data(text)
+                elif schema_type == 'match':
+                    return extract_match_data(text)
+                else:
+                    logger.error("All JSON extraction methods failed")
+                    return {"extraction_failed": True}
+    
+    return {"extraction_failed": True}
+
+
+def extract_linesheet_data(text: str) -> Dict[str, Any]:
+    """
+    Extract linesheet data from non-JSON text formats
     """
     try:
-        # Download the image
-        response = requests.get(image_url)
-        response.raise_for_status()
+        # First look for a direct score in the format "linesheet_score": X
+        score_match = re.search(r'"linesheet_score":\s*(\d+)', text)
+        if score_match:
+            score = int(score_match.group(1))
+            
+            # Look for reasoning text
+            reasoning_match = re.search(r'"reasoning_linesheet":\s*"([^"]+)"', text)
+            reasoning = reasoning_match.group(1) if reasoning_match else ""
+            
+            return {
+                "linesheet_score": score,
+                "reasoning_linesheet": reasoning
+            }
+        
+        # Look for score patterns in the document format
+        total_score_match = re.search(r'\*\*Total Linesheet Score.*?\*\*Value:\*\*\s*(\d+)', text, re.DOTALL)
+        
+        if not total_score_match:
+            total_score_match = re.search(r'Total Linesheet Score.*?Value:.*?(\d+)', text, re.DOTALL)
+            
+        if not total_score_match:
+            # Try another pattern that might appear in the output
+            total_score_match = re.search(r'linesheet_score.*?(\d+)', text, re.DOTALL)
+    
+        # Extract individual component scores
+        angle_match = re.search(r'angle.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
+        background_match = re.search(r'background.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
+        composition_match = re.search(r'composition.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
+        quality_match = re.search(r'Image Quality.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
+        
+        # If we found a total score, use it
+        if total_score_match:
+            linesheet_score = int(total_score_match.group(1))
+        else:
+            # Look for scores in a more general format
+            components = [
+                re.search(r'angle.*?(\d+).*?points', text, re.DOTALL),
+                re.search(r'background.*?(\d+).*?points', text, re.DOTALL),
+                re.search(r'composition.*?(\d+).*?points', text, re.DOTALL),
+                re.search(r'(image|quality).*?(\d+).*?points', text, re.DOTALL)
+            ]
+            
+            scores = []
+            for comp in components:
+                if comp:
+                    # Some patterns might have the score in group 1, others in group 2
+                    group_to_use = 1 if len(comp.groups()) == 1 else 2
+                    try:
+                        scores.append(int(comp.group(group_to_use)))
+                    except (ValueError, IndexError):
+                        pass
+            
+            if scores:
+                linesheet_score = sum(scores)
+            else:
+                # If we can't find component scores, look for a numeric value followed by "points" or "score"
+                all_scores = re.findall(r'(\d+)\s*(?:points|score)', text, re.IGNORECASE)
+                if all_scores:
+                    try:
+                        linesheet_score = sum(int(s) for s in all_scores)
+                    except ValueError:
+                        return {"extraction_failed": True}
+                else:
+                    return {"extraction_failed": True}
+        
+        # Try to find a reasoning section
+        reasoning_section = re.search(r'reasoning_linesheet[\":\s]+([^}\"]+)', text, re.DOTALL | re.IGNORECASE)
+        
+        if reasoning_section:
+            reasoning = reasoning_section.group(1).strip()
+        else:
+            # Build reasoning text from component descriptions
+            reasoning_parts = []
+            
+            if angle_match:
+                angle_reasoning = re.search(r'angle.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
+                if angle_reasoning:
+                    reasoning_parts.append(f"Angle ({angle_match.group(1)} points): {angle_reasoning.group(1).strip()}")
+            
+            if background_match:
+                bg_reasoning = re.search(r'background.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
+                if bg_reasoning:
+                    reasoning_parts.append(f"Background ({background_match.group(1)} points): {bg_reasoning.group(1).strip()}")
+            
+            if composition_match:
+                comp_reasoning = re.search(r'composition.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
+                if comp_reasoning:
+                    reasoning_parts.append(f"Composition ({composition_match.group(1)} points): {comp_reasoning.group(1).strip()}")
+            
+            if quality_match:
+                quality_reasoning = re.search(r'Image Quality.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
+                if quality_reasoning:
+                    reasoning_parts.append(f"Image Quality ({quality_match.group(1)} points): {quality_reasoning.group(1).strip()}")
+            
+            reasoning = " ".join(reasoning_parts) if reasoning_parts else "Scores extracted from document format."
+        
+        return {
+            "linesheet_score": linesheet_score,
+            "reasoning_linesheet": reasoning
+        }
+                
+    except Exception as e:
+        logger.error(f"Linesheet extraction failed: {str(e)}")
+        return {"extraction_failed": True}
+
+
+def extract_match_data(text: str) -> Dict[str, Any]:
+    """
+    Extract match analysis data from non-JSON text formats
+    """
+    try:
+        # Create default structure
+        result = {
+            "description": "",
+            "user_provided": {
+                "brand": "",
+                "category": "",
+                "color": ""
+            },
+            "extracted_features": {
+                "brand": "",
+                "category": "",
+                "color": ""
+            },
+            "match_score": float('nan'),
+            "reasoning_match": ""
+        }
+        
+        # Look for description
+        description_match = re.search(r'(The\s+image\s+shows.*?\.)', text, re.DOTALL)
+        if description_match:
+            result["description"] = description_match.group(1).strip()
+        else:
+            # Try generic description extraction
+            sentences = re.findall(r'([^.!?]+[.!?])', text)
+            if sentences:
+                # Use the first sentence as description
+                result["description"] = sentences[0].strip()
+        
+        # Extract brand information
+        brand_match = re.search(r'brand[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE)
+        if brand_match:
+            brand = brand_match.group(1).strip()
+            # Check if brand is mentioned elsewhere
+            brand_mention = re.search(r'\b(adidas|nike|puma|reebok|new\s+balance)\b', text, re.IGNORECASE)
+            if not brand and brand_mention:
+                brand = brand_mention.group(1)
+            result["extracted_features"]["brand"] = brand
+            
+        # Extract category information
+        category_match = re.search(r'category[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE)
+        if category_match:
+            result["extracted_features"]["category"] = category_match.group(1).strip()
+        else:
+            # Look for category terms
+            category_terms = ["shoe", "sneaker", "footwear", "apparel", "clothing", "accessory"]
+            for term in category_terms:
+                if re.search(r'\b' + term + r'\b', text, re.IGNORECASE):
+                    result["extracted_features"]["category"] = term
+                    break
+        
+        # Extract color information
+        color_match = re.search(r'color[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE)
+        if color_match:
+            result["extracted_features"]["color"] = color_match.group(1).strip()
+        else:
+            # Look for color terms
+            color_list = ["red", "blue", "green", "yellow", "black", "white", "gray", "grey", "purple", "orange", "brown", "pink"]
+            found_colors = []
+            for color in color_list:
+                if re.search(r'\b' + color + r'\b', text, re.IGNORECASE):
+                    found_colors.append(color)
+            if found_colors:
+                result["extracted_features"]["color"] = ", ".join(found_colors)
+        
+        # Look for user provided info
+        user_brand_match = re.search(r'user[\s-]*provided.*?brand[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE | re.DOTALL)
+        if user_brand_match:
+            result["user_provided"]["brand"] = user_brand_match.group(1).strip()
+            
+        user_category_match = re.search(r'user[\s-]*provided.*?category[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE | re.DOTALL)
+        if user_category_match:
+            result["user_provided"]["category"] = user_category_match.group(1).strip()
+            
+        user_color_match = re.search(r'user[\s-]*provided.*?color[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE | re.DOTALL)
+        if user_color_match:
+            result["user_provided"]["color"] = user_color_match.group(1).strip()
+        
+        # Extract match score
+        score_match = re.search(r'match_score"?\s*:\s*(\d+)', text)
+        if score_match:
+            try:
+                result["match_score"] = float(score_match.group(1))
+            except ValueError:
+                pass
+        else:
+            # Try to infer score from text
+            if "all three features match" in text.lower():
+                result["match_score"] = 100
+            elif "two features match" in text.lower():
+                result["match_score"] = 67
+            elif "one feature match" in text.lower():
+                result["match_score"] = 33
+            elif "no features match" in text.lower():
+                result["match_score"] = 0
+        
+        # Extract reasoning
+        reasoning_match = re.search(r'reasoning_match"?\s*:\s*"?([^}"]+)"?', text, re.IGNORECASE)
+        if reasoning_match:
+            result["reasoning_match"] = reasoning_match.group(1).strip()
+        else:
+            # Try to construct reasoning based on what we found
+            features_matched = []
+            features_mismatched = []
+            
+            # Compare extracted to user provided
+            if result["extracted_features"]["brand"].lower() == result["user_provided"]["brand"].lower():
+                features_matched.append("brand")
+            else:
+                features_mismatched.append("brand")
+                
+            if result["extracted_features"]["category"].lower() == result["user_provided"]["category"].lower():
+                features_matched.append("category")
+            else:
+                features_mismatched.append("category")
+                
+            if result["extracted_features"]["color"].lower() == result["user_provided"]["color"].lower():
+                features_matched.append("color")
+            else:
+                features_mismatched.append("color")
+                
+            if features_matched and features_mismatched:
+                result["reasoning_match"] = f"The {', '.join(features_matched)} match, but the {', '.join(features_mismatched)} don't match."
+            elif features_matched:
+                result["reasoning_match"] = f"All features match: {', '.join(features_matched)}."
+            elif features_mismatched:
+                result["reasoning_match"] = f"No features match: {', '.join(features_mismatched)}."
+            else:
+                result["reasoning_match"] = "Could not determine reasoning."
+        
+        return result
+                
+    except Exception as e:
+        logger.error(f"Match extraction failed: {str(e)}")
+        return {"extraction_failed": True}
+
+
+def send_request_llama(image_path_or_url: str, prompt: str, headers: Dict[str, str], schema_type: str = 'generic') -> Dict[str, Any]:
+    """
+    Sends a request to the Llama 3.2 API with the image and prompt.
+    Works with both local file paths and URLs.
+    Returns the parsed response or a dictionary with extraction_failed=True if the request fails.
+    
+    Args:
+        image_path_or_url: Path to image file or URL
+        prompt: The prompt text to send
+        headers: API request headers
+        schema_type: Either 'match' or 'linesheet' to enable specific extraction
+    """
+    try:
+        # Get image data from either path or URL
+        img_data = get_image_data(image_path_or_url)
         
         # Convert to base64
-        image_bytes = BytesIO(response.content)
-        image = IMG2.open(image_bytes)
-        buffered = BytesIO()
-        image.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
+        base64_img = base64.b64encode(img_data).decode('utf-8')
         
-        # Prepare the API request
-        prompt = f"""
-        Analyze this product image in detail. This is a {product_details['color']} {product_details['category']} 
-        by {product_details['brand']}. Describe the specific model, design elements, materials, and unique features.
-        Generate a comprehensive JSON with these details.
-        """
-        
+        # Using Llama 3.2 compatible format
         payload = {
-            "inputs": {
-                "image": img_str,
-                "prompt": prompt
-            }
+            "model": "meta-llama/Llama-3.2-70b-chat-hf",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_img}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.2,  # Lower temperature for more deterministic responses
+            "response_format": {"type": "json_object"}  # Request JSON format
         }
+
+        logger.info("Sending request to Llama 3.2 API")
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/meta-llama/Llama-3.2-70b-chat-hf",
+            headers=headers,
+            json=payload
+        )
+        response.raise_for_status()
         
-        # Call the API
-        api_url = "https://api-inference.huggingface.co/models/openai/clip-vit-large-patch14-336"
-        api_response = requests.post(api_url, headers=headers, json=payload)
-        api_response.raise_for_status()
+        response_data = response.json()
         
-        # Process the response
-        result = api_response.json()
-        
-        # Generate a caption
-        caption = f"A {product_details['color']} {product_details['brand']} {product_details['category']} with " + \
-                  f"{result.get('unique_features', 'distinctive design elements')}"
-        
-        # Create the combined result
-        combined_result = {
-            "product_info": product_details,
-            "image_url": image_url,
-            "analysis": result,
-            "caption": caption
-        }
-        
-        return combined_result
-        
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request error: {e}")
-        raise
+        # Extract the content from Llama 3.2 response format
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            content = response_data["choices"][0]["message"]["content"]
+            logger.info("Successfully received response from Llama 3.2 API")
+            return extract_json(content, schema_type)
+        else:
+            logger.error(f"Unexpected response format: {response_data}")
+            return {"extraction_failed": True}
+            
     except Exception as e:
-        logging.error(f"Image processing error: {e}")
-        raise
+        logger.error(f"Request to Llama 3.2 API failed: {e}")
+        return {"extraction_failed": True}
+
+
+def process_image(image_path_or_url: str, product_details: Dict[str, str], headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Processes an image to perform match and linesheet analysis using Llama 3.2.
+    Works with both local file paths and URLs.
+    Returns a combined result dictionary with NaN values for failed numerical fields.
+    """
+    # Extract product details
+    product_brand = product_details.get("brand", "")
+    product_category = product_details.get("category", "")
+    product_color = product_details.get("color", "")
+    
+    # Create default result
+    default_result = create_default_result(product_brand, product_category, product_color)
+    
+    # Create prompts
+    match_analysis_prompt = f"""
+    Analyze this product image and extract key features.
+
+    Compare these features to the user-provided values:
+    - Brand: {product_brand}
+    - Category: {product_category}
+    - Color: {product_color}
+
+    IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
+    {{
+      "description": "Brief description of what you see in the image",
+      "user_provided": {{
+        "brand": "{product_brand}",
+        "category": "{product_category}",
+        "color": "{product_color}"
+      }},
+      "extracted_features": {{
+        "brand": "The brand you see in the image",
+        "category": "The product category you see",
+        "color": "The main colors you see"
+      }},
+      "match_score": 0,
+      "reasoning_match": "Explanation of your score"
+    }}
+
+    Calculate the match_score as follows:
+    - 100: All three features match
+    - 67: Two features match
+    - 33: One feature matches
+    - 0: No features match
+
+    Only return the JSON object, nothing else.
+    """
+
+    linesheet_analysis_prompt = """
+    Evaluate the visual composition of this product image.
+
+    Score the image on these 4 criteria (provide a score for EACH):
+
+    1. Angle (max 50 points):
+       - 50: Perfect straight-on side view
+       - 25: Front view or 3/4 angle
+       - 5: Rotated or tilted view
+
+    2. Background (max 50 points):
+       - 50: Clean white background
+       - 25: Neutral grey background
+       - 5: Complex or colorful background
+
+    3. Composition (max 50 points):
+       - 50: Clear product-only shot
+       - 25: Model wearing product
+       - 5: Product partially obstructed
+
+    4. Image Quality (max 50 points):
+       - 50: High-resolution, sharp image
+       - 25: Acceptable quality with minor issues
+       - 5: Low quality, blurry or pixelated
+
+    IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
+    {
+      "linesheet_score": 0,
+      "reasoning_linesheet": "Detailed explanation with individual scores for each criterion"
+    }
+
+    The linesheet_score should be the sum of all four individual criteria scores.
+
+    Only return the JSON object, nothing else.
+    """
+
+    try:
+        # Get match analysis - note the 'match' schema type
+        logger.info("Requesting match analysis from Llama 3.2")
+        match_result = send_request_llama(image_path_or_url, match_analysis_prompt, headers, 'match')
+        
+        # Check if extraction failed
+        if match_result.get("extraction_failed", False):
+            logger.warning("Match analysis extraction failed, using default values")
+            match_data = default_result
+        else:
+            # Update default result with match data
+            match_data = default_result.copy()
+            match_data["description"] = match_result.get("description", "")
+            
+            # Extract nested objects safely
+            if isinstance(match_result.get("extracted_features"), dict):
+                match_data["extracted_features"] = match_result["extracted_features"]
+            
+            if isinstance(match_result.get("user_provided"), dict):
+                match_data["user_provided"] = match_result["user_provided"]
+                
+            # Handle match score
+            try:
+                match_score = float(match_result.get("match_score", float('nan')))
+                match_data["match_score"] = match_score if not math.isnan(match_score) else float('nan')
+            except (ValueError, TypeError):
+                match_data["match_score"] = float('nan')
+                
+            match_data["reasoning_match"] = match_result.get("reasoning_match", "")
+
+        # Get linesheet analysis - note the 'linesheet' schema type
+        logger.info("Requesting linesheet analysis from Llama 3.2")
+        linesheet_result = send_request_llama(image_path_or_url, linesheet_analysis_prompt, headers, 'linesheet')
+        
+        # Process linesheet result
+        if linesheet_result.get("extraction_failed", False):
+            logger.warning("Linesheet analysis extraction failed, using default values")
+            linesheet_score = float('nan')
+            reasoning_linesheet = ""
+        else:
+            # Handle linesheet score
+            try:
+                linesheet_score = float(linesheet_result.get("linesheet_score", float('nan')))
+                linesheet_score = linesheet_score if not math.isnan(linesheet_score) else float('nan')
+            except (ValueError, TypeError):
+                linesheet_score = float('nan')
+                
+            reasoning_linesheet = linesheet_result.get("reasoning_linesheet", "")
+
+        # Create final OrderedDict with both results
+        final_result = OrderedDict([
+            ("description", match_data["description"]),
+            ("user_provided", match_data["user_provided"]),
+            ("extracted_features", match_data["extracted_features"]),
+            ("match_score", match_data["match_score"]),
+            ("reasoning_match", match_data["reasoning_match"]),
+            ("linesheet_score", linesheet_score),
+            ("reasoning_linesheet", reasoning_linesheet),
+        ])
+
+        return final_result
+    
+    except Exception as e:
+        logger.error(f"Processing failed: {str(e)}")
+        return default_result
+
+
+def main():
+    """Example usage of the functions"""
+    # API headers
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer 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"
+    }
+    
+    # Product details
+    product_details = {
+        "brand": "adidas",
+        "category": "shoe",
+        "color": "blue"
+    }
+    
+    # Image URL example
+    image_url = 'http://allikestore.com/cdn/shop/products/adidas-x-neighborhood-i-5923-grey-b37343.jpg'
+    
+    try:
+        # Process the image from URL
+        result = process_image(image_url, product_details, headers)
+        
+        print("\nFinal Combined Result:")
+        print(json.dumps(result, indent=4))
+        
+        # Optionally save the result to a file
+        with open("analysis_result.json", "w") as f:
+            json.dump(result, indent=4, fp=f)
+            
+    except Exception as e:
+        logger.error(f"Main process failed: {str(e)}")
+
 
 def batch_process_images(headers, file_id=None, limit=10):
     """
