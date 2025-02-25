@@ -2378,10 +2378,39 @@ def process_image_batch(payload):
 # API ROUTES
 #################################################
 
+@app.post("/update_sort_llama/")
+async def api_update_sort(file_id_db: str):
+    """
+    API route to update sort order for a file.
+    
+    Args:
+        file_id_db (str): The FileID to update sort order for
+        
+    Returns:
+        dict: Result of updating sort order
+    """
+    try:
+        logger.info(f"Received request to update sort order for FileID: {file_id_db}")
+        
+        # Update sort order
+        sort_order_list = update_sort_order(file_id_db)
+        
+        if sort_order_list:
+            return {
+                "message": f"Sort order updated successfully for FileID: {file_id_db}",
+                "sort_order": sort_order_list
+            }
+        else:
+            return {"error": f"Failed to update sort order for FileID: {file_id_db}"}
+    except Exception as e:
+        logger.error(f"Error updating sort order: {e}")
+        return {"error": f"An error occurred: {str(e)}"}
+
 @app.post("/restart-failed-batch/")
 async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str):
     """
-    API route to restart processing for a file.
+    API route to restart processing for a file, now focused on checking for missing images
+    and launching necessary processes.
     
     Args:
         background_tasks: FastAPI background tasks
@@ -2392,8 +2421,59 @@ async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str
     """
     try:
         logger.info(f"Received request to restart processing for FileID: {file_id_db}")
-        background_tasks.add_task(process_restart_batch, file_id_db)
-        return {"message": "Processing restart initiated successfully. You will be notified upon completion."}
+        
+        # First check for records missing URLs completely
+        missing_urls_df = fetch_missing_images(file_id_db, limit=1000, ai_analysis_only=False)
+        
+        # Extract entries with missing URLs
+        needs_url_generation = missing_urls_df[missing_urls_df['ImageURL'].isnull() | (missing_urls_df['ImageURL'] == '')].copy()
+        
+        # Extract entries with URLs but missing AI analysis
+        needs_analysis = missing_urls_df[~(missing_urls_df['ImageURL'].isnull() | (missing_urls_df['ImageURL'] == ''))].copy()
+        
+        if not needs_url_generation.empty:
+            logger.info(f"Found {len(needs_url_generation)} records missing URLs for FileID: {file_id_db}")
+            needs_regeneration = True
+        else:
+            logger.info(f"No records missing URLs found for FileID: {file_id_db}")
+            needs_regeneration = False
+            
+        if not needs_analysis.empty:
+            logger.info(f"Found {len(needs_analysis)} images with URLs but missing AI analysis for FileID: {file_id_db}")
+            needs_ai_analysis = True
+        else:
+            logger.info(f"No images missing AI analysis found for FileID: {file_id_db}")
+            needs_ai_analysis = False
+        
+        if needs_regeneration or needs_ai_analysis:
+            # Process in the background
+            background_tasks.add_task(process_restart_batch, file_id_db)
+            
+            message_parts = []
+            if needs_regeneration:
+                message_parts.append(f"{len(needs_url_generation)} records missing URLs")
+            if needs_ai_analysis:
+                message_parts.append(f"{len(needs_analysis)} images missing AI analysis")
+                
+            message = f"Processing restart initiated for {' and '.join(message_parts)}. You will be notified upon completion."
+            
+            return {
+                "message": message
+            }
+        else:
+            # If nothing is missing, just update sort order
+            logger.info(f"No missing data found for FileID: {file_id_db}. Running sort order update only.")
+            
+            # Call the sort order update directly
+            sort_order_list = update_sort_order(file_id_db)
+            
+            # Generate download file in the background
+            background_tasks.add_task(generate_download_file, file_id_db)
+            
+            return {
+                "message": "No missing data found. Sort order updated and download file generation initiated.",
+                "sort_order": sort_order_list
+            }
     except Exception as e:
         logger.error(f"Error restarting processing: {e}")
         return {"error": f"An error occurred: {str(e)}"}
