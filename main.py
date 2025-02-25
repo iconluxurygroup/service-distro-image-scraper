@@ -439,7 +439,7 @@ def clean_json(value):
         return None  # Return NULL for invalid JSON
 
 
-def update_sort_order(file_id, conn_str):
+def update_sort_order(file_id):
     """
     Updates the SortOrder column for images:
     - `SortOrder = 1` for the best image.
