@@ -1312,39 +1312,6 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], heade
         return default_result
 
 
-def main():
-    """Example usage of the functions"""
-    # API headers
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer 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"
-    }
-    
-    # Product details
-    product_details = {
-        "brand": "adidas",
-        "category": "shoe",
-        "color": "blue"
-    }
-    
-    # Image URL example
-    image_url = 'http://allikestore.com/cdn/shop/products/adidas-x-neighborhood-i-5923-grey-b37343.jpg'
-    
-    try:
-        # Process the image from URL
-        result = process_image(image_url, product_details, headers)
-        
-        print("\nFinal Combined Result:")
-        print(json.dumps(result, indent=4))
-        
-        # Optionally save the result to a file
-        with open("analysis_result.json", "w") as f:
-            json.dump(result, indent=4, fp=f)
-            
-    except Exception as e:
-        logger.error(f"Main process failed: {str(e)}")
-
-
 def batch_process_images(headers, file_id=None, limit=10):
     """
     Process multiple images in a batch, either by file_id or by fetching pending images.
@@ -2389,3 +2356,9 @@ if __name__ == "__main__":
     # Start the FastAPI server
     import uvicorn
     uvicorn.run("main:app", port=8080, host='0.0.0.0')
+    # API headers
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer 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"
+    }
+  
