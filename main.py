@@ -1407,7 +1407,13 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
 
     def is_result_valid(result: Dict[str, Any]) -> bool:
         """
-        Check if the analysis result is meaningful
+        Check if the analysis result is meaningful and complete
+        
+        Args:
+            result (Dict[str, Any]): The analysis result to validate
+            
+        Returns:
+            bool: True if the result is valid and complete, False otherwise
         """
         if result.get("extraction_failed", False):
             logger.warning("Result marked as extraction failed")
@@ -1420,10 +1426,16 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
         extracted_color = result.get("extracted_features", {}).get("color", "").strip()
         match_score = result.get("match_score", float('nan'))
         linesheet_score = result.get("linesheet_score", float('nan'))
+        reasoning_linesheet = result.get("reasoning_linesheet", "").strip()
 
         # Check if linesheet score is NaN - this should trigger a retry
         if math.isnan(linesheet_score):
             logger.warning("Linesheet score is NaN - requires retry")
+            return False
+            
+        # Check if linesheet reasoning is missing or empty
+        if not reasoning_linesheet:
+            logger.warning("Linesheet reasoning is missing or empty - requires retry")
             return False
 
         # Check if all core fields are empty or NaN
@@ -1443,9 +1455,9 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
             logger.debug(f"Extracted Color: {extracted_color}")
             logger.debug(f"Match Score: {match_score}")
             logger.debug(f"Linesheet Score: {linesheet_score}")
+            logger.debug(f"Linesheet Reasoning: {reasoning_linesheet}")
 
         return is_valid
-
     # Retry loop for processing
     for attempt in range(max_retries):
         try:
