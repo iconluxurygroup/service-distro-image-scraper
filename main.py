@@ -1310,7 +1310,7 @@ def batch_process_images(file_id=None, limit=8):
     """
     try:
         # Fetch only images with missing or NaN JSON fields
-        df = fetch_missing_images(file_id, limit)
+        df = fetch_pending_images(file_id, limit)
 
         if df.empty:
             logging.info("No images to process (all have valid data)")
