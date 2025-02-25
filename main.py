@@ -515,8 +515,7 @@ def clean_json(value):
         })
 def update_sort_order(file_id):
     """
-    Updates the SortOrder column for images with correct priority handling.
-    Perfect matches (score 100) are always ranked first, then sort by match_score and linesheet_score.
+    Updates the SortOrder column for images with improved debugging and validation.
     
     Args:
         file_id: The file ID to update sort order for
@@ -580,8 +579,8 @@ def update_sort_order(file_id):
             logging.warning(f"⚠️ No records found for FileID: {file_id}")
             return []
         
-        # Step 3: Use an improved query for updating sort order with proper priority
-        logging.info("Updating sort order with perfect match priority")
+        # Step 3: Use a more robust query for updating sort order
+        logging.info("Updating sort order using robust query")
         
         # Begin transaction
         cursor.execute("BEGIN TRANSACTION")
@@ -602,9 +601,15 @@ def update_sort_order(file_id):
             logging.error(f"Error resetting SortOrder values: {reset_error}")
             cursor.execute("ROLLBACK")
             return None
-            
-        # Now run the improved sort order update with correct priority handling
-        improved_sort_query = """
+    def update_sort_order(file_id):
+    try:
+        connection = pyodbc.connect(conn_str)
+        cursor = connection.cursor()
+
+        logger.info(f"Starting sort order update for FileID: {file_id}")
+        
+        # Log the exact SQL query that will be executed
+        safe_sort_query = """
         WITH CleanedResults AS (
             SELECT 
                 t.ResultID, 
@@ -631,10 +636,7 @@ def update_sort_order(file_id):
                 EntryID,
                 ROW_NUMBER() OVER (
                     PARTITION BY EntryID 
-                    ORDER BY 
-                        CASE WHEN match_score = 100 THEN 1 ELSE 0 END DESC,  -- Perfect matches first
-                        match_score DESC,                                   -- Then by match score
-                        linesheet_score DESC                                -- Then by linesheet score
+                    ORDER BY match_score DESC, linesheet_score DESC
                 ) AS rank
             FROM CleanedResults
         )
@@ -644,15 +646,36 @@ def update_sort_order(file_id):
         INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID;
         """
         
+        logger.info("Query prepared, attempting execution")
+        
+        # Log parameters and connection details
+        logger.info(f"Connection details: {connection}")
+        logger.info(f"File ID parameter: {file_id}")
+        
         try:
-            cursor.execute(improved_sort_query, (file_id,))
+            # Execute and log rows affected
+            cursor.execute(safe_sort_query, (file_id,))
+            rows_affected = cursor.rowcount
+            logger.info(f"Rows affected by update: {rows_affected}")
+            
+            # Explicitly commit the transaction
+            connection.commit()
+            logger.info("Transaction committed successfully")
+            
+        except Exception as exec_error:
+            logger.error(f"Execution error: {exec_error}")
+            connection.rollback()
+            raise
+        
+        try:
+            cursor.execute(safe_sort_query, (file_id,))
             cursor.execute("COMMIT")
-            logging.info(f"✅ Successfully updated sort order with perfect match priority")
+            logging.info(f"✅ Successfully updated sort order")
         except Exception as sort_error:
             logging.error(f"Error updating sort order: {sort_error}")
             cursor.execute("ROLLBACK")
             
-            # If the main query fails, try with a basic ranking approach that still prioritizes perfect matches
+            # If the main query fails, try with a basic ranking approach
             try:
                 cursor.execute("BEGIN TRANSACTION")
                 basic_sort_query = """
@@ -660,21 +683,7 @@ def update_sort_order(file_id):
                     SELECT 
                         t.ResultID, 
                         t.EntryID,
-                        CASE 
-                            WHEN ISJSON(t.aijson) = 1 AND
-                                 JSON_VALUE(t.aijson, '$.match_score') = '100' THEN 1
-                            ELSE 0
-                        END as is_perfect_match,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY t.EntryID 
-                            ORDER BY 
-                                CASE 
-                                    WHEN ISJSON(t.aijson) = 1 AND
-                                         JSON_VALUE(t.aijson, '$.match_score') = '100' THEN 1
-                                    ELSE 0
-                                END DESC,
-                                t.ResultID
-                        ) AS rank
+                        ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS rank
                     FROM utb_ImageScraperResult t
                     INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                     WHERE r.FileID = ?
@@ -686,12 +695,11 @@ def update_sort_order(file_id):
                 """
                 cursor.execute(basic_sort_query, (file_id,))
                 cursor.execute("COMMIT")
-                logging.info(f"✅ Updated sort order using basic ranking with perfect match priority as fallback")
+                logging.info(f"✅ Updated sort order using basic ranking as fallback")
             except Exception as basic_sort_error:
                 logging.error(f"Even basic sort update failed: {basic_sort_error}")
                 cursor.execute("ROLLBACK")
                 return None
-        
         # Step 4: Verify the sort order has actually changed
         verify_query = """
         SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
