@@ -1595,7 +1595,6 @@ async def generate_download_file(file_id):
     except Exception as e:
         logger.error(f"Error generating download file: {e}")
         return {"error": f"An error occurred: {str(e)}"}
-
 async def process_restart_batch(file_id_db):
     """
     Restart processing for a file.
@@ -1609,26 +1608,30 @@ async def process_restart_batch(file_id_db):
         # Get records to search
         search_df = get_records_to_search(file_id_db)
         
-        if search_df.empty:
-            logger.warning(f"No records to search for FileID: {file_id_db}")
-            return
+        # If there are records to search, process them
+        if len(search_df) > 0:
+            logger.info(f"Found {len(search_df)} records to search for FileID: {file_id_db}")
+            search_list = search_df.to_dict('records')
+            
+            # Process in batches
+            BATCH_SIZE = 100
+            batches = [search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
+            
+            logger.info(f"Processing {len(search_list)} records in {len(batches)} batches")
+            
+            futures = [process_batch.remote(batch) for batch in batches]
+            ray.get(futures)
+        else:
+            logger.info(f"No records to search for FileID: {file_id_db}, continuing with next steps")
         
-        search_list = search_df.to_dict('records')
-        
-        # Process in batches
-        BATCH_SIZE = 100
-        batches = [search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-        
-        logger.info(f"Processing {len(search_list)} records in {len(batches)} batches")
-        
-        futures = [process_batch.remote(batch) for batch in batches]
-        ray.get(futures)
-        
-        # Update sort order and process images
+        # Continue with remaining steps regardless of whether records were found
+        logger.info(f"Updating sort order for FileID: {file_id_db}")
         update_sort_order(file_id_db)
+        
+        logger.info(f"Processing images for FileID: {file_id_db}")
         process_images(file_id_db)
         
-        # Generate download file
+        logger.info(f"Generating download file for FileID: {file_id_db}")
         await generate_download_file(file_id_db)
         
         logger.info(f"Restart processing completed for FileID: {file_id_db}")
