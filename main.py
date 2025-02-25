@@ -756,116 +756,79 @@ def get_image_data(image_path_or_url: str) -> bytes:
             logger.error(f"Failed to read local image file: {e}")
             raise
 
-def extract_linesheet_data(text: str) -> Dict[str, Any]:
+def extract_json(text: str, schema_type: str = 'generic') -> Dict[str, Any]:
     """
-    Extract linesheet data from non-JSON text formats
-    """
-    try:
-        # First look for a direct score in the format "linesheet_score": X
-        score_match = re.search(r'"linesheet_score":\s*(\d+)', text)
-        if score_match:
-            score = int(score_match.group(1))
-            
-            # Look for reasoning text
-            reasoning_match = re.search(r'"reasoning_linesheet":\s*"([^"]+)"', text)
-            reasoning = reasoning_match.group(1) if reasoning_match else ""
-            
-            return {
-                "linesheet_score": score,
-                "reasoning_linesheet": reasoning
-            }
-        
-        # Look for score patterns in the document format
-        total_score_match = re.search(r'\*\*Total Linesheet Score.*?\*\*Value:\*\*\s*(\d+)', text, re.DOTALL)
-        
-        if not total_score_match:
-            total_score_match = re.search(r'Total Linesheet Score.*?Value:.*?(\d+)', text, re.DOTALL)
-            
-        if not total_score_match:
-            # Try another pattern that might appear in the output
-            total_score_match = re.search(r'linesheet_score.*?(\d+)', text, re.DOTALL)
+    Extracts a valid JSON object from raw text using multiple fallback methods.
     
-        # Extract individual component scores
-        angle_match = re.search(r'angle.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
-        background_match = re.search(r'background.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
-        composition_match = re.search(r'composition.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
-        quality_match = re.search(r'Image Quality.*?score.*?Value:.*?(\d+)', text, re.DOTALL)
+    Args:
+        text (str): The text to extract JSON from
+        schema_type (str): Either 'match' or 'linesheet' to enable schema-specific extraction
         
-        # If we found a total score, use it
-        if total_score_match:
-            linesheet_score = int(total_score_match.group(1))
-        else:
-            # Look for scores in a more general format
-            components = [
-                re.search(r'angle.*?(\d+).*?points', text, re.DOTALL),
-                re.search(r'background.*?(\d+).*?points', text, re.DOTALL),
-                re.search(r'composition.*?(\d+).*?points', text, re.DOTALL),
-                re.search(r'(image|quality).*?(\d+).*?points', text, re.DOTALL)
-            ]
-            
-            scores = []
-            for comp in components:
-                if comp:
-                    # Some patterns might have the score in group 1, others in group 2
-                    group_to_use = 1 if len(comp.groups()) == 1 else 2
-                    try:
-                        scores.append(int(comp.group(group_to_use)))
-                    except (ValueError, IndexError):
-                        pass
-            
-            if scores:
-                linesheet_score = sum(scores)
-            else:
-                # If we can't find component scores, look for a numeric value followed by "points" or "score"
-                all_scores = re.findall(r'(\d+)\s*(?:points|score)', text, re.IGNORECASE)
-                if all_scores:
-                    try:
-                        linesheet_score = sum(int(s) for s in all_scores)
-                    except ValueError:
-                        return {"extraction_failed": True}
-                else:
-                    return {"extraction_failed": True}
-        
-        # Try to find a reasoning section
-        reasoning_section = re.search(r'reasoning_linesheet[\":\s]+([^}\"]+)', text, re.DOTALL | re.IGNORECASE)
-        
-        if reasoning_section:
-            reasoning = reasoning_section.group(1).strip()
-        else:
-            # Build reasoning text from component descriptions
-            reasoning_parts = []
-            
-            if angle_match:
-                angle_reasoning = re.search(r'angle.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
-                if angle_reasoning:
-                    reasoning_parts.append(f"Angle ({angle_match.group(1)} points): {angle_reasoning.group(1).strip()}")
-            
-            if background_match:
-                bg_reasoning = re.search(r'background.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
-                if bg_reasoning:
-                    reasoning_parts.append(f"Background ({background_match.group(1)} points): {bg_reasoning.group(1).strip()}")
-            
-            if composition_match:
-                comp_reasoning = re.search(r'composition.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
-                if comp_reasoning:
-                    reasoning_parts.append(f"Composition ({composition_match.group(1)} points): {comp_reasoning.group(1).strip()}")
-            
-            if quality_match:
-                quality_reasoning = re.search(r'Image Quality.*?Reasoning:.*?([^*]+)', text, re.DOTALL)
-                if quality_reasoning:
-                    reasoning_parts.append(f"Image Quality ({quality_match.group(1)} points): {quality_reasoning.group(1).strip()}")
-            
-            reasoning = " ".join(reasoning_parts) if reasoning_parts else "Scores extracted from document format."
-        
-        return {
-            "linesheet_score": linesheet_score,
-            "reasoning_linesheet": reasoning
-        }
-                
-    except Exception as e:
-        print(f"❌ Linesheet extraction failed: {str(e)}")
+    Returns:
+        Dict[str, Any]: Extracted data or a dictionary with extraction_failed=True
+    """
+    if not text or not text.strip():
         return {"extraction_failed": True}
+    
+    # Preprocessing to clean up text
+    text = text.strip()
+    
+    # Function to clean and validate JSON-like text
+    def clean_json_text(raw_text: str) -> str:
+        # Remove any leading/trailing non-JSON text
+        raw_text = raw_text.strip()
+        
+        # Remove markdown code block markers
+        raw_text = raw_text.replace('```json', '').replace('```', '').strip()
+        
+        # Remove any text before the first '{' and after the last '}'
+        first_brace = raw_text.find('{')
+        last_brace = raw_text.rfind('}')
+        
+        if first_brace != -1 and last_brace != -1:
+            raw_text = raw_text[first_brace:last_brace+1].strip()
+        
+        return raw_text
 
+    # Multiple parsing attempts
+    parsing_attempts = [
+        # Direct JSON parsing
+        lambda t: json.loads(clean_json_text(t)),
+        
+        # Regex-based JSON extraction
+        lambda t: json.loads(re.search(r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}', 
+                                       clean_json_text(t), re.DOTALL).group(0)),
+        
+        # Schema-specific parsing for match
+        lambda t: extract_match_data(t) if schema_type == 'match' else {"extraction_failed": True},
+        
+        # Schema-specific parsing for linesheet
+        lambda t: extract_linesheet_data(t) if schema_type == 'linesheet' else {"extraction_failed": True}
+    ]
+
+    # Try each parsing method
+    for attempt in parsing_attempts:
+        try:
+            result = attempt(text)
+            
+            # Validate result based on schema type
+            if schema_type == 'match':
+                if all(key in result for key in ['description', 'user_provided', 'extracted_features', 'match_score', 'reasoning_match']):
+                    return result
+            elif schema_type == 'linesheet':
+                if all(key in result for key in ['linesheet_score', 'reasoning_linesheet']):
+                    return result
+            
+            # If schema validation fails, continue to next attempt
+            continue
+        
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            # If parsing fails, continue to next method
+            continue
+    
+    # If all parsing methods fail
+    print("❌ All JSON extraction methods failed")
+    return {"extraction_failed": True}
 
 def extract_match_data(text: str) -> Dict[str, Any]:
     """
@@ -889,124 +852,77 @@ def extract_match_data(text: str) -> Dict[str, Any]:
             "reasoning_match": ""
         }
         
-        # Look for description
-        description_match = re.search(r'(The\s+image\s+shows.*?\.)', text, re.DOTALL)
+        # Preprocessing: Remove any non-relevant text
+        text = text.strip()
+        
+        # Extract description
+        description_match = re.search(r'"description"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
         if description_match:
             result["description"] = description_match.group(1).strip()
-        else:
-            # Try generic description extraction
-            sentences = re.findall(r'([^.!?]+[.!?])', text)
-            if sentences:
-                # Use the first sentence as description
-                result["description"] = sentences[0].strip()
         
-        # Extract brand information
-        brand_match = re.search(r'brand[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE)
-        if brand_match:
-            brand = brand_match.group(1).strip()
-            # Check if brand is mentioned elsewhere
-            brand_mention = re.search(r'\b(adidas|nike|puma|reebok|new\s+balance)\b', text, re.IGNORECASE)
-            if not brand and brand_mention:
-                brand = brand_mention.group(1)
-            result["extracted_features"]["brand"] = brand
-            
-        # Extract category information
-        category_match = re.search(r'category[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE)
-        if category_match:
-            result["extracted_features"]["category"] = category_match.group(1).strip()
-        else:
-            # Look for category terms
-            category_terms = ["shoe", "sneaker", "footwear", "apparel", "clothing", "accessory"]
-            for term in category_terms:
-                if re.search(r'\b' + term + r'\b', text, re.IGNORECASE):
-                    result["extracted_features"]["category"] = term
-                    break
+        # Extract user_provided details
+        for field in ['brand', 'category', 'color']:
+            user_match = re.search(fr'"user_provided".*?"{field}"\s*:\s*"([^"]*)"', text, re.IGNORECASE | re.DOTALL)
+            if user_match:
+                result['user_provided'][field] = user_match.group(1).strip()
         
-        # Extract color information
-        color_match = re.search(r'color[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE)
-        if color_match:
-            result["extracted_features"]["color"] = color_match.group(1).strip()
-        else:
-            # Look for color terms
-            color_list = ["red", "blue", "green", "yellow", "black", "white", "gray", "grey", "purple", "orange", "brown", "pink"]
-            found_colors = []
-            for color in color_list:
-                if re.search(r'\b' + color + r'\b', text, re.IGNORECASE):
-                    found_colors.append(color)
-            if found_colors:
-                result["extracted_features"]["color"] = ", ".join(found_colors)
-        
-        # Look for user provided info
-        user_brand_match = re.search(r'user[\s-]*provided.*?brand[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE | re.DOTALL)
-        if user_brand_match:
-            result["user_provided"]["brand"] = user_brand_match.group(1).strip()
-            
-        user_category_match = re.search(r'user[\s-]*provided.*?category[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE | re.DOTALL)
-        if user_category_match:
-            result["user_provided"]["category"] = user_category_match.group(1).strip()
-            
-        user_color_match = re.search(r'user[\s-]*provided.*?color[:\s]+"?([^"\n,]+)"?', text, re.IGNORECASE | re.DOTALL)
-        if user_color_match:
-            result["user_provided"]["color"] = user_color_match.group(1).strip()
+        # Extract extracted_features details
+        for field in ['brand', 'category', 'color']:
+            feature_match = re.search(fr'"extracted_features".*?"{field}"\s*:\s*"([^"]*)"', text, re.IGNORECASE | re.DOTALL)
+            if feature_match:
+                result['extracted_features'][field] = feature_match.group(1).strip()
         
         # Extract match score
-        score_match = re.search(r'match_score"?\s*:\s*(\d+)', text)
+        score_match = re.search(r'"match_score"\s*:\s*(\d+)', text)
         if score_match:
             try:
                 result["match_score"] = float(score_match.group(1))
             except ValueError:
                 pass
-        else:
-            # Try to infer score from text
-            if "all three features match" in text.lower():
-                result["match_score"] = 100
-            elif "two features match" in text.lower():
-                result["match_score"] = 67
-            elif "one feature match" in text.lower():
-                result["match_score"] = 33
-            elif "no features match" in text.lower():
-                result["match_score"] = 0
         
         # Extract reasoning
-        reasoning_match = re.search(r'reasoning_match"?\s*:\s*"?([^}"]+)"?', text, re.IGNORECASE)
+        reasoning_match = re.search(r'"reasoning_match"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
         if reasoning_match:
             result["reasoning_match"] = reasoning_match.group(1).strip()
-        else:
-            # Try to construct reasoning based on what we found
-            features_matched = []
-            features_mismatched = []
-            
-            # Compare extracted to user provided
-            if result["extracted_features"]["brand"].lower() == result["user_provided"]["brand"].lower():
-                features_matched.append("brand")
-            else:
-                features_mismatched.append("brand")
-                
-            if result["extracted_features"]["category"].lower() == result["user_provided"]["category"].lower():
-                features_matched.append("category")
-            else:
-                features_mismatched.append("category")
-                
-            if result["extracted_features"]["color"].lower() == result["user_provided"]["color"].lower():
-                features_matched.append("color")
-            else:
-                features_mismatched.append("color")
-                
-            if features_matched and features_mismatched:
-                result["reasoning_match"] = f"The {', '.join(features_matched)} match, but the {', '.join(features_mismatched)} don't match."
-            elif features_matched:
-                result["reasoning_match"] = f"All features match: {', '.join(features_matched)}."
-            elif features_mismatched:
-                result["reasoning_match"] = f"No features match: {', '.join(features_mismatched)}."
-            else:
-                result["reasoning_match"] = "Could not determine reasoning."
         
         return result
-                
+    
     except Exception as e:
         print(f"❌ Match extraction failed: {str(e)}")
         return {"extraction_failed": True}
 
+def extract_linesheet_data(text: str) -> Dict[str, Any]:
+    """
+    Extract linesheet data from non-JSON text formats
+    """
+    try:
+        # Preprocessing: Remove any non-relevant text
+        text = text.strip()
+        
+        # Extract linesheet score
+        score_match = re.search(r'"linesheet_score"\s*:\s*(\d+)', text)
+        if score_match:
+            linesheet_score = int(score_match.group(1))
+        else:
+            # Fallback method to find scores
+            scores = re.findall(r'\b(\d+)\s*(?:points|score)\b', text, re.IGNORECASE)
+            if scores:
+                linesheet_score = sum(int(s) for s in scores)
+            else:
+                return {"extraction_failed": True}
+        
+        # Extract reasoning
+        reasoning_match = re.search(r'"reasoning_linesheet"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
+        reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+        
+        return {
+            "linesheet_score": linesheet_score,
+            "reasoning_linesheet": reasoning
+        }
+    
+    except Exception as e:
+        print(f"❌ Linesheet extraction failed: {str(e)}")
+        return {"extraction_failed": True}
 def create_default_result(product_brand: str = "", product_category: str = "", product_color: str = "") -> Dict[str, Any]:
     """
     Creates a default result dictionary with NaN values for numerical fields and 
@@ -1029,99 +945,6 @@ def create_default_result(product_brand: str = "", product_category: str = "", p
         "linesheet_score": float('nan'),
         "reasoning_linesheet": ""
     }
-    
-def extract_json(text: str, schema_type: str = 'generic') -> Dict[str, Any]:
-    """
-    Extracts a valid JSON object from raw text using multiple fallback methods.
-    
-    Args:
-        text (str): The text to extract JSON from
-        schema_type (str): Either 'match' or 'linesheet' to enable schema-specific extraction
-        
-    Returns:
-        Dict[str, Any]: Extracted data or a dictionary with extraction_failed=True
-    """
-    if not text or not text.strip():
-        return {"extraction_failed": True}
-    
-    # Preprocessing to clean up text
-    text = text.strip()
-    
-    # First attempt: direct JSON parsing
-    try:
-        # Try parsing the entire text
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print("⚠️ Direct JSON parsing failed, trying alternative methods")
-    
-    # Second attempt: find JSON between first { and last }
-    try:
-        # Find the first { and last } to get potential JSON
-        first_brace = text.find('{')
-        last_brace = text.rfind('}')
-        
-        if first_brace != -1 and last_brace != -1:
-            potential_json = text[first_brace:last_brace+1]
-            return json.loads(potential_json)
-    except (json.JSONDecodeError, ValueError):
-        print("⚠️ First/last brace method failed")
-    
-    # Third attempt: regex to find JSON
-    try:
-        import re
-        # More flexible regex to capture JSON-like structures
-        match = re.search(r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-    except (json.JSONDecodeError, AttributeError):
-        print("⚠️ Regex JSON extraction failed")
-    
-    # Fourth attempt: schema-specific parsing
-    try:
-        if schema_type == 'linesheet':
-            return extract_linesheet_data(text)
-        elif schema_type == 'match':
-            return extract_match_data(text)
-    except Exception:
-        print("⚠️ Schema-specific extraction failed")
-    
-    # Final attempt: manual JSON reconstruction
-    try:
-        # Remove any leading/trailing non-JSON text
-        json_match = re.search(r'\{.*\}', text, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group(0))
-    except Exception:
-        print("⚠️ Manual JSON reconstruction failed")
-    
-    # Specific handling for linesheet and match analysis patterns
-    if schema_type == 'linesheet':
-        # Look for linesheet-specific patterns
-        try:
-            linesheet_match = re.search(r'"linesheet_score":\s*(\d+).*?"reasoning_linesheet":\s*"([^"]*)"', text, re.DOTALL)
-            if linesheet_match:
-                return {
-                    "linesheet_score": int(linesheet_match.group(1)),
-                    "reasoning_linesheet": linesheet_match.group(2)
-                }
-        except Exception:
-            print("⚠️ Linesheet specific parsing failed")
-    
-    elif schema_type == 'match':
-        # Look for match-specific patterns
-        try:
-            match_matches = re.findall(r'"(\w+)":\s*"?([^",\n}]+)"?', text)
-            if match_matches:
-                result = {}
-                for key, value in match_matches:
-                    result[key] = value
-                return result
-        except Exception:
-            print("⚠️ Match specific parsing failed")
-    
-    # If all else fails
-    print("❌ All JSON extraction methods failed")
-    return {"extraction_failed": True}
 
 def send_request(image_path_or_url: str, prompt: str, schema: Dict[str, Any], headers: Dict[str, str], schema_type: str = 'generic') -> Dict[str, Any]:
     """
