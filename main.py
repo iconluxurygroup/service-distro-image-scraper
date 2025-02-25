@@ -1156,14 +1156,18 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
         match_score = result.get("match_score", float('nan'))
         linesheet_score = result.get("linesheet_score", float('nan'))
 
+        # Check if linesheet score is NaN - this should trigger a retry
+        if math.isnan(linesheet_score):
+            logger.warning("Linesheet score is NaN - requires retry")
+            return False
+
         # Check if all core fields are empty or NaN
         is_valid = not (
             not description and
             not extracted_brand and
             not extracted_category and
             not extracted_color and
-            math.isnan(match_score) and
-            math.isnan(linesheet_score)
+            math.isnan(match_score)
         )
 
         if not is_valid:
