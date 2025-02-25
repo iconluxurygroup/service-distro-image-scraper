@@ -1,12 +1,11 @@
 from fastapi import FastAPI, BackgroundTasks
-import asyncio, os,threading,uuid,requests,openpyxl,uvicorn,shutil,mimetypes,time
-from icon_image_lib.utility import process_row  # Assuming this is correctly implemented
+import asyncio, os, threading, uuid, requests, openpyxl, uvicorn, shutil, mimetypes, time
 from openpyxl import load_workbook
 from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
-import datetime,re
+import datetime, re
 import boto3
 import logging
 from io import BytesIO
@@ -16,661 +15,273 @@ from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.util.retry import Retry
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition,Personalization,Cc,To
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition, Personalization, Cc, To
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import aiohttp
 from aiohttp import ClientTimeout
 from aiohttp_retry import RetryClient, ExponentialRetry
-#logging.basicConfig(level=logging.INFO)
-#logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-# Example usage
-logger.info("Informational message")
-logger.error("Error message")
-from sqlalchemy import create_engine
-import urllib.parse
+import pandas as pd
 import pyodbc
 from dotenv import load_dotenv
-import pandas as pd
-#load_dotenv()
-import base64,zlib
-from threading import Thread
-AWS_ACCESS_KEY_ID='AKIAZQ3DSIQ5BGLY355N'
-AWS_SECRET_ACCESS_KEY='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'
-REGION='us-east-2'
-MSSQLS_PWD="Ftu5675FDG54hjhiuu$"
+import base64, zlib
+import json
+import ray
+import tldextract
+from collections import Counter
+from sqlalchemy import create_engine
+import urllib.parse  # For URL encoding/decoding
+import base64  # For base64 encoding/decoding
+import zlib  # Fo
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Environment settings
+AWS_ACCESS_KEY_ID = 'AKIAZQ3DSIQ5BGLY355N'
+AWS_SECRET_ACCESS_KEY = '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'
+REGION = 'us-east-2'
+MSSQLS_PWD = "Ftu5675FDG54hjhiuu$"
+
+# Database connection strings
+pwd_str = f"Pwd={MSSQLS_PWD};"
+conn_str = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
+conn = conn_str
+engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
+
+# Initialize FastAPI app
+app = FastAPI()
+
+#################################################
+# AWS S3 FUNCTIONS
+#################################################
+
 def get_spaces_client():
-    logger.info("Creating spaces client")
-    # session = boto3.session.Session()
-    # client = boto3.client(service_name='s3',
-    #                         region_name=os.getenv('REGION'),
-    #                         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    #                         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
-    client = boto3.client(service_name='s3',
-                            region_name=REGION,
-                            aws_access_key_id=AWS_ACCESS_KEY_ID,
-                            aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
-    logger.info("Spaces client created successfully")
-    return client
+    """
+    Create an AWS S3 client for file storage.
+    
+    Returns:
+        boto3.client: AWS S3 client
+    """
+    try:
+        logger.info("Creating S3 client")
+        client = boto3.client(
+            service_name='s3',
+            region_name=REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        )
+        logger.info("S3 client created successfully")
+        return client
+    except Exception as e:
+        logger.error(f"Error creating S3 client: {e}")
+        raise
 
 def upload_file_to_space(file_src, save_as, is_public):
-    spaces_client = get_spaces_client()
-    space_name = 'iconluxurygroup-s3'  # Your space name
-
-    # if not content_type:
-    #     content_type_guess = mimetypes.guess_type(file_src)[0]
-    #     if not content_type_guess:
-    #         raise Exception("Content type could not be guessed. Please specify it directly.")
-    #     content_type = content_type_guess
-    spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
-    print(f"File uploaded successfully to {space_name}/{save_as}")
-    # Generate and return the public URL if the file is public
-    if is_public:
-        # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
-        upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
-        print(f"Public URL: {upload_url}")
-        return upload_url
-
-
-
-
-def send_email(to_emails, subject, download_url,jobId):
-    # Encode the URL if necessary (example shown, adjust as needed)
-    # from urllib.parse import quote
-    # download_url = quote(download_url, safe='')
-
-
-    html_content = f"""
-<html>
-<body>
-<div class="container">
-    <p>Your file is ready for download.</p>
-     <a href="{download_url}" class="download-button">Download File</a>
-
-    <p><br>Please use the link below to modify the file<br></p
-    <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
-    <br>  
+    """
+    Upload a file to AWS S3.
     
-    <p>--</p>
-    <p>CMS:v1.1</p>
-</div>
-</body>
-</html>
-"""
-    message = Mail(
-        from_email='nik@iconluxurygroup.com',
-        subject=subject,
-        html_content=html_content
-    )
-    # # Read and encode the Excel file
-    # with open(excel_file_path, 'rb') as f:
-    #     excel_data = f.read()
-    # encoded_excel_data = b64encode(excel_data).decode()
+    Args:
+        file_src (str): Path to the file to upload
+        save_as (str): Name to save the file as in S3
+        is_public (bool): Whether the file should be publicly accessible
+        
+    Returns:
+        str: Public URL of the uploaded file if is_public is True
+    """
+    try:
+        spaces_client = get_spaces_client()
+        space_name = 'iconluxurygroup-s3'
+        
+        spaces_client.upload_file(
+            file_src, 
+            space_name,
+            save_as,
+            ExtraArgs={'ACL': 'public-read'} if is_public else {}
+        )
+        
+        logger.info(f"File uploaded successfully to {space_name}/{save_as}")
+        
+        # Generate and return the public URL if the file is public
+        if is_public:
+            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
+            logger.info(f"Public URL: {upload_url}")
+            return upload_url
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error uploading file to S3: {e}")
+        raise
 
-    # attachment = Attachment(
-    #     FileContent(encoded_excel_data),
-    #     FileName(excel_file_path.split('/')[-1]),
-    #     FileType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
-    #     Disposition('attachment')
-    # )
-    # message.attachment = attachment
+#################################################
+# EMAIL FUNCTIONS
+#################################################
+
+def send_email(to_emails, subject, download_url, jobId):
+    """
+    Send an email notification with file download link.
     
-    cc_recipient = 'nik@iconluxurygroup.com'
-    if to_emails == cc_recipient:
+    Args:
+        to_emails (str): Email address to send to
+        subject (str): Email subject
+        download_url (str): URL to download the file
+        jobId (str): Job ID for editing the file
+    """
+    try:
+        html_content = f"""
+        <html>
+        <body>
+        <div class="container">
+            <p>Your file is ready for download.</p>
+             <a href="{download_url}" class="download-button">Download File</a>
+
+            <p><br>Please use the link below to modify the file<br></p
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
+            <br>  
+            
+            <p>--</p>
+            <p>CMS:v1.1</p>
+        </div>
+        </body>
+        </html>
+        """
+        
+        message = Mail(
+            from_email='nik@iconluxurygroup.com',
+            subject=subject,
+            html_content=html_content
+        )
+        
+        cc_recipient = 'nik@iconluxurygroup.com'
+        if to_emails == cc_recipient:
+            cc_recipient = 'notifications@popovtech.com'
+        
+        personalization = Personalization()
+        personalization.add_cc(Cc(cc_recipient))
+        personalization.add_to(To(to_emails))
+        message.add_personalization(personalization)
+        
+        logger.info(f"Sending email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
+        
+        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+        response = sg.send(message)
+        
+        logger.info(f"Email sent successfully: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+
+def send_message_email(to_emails, subject, message):
+    """
+    Send a simple message email.
+    
+    Args:
+        to_emails (str): Email address to send to
+        subject (str): Email subject
+        message (str): Email message content
+    """
+    try:
+        message_with_breaks = message.replace("\n", "<br>")
+
+        html_content = f"""
+        <html>
+        <body>
+        <div class="container">
+            <p>Message details:<br>{message_with_breaks}</p>
+            <p>CMS:v1</p>
+        </div>
+        </body>
+        </html>
+        """
+        
+        message_obj = Mail(
+            from_email='distrotool@iconluxurygroup.com',
+            subject=subject,
+            html_content=html_content
+        )
+        
         cc_recipient = 'notifications@popovtech.com'
-    
-    personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
-    personalization.add_to(To(to_emails))
-    message.add_personalization(personalization)
-    print("trying")
-    try:
-        #
+        personalization = Personalization()
+        personalization.add_cc(Cc(cc_recipient))
+        personalization.add_to(To(to_emails))
+        message_obj.add_personalization(personalization)
+        
+        logger.info(f"Sending message email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
+        
         sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
-        response = sg.send(message)
-        print(response.status_code)
-        print(response.body)
-        print(response.headers)
-    except Exception as e:
-        print(e)
-        #raise
+        response = sg.send(message_obj)
         
-def send_message_email(to_emails, subject,message):
-    message_with_breaks = message.replace("\n", "<br>")
+        logger.info(f"Message email sent successfully: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error sending message email: {e}")
 
-    html_content = f"""
-<html>
-<body>
-<div class="container">
-    <!-- Use the modified message with <br> for line breaks -->
-    <p>Message details:<br>{message_with_breaks}</p>
-    <p>CMS:v1</p>
-</div>
-</body>
-</html>
-"""
-    message = Mail(
-        from_email='distrotool@iconluxurygroup.com',
-        subject=subject,
-        html_content=html_content
-    )
+#################################################
+# DATABASE FUNCTIONS
+#################################################
+
+def fetch_pending_images(limit=10):
+    """
+    Fetch pending images from the database that need AI processing.
     
-    cc_recipient = 'notifications@popovtech.com'
-    personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
-    personalization.add_to(To(to_emails))
-    message.add_personalization(personalization)
+    Args:
+        limit (int): Maximum number of records to fetch
+        
+    Returns:
+        pd.DataFrame: DataFrame containing pending image records
+    """
+    query = """
+        SELECT rr.ResultID, rr.EntryID, rr.ImageURL, 
+               r.ProductBrand, r.ProductCategory, r.ProductColor
+        FROM utb_ImageScraperRecords r
+        INNER JOIN utb_ImageScraperResult rr ON r.EntryID = rr.EntryID
+        WHERE rr.aijson IS NULL
+        ORDER BY rr.ResultID
+        LIMIT ?
+    """
     try:
-        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
-        response = sg.send(message)
-        print(response.status_code)
-        print(response.body)
-        print(response.headers)
+        with pyodbc.connect(conn_str) as conn:
+            df = pd.read_sql(query, conn, params=[limit])
+            logging.info(f"Fetched {len(df)} pending images for processing")
+            return df
     except Exception as e:
-        print(e)
-        #raise
+        logging.error(f"Error fetching pending images: {e}")
+        return pd.DataFrame()
+
+def fetch_images_by_file_id(file_id):
+    """
+    Fetch image data along with brand, category, and color from the database by FileID.
+    
+    Args:
+        file_id (int): The FileID to fetch records for
         
-        
-async def create_temp_dirs(unique_id):
-    loop = asyncio.get_running_loop()  # Get the current loop directly
-    base_dir = os.path.join(os.getcwd(), 'temp_files')
-    temp_images_dir = os.path.join(base_dir, 'images', str(unique_id))
-    temp_excel_dir = os.path.join(base_dir, 'excel', str(unique_id))
+    Returns:
+        pd.DataFrame: DataFrame containing image records for the given FileID
+    """
+    query = """
+        SELECT rr.ResultID, rr.EntryID, rr.ImageURL, 
+               r.ProductBrand, r.ProductCategory, r.ProductColor
+        FROM utb_ImageScraperRecords r
+        INNER JOIN utb_ImageScraperResult rr ON r.EntryID = rr.EntryID
+        WHERE r.FileID = ?
+    """
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            df = pd.read_sql(query, conn, params=[file_id])
+            logging.info(f"Fetched {len(df)} images for FileID {file_id}")
+            return df
+    except Exception as e:
+        logging.error(f"Error fetching images for FileID {file_id}: {e}")
+        return pd.DataFrame()
 
-    await loop.run_in_executor(None, lambda: os.makedirs(temp_images_dir, exist_ok=True))
-    await loop.run_in_executor(None, lambda: os.makedirs(temp_excel_dir, exist_ok=True))
-
-    return temp_images_dir, temp_excel_dir
-
-async def cleanup_temp_dirs(directories):
-    loop = asyncio.get_running_loop()  # Get the current loop directly
-    for dir_path in directories:
-        await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
-pwd_str =f"Pwd={MSSQLS_PWD};"
-#pwd_value = str(os.environ.get('MSSQLS_PWD'))
-conn_str = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
-global conn
-conn = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
-global engine
-engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
-app = FastAPI()
-def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-    insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl,UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
-    values = (file_name, file_source,send_to_email)
-
-    cursor.execute(insert_query, values)
-
-    file_id = cursor.fetchval()
-
-    connection.commit()
-    cursor.close()
-    connection.close()
-
-    return file_id
-def get_records_to_search(file_id,engine):
-    sql_query = f"Select EntryID, ProductModel as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null UNION ALL Select EntryID, ProductModel + ' '  + ProductBrand as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null Order by 1"
-    print(sql_query)
-    df = pd.read_sql_query(sql_query, con=engine)
-    return df
-def load_payload_db(rows, file_id):
-    # Create DataFrame from list of dictionaries (rows)
-    df = pd.DataFrame(rows)
-
-    # Rename columns
-    df = df.rename(columns={
-        'absoluteRowIndex': 'ExcelRowID',  # Renaming 'index' to 'ExcelRowID'
-        'searchValue': 'ProductModel',  # Renaming 'SKU' to 'ProductModel'
-        'brandValue': 'ProductBrand',  # Renaming 'Brand' to 'ProductBrand'
-        'colorValue': 'ProductColor',
-        'CategoryValue': 'ProductCategory'
-    })
-
-    # Insert new column 'FileID' at the beginning with all values set to file_id
-    df.insert(0, 'FileID', file_id)
-    df = df.drop(columns=['imageValue'], axis=1)
-    print(df)
-    # Load DataFrame into SQL database
-    df.to_sql(name='utb_ImageScraperRecords', con=engine, index=False, if_exists='append')
-
-    return df
-def get_endpoint():
-     connection = pyodbc.connect(conn)
-     cursor = connection.cursor()
-     sql_query = "Select top 1 EndpointURL from utb_Endpoints where EndpointIsBlocked = 0 Order by NewID() "
-     cursor.execute(sql_query)
-     endpoint_url = cursor.fetchone()
-     connection.commit()
-     cursor.close()
-     connection.close()
-     if endpoint_url:
-         (endpoint,) = endpoint_url
-         print(endpoint_url)
-         print(datetime.datetime.now())
-     else:
-         print("No EndpointURL")
-         endpoint = "No EndpointURL"
-     return endpoint
-def remove_endpoint(endpoint):
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-    sql_query = f"Update utb_Endpoints set EndpointIsBlocked = 1 where  EndpointURL  = '{endpoint}'"
-    cursor.execute(sql_query)
-    connection.commit()
-    cursor.close()
-    connection.close()
-def unpack_content(encoded_content):
-    if encoded_content:
-        compressed_content = base64.b64decode(encoded_content)
-        original_content = zlib.decompress(compressed_content)
-        # with open('text.html', 'w') as file:
-        #     file.write(str(original_content))
-        return original_content # Return as binary data
-    return None
-def process_search_row(search_string,endpoint,entry_id):
-        search_url = f"{endpoint}?query={search_string}"
-        print(search_url)
-
-        try:
-            response = requests.get(search_url, timeout=60)
-            print(response.status_code)
-            if response.status_code != 200 or response.json().get('body') is None:
-                print('trying again 1')
-                remove_endpoint(endpoint)
-                n_endpoint = get_endpoint()
-                return process_search_row(search_string,n_endpoint,entry_id)  # Add return here
-            else:
-                response_json = response.json()
-                result = response_json.get('body', None)
-                if result:
-                    unpacked_html = unpack_content(result)
-                    print(len(unpacked_html))
-                    parsed_data = GP(unpacked_html)
-                    if parsed_data is None:
-                        print('trying again 2')
-                        remove_endpoint(endpoint)
-                        n_endpoint = get_endpoint()
-                        return process_search_row(search_string,n_endpoint,entry_id)  # Add return here
-                    if type(parsed_data)==list:
-                        if parsed_data[0][0] == 'No start_tag or end_tag':
-                            print('trying again 3')
-                            remove_endpoint(endpoint)
-                            n_endpoint = get_endpoint()
-                            return process_search_row(search_string,n_endpoint,entry_id)
-                    else:
-                        print('parsed data!')
-                        image_url = parsed_data[0]
-                        image_desc = parsed_data[1]
-                        image_source = parsed_data[2]
-                        image_thumb = parsed_data[3]
-
-                        print(
-                            f'Image URL: {type(image_url)} {image_url}\nImage Desc:  {type(image_desc)} {image_desc}\nImage Source:{type(image_source)}  {image_source}')
-                        if image_url:
-                            df = pd.DataFrame({
-                                'ImageUrl': image_url,
-                                'ImageDesc': image_desc,
-                                'ImageSource': image_source,
-                                'ImageUrlThumbnail':image_thumb,
-                            })
-                            if not df.empty:
-                                    df.insert(0, 'EntryId', entry_id)
-                                    df.to_sql(name='utb_ImageScraperResult', con=engine, index=False,
-                                                     if_exists='append')
-
-                                    sql_query = f"update utb_ImageScraperRecords set  Step1 = getdate() where EntryID = {entry_id}"
-
-                                    # Create a cursor from the connection
-                                    connection = pyodbc.connect(conn)
-                                    cursor = connection.cursor()
-
-                                    # Execute the update query
-                                    cursor.execute(sql_query)
-
-                                    # Commit the changes
-                                    connection.commit()
-
-                                    # Close the connection
-                                    connection.close()
-                        else:
-                            print('trying again 4')
-
-                            remove_endpoint(endpoint)
-                            n_endpoint = get_endpoint()
-                            return process_search_row(search_string,n_endpoint,entry_id)
-        except requests.RequestException as e:
-            print('trying again 5')
-            remove_endpoint(endpoint)
-            n_endpoint = get_endpoint()
-            print(f"Error making request: {e}\nTrying Again: {n_endpoint}")
-            return process_search_row(search_string,n_endpoint,entry_id)
-        
-        
-def update_file_generate_complete(file_id):
-    query = f'update utb_ImageScraperFiles set CreateFileCompleteTime = getdate() Where ID = {file_id}'       
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update query
-    cursor.execute(query)
-    # Commit the changes
-    connection.commit()
-
-    # Close the connection
-    connection.close()    
-        
-def get_file_location(file_id):
-    query = f"Select FileLocationUrl from utb_ImageScraperFiles where ID = {file_id}"
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update query
-    cursor.execute(query)
-    file_location_url = cursor.fetchone()
-    # Commit the changes
-    connection.commit()
-
-    # Close the connection
-    connection.close()
-    if file_location_url:
-        (file_location_url,) = file_location_url
-        print(file_location_url)
-    else:
-
-        file_location_url = "No File Found"
-    return file_location_url
-
-def update_file_location_complete(file_id,file_location):
-    query = f"update utb_ImageScraperFiles set FileLocationURLComplete = '{file_location}' Where ID ={file_id}"
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update query
-    cursor.execute(query)
-
-    # Commit the changes
-    connection.commit()
-    connection.close()
-    
-def get_images_excel_db(file_id):
-    update_file_start_query = f"update utb_ImageScraperFiles set CreateFileStartTime = getdate() Where ID = {file_id}"
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update query
-    cursor.execute(update_file_start_query)
-
-    # Commit the changes
-    connection.commit()
-    connection.close()
-
-    query_get_images_to_excel = """Select s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail from utb_ImageScraperFiles f
-inner join utb_ImageScraperRecords s on s.FileID = f.ID 
-inner join utb_ImageScraperResult r on r.EntryID = s.EntryID 
-Where f.ID = $FileID$ and r.SortOrder = 1
-Order by s.ExcelRowID"""
-
-    query_get_images_to_excel = query_get_images_to_excel.replace('$FileID$',str(file_id))
-    print(query_get_images_to_excel)
-    # Close the connection
-
-    df = pd.read_sql_query(query_get_images_to_excel, con=engine)
-    return df
-
-def update_sort_order(file_id):
-    print('executing update sort order')
-    query = """with toupdate as (
-select t.*,
-row_number() over (partition by t.EntryID order by t.ResultID) as seqnum
-from utb_ImageScraperResult t 
-inner join utb_ImageScraperRecords r on r.EntryID = t.EntryID 
-Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
-
-    query = query.replace('$FileID$',str(file_id))
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update queryf
-    cursor.execute(query)
-
-    # Commit the changes
-    connection.commit()
-
-    # Close the connection
-    connection.close()
-    
-    
-    
-    
-    
-    
-    
-    complete_query = f"update utb_ImageScraperFiles set ImageCompleteTime = getdate() Where ID = {file_id}"
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update query
-    cursor.execute(complete_query)
-
-    # Commit the changes
-    connection.commit()
-
-    # Close the connection
-    connection.close()
-    print('completed update sort order')
-def get_send_to_email(file_id_db):
-    
-    query = f"Select UserEmail from utb_ImageScraperFiles where ID = {file_id_db}"
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update query
-    cursor.execute(query)
-    send_to_email = cursor.fetchone()
-    # Commit the changes
-    connection.commit()
-
-    # Close the connection
-    connection.close()
-    if send_to_email:
-        (send_to_email,) = send_to_email
-        print(send_to_email)
-    else:
-
-        send_to_email = "No Email Found"
-    return send_to_email  
-
-async def generate_download_file(file_id):
-    preferred_image_method = 'append'
-    
-    start_time = time.time()
-    loop = asyncio.get_running_loop()
-    
-    selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
-    selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe,selected_images_df )
-    
-    print(selected_images_df.head())
-    print(selected_image_list)
-    
-    provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location,file_id )
-    decoded_string = urllib.parse.unquote(provided_file_path)
-    print(provided_file_path,' ',decoded_string)
-    file_name = provided_file_path.split('/')[-1]
-    temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
-    local_filename = os.path.join(temp_excel_dir, file_name)
-    failed_img_urls = await download_all_images(selected_image_list, temp_images_dir)
-    contenttype = os.path.splitext(local_filename)[1]
-    response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
-    if response.status_code != 200:
-        logger.error(f"Failed to download file: {response.status_code}")
-        return {"error": "Failed to download the provided file."}
-    with open(local_filename, "wb") as file:
-        file.write(response.content)
-        
-    logger.info("Writing images to Excel")
-    failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-    print(f"failed rows: {failed_rows}")
-    #if failed_rows != []:
-    if failed_img_urls:
-        print(failed_img_urls)
-        #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-        fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
-        logger.error(f"Failed to write images for rows: {failed_rows}")
-        logger.error(f"Failed rows added to excel: {fail_rows_written})")
-        
-    logger.info("Uploading file to space")
-    #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
-    is_public = True
-    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name,is_public)  
-
-    await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
-    await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
-  
-    subject_line = f"{file_name} Job Notification"
-    print(subject_line)
-    
-    
-    
-    
-    send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id)
-    await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email,subject_line,public_url,file_id)
-    print('Sending email:\n',send_to_email)
-
-    #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, 'Your File Is Ready', public_url, local_filename)
-    if os.listdir(temp_images_dir) !=[]:
-        logger.info("Sending email")
-        #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, f'Started {file_name}', public_url, local_filename,execution_time,'')
-    #await send_email(send_to_email, 'Your File Is Ready', public_url, local_filename)
-    logger.info("Cleaning up temporary directories")
-    await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
-    
-    logger.info("Processing completed successfully")
-    
-    return {"message": "Processing completed successfully.", "results": 'hardcoded result value', "public_url": public_url}
-    
-# async def process_image_batch(payload: dict):
-#     start_time = time.time()
-#     # Your existing logic here
-#     # Include all steps from processing start to finish,
-#     # such as downloading images, writing images to Excel, etc.
-#
-#     logger.info(f"Processing started for payload: {payload}")
-#     rows = payload.get('rowData', [])
-#     provided_file_path = payload.get('filePath')
-#     logger.info("Received request to process image batch")
-#     file_name = provided_file_path.split('/')[-1]
-#     send_to_email = payload.get('sendToEmail', 'nik@iconluxurygroup.com')
-#     preferred_image_method = payload.get('preferredImageMethod', 'append')
-#     file_id_db = insert_file_db(file_name, provided_file_path)
-#     print(file_id_db)
-#     load_payload_db(rows, file_id_db)
-#     search_df = get_records_to_search(file_id_db, engine)
-#     print(search_df)
-#
-#     semaphore = asyncio.Semaphore(int(os.environ.get('MAX_THREAD')))  # Limit concurrent tasks to avoid overloading
-#     loop = asyncio.get_running_loop()
-#     print(rows)
-#     try:
-#     #    # Create a temporary directory to save downloaded images
-#     #
-#     #
-#          await loop.run_in_executor(ThreadPoolExecutor(), send_message_email, send_to_email, f'Started {file_name}', f'Total Rows: {len(rows)}\nFilename: {file_name}\nDB_file_id: {file_id_db}\nUploaded File: {provided_file_path}')
-#     #
-#          tasks = [process_with_semaphore(row, semaphore,file_id_db) for _, row in search_df.iterrows()]
-#          await asyncio.gather(*tasks, return_exceptions=True)
-#
-#          await loop.run_in_executor(ThreadPoolExecutor(), update_sort_order,file_id_db)
-#     #
-#          #if any(isinstance(result, Exception) for result in results):
-#              #logger.error("Error occurred during image processing.")
-#              #return {"error": "An error occurred during processing."}
-#          #print(results)
-#
-#          # logger.info("Downloading images")
-#          #
-#          # #clean_results = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_downloadV2, results,send_to_email)
-#          # clean_results = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_downloadV2, results)
-#          # if clean_results == []:
-#          #     send_message_email(send_to_email,f'Started {file_name}','No images found\nPlease make sure correct column values are provided\nIf api is disabled this reponse will be sent')
-#          # print(clean_results)
-#          # logger.info("clean_results: {}".format(clean_results))
-#
-#
-#
-#     # #
-#     # #     #d_complete_ = await loop.run_in_executor(ThreadPoolExecutor(), download_all_images, clean_results, temp_images_dir)
-#     #      failed_img_urls = await download_all_images(clean_results, temp_images_dir)
-#     # #
-#     #      contenttype = os.path.splitext(local_filename)[1]
-#     #      logger.info("Downloading Excel from web")
-#     #      response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
-#     #      if response.status_code != 200:
-#     #          logger.error(f"Failed to download file: {response.status_code}")
-#     #          return {"error": "Failed to download the provided file."}
-#     #      with open(local_filename, "wb") as file:
-#     #          file.write(response.content)
-#
-#     #     logger.info("Writing images to Excel")
-#     #     failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-#     #     print(f"failed rows: {failed_rows}")
-#     #     #if failed_rows != []:
-#     #     if failed_img_urls:
-#     #         print(failed_img_urls)
-#     #         #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-#     #         fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
-#     #         logger.error(f"Failed to write images for rows: {failed_rows}")
-#     #         logger.error(f"Failed rows added to excel: {fail_rows_written})")
-#     #
-#     #     logger.info("Uploading file to space")
-#     #     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
-#     #     is_public = True
-#     #     public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, local_filename,is_public,contenttype)
-#     #     end_time = time.time()
-#     #     execution_time = end_time - start_time
-#     #     #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, 'Your File Is Ready', public_url, local_filename)
-#     #     if os.listdir(temp_images_dir) !=[]:
-#     #         logger.info("Sending email")
-#     #         await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, f'Started {file_name}', public_url, local_filename,execution_time,'')
-#     #     #await send_email(send_to_email, 'Your File Is Ready', public_url, local_filename)
-#     #     logger.info("Cleaning up temporary directories")
-#     #     await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
-#     #
-#     #     logger.info("Processing completed successfully")
-#     #
-#     #     return {"message": "Processing completed successfully.", "results": results, "public_url": public_url}
-#     #
-#     except Exception as e:
-#          logger.exception("An unexpected error occurred during processing: %s", e)
-#          await loop.run_in_executor(ThreadPoolExecutor(), send_message_email, send_to_email, f'Started {file_name}', f"An unexpected error occurred during processing.\nError: {str(e)}")
-#          return {"error": f"An unexpected error occurred during processing. Error: {e}"}
-#
-import asyncio
-import ray
-import pyodbc
-import pandas as pd
-import requests
-import json
-import os
-
-import pandas as pd
-import torch
-from PIL import Image
-from openai import OpenAI
-
-hg_client = OpenAI(
-		base_url = "https://j1o1wtb04ya9z0qz.us-east-1.aws.endpoints.huggingface.cloud/v1/",
-	    api_key="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"
-)
-# -------------------------------------------------------------------
-# 1. Database Connection (adjust or remove if not needed)
-# -------------------------------------------------------------------
-# -------------------------------------------------------------------
 def update_database(result_id, aijson, aicaption):
     """
     Update the database with the AI JSON and AI-generated caption.
+    
+    Args:
+        result_id (int): The ResultID to update
+        aijson (str): JSON string containing AI analysis results
+        aicaption (str): AI-generated caption for the image
+        
+    Returns:
+        bool: True if update successful, False otherwise
     """
     query = """
         UPDATE utb_ImageScraperResult
@@ -683,441 +294,699 @@ def update_database(result_id, aijson, aicaption):
             cursor.execute(query, (aijson, aicaption, result_id))
             conn.commit()
             logging.info(f"Database updated for ResultID={result_id}, rows affected: {cursor.rowcount}")
+            return cursor.rowcount > 0
     except Exception as e:
         logging.error(f"Error updating database for ResultID {result_id}: {e}")
+        return False
 
-def fetch_image_data(file_id):
+def insert_file_db(file_name, file_source, send_to_email="nik@iconluxurygroup.com"):
     """
-    Fetch image data along with brand, category, and color from the database.
-    """
-    query = """
-        SELECT rr.ResultID, rr.EntryID, rr.ImageURL, 
-               r.ProductBrand, r.ProductCategory, r.ProductColor
-        FROM utb_ImageScraperRecords r
-        INNER JOIN utb_ImageScraperResult rr ON r.EntryID = rr.EntryID
-        WHERE r.FileID = ?
-    """
-    try:
-        with pyodbc.connect(conn_str) as conn:
-            df = pd.read_sql(query, conn, params=[file_id])
-            return df
-    except Exception as e:
-        logging.error(f"Database error: {e}")
-        return pd.DataFrame()  # Return empty DataFrame on error
-
-# -------------------------------------------------------------------
-# 2. Detect All Features (via InferenceClient)
-# -------------------------------------------------------------------
-def detect_all_features_llama(image_url):
-    """
-    Use a remote LLaMA-based model via Hugging Face InferenceClient
-    to 'detect' features and return a JSON string.
+    Insert a new file record into the database.
     
-    The prompt requests the model to produce valid JSON with
-    'labels', 'logos', 'text', 'image_properties', 'web_entities'.
+    Args:
+        file_name (str): The name of the file
+        file_source (str): The URL of the file
+        send_to_email (str): The email to send notifications to
+        
+    Returns:
+        int: The ID of the newly inserted file
     """
     try:
-        # Prompt for JSON-based analysis:
-        user_text = (
-            "You are an image analysis AI. Describe the following image with:\n"
-            "1) labels - main objects or concepts\n"
-            "2) logos - brand or trademark if any\n"
-            "3) text - any readable text\n"
-            "4) colors - main color or palette\n"
-            "5) web_entities - other relevant or similar concepts\n\n"
-            "Format your answer strictly as valid JSON with keys:\n"
-            "{\n"
-            "  'labels': [],\n"
-            "  'logos': [],\n"
-            "  'text': [],\n"
-            "  'image_properties': [],\n"
-            "  'web_entities': []\n"
-            "}\n\n"
-            "Analyze the image and provide that JSON."
-        )
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
+        values = (file_name, file_source, send_to_email)
 
-        # Messages structure for the HF Inference endpoint
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                ]
-            }
-        ]
-
-        # Inference call (non-streaming)
-        response = hg_client.chat.completions.create(
-            model="tgi",
-            messages=messages,
-            max_tokens=500,
-            stream=True
-        )
-
-        # Validate 'choices' in response
-        if not response:
-            logging.error("No 'choices' in the response for feature detection.")
-            return ""
-
-        # List to collect chunks
-        chunks_list = []
-
-        # Iterate over the stream
-        for chunk in response:
-            # Make sure the chunk has the 'delta' and 'content' keys before using them
-            if "choices" in chunk and len(chunk["choices"]) > 0:
-                delta_content = chunk["choices"][0]["delta"].get("content", "")
-                if delta_content:
-                    # Append the chunk content to your list
-                    chunks_list.append(delta_content)
-
-        # Now you can join them if you want the full text
-        full_response = "".join(chunks_list)
-        # Attempt to parse as JSON
-        try:
-            parsed = json.loads(full_response)
-            # Ensure all keys exist
-            for key in ["labels", "logos", "text", "image_properties", "web_entities"]:
-                if key not in parsed:
-                    parsed[key] = []
-            # Return a nicely formatted JSON string
-            return json.dumps(parsed, indent=4)
-        except json.JSONDecodeError:
-            logging.warning("Model did not return valid JSON. Returning raw text.")
-            return full_response
-
+        cursor.execute(insert_query, values)
+        file_id = cursor.fetchval()
+        connection.commit()
+        cursor.close()
+        connection.close()
+        logging.info(f"Inserted new file record with ID: {file_id}")
+        return file_id
     except Exception as e:
-        logging.error(f"Error analyzing image with LLaMA: {e}")
-        return ""
+        logging.error(f"Error inserting file record: {e}")
+        raise
 
-# -------------------------------------------------------------------
-# 3. Generate Caption (via InferenceClient)
-# -------------------------------------------------------------------
-def generate_caption_llama(image_url, aijson):
+def load_payload_db(rows, file_id):
     """
-    Generate a short product-like caption from the remote LLaMA model.
-    Example format: "<Short Description> <Category> <Brand> <Color>"
-    If unknown, use 'NaN'.
+    Load payload data into the database.
+    
+    Args:
+        rows (list): List of dictionaries containing row data
+        file_id (int): The FileID to associate with the rows
+        
+    Returns:
+        pd.DataFrame: DataFrame containing the loaded rows
     """
     try:
-        # Build prompt with the AI JSON context + instructions
-        user_text = (
-            "### AI Image Analysis Data ###\n"
-            f"{aijson}\n\n"
-            "### INSTRUCTIONS ###\n"
-            "Analyze the data above and the image, then extract:\n"
-            "1) Short Description (1-2 words)\n"
-            "2) Category (e.g., 'Shoe', 'Bag', 'Laptop')\n"
-            "3) Brand (e.g., 'Nike', 'Gucci', or 'NaN' if unknown)\n"
-            "4) Color (e.g., 'Black', 'Blue', or 'NaN')\n\n"
-            "### OUTPUT FORMAT ###\n"
-            "Return ONLY the final caption, like: \"<Short Description> <Category> <Brand> <Color>\"\n"
-            "If any field is unknown, replace it with 'NaN'.\n"
-            "No extra text, no explanation."
-        )
+        # Create DataFrame from list of dictionaries (rows)
+        df = pd.DataFrame(rows)
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                ]
-            }
-        ]
+        # Rename columns
+        df = df.rename(columns={
+            'absoluteRowIndex': 'ExcelRowID',
+            'searchValue': 'ProductModel',
+            'brandValue': 'ProductBrand',
+            'colorValue': 'ProductColor',
+            'CategoryValue': 'ProductCategory'
+        })
 
-        response = hg_client.chat.completions.create(
-            model="meta-llama/Llama-3.2-11B-Vision-Instruct",
-            messages=messages,
-            max_tokens=500,
-            stream=True
-        )
-
-        # Validate 'choices' in response
-        if not response:
-            logging.error("No 'choices' in the response for caption generation.")
-            return "Item NaN NaN NaN"
-
-
-        # List to collect chunks
-        chunks_list = []
-
-        # Iterate over the stream
-        for chunk in response:
-            # Make sure the chunk has the 'delta' and 'content' keys before using them
-            if "choices" in chunk and len(chunk["choices"]) > 0:
-                delta_content = chunk["choices"][0]["delta"].get("content", "")
-                if delta_content:
-                    # Append the chunk content to your list
-                    chunks_list.append(delta_content)
-
-        # Now you can join them if you want the full text
-        full_response = "".join(chunks_list)
-
-
-
-        return full_response if full_response else "Item NaN NaN NaN"
-
+        # Insert new column 'FileID' at the beginning with all values set to file_id
+        df.insert(0, 'FileID', file_id)
+        if 'imageValue' in df.columns:
+            df = df.drop(columns=['imageValue'], axis=1)
+        
+        # Load DataFrame into SQL database using pyodbc instead of to_sql
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        
+        for _, row in df.iterrows():
+            columns = ', '.join(df.columns)
+            placeholders = ', '.join(['?'] * len(df.columns))
+            insert_query = f"INSERT INTO utb_ImageScraperRecords ({columns}) VALUES ({placeholders})"
+            cursor.execute(insert_query, tuple(row))
+        
+        connection.commit()
+        cursor.close()
+        connection.close()
+        
+        logging.info(f"Loaded {len(df)} rows into utb_ImageScraperRecords for FileID: {file_id}")
+        return df
     except Exception as e:
-        logging.error(f"Error generating caption: {e}")
-        return "Item NaN NaN NaN"
+        logging.error(f"Error loading payload data: {e}")
+        raise
 
-# -------------------------------------------------------------------
-# 4. Main Loop
-# -------------------------------------------------------------------
-def process_images(file_id):
+def get_records_to_search(file_id):
     """
-    1) Fetch image data from DB.
-    2) For each image:
-       - Use detect_all_features_llama() for JSON.
-       - Use generate_caption_llama() for caption.
-       - Update DB with results.
+    Get records that need to be searched for images.
+    
+    Args:
+        file_id (int): The FileID to get records for
+        
+    Returns:
+        pd.DataFrame: DataFrame containing records to search
     """
-    df = fetch_image_data(file_id)
-    if df.empty:
-        logging.warning("No records found for FileID=%s", file_id)
-        return
+    try:
+        sql_query = f"""
+            SELECT EntryID, ProductModel as SearchString 
+            FROM utb_ImageScraperRecords 
+            WHERE FileID = {file_id} AND Step1 is null 
+            UNION ALL 
+            SELECT EntryID, ProductModel + ' ' + ProductBrand as SearchString 
+            FROM utb_ImageScraperRecords 
+            WHERE FileID = {file_id} AND Step1 is null 
+            ORDER BY 1
+        """
+        
+        with pyodbc.connect(conn) as connection:
+            df = pd.read_sql_query(sql_query, connection)
+        
+        logging.info(f"Got {len(df)} records to search for FileID: {file_id}")
+        return df
+    except Exception as e:
+        logging.error(f"Error getting records to search: {e}")
+        return pd.DataFrame()
 
-    for _, row in df.iterrows():
-        try:
-            image_url = row["ImageURL"]
-            result_id = row["ResultID"]
+def update_sort_order(file_id):
+    """
+    Update the sort order of image results.
+    
+    Args:
+        file_id (int): The FileID to update sort order for
+    """
+    try:
+        query = """
+            WITH toupdate AS (
+                SELECT t.*,
+                ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS seqnum
+                FROM utb_ImageScraperResult t 
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+                WHERE r.FileID = ?
+            ) 
+            UPDATE toupdate SET SortOrder = seqnum
+        """
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(query, (file_id,))
+        connection.commit()
+        
+        # Mark image processing as complete
+        complete_query = "UPDATE utb_ImageScraperFiles SET ImageCompleteTime = GETDATE() WHERE ID = ?"
+        cursor.execute(complete_query, (file_id,))
+        connection.commit()
+        
+        cursor.close()
+        connection.close()
+        
+        logging.info(f"Updated sort order for FileID: {file_id}")
+    except Exception as e:
+        logging.error(f"Error updating sort order: {e}")
+        raise
 
-            # 1) Detect all features
-            llama_features_json = detect_all_features_llama(image_url)
-            if not llama_features_json:
-                logging.warning(f"LLaMA returned empty result for URL={image_url}")
-                continue
+def update_file_generate_complete(file_id):
+    """
+    Update file generation completion time.
+    
+    Args:
+        file_id (int): The FileID to update
+    """
+    try:
+        query = "UPDATE utb_ImageScraperFiles SET CreateFileCompleteTime = GETDATE() WHERE ID = ?"
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(query, (file_id,))
+        connection.commit()
+        cursor.close()
+        connection.close()
+        
+        logging.info(f"Marked file generation as complete for FileID: {file_id}")
+    except Exception as e:
+        logging.error(f"Error updating file generation completion time: {e}")
 
-            # 2) Generate short caption
-            ai_caption = generate_caption_llama(image_url, llama_features_json)
+def update_file_location_complete(file_id, file_location):
+    """
+    Update file location URL after processing.
+    
+    Args:
+        file_id (int): The FileID to update
+        file_location (str): The URL of the processed file
+    """
+    try:
+        query = "UPDATE utb_ImageScraperFiles SET FileLocationURLComplete = ? WHERE ID = ?"
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(query, (file_location, file_id))
+        connection.commit()
+        cursor.close()
+        connection.close()
+        
+        logging.info(f"Updated file location URL for FileID: {file_id}")
+    except Exception as e:
+        logging.error(f"Error updating file location URL: {e}")
 
-            # 3) Update DB
-            update_database(result_id, llama_features_json, ai_caption)
-            logging.info(f"Record {result_id} processed. Caption: {ai_caption}")
+def get_file_location(file_id):
+    """
+    Get the file location URL for a file.
+    
+    Args:
+        file_id (int): The FileID to get the location for
+        
+    Returns:
+        str: The file location URL
+    """
+    try:
+        query = "SELECT FileLocationUrl FROM utb_ImageScraperFiles WHERE ID = ?"
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(query, (file_id,))
+        file_location_url = cursor.fetchone()
+        connection.close()
+        
+        if file_location_url:
+            file_location_url = file_location_url[0]
+            logging.info(f"Got file location URL for FileID: {file_id}: {file_location_url}")
+            return file_location_url
+        else:
+            logging.warning(f"No file location URL found for FileID: {file_id}")
+            return "No File Found"
+    except Exception as e:
+        logging.error(f"Error getting file location URL: {e}")
+        return "Error retrieving file location"
 
-        except Exception as e:
-            logging.error(f"Error processing record {row.get('ResultID')}: {e}")
-            continue
+def get_send_to_email(file_id):
+    """
+    Get the email address to send notifications to.
+    
+    Args:
+        file_id (int): The FileID to get the email for
+        
+    Returns:
+        str: The email address
+    """
+    try:
+        query = "SELECT UserEmail FROM utb_ImageScraperFiles WHERE ID = ?"
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(query, (file_id,))
+        send_to_email = cursor.fetchone()
+        connection.close()
+        
+        if send_to_email:
+            send_to_email = send_to_email[0]
+            logging.info(f"Got email address for FileID: {file_id}: {send_to_email}")
+            return send_to_email
+        else:
+            logging.warning(f"No email address found for FileID: {file_id}")
+            return "No Email Found"
+    except Exception as e:
+        logging.error(f"Error getting email address: {e}")
+        return "nik@iconluxurygroup.com"  # Default fallback
 
-
+def get_images_excel_db(file_id):
+    """
+    Get images for Excel export from the database.
+    
+    Args:
+        file_id (int): The FileID to get images for
+        
+    Returns:
+        pd.DataFrame: DataFrame containing images for Excel export
+    """
+    try:
+        # Update file start time
+        update_file_start_query = "UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?"
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(update_file_start_query, (file_id,))
+        connection.commit()
+        connection.close()
+        
+        # Get images for Excel
+        query = """
+            SELECT s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail 
+            FROM utb_ImageScraperFiles f
+            INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
+            INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
+            WHERE f.ID = ? AND r.SortOrder = 1
+            ORDER BY s.ExcelRowID
+        """
+        
+        with pyodbc.connect(conn) as connection:
+            df = pd.read_sql_query(query, connection, params=[file_id])
+        
+        logging.info(f"Got {len(df)} images for Excel export for FileID: {file_id}")
+        return df
+    except Exception as e:
+        logging.error(f"Error getting images for Excel export: {e}")
+        return pd.DataFrame()
 
 def get_lm_products(file_id):
-
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-    query = f"exec usp_ImageScrapergetMatchFromRetail {file_id}"
-    print(query)
-    # Execute the update query
-    cursor.execute(query)
-
-    # Commit the changes
-    connection.commit()
-    connection.close()
+    """
+    Execute stored procedure to match products from retail.
     
-def process_restart_batch(file_id_db):
-    search_df = get_records_to_search(file_id_db, engine)
-    print(search_df)
-    search_list=list(search_df.T.to_dict().values())
-    ####
-    start = datetime.datetime.now()
-    print(f"Start of whole process: {start}")
-    BATCH_SIZE=100
-    batches=[search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-    print(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
-    futures=[process_batch.remote(batch) for batch in batches]
-    ray.get(futures)
-    end = datetime.datetime.now()
-    
-    
-    print("executing generate in restart")
-    
-    
-    
-    update_sort_order(file_id_db)
-    process_images(file_id_db)
-    asyncio.run(generate_download_file(file_id_db))
-    
-
-    
-    print(f"End of whole process: {end}")
-    print(f"It took {end - start} to complete")
-    #####
-
-    
-def process_image_batch(payload: dict):
-    logger.info(f"Processing started for payload: {payload}")
-    rows = payload.get('rowData', [])
-    provided_file_path = payload.get('filePath')
-    logger.info("Received request to process image batch")
-    file_name = provided_file_path.split('/')[-1]
-    send_to_email = payload.get('sendToEmail', 'nik@iconluxurygroup.com')
-    print(f"Send To: {send_to_email}")
-    preferred_image_method = payload.get('preferredImageMethod', 'append')
-    file_id_db = insert_file_db(file_name, provided_file_path,send_to_email)
-    print(file_id_db)
-    load_payload_db(rows, file_id_db)
-    get_lm_products(file_id_db)
-    search_df = get_records_to_search(file_id_db, engine)
-    print(search_df)
-    search_list=list(search_df.T.to_dict().values())
-    ####
-    start = datetime.datetime.now()
-    print(f"Start of whole process: {start}")
-    BATCH_SIZE=100
-    batches=[search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-    print(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
-    futures=[process_batch.remote(batch) for batch in batches]
-    ray.get(futures)
-    end = datetime.datetime.now()
-    print("executing generate")
-
-    #####
-    update_sort_order(file_id_db)
-    process_images(file_id_db)
-    asyncio.run(generate_download_file(file_id_db))
-    print(f"End of whole process: {end}")
-    print(f"It took {end - start} to complete")
-    
-@app.post("/restart-failed-batch/")
-async def process_restart(background_tasks: BackgroundTasks, file_id_db: str):
-    logger.info("Received request to process image batch")
-    background_tasks.add_task(process_restart_batch, file_id_db)
-    #await process_image_batch(payload)
-    return {"message": "Processing started successfully. You will be notified upon completion."}
-
-@app.post("/process-image-batch/")
-async def process_payload(background_tasks: BackgroundTasks, payload: dict):
-    logger.info("Received request to process image batch")
-    background_tasks.add_task(process_image_batch, payload)
-    #await process_image_batch(payload)
-    return {"message": "Processing started successfully. You will be notified upon completion."}
-@app.post("/generate-download-file/")
-async def process_file(background_tasks: BackgroundTasks, file_id: int):
-    logger.info("Received request to process image batch")
-    background_tasks.add_task(generate_download_file, str(file_id))
-    #await generate_download_file((str(file_id)))
-    return {"message": "Processing started successfully. You will be notified upon completion."}
-
-@ray.remote
-def process_db_row(row):
-    entry_id = row['EntryID']
-    searchString = row['SearchString']
-    print(f"Entry Id: {entry_id}\nSearch String {searchString}")
-    endpoint = get_endpoint()
-    process_search_row(searchString, endpoint, entry_id)
-@ray.remote
-def process_batch(batch):
-    # Process each item in the batch in parallel
-    futures = [process_db_row.remote(data) for data in batch]
-    print(futures)
-    results = ray.get(futures)
-    return results
-
-
-
-def highlight_cell(excel_file, cell_reference):
-    workbook = openpyxl.load_workbook(excel_file)
-    sheet = workbook.active
-    sheet[cell_reference].fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    workbook.save(excel_file)
-def write_failed_downloads_to_excel(failed_downloads, excel_file):
-    if failed_downloads:
-        workbook = openpyxl.load_workbook(excel_file)
-
-        # Select the active worksheet or specify by name
-        worksheet = workbook.active  # or workbook.get_sheet_by_name('SheetName')
-        # Iterate over the failed rows
-        for row in failed_downloads:
-            url = row[0]
-            row_id = row[1]
-            if url:
-                if url != 'None found in this filter':
-                    # Write the URL to column A of the failed row
-                    # Adjust the cell reference as needed (row index might need +1 depending on header row)
-                    cell_reference = f"{get_column_letter(1)}{row_id}"  # Column A, row number
-                    worksheet[cell_reference] = str(url)
-                    highlight_cell(excel_file, cell_reference)
-        workbook.save(excel_file)
-        logger.info(f"Failed downloads written to Excel file: {excel_file}")
-    else:
-        logger.info("No failed downloads to write to Excel.")
-def write_failed_img_urls(excel_file_path, clean_results, failed_rows):
-    # Load the workbook
-    added_rows = [] 
-    workbook = openpyxl.load_workbook(excel_file_path)
-    
-    # Select the active worksheet or specify by name
-    worksheet = workbook.active  # or workbook.get_sheet_by_name('SheetName')
-    
-    # Convert clean_results to a dictionary for easier lookup
-    clean_results_dict = {row: url for row, url in clean_results}
-    
-    # Iterate over the failed rows
-    for row in failed_rows:
-        # Look up the URL in the clean_results_dict using the row as a key
-        url = clean_results_dict.get(row)
+    Args:
+        file_id (int): The FileID to match products for
+    """
+    try:
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        query = f"EXEC usp_ImageScrapergetMatchFromRetail {file_id}"
+        cursor.execute(query)
+        connection.commit()
+        connection.close()
         
-        if url:
-            # Write the URL to column A of the failed row
-            # Adjust the cell reference as needed (row index might need +1 depending on header row)
-            cell_reference = f"{get_column_letter(1)}{row}"  # Column A, row number
-            worksheet[cell_reference] = str(url)
-            highlight_cell(excel_file_path,cell_reference)
-            added_rows.append(row)
+        logging.info(f"Executed stored procedure to match products for FileID: {file_id}")
+    except Exception as e:
+        logging.error(f"Error executing stored procedure to match products: {e}")
+
+def get_endpoint():
+    """
+    Get a random endpoint URL from the database.
+    
+    Returns:
+        str: The endpoint URL
+    """
+    try:
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        sql_query = "SELECT TOP 1 EndpointURL FROM utb_Endpoints WHERE EndpointIsBlocked = 0 ORDER BY NEWID()"
+        cursor.execute(sql_query)
+        endpoint_url = cursor.fetchone()
+        connection.close()
+        
+        if endpoint_url:
+            endpoint = endpoint_url[0]
+            logging.info(f"Got endpoint URL: {endpoint}")
+            return endpoint
+        else:
+            logging.warning("No endpoint URL found")
+            return "No EndpointURL"
+    except Exception as e:
+        logging.error(f"Error getting endpoint URL: {e}")
+        return "No EndpointURL"
+
+def remove_endpoint(endpoint):
+    """
+    Mark an endpoint as blocked in the database.
+    
+    Args:
+        endpoint (str): The endpoint URL to block
+    """
+    try:
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        sql_query = f"UPDATE utb_Endpoints SET EndpointIsBlocked = 1 WHERE EndpointURL = '{endpoint}'"
+        cursor.execute(sql_query)
+        connection.commit()
+        connection.close()
+        logging.info(f"Marked endpoint as blocked: {endpoint}")
+    except Exception as e:
+        logging.error(f"Error marking endpoint as blocked: {e}")
+
+#################################################
+# IMAGE PROCESSING FUNCTIONS
+#################################################
+
+def unpack_content(encoded_content):
+    """
+    Unpack base64 encoded and compressed content.
+    
+    Args:
+        encoded_content (str): Base64 encoded and compressed content
+        
+    Returns:
+        bytes: Unpacked content
+    """
+    try:
+        if encoded_content:
+            compressed_content = base64.b64decode(encoded_content)
+            original_content = zlib.decompress(compressed_content)
+            return original_content  # Return as binary data
+        return None
+    except Exception as e:
+        logging.error(f"Error unpacking content: {e}")
+        return None
+
+def process_image(image_url, product_details, headers):
+    """
+    Process an image using the image analysis API.
+    
+    Args:
+        image_url (str): URL of the image to process
+        product_details (dict): Dictionary containing product brand, category, and color
+        headers (dict): API request headers
+        
+    Returns:
+        dict: Analysis results
+    """
+    try:
+        # Download the image
+        response = requests.get(image_url)
+        response.raise_for_status()
+        
+        # Convert to base64
+        image_bytes = BytesIO(response.content)
+        image = IMG2.open(image_bytes)
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        # Prepare the API request
+        prompt = f"""
+        Analyze this product image in detail. This is a {product_details['color']} {product_details['category']} 
+        by {product_details['brand']}. Describe the specific model, design elements, materials, and unique features.
+        Generate a comprehensive JSON with these details.
+        """
+        
+        payload = {
+            "inputs": {
+                "image": img_str,
+                "prompt": prompt
+            }
+        }
+        
+        # Call the API
+        api_url = "https://api-inference.huggingface.co/models/openai/clip-vit-large-patch14-336"
+        api_response = requests.post(api_url, headers=headers, json=payload)
+        api_response.raise_for_status()
+        
+        # Process the response
+        result = api_response.json()
+        
+        # Generate a caption
+        caption = f"A {product_details['color']} {product_details['brand']} {product_details['category']} with " + \
+                  f"{result.get('unique_features', 'distinctive design elements')}"
+        
+        # Create the combined result
+        combined_result = {
+            "product_info": product_details,
+            "image_url": image_url,
+            "analysis": result,
+            "caption": caption
+        }
+        
+        return combined_result
+        
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request error: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Image processing error: {e}")
+        raise
+
+def batch_process_images(headers, file_id=None, limit=10):
+    """
+    Process multiple images in a batch, either by file_id or by fetching pending images.
+    
+    Args:
+        headers (dict): API request headers
+        file_id (int, optional): FileID to process images for
+        limit (int): Maximum number of records to process if file_id is None
+        
+    Returns:
+        int: Number of successfully processed images
+    """
+    # Fetch images either by file_id or pending status
+    if file_id:
+        df = fetch_images_by_file_id(file_id)
+    else:
+        df = fetch_pending_images(limit)
+    
+    if df.empty:
+        logging.info("No images to process")
+        return 0
+    
+    success_count = 0
+    
+    # Process each image
+    for _, row in df.iterrows():
+        result_id = row['ResultID']
+        image_url = row['ImageURL']
+        
+        # Create product details dictionary
+        product_details = {
+            "brand": row['ProductBrand'],
+            "category": row['ProductCategory'],
+            "color": row['ProductColor']
+        }
+        
+        try:
+            # Process the image
+            result = process_image(image_url, product_details, headers)
             
-        # Save the workbook
-        workbook.save(excel_file_path)
-    return added_rows
-def prepare_images_for_download_dataframe(df):
-    images_to_download = []
+            # Serialize the JSON result
+            json_result = json.dumps(result)
+            caption = result.get('caption', '')
+            
+            # Update the database
+            success = update_database(result_id, json_result, caption)
+            
+            if success:
+                success_count += 1
+                logging.info(f"Successfully processed and updated image {result_id}")
+            else:
+                logging.warning(f"Database update failed for image {result_id}")
+                
+        except Exception as e:
+            logging.error(f"Error processing image {result_id}: {e}")
+    
+    logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
+    return success_count
 
-    for row in df.itertuples(index=False,name=None):
-        print(row)
-        if row[1] != 'No google image results found':
-            images_to_download.append(row)
+def process_images(file_id):
+    """
+    Process images for a specific file.
+    
+    Args:
+        file_id (int): The FileID to process images for
+        
+    Returns:
+        int: Number of successfully processed images
+    """
+    try:
+        # API headers
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer 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"
+        }
+        
+        logger.info(f"Processing images for FileID {file_id}")
+        count = batch_process_images(headers, file_id=file_id)
+        logger.info(f"Successfully processed {count} images for FileID {file_id}")
+        
+        return count
+    except Exception as e:
+        logger.error(f"Error processing images: {e}")
+        return 0
 
-    return images_to_download
+def process_search_row(search_string, endpoint, entry_id):
+    """
+    Process a search row to find images.
+    
+    Args:
+        search_string (str): String to search for
+        endpoint (str): API endpoint to use
+        entry_id (int): Entry ID in the database
+        
+    Returns:
+        bool: True if processing was successful, False otherwise
+    """
+    try:
+        search_url = f"{endpoint}?query={search_string}"
+        logging.info(f"Searching URL: {search_url}")
 
-def prepare_images_for_download(results,send_to_email):
-    images_to_download = []
+        response = requests.get(search_url, timeout=60)
+        logging.info(f"Got response with status code: {response.status_code}")
+        
+  # First check if the response status is OK
+        if response.status_code != 200:
+            logging.warning(f'Response status code not OK: {response.status_code}, trying again with new endpoint')
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id)
+        
+        # Then try to parse JSON, handling the case where response is not JSON
+        try:
+            response_json = response.json()
+            result = response_json.get('body', None)
+        except json.JSONDecodeError:
+            logging.warning(f'Response is not valid JSON: {response.text[:100]}..., trying again with new endpoint')
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id)
+        
+        # Check if 'body' field exists and is not None
+        if not result:
+            logging.warning('No result body, trying again with new endpoint')
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id)
+        
+        unpacked_html = unpack_content(result)
+        
+        if not unpacked_html or len(unpacked_html) < 100:
+            logging.warning('Unpacked HTML invalid or too small, trying again with new endpoint')
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id)
+        
+        parsed_data = GP(unpacked_html)
+        
+        if parsed_data is None:
+            logging.warning('Parsed data is None, trying again with new endpoint')
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id)
+        
+        if isinstance(parsed_data, list) and parsed_data[0][0] == 'No start_tag or end_tag':
+            logging.warning('Invalid parsed data structure, trying again with new endpoint')
+            remove_endpoint(endpoint)
+            n_endpoint = get_endpoint()
+            return process_search_row(search_string, n_endpoint, entry_id)
+        
+        # Process valid parsed data
+        image_url = parsed_data[0]
+        image_desc = parsed_data[1]
+        image_source = parsed_data[2]
+        image_thumb = parsed_data[3]
+        
+        logging.info(f'Got image data for entry ID {entry_id}')
+        
+        if image_url:
+            # Create DataFrame with image data
+            df = pd.DataFrame({
+                'ImageUrl': image_url,
+                'ImageDesc': image_desc,
+                'ImageSource': image_source,
+                'ImageUrlThumbnail': image_thumb,
+            })
+            
+            if not df.empty:
+                # Insert EntryId column
+                df.insert(0, 'EntryId', entry_id)
+                
+                # Insert data into database
+                df.to_sql(name='utb_ImageScraperResult', con=engine, index=False, if_exists='append')
+                
+                # Update record status
+                connection = pyodbc.connect(conn)
+                cursor = connection.cursor()
+                sql_query = f"UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = {entry_id}"
+                cursor.execute(sql_query)
+                connection.commit()
+                connection.close()
+                
+                logging.info(f'Successfully processed and updated entry ID {entry_id}')
+                return True
+        
+        # If we get here, there was no valid image URL
+        logging.warning('No valid image URL, trying again with new endpoint')
+        remove_endpoint(endpoint)
+        n_endpoint = get_endpoint()
+        return process_search_row(search_string, n_endpoint, entry_id)
+    
+    except requests.RequestException as e:
+        logging.error(f"Request error: {e}")
+        remove_endpoint(endpoint)
+        n_endpoint = get_endpoint()
+        logging.info(f"Trying again with new endpoint: {n_endpoint}")
+        return process_search_row(search_string, n_endpoint, entry_id)
+    
+    except Exception as e:
+        logging.error(f"Error processing search row: {e}")
+        remove_endpoint(endpoint)
+        n_endpoint = get_endpoint()
+        logging.info(f"Trying again with new endpoint: {n_endpoint}")
+        return process_search_row(search_string, n_endpoint, entry_id)
 
-    for package in results:
-        # Ensure the 'result' key is available and its 'status' is 'Completed'.
-        if package.get('result', {}).get('url') == 'Completed':
-            # Iterate over each 'result' entry if it exists and is a list.
-            for result_entry in package.get('result', {}).get('result', []):
-                # Check if the entry is 'Completed' and contains a 'result' key with a URL.
-                if result_entry.get('status') == 'Completed' and isinstance(result_entry.get('result'), dict):
-                    result_data = result_entry.get('result')
-                    url = result_data.get('url')
-                    if url:  # Ensure the URL is not None or empty.
-                        images_to_download.append((package.get('absoluteRowIndex'), url))
+#################################################
+# IMAGE DOWNLOAD AND PROCESSING
+#################################################
 
-    #if not images_to_download:
-        #send_message_email(send_to_email,f'Started {file_name}','No images found in the results')
-        #raise Exception("No valid image URLs found in the results")
-
-
-    return images_to_download
-import tldextract
-from collections import Counter
 def extract_domains_and_counts(data):
     """Extract domains from URLs and count their occurrences."""
-    domains = [tldextract.extract(url).registered_domain for _, url,thumb in data]
+    domains = [tldextract.extract(url).registered_domain for _, url, thumb in data]
     domain_counts = Counter(domains)
     return domain_counts
 
 def analyze_data(data):
+    """
+    Analyze image data to determine optimal connection pool size.
+    
+    Args:
+        data (list): List of image data to analyze
+        
+    Returns:
+        int: Optimal connection pool size
+    """
     domain_counts = extract_domains_and_counts(data)
     logger.info("Domain counts: %s", domain_counts)
     unique_domains = len(domain_counts)
-    print(f"Unique Domain Len: {unique_domains}")
-    pool_size = min(500, max(10, unique_domains * 2))  # Adjust as needed
-    print(f"Pool size: {pool_size}")
+    logger.info(f"Unique Domain Count: {unique_domains}")
+    
+    # Adjust pool size based on unique domains
+    pool_size = min(500, max(10, unique_domains * 2))
+    logger.info(f"Using connection pool size: {pool_size}")
+    
     return pool_size
+
 def build_headers(url):
+    """
+    Build request headers based on URL domain.
+    
+    Args:
+        url (str): URL to build headers for
+        
+    Returns:
+        dict: Headers for the request
+    """
     domain_info = tldextract.extract(url)
     domain = f"{domain_info.domain}.{domain_info.suffix}"
     
@@ -1127,71 +996,26 @@ def build_headers(url):
         "Accept-Language": "en-US,en;q=0.9",
         "Upgrade-Insecure-Requests": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        # "Referer": "Set this if needed based on your logic"
     }
-    #if domain:
-        #headers["Referer"] = f"https://{domain}/"
-        #print(f"Headers: {headers['Referer']}")
-    # Additional dynamic header settings can go here.
-    # Example for Referer (if applicable):
-    # headers["Referer"] = f"https://{domain}/"
     
     return headers
-def try_convert_to_png(image_path, new_path, image_name):
-    logger.info(f"Attempting to convert image to PNG: {image_path}")
-    try:
-        with IMG2.open(image_path) as img:
-            final_image_path = os.path.join(new_path, f"{image_name}.png")
-            img.convert("RGB").save(final_image_path, 'PNG')
-            os.remove(image_path)  # Cleanup original/temp file
-            logger.info(f"Image successfully converted to PNG: {final_image_path}")
-            return True
-    except IOError as e:
-        logger.error(f"Failed to convert image to PNG: {e}")
-        return False
-async def download_all_images(data, save_path):
-    failed_downloads = []
-    pool_size = analyze_data(data)  # Placeholder for your actual data analysis function
-
-    logger.info(f"Setting up session with pool size: {pool_size}")
-
-    # Setup async session with retry policy
-    timeout = ClientTimeout(total=60)
-    retry_options = ExponentialRetry(attempts=3, start_timeout=3)
-    connector = aiohttp.TCPConnector(ssl=False)
-
-    async with RetryClient(raise_for_status=False, retry_options=retry_options, timeout=timeout, connector=connector) as session:
-        semaphore = asyncio.Semaphore(pool_size)
-
-        logger.info("Scheduling image downloads")
-        tasks = [
-            image_download(semaphore, str(item[1]),str(item[2]), str(item[0]), save_path, session)
-            for index, item in enumerate(data, start=1)
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        logger.info("Processing download results")
-        for index, result in enumerate(results):
-            if isinstance(result, Exception):
-                #THUMBNAIL DOWNLOAD ON FAIL
-                print(data[index])
-                logger.error(f"Download task generated an exception: {result}")
-                logger.error(f"Trying again with :{str(data[index][2])}")
-                print(f"Download task generated an exception: {result}")
-                print(f"Trying again with :{str(data[index][2])}")
-                await thumbnail_download(semaphore, str(data[index][2]),str(data[index][0]), save_path, session)
-                #THUMBNAIL DOWNLOAD ON FAIL
-                failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
-            else:
-                logger.info(f"Download task completed with result: {result}")
-                if result is False:
-                    failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
-
-    return failed_downloads
-
 
 async def image_download(semaphore, url, thumbnail, image_name, save_path, session, fallback_formats=None):
+    """
+    Download an image from a URL.
+    
+    Args:
+        semaphore (asyncio.Semaphore): Semaphore to limit concurrent downloads
+        url (str): URL to download the image from
+        thumbnail (str): Thumbnail URL to fall back to if main URL fails
+        image_name (str): Name to save the image as
+        save_path (str): Path to save the image to
+        session (aiohttp.ClientSession): HTTP session to use for the request
+        fallback_formats (list): List of image formats to try if the default format fails
+        
+    Returns:
+        bool: True if download was successful, False otherwise
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -1204,8 +1028,6 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
         logger.info(f"Initiating download for URL: {url} Img: {image_name}")
         try:
             async with session.get(url, headers=headers) as response:
-                logger.info(f"Requesting URL: {url} with stream=True")
-                # response = session.get(url, stream=True)
                 logger.info(f"Received response: {response.status} for URL: {url}")
 
                 if response.status == 200:
@@ -1241,19 +1063,30 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
         except TimeoutError as exc:
             # Handle the timeout specifically
             logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
-            print('timeout error inside the downlaod function')
+            print('timeout error inside the download function')
             print(exc)
-            # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
-            # return False
             return False
 
         except Exception as exc:
             logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
-            # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
-            # return False
             print(exc)
             return False
+
 async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
+    """
+    Download a thumbnail image as a fallback.
+    
+    Args:
+        semaphore (asyncio.Semaphore): Semaphore to limit concurrent downloads
+        url (str): URL to download the thumbnail from
+        image_name (str): Name to save the image as
+        save_path (str): Path to save the image to
+        session (aiohttp.ClientSession): HTTP session to use for the request
+        fallback_formats (list): List of image formats to try if the default format fails
+        
+    Returns:
+        bool: True if download was successful, False otherwise
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -1263,11 +1096,9 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
         if fallback_formats is None:
             fallback_formats = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
 
-        logger.info(f"Initiating download for URL: {url} Img: {image_name}")
+        logger.info(f"Initiating thumbnail download for URL: {url} Img: {image_name}")
         try:
             async with session.get(url, headers=headers) as response:
-                logger.info(f"Requesting URL: {url} with stream=True")
-                # response = session.get(url, stream=True)
                 logger.info(f"Received response: {response.status} for URL: {url}")
 
                 if response.status == 200:
@@ -1296,19 +1127,77 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
                                 logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
                     return False
                 else:
-                    logger.error(f"Download failed with status code {response.status} for URL: {url}")
+                    logger.error(f"Thumbnail download failed with status code {response.status} for URL: {url}")
 
         except TimeoutError:
             # Handle the timeout specifically
-            logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
+            logger.error(f"Timeout occurred while downloading thumbnail {url} Image: {image_name}")
             return False
         except Exception as exc:
-            logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
+            logger.error(f"Exception occurred during thumbnail download or processing for URL: {url}: {exc}", exc_info=True)
             return False
+
+async def download_all_images(data, save_path):
+    """
+    Download all images in the data list.
+    
+    Args:
+        data (list): List of image data to download
+        save_path (str): Path to save downloaded images to
+        
+    Returns:
+        list: List of failed downloads (URL, row ID pairs)
+    """
+    failed_downloads = []
+    pool_size = analyze_data(data)  # Get optimal pool size based on data analysis
+
+    logger.info(f"Setting up session with pool size: {pool_size}")
+
+    # Setup async session with retry policy
+    timeout = ClientTimeout(total=60)
+    retry_options = ExponentialRetry(attempts=3, start_timeout=3)
+    connector = aiohttp.TCPConnector(ssl=False, limit=pool_size)
+
+    async with RetryClient(raise_for_status=False, retry_options=retry_options, 
+                          timeout=timeout, connector=connector) as session:
+        semaphore = asyncio.Semaphore(pool_size)
+
+        logger.info("Scheduling image downloads")
+        tasks = [
+            image_download(semaphore, str(item[1]), str(item[2]), str(item[0]), save_path, session)
+            for index, item in enumerate(data, start=1)
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info("Processing download results")
+        for index, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Try thumbnail download on failure
+                logger.error(f"Download task generated an exception: {result}")
+                logger.error(f"Trying again with thumbnail: {str(data[index][2])}")
+                await thumbnail_download(semaphore, str(data[index][2]), str(data[index][0]), save_path, session)
+                failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
+            else:
+                logger.info(f"Download task completed with result: {result}")
+                if result is False:
+                    failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
+
+    return failed_downloads
+
 def verify_png_image_single(image_path):
+    """
+    Verify that an image is a valid PNG.
+    
+    Args:
+        image_path (str): Path to the image to verify
+        
+    Returns:
+        bool: True if the image is valid, False otherwise
+    """
     try:
         img = IMG2.open(image_path)
-        img.verify()  # I'm using verify() method to check if it's a valid image
+        img.verify()  # Verify it's a valid image
         logging.info(f"Image verified successfully: {image_path}")
     except Exception as e:
         logging.error(f"IMAGE verify ERROR: {e}, for image: {image_path}")
@@ -1329,9 +1218,18 @@ def verify_png_image_single(image_path):
     return True
 
 def resize_image(image_path):
+    """
+    Resize an image to a maximum size.
+    
+    Args:
+        image_path (str): Path to the image to resize
+        
+    Returns:
+        bool: True if resizing was successful, False otherwise
+    """
     try:
         img = IMG2.open(image_path)
-        MAXSIZE = 145
+        MAXSIZE = 145  # Maximum size in pixels
         if img:
             h, w = img.height, img.width  # original size
             logging.debug(f"Original size: height={h}, width={w}")
@@ -1349,59 +1247,538 @@ def resize_image(image_path):
             return True
     except Exception as e:
         logging.error(f"Error resizing image: {e}, for image: {image_path}")
-        return False               
-def write_excel_image(local_filename, temp_dir,preferred_image_method):
-    failed_rows = []
-    # Load the workbook and select the active worksheet
-    wb = load_workbook(local_filename)
-    ws = wb.active
-    print(os.listdir(temp_dir))
-    
-    # Iterate through each file in the temporary directory
-    for image_file in os.listdir(temp_dir):
-        image_path = os.path.join(temp_dir, image_file)
-        # Extract row number or other identifier from the image file name
-        try:
-            # Assuming the file name can be directly converted to an integer row number
-            row_number = int(image_file.split('.')[0])
-            logging.info(f"Processing row {row_number}, image path: {image_path}")
-        except ValueError:
-            logging.warning(f"Skipping file {image_file}: does not match expected naming convention")
-            continue  # Skip files that do not match the expected naming convention
-        verify_image = verify_png_image_single(image_path)    
-        # Check if the image meets the criteria to be added
-        if verify_image:
-            logging.info('Inserting image')
-            img = openpyxl.drawing.image.Image(image_path)
-            # Determine the anchor point based on the preferred image method
-            if preferred_image_method in ["overwrite", "append"]:
-                anchor = "A" + str(row_number)
-                logging.info('Anchor assigned')
-            elif preferred_image_method == "NewColumn":
-                anchor = "B" + str(row_number)  # Example adjustment for a different method
-            else:
-                logging.error(f'Unrecognized preferred image method: {preferred_image_method}')
-                continue  # Skip if the method is not recognized
-                
-            img.anchor = anchor
-            ws.add_image(img)
-            #wb.save(local_filename)
-            logging.info(f'Image saved at {anchor}')
-        else:
-            failed_rows.append(row_number)
-            logging.warning('Inserting image skipped due to verify_png_image_single failure.')   
-    # Finalize changes to the workbook
-    logging.info('Finished processing all images.')
-    wb.save(local_filename)
-    return failed_rows 
+        return False
 
+def highlight_cell(excel_file, cell_reference):
+    """
+    Highlight a cell in an Excel file.
+    
+    Args:
+        excel_file (str): Path to the Excel file
+        cell_reference (str): Cell reference to highlight (e.g., "A1")
+    """
+    try:
+        workbook = load_workbook(excel_file)
+        sheet = workbook.active
+        sheet[cell_reference].fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        workbook.save(excel_file)
+        logging.info(f"Highlighted cell {cell_reference} in {excel_file}")
+    except Exception as e:
+        logging.error(f"Error highlighting cell: {e}")
+
+def write_failed_downloads_to_excel(failed_downloads, excel_file):
+    """
+    Write failed downloads to an Excel file.
+    
+    Args:
+        failed_downloads (list): List of failed downloads (URL, row ID pairs)
+        excel_file (str): Path to the Excel file
+    """
+    if failed_downloads:
+        try:
+            workbook = load_workbook(excel_file)
+            worksheet = workbook.active
+            
+            for row in failed_downloads:
+                url = row[0]
+                row_id = row[1]
+                if url and url != 'None found in this filter':
+                    # Write the URL to column A of the failed row
+                    cell_reference = f"{get_column_letter(1)}{row_id}"  # Column A, row number
+                    worksheet[cell_reference] = str(url)
+                    highlight_cell(excel_file, cell_reference)
+            
+            workbook.save(excel_file)
+            logger.info(f"Failed downloads written to Excel file: {excel_file}")
+            return True
+        except Exception as e:
+            logger.error(f"Error writing failed downloads to Excel: {e}")
+            return False
+    else:
+        logger.info("No failed downloads to write to Excel.")
+        return True
+
+def write_excel_image(local_filename, temp_dir, preferred_image_method):
+    """
+    Write images to an Excel file.
+    
+    Args:
+        local_filename (str): Path to the Excel file
+        temp_dir (str): Path to the directory containing images
+        preferred_image_method (str): Preferred method for inserting images ('append', 'overwrite', 'NewColumn')
+        
+    Returns:
+        list: List of row numbers that failed
+    """
+    failed_rows = []
+    try:
+        # Load the workbook and select the active worksheet
+        wb = load_workbook(local_filename)
+        ws = wb.active
+        logger.info(f"Processing images in {temp_dir} for Excel file {local_filename}")
+        
+        # Iterate through each file in the temporary directory
+        for image_file in os.listdir(temp_dir):
+            image_path = os.path.join(temp_dir, image_file)
+            # Extract row number from the image file name
+            try:
+                # Assuming the file name can be directly converted to an integer row number
+                row_number = int(image_file.split('.')[0])
+                logging.info(f"Processing row {row_number}, image path: {image_path}")
+            except ValueError:
+                logging.warning(f"Skipping file {image_file}: does not match expected naming convention")
+                continue  # Skip files that do not match the expected naming convention
+            
+            # Verify the image meets criteria to be added
+            verify_image = verify_png_image_single(image_path)    
+            if verify_image:
+                logging.info('Inserting image')
+                img = Image(image_path)
+                # Determine the anchor point based on the preferred image method
+                if preferred_image_method in ["overwrite", "append"]:
+                    anchor = "A" + str(row_number)
+                    logging.info('Anchor assigned')
+                elif preferred_image_method == "NewColumn":
+                    anchor = "B" + str(row_number)  # Example adjustment for a different method
+                else:
+                    logging.error(f'Unrecognized preferred image method: {preferred_image_method}')
+                    continue  # Skip if the method is not recognized
+                    
+                img.anchor = anchor
+                ws.add_image(img)
+                logging.info(f'Image added at {anchor}')
+            else:
+                failed_rows.append(row_number)
+                logging.warning('Inserting image skipped due to verify_png_image_single failure.')   
+        
+        # Save the workbook
+        logging.info('Finished processing all images.')
+        wb.save(local_filename)
+        return failed_rows
+    except Exception as e:
+        logging.error(f"Error writing images to Excel: {e}")
+        return failed_rows
+
+def write_failed_img_urls(excel_file_path, clean_results, failed_rows):
+    """
+    Write failed image URLs to an Excel file.
+    
+    Args:
+        excel_file_path (str): Path to the Excel file
+        clean_results (list): List of (row, URL) pairs
+        failed_rows (list): List of row numbers that failed
+        
+    Returns:
+        list: List of row numbers that were added
+    """
+    added_rows = [] 
+    try:
+        # Load the workbook
+        workbook = load_workbook(excel_file_path)
+        
+        # Select the active worksheet
+        worksheet = workbook.active  
+        
+        # Convert clean_results to a dictionary for easier lookup
+        clean_results_dict = {row: url for row, url in clean_results}
+        
+        # Iterate over the failed rows
+        for row in failed_rows:
+            # Look up the URL in the clean_results_dict using the row as a key
+            url = clean_results_dict.get(row)
+            
+            if url:
+                # Write the URL to column A of the failed row
+                cell_reference = f"{get_column_letter(1)}{row}"  # Column A, row number
+                worksheet[cell_reference] = str(url)
+                highlight_cell(excel_file_path, cell_reference)
+                added_rows.append(row)
+        
+        # Save the workbook
+        workbook.save(excel_file_path)
+        return added_rows
+    except Exception as e:
+        logging.error(f"Error writing failed image URLs to Excel: {e}")
+        return added_rows
+
+def prepare_images_for_download_dataframe(df):
+    """
+    Prepare images for download from a DataFrame.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing image data
+        
+    Returns:
+        list: List of image tuples (row, URL, thumbnail) for download
+    """
+    images_to_download = []
+    try:
+        for row in df.itertuples(index=False, name=None):
+            if row[1] != 'No google image results found':
+                images_to_download.append(row)
+        
+        logging.info(f"Prepared {len(images_to_download)} images for download")
+        return images_to_download
+    except Exception as e:
+        logging.error(f"Error preparing images for download: {e}")
+        return []
+
+#################################################
+# RAY REMOTE FUNCTIONS
+#################################################
+
+@ray.remote
+def process_db_row(row):
+    """
+    Process a database row for image searching.
+    
+    Args:
+        row (dict): Dictionary containing row data
+        
+    Returns:
+        dict: Result of processing the row
+    """
+    try:
+        entry_id = row['EntryID']
+        searchString = row['SearchString']
+        logger.info(f"Processing entry ID: {entry_id}, search string: {searchString}")
+        
+        endpoint = get_endpoint()
+        result = process_search_row(searchString, endpoint, entry_id)
+        
+        return {"entry_id": entry_id, "status": "success" if result else "error"}
+    except Exception as e:
+        logger.error(f"Error processing row: {e}")
+        return {"entry_id": row.get('EntryID', 'unknown'), "status": "error", "error": str(e)}
+
+@ray.remote
+def process_batch(batch):
+    """
+    Process a batch of database rows.
+    
+    Args:
+        batch (list): List of dictionaries containing row data
+        
+    Returns:
+        list: Results of processing the batch
+    """
+    try:
+        # Process each item in the batch in parallel
+        futures = [process_db_row.remote(data) for data in batch]
+        logger.info(f"Submitted {len(futures)} row processing tasks")
+        results = ray.get(futures)
+        return results
+    except Exception as e:
+        logger.error(f"Error processing batch: {e}")
+        return [{"status": "error", "error": str(e)}]
+
+#################################################
+# ASYNC WORKFLOW FUNCTIONS
+#################################################
+
+async def create_temp_dirs(unique_id):
+    """
+    Create temporary directories for file processing.
+    
+    Args:
+        unique_id (str): Unique identifier for the directories
+        
+    Returns:
+        tuple: Tuple containing paths to the temporary image and Excel directories
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        base_dir = os.path.join(os.getcwd(), 'temp_files')
+        temp_images_dir = os.path.join(base_dir, 'images', str(unique_id))
+        temp_excel_dir = os.path.join(base_dir, 'excel', str(unique_id))
+
+        await loop.run_in_executor(None, lambda: os.makedirs(temp_images_dir, exist_ok=True))
+        await loop.run_in_executor(None, lambda: os.makedirs(temp_excel_dir, exist_ok=True))
+
+        logger.info(f"Created temporary directories for ID: {unique_id}")
+        return temp_images_dir, temp_excel_dir
+    except Exception as e:
+        logger.error(f"Error creating temporary directories: {e}")
+        raise
+
+async def cleanup_temp_dirs(directories):
+    """
+    Clean up temporary directories after processing.
+    
+    Args:
+        directories (list): List of directory paths to clean up
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        for dir_path in directories:
+            await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
+        logger.info(f"Cleaned up temporary directories: {directories}")
+    except Exception as e:
+        logger.error(f"Error cleaning up temporary directories: {e}")
+
+async def generate_download_file(file_id):
+    """
+    Generate a download file for a processed file.
+    
+    Args:
+        file_id (str): The FileID to generate a download file for
+        
+    Returns:
+        dict: Result of generating the download file
+    """
+    try:
+        preferred_image_method = 'append'
+        start_time = time.time()
+        loop = asyncio.get_running_loop()
+        
+        # Get images for Excel
+        selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
+        selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe, selected_images_df)
+        
+        logger.info(f"Selected {len(selected_image_list)} images for download")
+        
+        # Get file location
+        provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id)
+        decoded_string = urllib.parse.unquote(provided_file_path)
+        file_name = provided_file_path.split('/')[-1]
+        
+        # Create temporary directories
+        temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
+        local_filename = os.path.join(temp_excel_dir, file_name)
+        
+        # Download images
+        failed_img_urls = await download_all_images(selected_image_list, temp_images_dir)
+        
+        # Download Excel file
+        response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
+        if response.status_code != 200:
+            logger.error(f"Failed to download file: {response.status_code}")
+            return {"error": "Failed to download the provided file."}
+        
+        with open(local_filename, "wb") as file:
+            file.write(response.content)
+        
+        # Write images to Excel
+        logger.info("Writing images to Excel")
+        failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
+        
+        # Write failed downloads to Excel
+        if failed_img_urls:
+            await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls, local_filename)
+            logger.warning(f"Failed to download {len(failed_img_urls)} images")
+        
+        # Upload file to S3
+        logger.info("Uploading file to S3")
+        public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name, True)
+        
+        # Update database
+        await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
+        await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
+        
+        # Send email notification
+        subject_line = f"{file_name} Job Notification"
+        send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id)
+        await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, subject_line, public_url, file_id)
+        
+        # Clean up temporary directories
+        logger.info("Cleaning up temporary directories")
+        await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
+        
+        end_time = time.time()
+        execution_time = end_time - start_time
+        logger.info(f"Processing completed in {execution_time:.2f} seconds")
+        
+        return {
+            "message": "Processing completed successfully.",
+            "public_url": public_url
+        }
+    except Exception as e:
+        logger.error(f"Error generating download file: {e}")
+        return {"error": f"An error occurred: {str(e)}"}
+
+async def process_restart_batch(file_id_db):
+    """
+    Restart processing for a file.
+    
+    Args:
+        file_id_db (str): The FileID to restart processing for
+    """
+    try:
+        logger.info(f"Restarting processing for FileID: {file_id_db}")
+        
+        # Get records to search
+        search_df = get_records_to_search(file_id_db)
+        
+        if search_df.empty:
+            logger.warning(f"No records to search for FileID: {file_id_db}")
+            return
+        
+        search_list = search_df.to_dict('records')
+        
+        # Process in batches
+        BATCH_SIZE = 100
+        batches = [search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
+        
+        logger.info(f"Processing {len(search_list)} records in {len(batches)} batches")
+        
+        futures = [process_batch.remote(batch) for batch in batches]
+        ray.get(futures)
+        
+        # Update sort order and process images
+        update_sort_order(file_id_db)
+        process_images(file_id_db)
+        
+        # Generate download file
+        await generate_download_file(file_id_db)
+        
+        logger.info(f"Restart processing completed for FileID: {file_id_db}")
+    except Exception as e:
+        logger.error(f"Error restarting processing for FileID {file_id_db}: {e}")
+
+def process_image_batch(payload):
+    """
+    Process a batch of images from payload data.
+    
+    Args:
+        payload (dict): Dictionary containing payload data
+    """
+    try:
+        logger.info(f"Processing started for payload")
+        
+        rows = payload.get('rowData', [])
+        provided_file_path = payload.get('filePath')
+        file_name = provided_file_path.split('/')[-1]
+        send_to_email = payload.get('sendToEmail', 'nik@iconluxurygroup.com')
+        
+        logger.info(f"Processing file: {file_name}, send to: {send_to_email}")
+        
+        # Insert file record
+        file_id_db = insert_file_db(file_name, provided_file_path, send_to_email)
+        
+        # Load payload data
+        load_payload_db(rows, file_id_db)
+        
+        # Match products from retail
+        get_lm_products(file_id_db)
+        
+        # Get records to search
+        search_df = get_records_to_search(file_id_db)
+        
+        if search_df.empty:
+            logger.warning(f"No records to search for FileID: {file_id_db}")
+            return
+        
+        search_list = search_df.to_dict('records')
+        
+        # Process in batches
+        BATCH_SIZE = 100
+        batches = [search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
+        
+        logger.info(f"Processing {len(search_list)} records in {len(batches)} batches")
+        
+        start = datetime.datetime.now()
+        futures = [process_batch.remote(batch) for batch in batches]
+        ray.get(futures)
+        end = datetime.datetime.now()
+        
+        logger.info(f"Batch processing completed in {end - start}")
+        
+        # Update sort order and process images
+        update_sort_order(file_id_db)
+        process_images(file_id_db)
+        
+        # Generate download file
+        asyncio.run(generate_download_file(file_id_db))
+        
+        logger.info(f"Processing completed for FileID: {file_id_db}")
+    except Exception as e:
+        logger.error(f"Error processing batch: {e}")
+        try:
+            # Send failure notification
+            send_message_email(
+                send_to_email, 
+                f"Error processing {file_name}", 
+                f"An error occurred while processing your file: {str(e)}"
+            )
+        except Exception as email_error:
+            logger.error(f"Failed to send error notification: {email_error}")
+
+#################################################
+# API ROUTES
+#################################################
+
+@app.post("/restart-failed-batch/")
+async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str):
+    """
+    API route to restart processing for a file.
+    
+    Args:
+        background_tasks: FastAPI background tasks
+        file_id_db (str): The FileID to restart processing for
+        
+    Returns:
+        dict: Result of restarting processing
+    """
+    try:
+        logger.info(f"Received request to restart processing for FileID: {file_id_db}")
+        background_tasks.add_task(process_restart_batch, file_id_db)
+        return {"message": "Processing restart initiated successfully. You will be notified upon completion."}
+    except Exception as e:
+        logger.error(f"Error restarting processing: {e}")
+        return {"error": f"An error occurred: {str(e)}"}
+
+@app.post("/process-image-batch/")
+async def api_process_payload(background_tasks: BackgroundTasks, payload: dict):
+    """
+    API route to process a batch of images.
+    
+    Args:
+        background_tasks: FastAPI background tasks
+        payload (dict): Dictionary containing payload data
+        
+    Returns:
+        dict: Result of processing the batch
+    """
+    try:
+        logger.info("Received request to process image batch")
+        background_tasks.add_task(process_image_batch, payload)
+        return {"message": "Processing started successfully. You will be notified upon completion."}
+    except Exception as e:
+        logger.error(f"Error processing payload: {e}")
+        return {"error": f"An error occurred: {str(e)}"}
+
+@app.post("/generate-download-file/")
+async def api_process_file(background_tasks: BackgroundTasks, file_id: int):
+    """
+    API route to generate a download file.
+    
+    Args:
+        background_tasks: FastAPI background tasks
+        file_id (int): The FileID to generate a download file for
+        
+    Returns:
+        dict: Result of generating the download file
+    """
+    try:
+        logger.info(f"Received request to generate download file for FileID: {file_id}")
+        background_tasks.add_task(generate_download_file, str(file_id))
+        return {"message": "Processing started successfully. You will be notified upon completion."}
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        return {"error": f"An error occurred: {str(e)}"}
+
+#################################################
+# MAIN ENTRY POINT
+#################################################
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server")
-    print(os.environ)
-    #uvicorn.run("main:app", port=8000, host='0.0.0.0', reload=True)
-    uvicorn.run("main:app", port=8080, host='0.0.0.0')
+    
+    # Initialize Ray if not already initialized
     if ray.is_initialized():
         ray.shutdown()
     ray.init(address='auto')
-
+    
+    # Start the FastAPI server
+    import uvicorn
+    uvicorn.run("main:app", port=8080, host='0.0.0.0')
