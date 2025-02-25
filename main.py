@@ -601,13 +601,7 @@ def update_sort_order(file_id):
             logging.error(f"Error resetting SortOrder values: {reset_error}")
             cursor.execute("ROLLBACK")
             return None
-    def update_sort_order(file_id):
-    try:
-        connection = pyodbc.connect(conn_str)
-        cursor = connection.cursor()
 
-        logger.info(f"Starting sort order update for FileID: {file_id}")
-        
         # Log the exact SQL query that will be executed
         safe_sort_query = """
         WITH CleanedResults AS (
