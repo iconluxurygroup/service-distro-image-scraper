@@ -877,12 +877,18 @@ def send_request_llama(image_path_or_url: str, prompt: str, headers: Dict[str, s
         logger.error(f"Request to Llama 3.2 API failed: {e}")
         return {"extraction_failed": True}
 
-def process_image(image_path_or_url: str, product_details: Dict[str, str], headers: Dict[str, str]) -> Dict[str, Any]:
+def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Dict[str, Any]:
     """
     Processes an image to perform match and linesheet analysis.
     Works with both local file paths and URLs.
     Returns a combined result dictionary with NaN values for failed numerical fields.
     """
+    # Headers for Hugging Face API
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer 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"
+    }
+
     # Extract product details
     product_brand = product_details.get("brand", "")
     product_category = product_details.get("category", "")
@@ -964,19 +970,10 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], heade
 
     try:
         # Get match analysis - note the 'match' schema type
-        logger.info("Requesting match analysis from Llama 3.2")
-        try:
-            match_result = send_request_llama(image_path_or_url, match_analysis_prompt, headers, 'match')
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Match analysis request failed: {e}")
-            match_result = {"extraction_failed": True}
-        except Exception as e:
-            logger.error(f"Unexpected error in match analysis: {e}")
-            match_result = {"extraction_failed": True}
+        match_result = send_request(image_path_or_url, match_analysis_prompt, match_schema, headers, 'match')
         
         # Check if extraction failed
         if match_result.get("extraction_failed", False):
-            logger.warning("Match analysis extraction failed, using default values")
             match_data = default_result
         else:
             # Update default result with match data
@@ -1000,19 +997,10 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], heade
             match_data["reasoning_match"] = match_result.get("reasoning_match", "")
 
         # Get linesheet analysis - note the 'linesheet' schema type
-        logger.info("Requesting linesheet analysis from Llama 3.2")
-        try:
-            linesheet_result = send_request_llama(image_path_or_url, linesheet_analysis_prompt, headers, 'linesheet')
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Linesheet analysis request failed: {e}")
-            linesheet_result = {"extraction_failed": True}
-        except Exception as e:
-            logger.error(f"Unexpected error in linesheet analysis: {e}")
-            linesheet_result = {"extraction_failed": True}
+        linesheet_result = send_request(image_path_or_url, linesheet_analysis_prompt, linesheet_schema, headers, 'linesheet')
         
         # Process linesheet result
         if linesheet_result.get("extraction_failed", False):
-            logger.warning("Linesheet analysis extraction failed, using default values")
             linesheet_score = float('nan')
             reasoning_linesheet = ""
         else:
@@ -1039,15 +1027,14 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], heade
         return final_result
     
     except Exception as e:
-        logger.error(f"Overall processing failed: {str(e)}")
+        print(f"🚨 Processing failed: {str(e)}")
         return default_result
 
-def batch_process_images(headers, file_id=None, limit=10):
+def batch_process_images(file_id=None, limit=10):
     """
     Process multiple images in a batch, either by file_id or by fetching pending images.
     
     Args:
-        headers (dict): API request headers
         file_id (int, optional): FileID to process images for
         limit (int): Maximum number of records to process if file_id is None
         
@@ -1080,7 +1067,7 @@ def batch_process_images(headers, file_id=None, limit=10):
         
         try:
             # Process the image
-            result = process_image(image_url, product_details, headers)
+            result = process_image(image_url, product_details)
             
             # Serialize the JSON result
             json_result = json.dumps(result)
@@ -1100,6 +1087,7 @@ def batch_process_images(headers, file_id=None, limit=10):
     
     logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
     return success_count
+
 def process_images(file_id):
     """
     Process images for a specific file.
@@ -1111,21 +1099,14 @@ def process_images(file_id):
         int: Number of successfully processed images
     """
     try:
-        # API headers
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer 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"
-        }
-        
         logger.info(f"Processing images for FileID {file_id}")
-        count = batch_process_images(headers, file_id=file_id)
+        count = batch_process_images(file_id=file_id)
         logger.info(f"Successfully processed {count} images for FileID {file_id}")
         
         return count
     except Exception as e:
         logger.error(f"Error processing images: {e}")
         return 0
-
 def process_search_row(search_string, endpoint, entry_id):
     """
     Process a search row to find images.
