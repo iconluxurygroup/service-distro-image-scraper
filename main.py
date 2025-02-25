@@ -2890,7 +2890,7 @@ async def fix_json_data(background_tasks: BackgroundTasks, file_id: str = None, 
                         )
                     """
                     try:
-                        cursor.execute(query, (limit, file_id))
+                        cursor.execute(query, (file_id,)) 
                     except Exception as e:
                         logger.warning(f"Error in complex query: {e}, falling back to simpler query")
                         # Fallback to simpler query if JSON validation fails
@@ -2900,7 +2900,7 @@ async def fix_json_data(background_tasks: BackgroundTasks, file_id: str = None, 
                             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                             WHERE r.FileID = ?
                         """
-                        cursor.execute(query, (limit, file_id))
+                        cursor.execute(query, (file_id,)) 
                 else:
                     # When no file_id is provided, scan across all files
                     query = """
