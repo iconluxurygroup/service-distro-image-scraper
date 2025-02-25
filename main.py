@@ -778,7 +778,6 @@ def create_default_result(product_brand: str = "", product_category: str = "", p
         "linesheet_score": float('nan'),
         "reasoning_linesheet": ""
     }
-
 def extract_json(text: str, schema_type: str = 'generic') -> Dict[str, Any]:
     """
     Extracts a valid JSON object from raw text using multiple fallback methods.
@@ -793,22 +792,84 @@ def extract_json(text: str, schema_type: str = 'generic') -> Dict[str, Any]:
     if not text or not text.strip():
         return {"extraction_failed": True}
     
-    # Reuse the existing extract_json implementation from paste-3.txt
-    # (Code for extract_json, extract_match_data, and extract_linesheet_data 
-    #  remains the same as in the paste-3.txt file)
+    # Preprocessing to clean up text
+    text = text.strip()
+    
+    # First attempt: direct JSON parsing
     try:
-        # Use the existing extract_json implementation from paste-3.txt
-        # This will include the methods for regex parsing and fallback extraction
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("extract_module", "paste-3.txt")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Try parsing the entire text
+        return json.loads(text)
+    except json.JSONDecodeError:
+        print("⚠️ Direct JSON parsing failed, trying alternative methods")
+    
+    # Second attempt: find JSON between first { and last }
+    try:
+        # Find the first { and last } to get potential JSON
+        first_brace = text.find('{')
+        last_brace = text.rfind('}')
         
-        # Call the function from the imported module
-        return module.extract_json(text, schema_type)
-    except Exception as e:
-        logger.error(f"Fallback JSON extraction failed: {e}")
-        return {"extraction_failed": True}
+        if first_brace != -1 and last_brace != -1:
+            potential_json = text[first_brace:last_brace+1]
+            return json.loads(potential_json)
+    except (json.JSONDecodeError, ValueError):
+        print("⚠️ First/last brace method failed")
+    
+    # Third attempt: regex to find JSON
+    try:
+        import re
+        # More flexible regex to capture JSON-like structures
+        match = re.search(r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    except (json.JSONDecodeError, AttributeError):
+        print("⚠️ Regex JSON extraction failed")
+    
+    # Fourth attempt: schema-specific parsing
+    try:
+        if schema_type == 'linesheet':
+            return extract_linesheet_data(text)
+        elif schema_type == 'match':
+            return extract_match_data(text)
+    except Exception:
+        print("⚠️ Schema-specific extraction failed")
+    
+    # Final attempt: manual JSON reconstruction
+    try:
+        # Remove any leading/trailing non-JSON text
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+    except Exception:
+        print("⚠️ Manual JSON reconstruction failed")
+    
+    # Specific handling for linesheet and match analysis patterns
+    if schema_type == 'linesheet':
+        # Look for linesheet-specific patterns
+        try:
+            linesheet_match = re.search(r'"linesheet_score":\s*(\d+).*?"reasoning_linesheet":\s*"([^"]*)"', text, re.DOTALL)
+            if linesheet_match:
+                return {
+                    "linesheet_score": int(linesheet_match.group(1)),
+                    "reasoning_linesheet": linesheet_match.group(2)
+                }
+        except Exception:
+            print("⚠️ Linesheet specific parsing failed")
+    
+    elif schema_type == 'match':
+        # Look for match-specific patterns
+        try:
+            match_matches = re.findall(r'"(\w+)":\s*"?([^",\n}]+)"?', text)
+            if match_matches:
+                result = {}
+                for key, value in match_matches:
+                    result[key] = value
+                return result
+        except Exception:
+            print("⚠️ Match specific parsing failed")
+    
+    # If all else fails
+    print("❌ All JSON extraction methods failed")
+    return {"extraction_failed": True}
 
 def send_request(image_path_or_url: str, prompt: str, schema: Dict[str, Any], headers: Dict[str, str], schema_type: str = 'generic') -> Dict[str, Any]:
     """
@@ -882,13 +943,21 @@ def send_request(image_path_or_url: str, prompt: str, schema: Dict[str, Any], he
     logger.info(f"\n🔵 FINAL TEXT RESPONSE: {final_text}")
     return extract_json(final_text, schema_type)
 
-# Keep the rest of the previous implementation of process_image and other functions
-def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Dict[str, Any]:
+def process_image(image_path_or_url: str, product_details: Dict[str, str], max_retries: int = 3) -> Dict[str, Any]:
     """
-    Processes an image to perform match and linesheet analysis.
-    Works with both local file paths and URLs.
-    Returns a combined result dictionary with NaN values for failed numerical fields.
+    Processes an image to perform match and linesheet analysis with retry mechanism.
+    
+    Args:
+        image_path_or_url (str): Path or URL of the image to process
+        product_details (dict): Details about the product
+        max_retries (int): Maximum number of retry attempts
+        
+    Returns:
+        Dict[str, Any]: Processed image analysis result
     """
+    # Enhanced logging for input parameters
+    logger.info(f"Processing image: {image_path_or_url}")
+    
     # Headers for Hugging Face API
     headers = {
         "Content-Type": "application/json",
@@ -903,11 +972,10 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Di
     # Create default result
     default_result = create_default_result(product_brand, product_category, product_color)
     
-    # Enhanced logging for input parameters
-    logger.info(f"Processing image: {image_path_or_url}")
+    # Detailed logging of product details
     logger.info(f"Product Details - Brand: {product_brand}, Category: {product_category}, Color: {product_color}")
 
-    # Create prompts
+    # Create prompts (same as previous implementation)
     match_analysis_prompt = f"""
     Analyze this product image and extract key features.
 
@@ -978,11 +1046,11 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Di
     Only return the JSON object, nothing else.
     """
 
-    def log_detailed_error(stage: str, error: Exception):
+    def log_detailed_error(stage: str, error: Exception, attempt: int):
         """
         Log detailed error information
         """
-        logger.error(f"Error in {stage} stage:")
+        logger.error(f"Error in {stage} stage (Attempt {attempt + 1}):")
         logger.error(f"Error Type: {type(error).__name__}")
         logger.error(f"Error Message: {str(error)}")
         
@@ -997,87 +1065,119 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Di
         elif isinstance(error, TypeError):
             logger.error("Type Error might indicate unexpected data types")
 
-    try:
-        # Verify image can be downloaded
-        try:
-            img_data = get_image_data(image_path_or_url)
-            logger.info(f"Successfully retrieved image data, size: {len(img_data)} bytes")
-        except Exception as img_error:
-            log_detailed_error("Image Retrieval", img_error)
-            return default_result
-
-        # Get match analysis - note the 'match' schema type
-        try:
-            match_result = send_request(image_path_or_url, match_analysis_prompt, match_schema, headers, 'match')
-            logger.info("Match analysis request completed")
-        except Exception as match_error:
-            log_detailed_error("Match Analysis", match_error)
-            match_result = {"extraction_failed": True}
+    def is_result_valid(result: Dict[str, Any]) -> bool:
+        """
+        Check if the analysis result is meaningful
+        """
+        if result.get("extraction_failed", False):
+            logger.warning("Result marked as extraction failed")
+            return False
         
-        # Check if extraction failed
-        if match_result.get("extraction_failed", False):
-            logger.warning("Match analysis extraction failed, using default values")
-            match_data = default_result
-        else:
-            # Update default result with match data
-            match_data = default_result.copy()
-            match_data["description"] = match_result.get("description", "")
-            
-            # Extract nested objects safely
-            if isinstance(match_result.get("extracted_features"), dict):
-                match_data["extracted_features"] = match_result["extracted_features"]
-            
-            if isinstance(match_result.get("user_provided"), dict):
-                match_data["user_provided"] = match_result["user_provided"]
-                
-            # Handle match score
-            try:
-                match_score = float(match_result.get("match_score", float('nan')))
-                match_data["match_score"] = match_score if not math.isnan(match_score) else float('nan')
-            except (ValueError, TypeError):
-                match_data["match_score"] = float('nan')
-                
-            match_data["reasoning_match"] = match_result.get("reasoning_match", "")
+        # Detailed logging about result validity
+        description = result.get("description", "").strip()
+        extracted_brand = result.get("extracted_features", {}).get("brand", "").strip()
+        extracted_category = result.get("extracted_features", {}).get("category", "").strip()
+        extracted_color = result.get("extracted_features", {}).get("color", "").strip()
+        match_score = result.get("match_score", float('nan'))
+        linesheet_score = result.get("linesheet_score", float('nan'))
 
-        # Get linesheet analysis - note the 'linesheet' schema type
+        # Check if all core fields are empty or NaN
+        is_valid = not (
+            not description and
+            not extracted_brand and
+            not extracted_category and
+            not extracted_color and
+            math.isnan(match_score) and
+            math.isnan(linesheet_score)
+        )
+
+        if not is_valid:
+            logger.warning("Result deemed invalid due to empty or NaN values")
+            logger.debug(f"Description: {description}")
+            logger.debug(f"Extracted Brand: {extracted_brand}")
+            logger.debug(f"Extracted Category: {extracted_category}")
+            logger.debug(f"Extracted Color: {extracted_color}")
+            logger.debug(f"Match Score: {match_score}")
+            logger.debug(f"Linesheet Score: {linesheet_score}")
+
+        return is_valid
+
+    # Retry loop for processing
+    for attempt in range(max_retries):
         try:
-            linesheet_result = send_request(image_path_or_url, linesheet_analysis_prompt, linesheet_schema, headers, 'linesheet')
-            logger.info("Linesheet analysis request completed")
-        except Exception as linesheet_error:
-            log_detailed_error("Linesheet Analysis", linesheet_error)
-            linesheet_result = {"extraction_failed": True}
-        
-        # Process linesheet result
-        if linesheet_result.get("extraction_failed", False):
-            logger.warning("Linesheet analysis extraction failed, using default values")
-            linesheet_score = float('nan')
-            reasoning_linesheet = ""
-        else:
-            # Handle linesheet score
+            # Verify image can be downloaded
             try:
-                linesheet_score = float(linesheet_result.get("linesheet_score", float('nan')))
-                linesheet_score = linesheet_score if not math.isnan(linesheet_score) else float('nan')
-            except (ValueError, TypeError):
-                linesheet_score = float('nan')
-                
-            reasoning_linesheet = linesheet_result.get("reasoning_linesheet", "")
+                img_data = get_image_data(image_path_or_url)
+                logger.info(f"Successfully retrieved image data, size: {len(img_data)} bytes")
+            except Exception as img_error:
+                log_detailed_error("Image Retrieval", img_error, attempt)
+                if attempt == max_retries - 1:
+                    return default_result
+                time.sleep(1)  # Short wait before retry
+                continue
 
-        # Create final OrderedDict with both results
-        final_result = OrderedDict([
-            ("description", match_data["description"]),
-            ("user_provided", match_data["user_provided"]),
-            ("extracted_features", match_data["extracted_features"]),
-            ("match_score", match_data["match_score"]),
-            ("reasoning_match", match_data["reasoning_match"]),
-            ("linesheet_score", linesheet_score),
-            ("reasoning_linesheet", reasoning_linesheet),
-        ])
+            # Get match analysis
+            try:
+                match_result = send_request(image_path_or_url, match_analysis_prompt, match_schema, headers, 'match')
+                logger.info("Match analysis request completed")
+            except Exception as match_error:
+                log_detailed_error("Match Analysis", match_error, attempt)
+                if attempt == max_retries - 1:
+                    return default_result
+                time.sleep(1)  # Short wait before retry
+                continue
+            
+            # Get linesheet analysis
+            try:
+                linesheet_result = send_request(image_path_or_url, linesheet_analysis_prompt, linesheet_schema, headers, 'linesheet')
+                logger.info("Linesheet analysis request completed")
+            except Exception as linesheet_error:
+                log_detailed_error("Linesheet Analysis", linesheet_error, attempt)
+                if attempt == max_retries - 1:
+                    return default_result
+                time.sleep(1)  # Short wait before retry
+                continue
 
-        return final_result
+            # Combine results
+            final_result = OrderedDict([
+                ("description", match_result.get("description", "")),
+                ("user_provided", match_result.get("user_provided", {
+                    "brand": product_brand,
+                    "category": product_category,
+                    "color": product_color
+                })),
+                ("extracted_features", match_result.get("extracted_features", {
+                    "brand": "",
+                    "category": "",
+                    "color": ""
+                })),
+                ("match_score", match_result.get("match_score", float('nan'))),
+                ("reasoning_match", match_result.get("reasoning_match", "")),
+                ("linesheet_score", linesheet_result.get("linesheet_score", float('nan'))),
+                ("reasoning_linesheet", linesheet_result.get("reasoning_linesheet", "")),
+            ])
+
+            # Validate the result
+            if is_result_valid(final_result):
+                logger.info(f"Successfully processed image on attempt {attempt + 1}")
+                return final_result
+            
+            # If result is not valid, log and continue to next attempt
+            logger.warning(f"Invalid result on attempt {attempt + 1}. Retrying...")
+            
+            # Wait before next attempt
+            time.sleep(1)
+
+        except Exception as e:
+            log_detailed_error("Overall Processing", e, attempt)
+            if attempt == max_retries - 1:
+                return default_result
+            time.sleep(1)  # Short wait before retry
+
+    # If all attempts fail
+    logger.error(f"Failed to process image after {max_retries} attempts")
+    return default_result
     
-    except Exception as e:
-        log_detailed_error("Overall Processing", e)
-        return default_result
 def batch_process_images(file_id=None, limit=10):
     """
     Process multiple images in a batch, either by file_id or by fetching pending images.
