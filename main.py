@@ -2491,13 +2491,13 @@ def process_image_batch(payload):
 #################################################
 # API ROUTES
 #################################################
-
 @app.post("/update_sort_llama/")
-async def api_update_sort(file_id_db: str):
+async def api_update_sort(background_tasks: BackgroundTasks, file_id_db: str):
     """
     API route to update sort order for a file.
     
     Args:
+        background_tasks: FastAPI background tasks
         file_id_db (str): The FileID to update sort order for
         
     Returns:
@@ -2506,18 +2506,27 @@ async def api_update_sort(file_id_db: str):
     try:
         logger.info(f"Received request to update sort order for FileID: {file_id_db}")
         
-        # Update sort order
-        sort_order_list = update_sort_order(file_id_db)
+        # Create a background task to handle the update
+        def background_update_sort():
+            try:
+                logger.info(f"Starting background sort order update for FileID: {file_id_db}")
+                sort_order_list = update_sort_order(file_id_db)
+                logger.info(f"Completed background sort order update for FileID: {file_id_db}")
+                return sort_order_list
+            except Exception as e:
+                logger.error(f"Error in background sort order update: {e}")
+                return None
         
-        if sort_order_list:
-            return {
-                "message": f"Sort order updated successfully for FileID: {file_id_db}",
-                "sort_order": sort_order_list
-            }
-        else:
-            return {"error": f"Failed to update sort order for FileID: {file_id_db}"}
+        # Add the task to background tasks
+        background_tasks.add_task(background_update_sort)
+        
+        # Return immediately with acknowledgment
+        return {
+            "message": f"Sort order update for FileID: {file_id_db} has been initiated in the background",
+            "status": "processing"
+        }
     except Exception as e:
-        logger.error(f"Error updating sort order: {e}")
+        logger.error(f"Error setting up sort order update: {e}")
         return {"error": f"An error occurred: {str(e)}"}
 
 @app.post("/restart-failed-batch/")
