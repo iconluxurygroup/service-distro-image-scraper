@@ -433,13 +433,17 @@ def update_sort_order(file_id):
                 r.FileID = ? AND 
                 CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) >= 33
         )
-        UPDATE ranked_results 
-        SET SortOrder = row_num
+        UPDATE utb_ImageScraperResult 
+        SET SortOrder = r.row_num
+        FROM utb_ImageScraperResult t
+        INNER JOIN ranked_results r ON t.ResultID = r.ResultID
+        INNER JOIN utb_ImageScraperRecords rec ON rec.EntryID = t.EntryID
+        WHERE rec.FileID = ?
         """
         
         connection = pyodbc.connect(conn)
         cursor = connection.cursor()
-        cursor.execute(query, (file_id,))
+        cursor.execute(query, (file_id, file_id))
         connection.commit()
         
         # Mark image processing as complete
@@ -454,7 +458,6 @@ def update_sort_order(file_id):
     except Exception as e:
         logging.error(f"Error updating sort order: {e}")
         raise
-    
 def update_file_generate_complete(file_id):
     """
     Update file generation completion time.
