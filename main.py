@@ -411,29 +411,35 @@ import pyodbc
 import json
 import logging
 
+import pyodbc
+import json
+import logging
+
 def clean_json(value):
     """
-    Cleans JSON text by replacing invalid entries like NaN with NULL-safe values.
+    Cleans JSON text by replacing invalid entries like NaN and arrays with NULL-safe values.
     """
     if not value or value.strip() in ["None", "null", "NaN"]:
         return None
     try:
         parsed = json.loads(value)
-        if isinstance(parsed, dict):
-            if parsed.get("linesheet_score") in [None, "NaN"]:
-                parsed["linesheet_score"] = None  # Ensure it's NULL-safe
-            return json.dumps(parsed)  # Return valid JSON
+        if not isinstance(parsed, dict):
+            return None  # Skip non-dict JSON (e.g., arrays)
+        if parsed.get("linesheet_score") in [None, "NaN"]:
+            parsed["linesheet_score"] = None  # Replace with NULL
+        if parsed.get("match_score") in [None, "NaN"]:
+            parsed["match_score"] = None
+        return json.dumps(parsed)  # Return valid JSON
     except json.JSONDecodeError:
         return None
     return value
 
 def update_sort_order(file_id):
     """
-    Updates the SortOrder column for images based on `linesheet_score`.
-    Ensures:
-    - Highest `linesheet_score` gets `SortOrder = 0`
-    - Invalid JSON rows are skipped
-    - No duplicates get SortOrder = 0 for the same `EntryID`
+    Updates the SortOrder column for images based on `linesheet_score`, assigning:
+    - `SortOrder = 1` to the best-ranked image
+    - Sequential `SortOrder` (2, 3, 4...) for remaining images
+    - Handles invalid JSON issues
     """
     try:
         connection = pyodbc.connect(conn)
@@ -465,7 +471,7 @@ def update_sort_order(file_id):
             connection.commit()
             logging.info("✅ Invalid JSON entries cleaned.")
 
-        # Step 2: Update SortOrder for Valid JSON Entries
+        # Step 2: Assign Unique SortOrder per EntryID
         update_sort_order_query = """
         WITH RankedResults AS (
             SELECT 
@@ -494,11 +500,7 @@ def update_sort_order(file_id):
             WHERE r.FileID = ?
         )
         UPDATE utb_ImageScraperResult
-        SET SortOrder = 
-            CASE 
-                WHEN rr.rank = 1 AND rr.linesheet_score IS NOT NULL THEN 0
-                ELSE 15
-            END
+        SET SortOrder = rr.rank
         FROM utb_ImageScraperResult t
         INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID
         WHERE rr.FileID = ?
@@ -506,36 +508,6 @@ def update_sort_order(file_id):
         """
 
         cursor.execute(update_sort_order_query, (file_id, file_id))
-        connection.commit()
-
-        # Step 3: Ensure at least one image per EntryID has SortOrder = 0
-        fallback_query = """
-        WITH RankedResults AS (
-            SELECT 
-                t.ResultID, 
-                t.EntryID, 
-                r.FileID,
-                ROW_NUMBER() OVER (
-                    PARTITION BY t.EntryID 
-                    ORDER BY t.ResultID ASC
-                ) AS rank
-            FROM utb_ImageScraperResult t 
-            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-            WHERE r.FileID = ?
-        )
-        UPDATE utb_ImageScraperResult
-        SET SortOrder = 0
-        FROM utb_ImageScraperResult t
-        INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID
-        WHERE rr.FileID = ?
-        AND NOT EXISTS (
-            SELECT 1 FROM utb_ImageScraperResult sub 
-            WHERE sub.EntryID = rr.EntryID AND sub.SortOrder = 0
-        )
-        AND rr.rank = 1;
-        """
-
-        cursor.execute(fallback_query, (file_id, file_id))
         connection.commit()
 
         logging.info(f"✅ Successfully updated sort order for FileID: {file_id}")
@@ -548,6 +520,7 @@ def update_sort_order(file_id):
     finally:
         cursor.close()
         connection.close()
+
 
 
 def update_file_generate_complete(file_id):
