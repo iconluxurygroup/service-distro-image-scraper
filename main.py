@@ -2875,8 +2875,9 @@ async def fix_json_data(background_tasks: BackgroundTasks, file_id: str = None, 
                 
                 # Build the query based on whether a file_id was provided
                 if file_id:
-                    query = """
-                        SELECT TOP ? t.ResultID, t.aijson 
+             # Complex query
+                    query = f"""
+                        SELECT TOP {limit} t.ResultID, t.aijson 
                         FROM utb_ImageScraperResult t
                         INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                         WHERE r.FileID = ? AND (
@@ -2894,8 +2895,8 @@ async def fix_json_data(background_tasks: BackgroundTasks, file_id: str = None, 
                     except Exception as e:
                         logger.warning(f"Error in complex query: {e}, falling back to simpler query")
                         # Fallback to simpler query if JSON validation fails
-                        query = """
-                            SELECT TOP ? t.ResultID, t.aijson 
+                        query = f"""
+                            SELECT TOP {limit} t.ResultID, t.aijson 
                             FROM utb_ImageScraperResult t
                             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                             WHERE r.FileID = ?
