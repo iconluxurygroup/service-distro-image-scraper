@@ -409,10 +409,7 @@ def get_records_to_search(file_id):
         return pd.DataFrame()
 def update_sort_order(file_id):
     """
-    Update the sort order of image results, setting the highest-scoring result to 0.
-
-    Args:
-        file_id (int): The FileID to update sort order for
+    Update the sort order based on the highest linesheet score.
     """
     try:
         connection = pyodbc.connect(conn)
@@ -427,7 +424,7 @@ def update_sort_order(file_id):
                 CASE 
                     WHEN ISJSON(t.aijson) = 1 THEN 
                         TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
-                    ELSE NULL
+                    ELSE -1 -- Default to -1 if NULL or invalid
                 END AS linesheet_score,
                 ROW_NUMBER() OVER (
                     PARTITION BY t.EntryID 
@@ -435,18 +432,17 @@ def update_sort_order(file_id):
                         CASE 
                             WHEN ISJSON(t.aijson) = 1 THEN 
                                 TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
-                            ELSE NULL
+                            ELSE -1 -- Ensure NULLs are not ignored
                         END DESC
                 ) AS row_num
             FROM utb_ImageScraperResult t 
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-            WHERE 
-                r.FileID = ?
+            WHERE r.FileID = ?
         )
         UPDATE utb_ImageScraperResult 
         SET SortOrder = 
             CASE 
-                WHEN rr.row_num = 1 AND rr.linesheet_score IS NOT NULL THEN 0 
+                WHEN rr.row_num = 1 AND rr.linesheet_score >= 0 THEN 0 -- Set top result
                 ELSE 15 
             END
         FROM utb_ImageScraperResult t
@@ -458,16 +454,6 @@ def update_sort_order(file_id):
         # Execute the update
         cursor.execute(update_query, (file_id, file_id))
         connection.commit()
-
-        # Mark image processing as complete
-        complete_query = """
-        UPDATE utb_ImageScraperFiles 
-        SET ImageCompleteTime = GETDATE() 
-        WHERE ID = ?
-        """
-        cursor.execute(complete_query, (file_id,))
-        connection.commit()
-
         cursor.close()
         connection.close()
 
@@ -477,7 +463,7 @@ def update_sort_order(file_id):
         logging.error(f"Error updating sort order: {e}")
         import traceback
         logging.error(f"Detailed error traceback: {traceback.format_exc()}")
-        raise
+
 
 
 
