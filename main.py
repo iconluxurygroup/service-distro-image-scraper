@@ -422,29 +422,38 @@ def update_sort_order(file_id):
         # SQL to update sort order with top result marked as 0
         update_query = """
         WITH ranked_results AS (
-            SELECT 
-                t.ResultID, 
-                t.EntryID, 
-                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) AS linesheet_score,
-                ROW_NUMBER() OVER (
-                    PARTITION BY t.EntryID 
-                    ORDER BY 
-                        CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) DESC
-                ) AS row_num
-            FROM utb_ImageScraperResult t 
-            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-            WHERE 
-                r.FileID = ?
-        )
-        UPDATE utb_ImageScraperResult 
-        SET SortOrder = CASE 
-                            WHEN rr.row_num = 1 THEN 0 
-                            ELSE 15 
-                        END
-        FROM utb_ImageScraperResult t
-        INNER JOIN ranked_results rr ON t.ResultID = rr.ResultID
-        INNER JOIN utb_ImageScraperRecords rec ON rec.EntryID = t.EntryID
-        WHERE rec.FileID = ?
+        SELECT 
+            t.ResultID, 
+            t.EntryID, 
+            CASE 
+                WHEN ISJSON(t.aijson) = 1 THEN 
+                    TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
+                ELSE NULL
+            END AS linesheet_score,
+            ROW_NUMBER() OVER (
+                PARTITION BY t.EntryID 
+                ORDER BY 
+                    CASE 
+                        WHEN ISJSON(t.aijson) = 1 THEN 
+                            TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL)
+                        ELSE NULL
+                    END DESC
+            ) AS row_num
+        FROM utb_ImageScraperResult t 
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+        WHERE 
+            r.FileID = ?
+    )
+    UPDATE utb_ImageScraperResult 
+    SET SortOrder = CASE 
+                        WHEN rr.row_num = 1 THEN 0 
+                        ELSE 15 
+                    END
+    FROM utb_ImageScraperResult t
+    INNER JOIN ranked_results rr ON t.ResultID = rr.ResultID
+    INNER JOIN utb_ImageScraperRecords rec ON rec.EntryID = t.EntryID
+    WHERE rec.FileID = ?
+
         """
         
         # Execute the update
