@@ -408,45 +408,46 @@ def get_records_to_search(file_id):
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
 
+import math
+import pandas as pd
 import json
 import math
+import pyodbc
+import logging
 
 def clean_json(value):
     """
     Cleans JSON text by replacing invalid values like NaN, undefined, or incorrect formatting.
-    Ensures that JSON remains properly formatted and SQL Server compatible.
     """
     if not value or value.strip() in ["None", "null", "NaN", "undefined"]:
         return None  # Convert invalid JSON to NULL
-
+    
     try:
         parsed = json.loads(value)
-        
         if not isinstance(parsed, dict):
-            return None  # Skip non-dict JSON (e.g., lists or malformed JSON)
+            return None  # Skip non-dict JSON (e.g., lists or malformed data)
 
-        # Ensure numeric values are not NaN
+        # Convert NaN to None
         if isinstance(parsed.get("linesheet_score"), float) and math.isnan(parsed["linesheet_score"]):
             parsed["linesheet_score"] = None
         if isinstance(parsed.get("match_score"), float) and math.isnan(parsed["match_score"]):
             parsed["match_score"] = None
 
-        return json.dumps(parsed)  # Return fixed JSON string
+        return json.dumps(parsed)  # Return cleaned JSON as a string
 
     except json.JSONDecodeError:
         return None  # Return NULL for invalid JSON
 
 
-
-def update_sort_order(file_id):
+def update_sort_order(file_id, conn_str):
     """
     Updates the SortOrder column for images:
-    - `SortOrder = 1` for best image
-    - Sequential `SortOrder` (2, 3, 4...) for others
-    - Cleans invalid JSON before processing
+    - `SortOrder = 1` for the best image.
+    - Sequential `SortOrder` (2, 3, 4...) for others.
+    - Cleans invalid JSON before processing.
     """
     try:
-        connection = pyodbc.connect(conn)
+        connection = pyodbc.connect(conn_str)
         cursor = connection.cursor()
 
         logging.info(f"🔄 Updating sort order for FileID: {file_id}")
@@ -454,26 +455,30 @@ def update_sort_order(file_id):
         # Step 1: Identify and Fix Invalid JSON
         fetch_invalid_json = """
             SELECT ResultID, aijson FROM utb_ImageScraperResult
-            WHERE ISJSON(aijson) = 0 OR JSON_VALUE(aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
+            WHERE ISJSON(aijson) = 0 
+               OR JSON_VALUE(aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
+               OR JSON_VALUE(aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
         """
         cursor.execute(fetch_invalid_json)
         invalid_rows = cursor.fetchall()
 
         if invalid_rows:
             logging.warning(f"⚠️ Found {len(invalid_rows)} invalid JSON entries in aijson column!")
-            for row in invalid_rows[:5]:  # Log first 5 entries to avoid spamming logs
-                logging.warning(f"❌ Invalid JSON for ResultID={row[0]}: {row[1]}")
-
-            # Fix invalid JSON
+            
+            # Fix invalid JSON in batch update
+            updates = []
             for row in invalid_rows:
                 cleaned_json = clean_json(row[1])
                 if cleaned_json:
-                    cursor.execute(
-                        "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
-                        (cleaned_json, row[0])
-                    )
-            connection.commit()
-            logging.info("✅ Invalid JSON entries cleaned.")
+                    updates.append((cleaned_json, row[0]))
+            
+            if updates:
+                cursor.executemany(
+                    "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
+                    updates
+                )
+                connection.commit()
+                logging.info("✅ Invalid JSON entries cleaned.")
 
         # Step 2: Assign Unique SortOrder per EntryID
         update_sort_order_query = """
@@ -484,6 +489,12 @@ def update_sort_order(file_id):
                 r.FileID,
                 -- Convert JSON safely, replacing NaN with NULL
                 CASE 
+                    WHEN JSON_VALUE(t.aijson, '$.match_score') IS NULL 
+                    OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined') 
+                    THEN NULL 
+                    ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT) 
+                END AS match_score,
+                CASE 
                     WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL 
                     OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined') 
                     THEN NULL 
@@ -493,8 +504,12 @@ def update_sort_order(file_id):
                     PARTITION BY t.EntryID 
                     ORDER BY 
                         CASE 
+                            WHEN JSON_VALUE(t.aijson, '$.match_score') IS NULL 
+                            THEN -1 
+                            ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT) 
+                        END DESC,
+                        CASE 
                             WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL 
-                            OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined') 
                             THEN -1 
                             ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT) 
                         END DESC
@@ -507,8 +522,7 @@ def update_sort_order(file_id):
         SET SortOrder = rr.rank
         FROM utb_ImageScraperResult t
         INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID
-        WHERE rr.FileID = ?
-        AND rr.linesheet_score IS NOT NULL;
+        WHERE rr.FileID = ?;
         """
 
         cursor.execute(update_sort_order_query, (file_id, file_id))
@@ -516,14 +530,30 @@ def update_sort_order(file_id):
 
         logging.info(f"✅ Successfully updated sort order for FileID: {file_id}")
 
+        # Step 3: Return updated sort order
+        fetch_sort_order_query = """
+            SELECT ResultID, EntryID, SortOrder 
+            FROM utb_ImageScraperResult 
+            WHERE ResultID IN (SELECT ResultID FROM utb_ImageScraperRecords WHERE FileID = ?)
+            ORDER BY EntryID, SortOrder;
+        """
+        cursor.execute(fetch_sort_order_query, (file_id,))
+        results = cursor.fetchall()
+
+        sort_order_list = [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
+
+        return sort_order_list
+
     except Exception as e:
         logging.error(f"❌ Error updating sort order: {e}")
         import traceback
         logging.error(traceback.format_exc())
+        return None
 
     finally:
         cursor.close()
         connection.close()
+
 
 
 
