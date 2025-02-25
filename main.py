@@ -407,7 +407,6 @@ def get_records_to_search(file_id):
     except Exception as e:
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
-
 def update_sort_order(file_id):
     """
     Update the sort order of image results with filtering and sorting by linesheet score.
@@ -419,84 +418,62 @@ def update_sort_order(file_id):
         connection = pyodbc.connect(conn)
         cursor = connection.cursor()
         
-        # First, diagnose the JSON content
-        diagnostic_query = """
-        SELECT TOP 10 
-            ResultID, 
-            aijson,
-            LEN(aijson) as JsonLength
-        FROM utb_ImageScraperResult t 
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-        WHERE r.FileID = ?
-        """
-        
-        cursor.execute(diagnostic_query, (file_id,))
-        diagnostic_results = cursor.fetchall()
-        
-        # Log detailed diagnostic information
-        for row in diagnostic_results:
-            result_id, raw_json, json_length = row
-            logging.info(f"Diagnostic - ResultID: {result_id}, JSON Length: {json_length}")
-            
-            # Attempt to sanitize the JSON
-            try:
-                # Try to parse the full JSON string
-                import json
-                parsed_json = json.loads(raw_json)
-                logging.info(f"Successfully parsed JSON for ResultID {result_id}")
-            except Exception as parse_error:
-                logging.error(f"Failed to parse JSON for ResultID {result_id}: {parse_error}")
-                logging.error(f"Problematic JSON snippet: {raw_json[:500]}...")
-        
-        # If no diagnostic results, log a warning
-        if not diagnostic_results:
-            logging.warning(f"No results found for FileID {file_id}")
-            return
-
-        # SQL to safely update sort order
+        # SQL to safely update sort order with deduplication
         update_query = """
         WITH ranked_results AS (
             SELECT 
                 t.ResultID, 
                 t.EntryID, 
-                t.ImageUrl,
-                CASE 
-                    WHEN ISJSON(t.aijson) = 1 
-                    THEN 
-                        TRY_CONVERT(DECIMAL(10,2), 
-                            JSON_VALUE(t.aijson, '$.linesheet_score')
-                        )
-                    ELSE NULL 
-                END AS linesheet_score,
+                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) AS linesheet_score,
                 ROW_NUMBER() OVER (
                     PARTITION BY t.EntryID 
                     ORDER BY 
-                        CASE 
-                            WHEN ISJSON(t.aijson) = 1 
-                            THEN 
-                                TRY_CONVERT(DECIMAL(10,2), 
-                                    JSON_VALUE(t.aijson, '$.linesheet_score')
-                                )
-                            ELSE 0 
-                        END DESC
+                        CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) DESC
                 ) AS row_num
             FROM utb_ImageScraperResult t 
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
             WHERE 
                 r.FileID = ? AND 
                 ISJSON(t.aijson) = 1 AND
-                TRY_CONVERT(DECIMAL(10,2), JSON_VALUE(t.aijson, '$.linesheet_score')) >= 33
+                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) >= 33
+        )
+        DELETE FROM utb_ImageScraperResult
+        WHERE ResultID IN (
+            SELECT ResultID 
+            FROM ranked_results 
+            WHERE row_num > 1
+        )
+        """
+        
+        # Execute the delete to remove duplicates
+        cursor.execute(update_query, (file_id,))
+        delete_count = cursor.rowcount
+        connection.commit()
+        
+        # Update the remaining results with sort order
+        sort_query = """
+        WITH ranked_results AS (
+            SELECT 
+                t.ResultID, 
+                ROW_NUMBER() OVER (
+                    ORDER BY 
+                        CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) DESC
+                ) AS row_num
+            FROM utb_ImageScraperResult t 
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+            WHERE 
+                r.FileID = ? AND 
+                ISJSON(t.aijson) = 1 AND
+                CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS DECIMAL) >= 33
         )
         UPDATE utb_ImageScraperResult 
         SET SortOrder = r.row_num
         FROM utb_ImageScraperResult t
         INNER JOIN ranked_results r ON t.ResultID = r.ResultID
-        INNER JOIN utb_ImageScraperRecords rec ON rec.EntryID = t.EntryID
-        WHERE rec.FileID = ?
         """
         
-        # Execute the update
-        cursor.execute(update_query, (file_id, file_id))
+        # Execute the sort order update
+        cursor.execute(sort_query, (file_id,))
         connection.commit()
         
         # Mark image processing as complete
@@ -504,20 +481,19 @@ def update_sort_order(file_id):
         cursor.execute(complete_query, (file_id,))
         connection.commit()
         
+        # Log the number of duplicates removed
+        logging.info(f"Removed {delete_count} duplicate entries for FileID: {file_id}")
+        
         cursor.close()
         connection.close()
         
         logging.info(f"Updated sort order for FileID: {file_id}")
     except Exception as e:
         logging.error(f"Error updating sort order: {e}")
-        
-        # Additional error handling to provide more context
         import traceback
         logging.error(f"Detailed error traceback: {traceback.format_exc()}")
-        
         raise
-
-
+    
 def update_file_generate_complete(file_id):
     """
     Update file generation completion time.
