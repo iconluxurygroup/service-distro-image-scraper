@@ -1293,77 +1293,83 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
     # If all attempts fail
     logger.error(f"Failed to process image after {max_retries} attempts")
     return default_result
+import json
+import logging
+import pyodbc
+
 def batch_process_images(file_id=None, limit=8):
     """
-    Process multiple images in a batch, either by file_id or by fetching pending images.
+    Process multiple images in a batch, either by file_id or by fetching only missing or NaN images.
     
     Args:
-        file_id (int, optional): FileID to process images for
-        limit (int): Maximum number of records to process if file_id is None
+        file_id (int, optional): FileID to process images for.
+        limit (int): Maximum number of records to process if file_id is None.
         
     Returns:
-        int: Number of successfully processed images
+        int: Number of successfully processed images.
     """
-    # Fetch images either by file_id or pending status
-    if file_id:
-        df = fetch_images_by_file_id(file_id)
-    else:
-        df = fetch_pending_images(limit)
-    
-    if df.empty:
-        logging.info("No images to process")
-        return 0
-    
-    success_count = 0
-    perfect_matches = set()
-    
-    # Process each image
-    for _, row in df.iterrows():
-        result_id = row['ResultID']
-        entry_id = row['EntryID']
-        image_url = row['ImageURL']
-        
-        # Skip if this entry already has a perfect match
-        if entry_id in perfect_matches:
-            logging.info(f"Skipping image for EntryID {entry_id} as a perfect match already exists")
-            continue
-        
-        # Create product details dictionary
-        product_details = {
-            "brand": row['ProductBrand'],
-            "category": row['ProductCategory'],
-            "color": row['ProductColor']
-        }
-        
-        try:
-            # Process the image
-            result = process_image(image_url, product_details)
-                        # Serialize the JSON result
-            caption = result.get('description', '')  # Use description as caption
-        # When saving the result, ensure it's a clean JSON string
-            json_result = json.dumps(result, ensure_ascii=False)
-                        
+    try:
+        # Fetch only images with missing or NaN JSON fields
+        df = fetch_missing_images(file_id, limit)
 
-            # Update the database with the clean JSON string
-            success = update_database(result_id, json_result, caption)
-                    
-            if success:
-                success_count += 1
-                logging.info(f"Successfully processed and updated image {result_id}")
-                
-                # Check for perfect match (match_score == 100)
-                if result.get('match_score') == 100:
-                    perfect_matches.add(entry_id)
-                    logging.info(f"Perfect match found for EntryID {entry_id}")
-            else:
-                logging.warning(f"Database update failed for image {result_id}")
-                
-        except Exception as e:
-            logging.error(f"Error processing image {result_id}: {e}")
-    
-    logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
-    logging.info(f"Perfect matches found for EntryIDs: {perfect_matches}")
-    return success_count
+        if df.empty:
+            logging.info("No images to process (all have valid data)")
+            return 0
+
+        success_count = 0
+        perfect_matches = set()
+
+        # Process each image
+        for _, row in df.iterrows():
+            result_id = row['ResultID']
+            entry_id = row['EntryID']
+            image_url = row['ImageURL']
+
+            # Skip processing if a perfect match already exists for this EntryID
+            if entry_id in perfect_matches:
+                logging.info(f"Skipping image for EntryID {entry_id} (perfect match exists)")
+                continue
+
+            # Create product details dictionary
+            product_details = {
+                "brand": row.get('ProductBrand', ''),
+                "category": row.get('ProductCategory', ''),
+                "color": row.get('ProductColor', '')
+            }
+
+            try:
+                # Process the image
+                result = process_image(image_url, product_details)
+
+                # Serialize the JSON result
+                caption = result.get('description', '')  # Use description as caption
+                json_result = json.dumps(result, ensure_ascii=False)
+
+                # Update the database with the processed result
+                success = update_database(result_id, json_result, caption)
+
+                if success:
+                    success_count += 1
+                    logging.info(f"Successfully processed and updated image {result_id}")
+
+                    # If a perfect match (match_score == 100) is found, skip further processing for this EntryID
+                    if result.get('match_score') == 100:
+                        perfect_matches.add(entry_id)
+                        logging.info(f"Perfect match found for EntryID {entry_id}, skipping further images")
+
+                else:
+                    logging.warning(f"Database update failed for image {result_id}")
+
+            except Exception as e:
+                logging.error(f"Error processing image {result_id}: {e}")
+
+        logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
+        logging.info(f"Perfect matches found for EntryIDs: {perfect_matches}")
+        return success_count
+
+    except Exception as e:
+        logging.error(f"Error in batch processing: {e}")
+        return 0
 
 def process_images(file_id):
     """
