@@ -965,7 +965,14 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], heade
     try:
         # Get match analysis - note the 'match' schema type
         logger.info("Requesting match analysis from Llama 3.2")
-        match_result = send_request_llama(image_path_or_url, match_analysis_prompt, headers, 'match')
+        try:
+            match_result = send_request_llama(image_path_or_url, match_analysis_prompt, headers, 'match')
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Match analysis request failed: {e}")
+            match_result = {"extraction_failed": True}
+        except Exception as e:
+            logger.error(f"Unexpected error in match analysis: {e}")
+            match_result = {"extraction_failed": True}
         
         # Check if extraction failed
         if match_result.get("extraction_failed", False):
@@ -994,7 +1001,14 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], heade
 
         # Get linesheet analysis - note the 'linesheet' schema type
         logger.info("Requesting linesheet analysis from Llama 3.2")
-        linesheet_result = send_request_llama(image_path_or_url, linesheet_analysis_prompt, headers, 'linesheet')
+        try:
+            linesheet_result = send_request_llama(image_path_or_url, linesheet_analysis_prompt, headers, 'linesheet')
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Linesheet analysis request failed: {e}")
+            linesheet_result = {"extraction_failed": True}
+        except Exception as e:
+            logger.error(f"Unexpected error in linesheet analysis: {e}")
+            linesheet_result = {"extraction_failed": True}
         
         # Process linesheet result
         if linesheet_result.get("extraction_failed", False):
@@ -1025,7 +1039,7 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], heade
         return final_result
     
     except Exception as e:
-        logger.error(f"Processing failed: {str(e)}")
+        logger.error(f"Overall processing failed: {str(e)}")
         return default_result
 
 def batch_process_images(headers, file_id=None, limit=10):
@@ -1070,7 +1084,7 @@ def batch_process_images(headers, file_id=None, limit=10):
             
             # Serialize the JSON result
             json_result = json.dumps(result)
-            caption = result.get('caption', '')
+            caption = result.get('description', '')  # Use description as caption
             
             # Update the database
             success = update_database(result_id, json_result, caption)
@@ -1086,7 +1100,6 @@ def batch_process_images(headers, file_id=None, limit=10):
     
     logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
     return success_count
-
 def process_images(file_id):
     """
     Process images for a specific file.
