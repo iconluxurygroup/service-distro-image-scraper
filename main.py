@@ -1252,8 +1252,7 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
     # If all attempts fail
     logger.error(f"Failed to process image after {max_retries} attempts")
     return default_result
-    
-def batch_process_images(file_id=None, limit=10):
+def batch_process_images(file_id=None, limit=8):
     """
     Process multiple images in a batch, either by file_id or by fetching pending images.
     
@@ -1275,11 +1274,18 @@ def batch_process_images(file_id=None, limit=10):
         return 0
     
     success_count = 0
+    perfect_matches = set()
     
     # Process each image
     for _, row in df.iterrows():
         result_id = row['ResultID']
+        entry_id = row['EntryID']
         image_url = row['ImageURL']
+        
+        # Skip if this entry already has a perfect match
+        if entry_id in perfect_matches:
+            logging.info(f"Skipping image for EntryID {entry_id} as a perfect match already exists")
+            continue
         
         # Create product details dictionary
         product_details = {
@@ -1302,6 +1308,11 @@ def batch_process_images(file_id=None, limit=10):
             if success:
                 success_count += 1
                 logging.info(f"Successfully processed and updated image {result_id}")
+                
+                # Check for perfect match (match_score == 100)
+                if result.get('match_score') == 100:
+                    perfect_matches.add(entry_id)
+                    logging.info(f"Perfect match found for EntryID {entry_id}")
             else:
                 logging.warning(f"Database update failed for image {result_id}")
                 
@@ -1309,6 +1320,7 @@ def batch_process_images(file_id=None, limit=10):
             logging.error(f"Error processing image {result_id}: {e}")
     
     logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
+    logging.info(f"Perfect matches found for EntryIDs: {perfect_matches}")
     return success_count
 
 def process_images(file_id):
