@@ -407,6 +407,8 @@ def get_records_to_search(file_id):
     except Exception as e:
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
+
+
 def update_sort_order(file_id):
     """
     Update the sort order of image results with filtering and sorting by linesheet score.
@@ -494,6 +496,8 @@ def update_sort_order(file_id):
     except Exception as e:
         logging.error(f"Error updating sort order: {e}")
         raise
+
+
 def update_file_generate_complete(file_id):
     """
     Update file generation completion time.
