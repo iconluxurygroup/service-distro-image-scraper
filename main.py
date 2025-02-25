@@ -1315,20 +1315,11 @@ def fetch_missing_images(file_id=None, limit=8):
     except Exception as e:
         logging.error(f"Error fetching missing images: {e}")
         return pd.DataFrame()
-
 def batch_process_images(file_id=None, limit=8):
     """
-    Process multiple images in a batch, either by file_id or by fetching only missing or NaN images.
-    
-    Args:
-        file_id (int, optional): FileID to process images for.
-        limit (int): Maximum number of records to process if file_id is None.
-        
-    Returns:
-        int: Number of successfully processed images.
+    Process multiple images in a batch, and update sort order only after all images receive results.
     """
     try:
-        # Fetch only images with missing or NaN JSON fields
         df = fetch_missing_images(file_id, limit)
 
         if df.empty:
@@ -1338,18 +1329,16 @@ def batch_process_images(file_id=None, limit=8):
         success_count = 0
         perfect_matches = set()
 
-        # Process each image
         for _, row in df.iterrows():
             result_id = row['ResultID']
             entry_id = row['EntryID']
             image_url = row['ImageURL']
 
-            # Skip processing if a perfect match already exists for this EntryID
+            # Skip processing if a perfect match already exists
             if entry_id in perfect_matches:
                 logging.info(f"Skipping image for EntryID {entry_id} (perfect match exists)")
                 continue
 
-            # Create product details dictionary
             product_details = {
                 "brand": row.get('ProductBrand', ''),
                 "category": row.get('ProductCategory', ''),
@@ -1357,21 +1346,20 @@ def batch_process_images(file_id=None, limit=8):
             }
 
             try:
-                # Process the image
+                # Process image
                 result = process_image(image_url, product_details)
 
-                # Serialize the JSON result
-                caption = result.get('description', '')  # Use description as caption
+                # Serialize result JSON
+                caption = result.get('description', '')
                 json_result = json.dumps(result, ensure_ascii=False)
 
-                # Update the database with the processed result
+                # Update database with the new result
                 success = update_database(result_id, json_result, caption)
 
                 if success:
                     success_count += 1
                     logging.info(f"Successfully processed and updated image {result_id}")
 
-                    # If a perfect match (match_score == 100) is found, skip further processing for this EntryID
                     if result.get('match_score') == 100:
                         perfect_matches.add(entry_id)
                         logging.info(f"Perfect match found for EntryID {entry_id}, skipping further images")
@@ -1384,11 +1372,18 @@ def batch_process_images(file_id=None, limit=8):
 
         logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
         logging.info(f"Perfect matches found for EntryIDs: {perfect_matches}")
+
+        # 🔴 ADD THIS: Sort order should be updated after all images receive results
+        if success_count > 0:
+            logging.info(f"Updating sort order for FileID: {file_id} after processing")
+            update_sort_order(file_id)
+
         return success_count
 
     except Exception as e:
         logging.error(f"Error in batch processing: {e}")
         return 0
+
 
 def process_images(file_id):
     """
