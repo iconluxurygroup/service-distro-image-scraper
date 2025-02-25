@@ -1202,26 +1202,18 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
     Evaluate the visual composition of this product image.
 
     Score the image on these 4 criteria (provide a score for EACH):
-
-    1. Angle (max 50 points):
-       - 50: Perfect straight-on side view
-       - 25: Front view or 3/4 angle
-       - 5: Rotated or tilted view
-
-    2. Background (max 50 points):
-       - 50: Clean white background
-       - 25: Neutral grey background
-       - 5: Complex or colorful background
-
-    3. Composition (max 50 points):
-       - 50: Clear product-only shot
-       - 25: Model wearing product
-       - 5: Product partially obstructed
-
-    4. Image Quality (max 50 points):
-       - 50: High-resolution, sharp image
-       - 25: Acceptable quality with minor issues
-       - 5: Low quality, blurry or pixelated
+    1. Angle (max 50 points)
+        50: Perfect straight-on side view, fully centered
+        25: Front view or slight 3/4 angle
+        5: Rotated, tilted, or off-center view
+    2. Background (max 50 points)
+        50: Clean white background, no shadows or distractions
+        25: Neutral grey background or subtle gradient
+        5: Complex, textured, or colorful background
+    3. Composition (max 50 points)
+        50: Clear product-only shot (no models, mannequins, hands, or props)
+        25: Product displayed with a model or mannequin but still fully visible
+        5: Product is partially obstructed by hands, accessories, or other objects
 
     IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
     {
