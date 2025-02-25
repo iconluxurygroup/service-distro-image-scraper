@@ -1350,249 +1350,6 @@ def send_request(image_path_or_url: str, prompt: str, schema: Dict[str, Any], he
     logger.info(f"\n🔵 FINAL TEXT RESPONSE: {final_text}")
     return extract_json(final_text, schema_type)
 
-def process_image(image_path_or_url: str, product_details: Dict[str, str], max_retries: int = 3) -> Dict[str, Any]:
-    """
-    Processes an image to perform match and linesheet analysis with retry mechanism.
-    
-    Args:
-        image_path_or_url (str): Path or URL of the image to process
-        product_details (dict): Details about the product
-        max_retries (int): Maximum number of retry attempts
-        
-    Returns:
-        Dict[str, Any]: Processed image analysis result
-    """
-    # Enhanced logging for input parameters
-    logger.info(f"Processing image: {image_path_or_url}")
-    
-    # Headers for Hugging Face API
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer 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"
-    }
-
-    # Extract product details
-    product_brand = product_details.get("brand", "")
-    product_category = product_details.get("category", "")
-    product_color = product_details.get("color", "")
-    
-    # Create default result
-    default_result = create_default_result(product_brand, product_category, product_color)
-    
-    # Detailed logging of product details
-    logger.info(f"Product Details - Brand: {product_brand}, Category: {product_category}, Color: {product_color}")
-
-    # Create prompts (same as previous implementation)
-    match_analysis_prompt = f"""
-    Analyze this product image and extract key features.
-
-    Compare these features to the user-provided values:
-    - Brand: {product_brand}
-    - Category: {product_category}
-    - Color: {product_color}
-
-    IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
-    {{
-      "description": "Brief description of what you see in the image",
-      "user_provided": {{
-        "brand": "{product_brand}",
-        "category": "{product_category}",
-        "color": "{product_color}"
-      }},
-      "extracted_features": {{
-        "brand": "The brand you see in the image",
-        "category": "The product category you see",
-        "color": "The main colors you see"
-      }},
-      "match_score": 0,
-      "reasoning_match": "Explanation of your score"
-    }}
-
-    Calculate the match_score as follows:
-    - 100: All three features match
-    - 67: Two features match
-    - 33: One feature matches
-    - 0: No features match
-
-    Only return the JSON object, nothing else.
-    """
-
-    linesheet_analysis_prompt = """
-    Evaluate the visual composition of this product image.
-
-    Score the image on these 3 criteria (provide a score for EACH):
-    1. Angle (max 50 points)
-        50: Perfect straight-on side view, fully centered
-        25: Front view or slight 3/4 angle
-        5: Rotated, tilted, or off-center view
-    2. Background (max 50 points)
-        50: Clean white background, no shadows or distractions
-        25: Neutral grey background or subtle gradient
-        5: Complex, textured, or colorful background
-    3. Composition (max 50 points)
-        50: Clear product-only shot (no models, mannequins, hands, or props)
-        5: Product displayed with a model or mannequin but still fully visible
-        5: Product is partially obstructed by hands, accessories, or other objects
-        1: Product is barely is opened or unzipped, folded, etc - This describes a situation where the product has been slightly altered from its original state or packaging (perhaps opened for display).
-
-    IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
-    {
-      "linesheet_score": 0,
-      "reasoning_linesheet": "Detailed explanation with individual scores for each criterion"
-    }
-
-    The linesheet_score should be the sum of all four individual criteria scores.
-
-    Only return the JSON object, nothing else.
-    """
-
-    def log_detailed_error(stage: str, error: Exception, attempt: int):
-        """
-        Log detailed error information
-        """
-        logger.error(f"Error in {stage} stage (Attempt {attempt + 1}):")
-        logger.error(f"Error Type: {type(error).__name__}")
-        logger.error(f"Error Message: {str(error)}")
-        
-        # Additional context for common error types
-        if isinstance(error, requests.exceptions.RequestException):
-            logger.error("Request Error Details:")
-            logger.error(f"URL: {image_path_or_url}")
-            
-        elif isinstance(error, ValueError):
-            logger.error("Value Error might indicate issues with data conversion or parsing")
-        
-        elif isinstance(error, TypeError):
-            logger.error("Type Error might indicate unexpected data types")
-
-    def is_result_valid(result: Dict[str, Any]) -> bool:
-        """
-        Check if the analysis result is meaningful and complete
-        
-        Args:
-            result (Dict[str, Any]): The analysis result to validate
-            
-        Returns:
-            bool: True if the result is valid and complete, False otherwise
-        """
-        if result.get("extraction_failed", False):
-            logger.warning("Result marked as extraction failed")
-            return False
-        
-        # Detailed logging about result validity
-        description = result.get("description", "").strip()
-        extracted_brand = result.get("extracted_features", {}).get("brand", "").strip()
-        extracted_category = result.get("extracted_features", {}).get("category", "").strip()
-        extracted_color = result.get("extracted_features", {}).get("color", "").strip()
-        match_score = result.get("match_score", float('nan'))
-        linesheet_score = result.get("linesheet_score", float('nan'))
-        reasoning_linesheet = result.get("reasoning_linesheet", "").strip()
-
-        # Check if linesheet score is NaN - this should trigger a retry
-        if math.isnan(linesheet_score):
-            logger.warning("Linesheet score is NaN - requires retry")
-            return False
-            
-        # Check if linesheet reasoning is missing or empty
-        if not reasoning_linesheet:
-            logger.warning("Linesheet reasoning is missing or empty - requires retry")
-            return False
-
-        # Check if all core fields are empty or NaN
-        is_valid = not (
-            not description and
-            not extracted_brand and
-            not extracted_category and
-            not extracted_color and
-            math.isnan(match_score)
-        )
-
-        if not is_valid:
-            logger.warning("Result deemed invalid due to empty or NaN values")
-            logger.debug(f"Description: {description}")
-            logger.debug(f"Extracted Brand: {extracted_brand}")
-            logger.debug(f"Extracted Category: {extracted_category}")
-            logger.debug(f"Extracted Color: {extracted_color}")
-            logger.debug(f"Match Score: {match_score}")
-            logger.debug(f"Linesheet Score: {linesheet_score}")
-            logger.debug(f"Linesheet Reasoning: {reasoning_linesheet}")
-
-        return is_valid
-    # Retry loop for processing
-    for attempt in range(max_retries):
-        try:
-            # Verify image can be downloaded
-            try:
-                img_data = get_image_data(image_path_or_url)
-                logger.info(f"Successfully retrieved image data, size: {len(img_data)} bytes")
-            except Exception as img_error:
-                log_detailed_error("Image Retrieval", img_error, attempt)
-                if attempt == max_retries - 1:
-                    return default_result
-                time.sleep(1)  # Short wait before retry
-                continue
-
-            # Get match analysis
-            try:
-                match_result = send_request(image_path_or_url, match_analysis_prompt, match_schema, headers, 'match')
-                logger.info("Match analysis request completed")
-            except Exception as match_error:
-                log_detailed_error("Match Analysis", match_error, attempt)
-                if attempt == max_retries - 1:
-                    return default_result
-                time.sleep(1)  # Short wait before retry
-                continue
-            
-            # Get linesheet analysis
-            try:
-                linesheet_result = send_request(image_path_or_url, linesheet_analysis_prompt, linesheet_schema, headers, 'linesheet')
-                logger.info("Linesheet analysis request completed")
-            except Exception as linesheet_error:
-                log_detailed_error("Linesheet Analysis", linesheet_error, attempt)
-                if attempt == max_retries - 1:
-                    return default_result
-                time.sleep(1)  # Short wait before retry
-                continue
-
-            # Combine results
-            final_result = OrderedDict([
-                ("description", match_result.get("description", "")),
-                ("user_provided", match_result.get("user_provided", {
-                    "brand": product_brand,
-                    "category": product_category,
-                    "color": product_color
-                })),
-                ("extracted_features", match_result.get("extracted_features", {
-                    "brand": "",
-                    "category": "",
-                    "color": ""
-                })),
-                ("match_score", match_result.get("match_score", float('nan'))),
-                ("reasoning_match", match_result.get("reasoning_match", "")),
-                ("linesheet_score", linesheet_result.get("linesheet_score", float('nan'))),
-                ("reasoning_linesheet", linesheet_result.get("reasoning_linesheet", "")),
-            ])
-
-            # Validate the result
-            if is_result_valid(final_result):
-                logger.info(f"Successfully processed image on attempt {attempt + 1}")
-                return final_result
-            
-            # If result is not valid, log and continue to next attempt
-            logger.warning(f"Invalid result on attempt {attempt + 1}. Retrying...")
-            
-            # Wait before next attempt
-            time.sleep(1)
-
-        except Exception as e:
-            log_detailed_error("Overall Processing", e, attempt)
-            if attempt == max_retries - 1:
-                return default_result
-            time.sleep(1)  # Short wait before retry
-
-    # If all attempts fail
-    logger.error(f"Failed to process image after {max_retries} attempts")
-    return default_result
 import json
 import logging
 import pyodbc
@@ -1694,9 +1451,280 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True):
     except Exception as e:
         logger.error(f"Error fetching missing images: {e}")
         return pd.DataFrame()
+def process_image(image_path_or_url: str, product_details: Dict[str, str], max_retries: int = 3) -> Dict[str, Any]:
+    """
+    Processes an image to perform match and linesheet analysis with enhanced reliability.
+    
+    Args:
+        image_path_or_url (str): Path or URL of the image to process
+        product_details (dict): Details about the product
+        max_retries (int): Maximum number of retry attempts
+        
+    Returns:
+        Dict[str, Any]: Processed image analysis result
+    """
+    # Enhanced logging for input parameters
+    logger.info(f"Processing image: {image_path_or_url}")
+    
+    # Headers for Hugging Face API
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer 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"
+    }
+
+    # Extract product details
+    product_brand = product_details.get("brand", "")
+    product_category = product_details.get("category", "")
+    product_color = product_details.get("color", "")
+    
+    # Create default result
+    default_result = create_default_result(product_brand, product_category, product_color)
+    
+    # Try different image URLs if the main URL fails
+    urls_to_try = [image_path_or_url]
+    
+    # Check if we have a thumbnail URL to try as fallback
+    if "thumbnail" in product_details and product_details["thumbnail"]:
+        urls_to_try.append(product_details["thumbnail"])
+    
+    # If image_path_or_url contains "resized", try generating a non-resized version
+    if "resized" in image_path_or_url.lower():
+        # Attempt to create a non-resized URL by pattern matching
+        try:
+            # Common pattern: "...resized/w=1246,q=75,f=auto,/produit/..."
+            match = re.search(r'(.*resized/).*?(/.*)', image_path_or_url)
+            if match:
+                base_url = match.group(1)
+                path = match.group(2)
+                original_url = f"{base_url}original{path}"
+                urls_to_try.append(original_url)
+                logger.info(f"Added potential original image URL as fallback: {original_url}")
+        except Exception as url_error:
+            logger.error(f"Error generating alternative URL: {url_error}")
+    
+    logger.info(f"Will try {len(urls_to_try)} URLs for AI analysis")
+    
+    # Create prompts
+    match_analysis_prompt = f"""
+    Analyze this product image and extract key features.
+
+    Compare these features to the user-provided values:
+    - Brand: {product_brand}
+    - Category: {product_category}
+    - Color: {product_color}
+
+    IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
+    {{
+      "description": "Brief description of what you see in the image",
+      "user_provided": {{
+        "brand": "{product_brand}",
+        "category": "{product_category}",
+        "color": "{product_color}"
+      }},
+      "extracted_features": {{
+        "brand": "The brand you see in the image",
+        "category": "The product category you see",
+        "color": "The main colors you see"
+      }},
+      "match_score": 0,
+      "reasoning_match": "Explanation of your score"
+    }}
+
+    Calculate the match_score as follows:
+    - 100: All three features match
+    - 67: Two features match
+    - 33: One feature matches
+    - 0: No features match
+
+    Only return the JSON object, nothing else.
+    """
+
+    linesheet_analysis_prompt = """
+    Evaluate the visual composition of this product image.
+
+    Score the image on these 3 criteria (provide a score for EACH):
+    1. Angle (max 50 points)
+        50: Perfect straight-on side view, fully centered
+        25: Front view or slight 3/4 angle
+        5: Rotated, tilted, or off-center view
+    2. Background (max 50 points)
+        50: Clean white background, no shadows or distractions
+        25: Neutral grey background or subtle gradient
+        5: Complex, textured, or colorful background
+    3. Composition (max 50 points)
+        50: Clear product-only shot (no models, mannequins, hands, or props)
+        5: Product displayed with a model or mannequin but still fully visible
+        5: Product is partially obstructed by hands, accessories, or other objects
+        1: Product is barely is opened or unzipped, folded, etc - This describes a situation where the product has been slightly altered from its original state or packaging (perhaps opened for display).
+
+    IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
+    {
+      "linesheet_score": 0,
+      "reasoning_linesheet": "Detailed explanation with individual scores for each criterion"
+    }
+
+    The linesheet_score should be the sum of all four individual criteria scores.
+
+    Only return the JSON object, nothing else.
+    """
+
+    def is_result_valid(result: Dict[str, Any]) -> bool:
+        """Enhanced validation to check if the analysis result is meaningful"""
+        if result.get("extraction_failed", False):
+            logger.warning("Result marked as extraction failed")
+            return False
+        
+        # Detailed logging about result validity
+        description = result.get("description", "").strip()
+        extracted_brand = result.get("extracted_features", {}).get("brand", "").strip()
+        extracted_category = result.get("extracted_features", {}).get("category", "").strip()
+        extracted_color = result.get("extracted_features", {}).get("color", "").strip()
+        match_score = result.get("match_score", float('nan'))
+        linesheet_score = result.get("linesheet_score", float('nan'))
+        reasoning_linesheet = result.get("reasoning_linesheet", "").strip()
+        reasoning_match = result.get("reasoning_match", "").strip()
+
+        # Check if linesheet score is NaN - this should trigger a retry
+        if math.isnan(linesheet_score):
+            logger.warning("Linesheet score is NaN - requires retry")
+            return False
+            
+        # Check if linesheet reasoning is missing or empty
+        if not reasoning_linesheet:
+            logger.warning("Linesheet reasoning is missing or empty - requires retry")
+            return False
+            
+        # Check if match reasoning is missing or empty
+        if not reasoning_match:
+            logger.warning("Match reasoning is missing or empty - requires retry")
+            return False
+
+        # Check if all core fields are empty or NaN
+        is_valid = not (
+            not description and
+            not extracted_brand and
+            not extracted_category and
+            not extracted_color and
+            math.isnan(match_score)
+        )
+
+        if not is_valid:
+            logger.warning("Result deemed invalid due to empty or NaN values")
+            logger.debug(f"Description: {description}")
+            logger.debug(f"Extracted Brand: {extracted_brand}")
+            logger.debug(f"Extracted Category: {extracted_category}")
+            logger.debug(f"Extracted Color: {extracted_color}")
+            logger.debug(f"Match Score: {match_score}")
+            logger.debug(f"Linesheet Score: {linesheet_score}")
+            logger.debug(f"Linesheet Reasoning: {reasoning_linesheet}")
+            logger.debug(f"Match Reasoning: {reasoning_match}")
+
+        return is_valid
+
+    # For each URL to try
+    for url_index, current_url in enumerate(urls_to_try):
+        logger.info(f"Attempting AI analysis with URL {url_index+1}/{len(urls_to_try)}: {current_url}")
+        
+        # Retry loop for processing with the current URL
+        for attempt in range(max_retries):
+            try:
+                # Verify image can be retrieved
+                try:
+                    img_data = get_image_data(current_url)
+                    if len(img_data) < 1000:  # Very small images likely aren't valid
+                        logger.warning(f"Image data too small ({len(img_data)} bytes), may be invalid")
+                        if attempt == max_retries - 1 and url_index == len(urls_to_try) - 1:
+                            return default_result
+                        continue
+                    logger.info(f"Successfully retrieved image data, size: {len(img_data)} bytes")
+                except Exception as img_error:
+                    logger.error(f"Image retrieval error: {img_error}")
+                    if attempt == max_retries - 1 and url_index == len(urls_to_try) - 1:
+                        return default_result
+                    time.sleep(1)  # Short wait before retry
+                    continue
+
+                # Get match analysis
+                try:
+                    match_result = send_request(current_url, match_analysis_prompt, match_schema, headers, 'match')
+                    logger.info("Match analysis request completed")
+                    
+                    # Early validation of match result
+                    if match_result.get("extraction_failed", False) or "match_score" not in match_result:
+                        logger.warning("Match analysis failed or returned incomplete data")
+                        if attempt == max_retries - 1 and url_index == len(urls_to_try) - 1:
+                            return default_result
+                        time.sleep(1)
+                        continue
+                except Exception as match_error:
+                    logger.error(f"Match analysis error: {match_error}")
+                    if attempt == max_retries - 1 and url_index == len(urls_to_try) - 1:
+                        return default_result
+                    time.sleep(1)
+                    continue
+                
+                # Get linesheet analysis
+                try:
+                    linesheet_result = send_request(current_url, linesheet_analysis_prompt, linesheet_schema, headers, 'linesheet')
+                    logger.info("Linesheet analysis request completed")
+                    
+                    # Early validation of linesheet result
+                    if linesheet_result.get("extraction_failed", False) or "linesheet_score" not in linesheet_result:
+                        logger.warning("Linesheet analysis failed or returned incomplete data")
+                        if attempt == max_retries - 1 and url_index == len(urls_to_try) - 1:
+                            return default_result
+                        time.sleep(1)
+                        continue
+                except Exception as linesheet_error:
+                    logger.error(f"Linesheet analysis error: {linesheet_error}")
+                    if attempt == max_retries - 1 and url_index == len(urls_to_try) - 1:
+                        return default_result
+                    time.sleep(1)
+                    continue
+
+                # Combine results
+                final_result = OrderedDict([
+                    ("description", match_result.get("description", "")),
+                    ("user_provided", match_result.get("user_provided", {
+                        "brand": product_brand,
+                        "category": product_category,
+                        "color": product_color
+                    })),
+                    ("extracted_features", match_result.get("extracted_features", {
+                        "brand": "",
+                        "category": "",
+                        "color": ""
+                    })),
+                    ("match_score", match_result.get("match_score", float('nan'))),
+                    ("reasoning_match", match_result.get("reasoning_match", "")),
+                    ("linesheet_score", linesheet_result.get("linesheet_score", float('nan'))),
+                    ("reasoning_linesheet", linesheet_result.get("reasoning_linesheet", "")),
+                ])
+
+                # Validate the result
+                if is_result_valid(final_result):
+                    logger.info(f"Successfully processed image on attempt {attempt + 1} using URL #{url_index+1}")
+                    return final_result
+                
+                # If result is not valid, log and continue to next attempt
+                logger.warning(f"Invalid result on attempt {attempt + 1} for URL #{url_index+1}. Retrying...")
+                
+                # Wait before next attempt
+                time.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Processing error: {e}")
+                if attempt == max_retries - 1 and url_index == len(urls_to_try) - 1:
+                    return default_result
+                time.sleep(1)  # Short wait before retry
+
+    # If all attempts with all URLs fail
+    logger.error(f"Failed to process image after trying {len(urls_to_try)} URLs with {max_retries} attempts each")
+    return default_result
+
 def batch_process_images(file_id=None, limit=8):
     """
-    Process multiple images in a batch, and update sort order only after all images receive results.
+    Process multiple images in a batch with improved URL handling and error recovery.
     """
     try:
         df = fetch_missing_images(file_id, limit)
@@ -1718,10 +1746,25 @@ def batch_process_images(file_id=None, limit=8):
                 logging.info(f"Skipping image for EntryID {entry_id} (perfect match exists)")
                 continue
 
+            # Fetch any thumbnail URL if available
+            thumbnail_url = None
+            try:
+                with pyodbc.connect(conn_str) as connection:
+                    cursor = connection.cursor()
+                    thumb_query = "SELECT ImageUrlThumbnail FROM utb_ImageScraperResult WHERE ResultID = ?"
+                    cursor.execute(thumb_query, (result_id,))
+                    result = cursor.fetchone()
+                    if result and result[0]:
+                        thumbnail_url = result[0]
+                        logging.info(f"Found thumbnail URL for ResultID {result_id}: {thumbnail_url}")
+            except Exception as thumb_error:
+                logging.error(f"Error fetching thumbnail URL: {thumb_error}")
+
             product_details = {
                 "brand": row.get('ProductBrand', ''),
                 "category": row.get('ProductCategory', ''),
-                "color": row.get('ProductColor', '')
+                "color": row.get('ProductColor', ''),
+                "thumbnail": thumbnail_url  # Add thumbnail URL to product details
             }
 
             try:
@@ -1752,7 +1795,7 @@ def batch_process_images(file_id=None, limit=8):
         logging.info(f"Batch processing complete. Processed {success_count} out of {len(df)} images.")
         logging.info(f"Perfect matches found for EntryIDs: {perfect_matches}")
 
-        # 🔴 ADD THIS: Sort order should be updated after all images receive results
+        # Sort order should be updated after all images receive results
         if success_count > 0:
             logging.info(f"Updating sort order for FileID: {file_id} after processing")
             update_sort_order(file_id)
