@@ -686,11 +686,11 @@ def update_sort_order(file_id):
         
         # Step 5: Return a sample of the sort order
         fetch_sort_order_query = """
-            SELECT TOP 100 ResultID, EntryID, SortOrder 
-            FROM utb_ImageScraperResult t
-            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE r.FileID = ?
-            ORDER BY EntryID, SortOrder;
+       SELECT TOP 100 t.ResultID, t.EntryID, t.SortOrder 
+FROM utb_ImageScraperResult t
+INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+WHERE r.FileID = ?
+ORDER BY t.EntryID, t.SortOrder;
         """
         
         cursor.execute(fetch_sort_order_query, (file_id,))
