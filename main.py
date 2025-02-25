@@ -1372,21 +1372,80 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
 import json
 import logging
 import pyodbc
-def fetch_missing_images(file_id=None, limit=8):
+def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True):
     """
     Fetch images with missing or NaN JSON fields from the database.
+    
+    Args:
+        file_id (int, optional): The FileID to fetch missing images for
+        limit (int, optional): Maximum number of records to fetch
+        ai_analysis_only (bool, optional): If True, only fetch images missing AI analysis but with URLs.
+                                          If False, fetch all missing records including those without URLs.
+        
+    Returns:
+        pd.DataFrame: DataFrame containing missing image records
     """
     try:
-        connection = pyodbc.connect(conn)
+        connection = pyodbc.connect(conn_str)
         query_params = []
 
-        # Base SQL query to find missing images
-        query = """
-        SELECT t.ResultID, t.EntryID, t.ImageURL, r.ProductBrand, r.ProductCategory, r.ProductColor
-        FROM utb_ImageScraperResult t
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-        WHERE (ISJSON(t.aijson) = 0 OR JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL)
-        """
+        # Base SQL query depends on whether we're looking for just AI analysis issues or also missing URLs
+        if ai_analysis_only:
+            # Only looking for images with URLs but missing AI analysis
+            query = """
+            SELECT t.ResultID, t.EntryID, t.ImageURL, r.ProductBrand, r.ProductCategory, r.ProductColor
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE (
+                t.ImageURL IS NOT NULL 
+                AND t.ImageURL <> ''
+                AND (
+                    ISJSON(t.aijson) = 0 
+                    OR t.aijson IS NULL
+                    OR JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL
+                    OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
+                    OR JSON_VALUE(t.aijson, '$.match_score') IS NULL
+                    OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
+                )
+            )
+            """
+        else:
+            # Looking for records missing either URLs or AI analysis
+            query = """
+            -- Records missing in result table completely
+            SELECT NULL as ResultID, r.EntryID, NULL as ImageURL, 
+                   r.ProductBrand, r.ProductCategory, r.ProductColor
+            FROM utb_ImageScraperRecords r
+            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+            WHERE t.EntryID IS NULL
+            
+            UNION ALL
+            
+            -- Records with empty or NULL ImageURL
+            SELECT t.ResultID, t.EntryID, t.ImageURL, 
+                   r.ProductBrand, r.ProductCategory, r.ProductColor
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE t.ImageURL IS NULL OR t.ImageURL = ''
+            
+            UNION ALL
+            
+            -- Records with URLs but missing AI analysis
+            SELECT t.ResultID, t.EntryID, t.ImageURL, 
+                   r.ProductBrand, r.ProductCategory, r.ProductColor
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE t.ImageURL IS NOT NULL 
+              AND t.ImageURL <> ''
+              AND (
+                  ISJSON(t.aijson) = 0 
+                  OR t.aijson IS NULL
+                  OR JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL
+                  OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
+                  OR JSON_VALUE(t.aijson, '$.match_score') IS NULL
+                  OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
+              )
+            """
 
         # Add FileID filter if provided
         if file_id:
@@ -1400,10 +1459,16 @@ def fetch_missing_images(file_id=None, limit=8):
         # Fetch data
         df = pd.read_sql_query(query, connection, params=query_params)
         connection.close()
+        
+        if df.empty:
+            logger.info(f"No missing images found" + (f" for FileID: {file_id}" if file_id else ""))
+        else:
+            logger.info(f"Found {len(df)} missing images" + (f" for FileID: {file_id}" if file_id else ""))
+            
         return df
 
     except Exception as e:
-        logging.error(f"Error fetching missing images: {e}")
+        logger.error(f"Error fetching missing images: {e}")
         return pd.DataFrame()
 def batch_process_images(file_id=None, limit=8):
     """
@@ -2265,7 +2330,7 @@ async def generate_download_file(file_id):
         return {"error": f"An error occurred: {str(e)}"}
 async def process_restart_batch(file_id_db):
     """
-    Restart processing for a file.
+    Restart processing for a file, focusing on missing images.
     
     Args:
         file_id_db (str): The FileID to restart processing for
@@ -2290,21 +2355,70 @@ async def process_restart_batch(file_id_db):
             futures = [process_batch.remote(batch) for batch in batches]
             ray.get(futures)
         else:
-            logger.info(f"No records to search for FileID: {file_id_db}, continuing with next steps")
+            logger.info(f"No new records to search for FileID: {file_id_db}")
         
-        # Continue with remaining steps regardless of whether records were found
+        # First check for records with missing URLs or missing entries in result table
+        missing_urls_df = fetch_missing_images(file_id_db, limit=1000, ai_analysis_only=False)
+        
+        # Extract the entries that need URL generation (NULL or empty ImageURL)
+        needs_url_generation = missing_urls_df[missing_urls_df['ImageURL'].isnull() | (missing_urls_df['ImageURL'] == '')].copy()
+        
+        if not needs_url_generation.empty:
+            logger.info(f"Found {len(needs_url_generation)} records that need image URL generation for FileID: {file_id_db}")
+            
+            # For each entry that needs URL generation, process the search
+            for _, row in needs_url_generation.iterrows():
+                entry_id = row['EntryID']
+                # Get search string for this entry
+                search_string_query = f"""
+                    SELECT ProductModel as SearchString 
+                    FROM utb_ImageScraperRecords 
+                    WHERE EntryID = {entry_id}
+                """
+                with pyodbc.connect(conn_str) as connection:
+                    search_df = pd.read_sql_query(search_string_query, connection)
+                
+                if not search_df.empty:
+                    search_string = search_df.iloc[0]['SearchString']
+                    endpoint = get_endpoint()
+                    logger.info(f"Processing search for EntryID: {entry_id}, search string: {search_string}")
+                    success = process_search_row(search_string, endpoint, entry_id)
+                    if not success:
+                        logger.warning(f"Failed to generate URL for EntryID: {entry_id}")
+        
+        # Now check for images with URLs but missing AI analysis
+        missing_analysis_df = fetch_missing_images(file_id_db, limit=100, ai_analysis_only=True)
+        
+        if not missing_analysis_df.empty:
+            logger.info(f"Processing {len(missing_analysis_df)} images with missing AI analysis for FileID: {file_id_db}")
+            
+            # Process the missing images
+            batch_process_images(file_id=file_id_db, limit=len(missing_analysis_df))
+        else:
+            logger.info(f"No images with missing AI analysis for FileID: {file_id_db}")
+        
+        # Update sort order after processing is complete
         logger.info(f"Updating sort order for FileID: {file_id_db}")
         update_sort_order(file_id_db)
         
-        logger.info(f"Processing images for FileID: {file_id_db}")
-        process_images(file_id_db)
-        
+        # Generate download file
         logger.info(f"Generating download file for FileID: {file_id_db}")
         await generate_download_file(file_id_db)
         
         logger.info(f"Restart processing completed for FileID: {file_id_db}")
     except Exception as e:
         logger.error(f"Error restarting processing for FileID {file_id_db}: {e}")
+        # Send error notification
+        try:
+            send_to_email = get_send_to_email(file_id_db)
+            file_name = f"FileID: {file_id_db}"
+            send_message_email(
+                send_to_email, 
+                f"Error processing {file_name}", 
+                f"An error occurred while reprocessing your file: {str(e)}"
+            )
+        except Exception as email_error:
+            logger.error(f"Failed to send error notification: {email_error}")
 
 def process_image_batch(payload):
     """
