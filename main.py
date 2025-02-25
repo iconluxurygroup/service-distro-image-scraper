@@ -1374,14 +1374,15 @@ def batch_process_images(file_id=None, limit=8):
         try:
             # Process the image
             result = process_image(image_url, product_details)
-            
-            # Serialize the JSON result
-            json_result = json.dumps(result)
+                        # Serialize the JSON result
             caption = result.get('description', '')  # Use description as caption
-            
-            # Update the database
+        # When saving the result, ensure it's a clean JSON string
+            json_result = json.dumps(result, ensure_ascii=False)
+                        
+
+            # Update the database with the clean JSON string
             success = update_database(result_id, json_result, caption)
-            
+                    
             if success:
                 success_count += 1
                 logging.info(f"Successfully processed and updated image {result_id}")
