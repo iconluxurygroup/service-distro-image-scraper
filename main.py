@@ -810,15 +810,16 @@ def extract_json(text: str, schema_type: str = 'generic') -> Dict[str, Any]:
         logger.error(f"Fallback JSON extraction failed: {e}")
         return {"extraction_failed": True}
 
-def send_request_llama(image_path_or_url: str, prompt: str, headers: Dict[str, str], schema_type: str = 'generic') -> Dict[str, Any]:
+def send_request(image_path_or_url: str, prompt: str, schema: Dict[str, Any], headers: Dict[str, str], schema_type: str = 'generic') -> Dict[str, Any]:
     """
-    Sends a request to the Llama 3.2 API with the image and prompt.
+    Sends a request to the API with the image and prompt.
     Works with both local file paths and URLs.
     Returns the parsed response or a dictionary with extraction_failed=True if the request fails.
     
     Args:
         image_path_or_url: Path to image file or URL
         prompt: The prompt text to send
+        schema: JSON schema for validation
         headers: API request headers
         schema_type: Either 'match' or 'linesheet' to enable specific extraction
     """
@@ -828,55 +829,60 @@ def send_request_llama(image_path_or_url: str, prompt: str, headers: Dict[str, s
         
         # Convert to base64
         base64_img = base64.b64encode(img_data).decode('utf-8')
-        
-        # Using Llama 3.2 compatible format
-        payload = {
-            "model": "meta-llama/Llama-3.2-70b-chat-hf",
+            
+        json_data = {
+            "model": "tgi",
             "messages": [
                 {
-                    "role": "user",
+                    "role": "user", 
                     "content": [
                         {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_img}"
-                            }
-                        },
+                            "type": "image_url", 
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}
+                        }, 
                         {
-                            "type": "text",
+                            "type": "text", 
                             "text": prompt
                         }
                     ]
                 }
             ],
-            "max_tokens": 1024,
-            "temperature": 0.2,  # Lower temperature for more deterministic responses
-            "response_format": {"type": "json_object"}  # Request JSON format
+            "max_tokens": 500,
+            "stream": True,
+            "grammar": {"type": "json", "value": schema}
         }
 
-        logger.info("Sending request to Llama 3.2 API")
         response = requests.post(
-            "https://api-inference.huggingface.co/models/meta-llama/Llama-3.2-70b-chat-hf",
+            "https://j1o1wtb04ya9z0qz.us-east-1.aws.endpoints.huggingface.cloud/v1/chat/completions",
             headers=headers,
-            json=payload
+            json=json_data,
+            stream=True
         )
         response.raise_for_status()
-        
-        response_data = response.json()
-        
-        # Extract the content from Llama 3.2 response format
-        if "choices" in response_data and len(response_data["choices"]) > 0:
-            content = response_data["choices"][0]["message"]["content"]
-            logger.info("Successfully received response from Llama 3.2 API")
-            return extract_json(content, schema_type)
-        else:
-            logger.error(f"Unexpected response format: {response_data}")
-            return {"extraction_failed": True}
-            
     except Exception as e:
-        logger.error(f"Request to Llama 3.2 API failed: {e}")
+        logger.error(f"🚨 Request failed: {e}")
         return {"extraction_failed": True}
 
+    final_text = ""
+    logger.info("\n🔵 RECEIVING API RESPONSE:")
+    for line in response.iter_lines():
+        if line:
+            decoded_line = line.decode("utf-8").strip()
+            if decoded_line.startswith("data:"):
+                content = decoded_line[len("data:"):].strip()
+                if content == "[DONE]":
+                    break
+                try:
+                    chunk_json = json.loads(content)
+                    delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                    final_text += delta.get("content", "")
+                except json.JSONDecodeError:
+                    logger.warning("⚠️ JSON Decode Error in stream chunk")
+
+    logger.info(f"\n🔵 FINAL TEXT RESPONSE: {final_text}")
+    return extract_json(final_text, schema_type)
+
+# Keep the rest of the previous implementation of process_image and other functions
 def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Dict[str, Any]:
     """
     Processes an image to perform match and linesheet analysis.
@@ -897,6 +903,10 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Di
     # Create default result
     default_result = create_default_result(product_brand, product_category, product_color)
     
+    # Enhanced logging for input parameters
+    logger.info(f"Processing image: {image_path_or_url}")
+    logger.info(f"Product Details - Brand: {product_brand}, Category: {product_category}, Color: {product_color}")
+
     # Create prompts
     match_analysis_prompt = f"""
     Analyze this product image and extract key features.
@@ -968,12 +978,45 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Di
     Only return the JSON object, nothing else.
     """
 
+    def log_detailed_error(stage: str, error: Exception):
+        """
+        Log detailed error information
+        """
+        logger.error(f"Error in {stage} stage:")
+        logger.error(f"Error Type: {type(error).__name__}")
+        logger.error(f"Error Message: {str(error)}")
+        
+        # Additional context for common error types
+        if isinstance(error, requests.exceptions.RequestException):
+            logger.error("Request Error Details:")
+            logger.error(f"URL: {image_path_or_url}")
+            
+        elif isinstance(error, ValueError):
+            logger.error("Value Error might indicate issues with data conversion or parsing")
+        
+        elif isinstance(error, TypeError):
+            logger.error("Type Error might indicate unexpected data types")
+
     try:
+        # Verify image can be downloaded
+        try:
+            img_data = get_image_data(image_path_or_url)
+            logger.info(f"Successfully retrieved image data, size: {len(img_data)} bytes")
+        except Exception as img_error:
+            log_detailed_error("Image Retrieval", img_error)
+            return default_result
+
         # Get match analysis - note the 'match' schema type
-        match_result = send_request(image_path_or_url, match_analysis_prompt, match_schema, headers, 'match')
+        try:
+            match_result = send_request(image_path_or_url, match_analysis_prompt, match_schema, headers, 'match')
+            logger.info("Match analysis request completed")
+        except Exception as match_error:
+            log_detailed_error("Match Analysis", match_error)
+            match_result = {"extraction_failed": True}
         
         # Check if extraction failed
         if match_result.get("extraction_failed", False):
+            logger.warning("Match analysis extraction failed, using default values")
             match_data = default_result
         else:
             # Update default result with match data
@@ -997,10 +1040,16 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Di
             match_data["reasoning_match"] = match_result.get("reasoning_match", "")
 
         # Get linesheet analysis - note the 'linesheet' schema type
-        linesheet_result = send_request(image_path_or_url, linesheet_analysis_prompt, linesheet_schema, headers, 'linesheet')
+        try:
+            linesheet_result = send_request(image_path_or_url, linesheet_analysis_prompt, linesheet_schema, headers, 'linesheet')
+            logger.info("Linesheet analysis request completed")
+        except Exception as linesheet_error:
+            log_detailed_error("Linesheet Analysis", linesheet_error)
+            linesheet_result = {"extraction_failed": True}
         
         # Process linesheet result
         if linesheet_result.get("extraction_failed", False):
+            logger.warning("Linesheet analysis extraction failed, using default values")
             linesheet_score = float('nan')
             reasoning_linesheet = ""
         else:
@@ -1027,9 +1076,8 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str]) -> Di
         return final_result
     
     except Exception as e:
-        print(f"🚨 Processing failed: {str(e)}")
+        log_detailed_error("Overall Processing", e)
         return default_result
-
 def batch_process_images(file_id=None, limit=10):
     """
     Process multiple images in a batch, either by file_id or by fetching pending images.
