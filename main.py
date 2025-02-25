@@ -32,6 +32,7 @@ from sqlalchemy import create_engine
 import urllib.parse  # For URL encoding/decoding
 import base64  # For base64 encoding/decoding
 import zlib  # Fo
+import traceback
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -414,148 +415,306 @@ import json
 import math
 import pyodbc
 import logging
-
 def clean_json(value):
     """
     Cleans JSON text by replacing invalid values like NaN, undefined, or incorrect formatting.
+    Handles completely malformed JSON by replacing it with a valid default structure.
     """
-    if not value or value.strip() in ["None", "null", "NaN", "undefined"]:
-        return None  # Convert invalid JSON to NULL
+    # If the value is None or an empty string, return a default valid JSON
+    if not value or not isinstance(value, str) or value.strip() in ["None", "null", "NaN", "undefined"]:
+        return json.dumps({
+            "description": "",
+            "user_provided": {"brand": "", "category": "", "color": ""},
+            "extracted_features": {"brand": "", "category": "", "color": ""},
+            "match_score": None,
+            "reasoning_match": "",
+            "linesheet_score": None,
+            "reasoning_linesheet": ""
+        })
+    
+    # Check for common invalid starting characters (like '.', ',', etc.)
+    value = value.strip()
+    if value and value[0] not in ['{', '[', '"']:
+        logging.warning(f"Invalid JSON starting with '{value[0:10]}...' - replacing with default")
+        return json.dumps({
+            "description": "",
+            "user_provided": {"brand": "", "category": "", "color": ""},
+            "extracted_features": {"brand": "", "category": "", "color": ""},
+            "match_score": None,
+            "reasoning_match": "",
+            "linesheet_score": None,
+            "reasoning_linesheet": ""
+        })
     
     try:
+        # Try to parse the JSON
         parsed = json.loads(value)
+        
+        # Ensure it's a dictionary
         if not isinstance(parsed, dict):
-            return None  # Skip non-dict JSON (e.g., lists or malformed data)
-
+            logging.warning("JSON is not a dictionary - replacing with default structure")
+            return json.dumps({
+                "description": "",
+                "user_provided": {"brand": "", "category": "", "color": ""},
+                "extracted_features": {"brand": "", "category": "", "color": ""},
+                "match_score": None,
+                "reasoning_match": "",
+                "linesheet_score": None,
+                "reasoning_linesheet": ""
+            })
+        
         # Convert NaN to None
-        if isinstance(parsed.get("linesheet_score"), float) and math.isnan(parsed["linesheet_score"]):
-            parsed["linesheet_score"] = None
-        if isinstance(parsed.get("match_score"), float) and math.isnan(parsed["match_score"]):
+        if "linesheet_score" in parsed:
+            if isinstance(parsed["linesheet_score"], float) and math.isnan(parsed["linesheet_score"]):
+                parsed["linesheet_score"] = None
+            elif parsed["linesheet_score"] in ["NaN", "null", "undefined", ""]:
+                parsed["linesheet_score"] = None
+                
+        if "match_score" in parsed:
+            if isinstance(parsed["match_score"], float) and math.isnan(parsed["match_score"]):
+                parsed["match_score"] = None
+            elif parsed["match_score"] in ["NaN", "null", "undefined", ""]:
+                parsed["match_score"] = None
+        
+        # Ensure all required fields exist
+        if "description" not in parsed:
+            parsed["description"] = ""
+        if "user_provided" not in parsed:
+            parsed["user_provided"] = {"brand": "", "category": "", "color": ""}
+        if "extracted_features" not in parsed:
+            parsed["extracted_features"] = {"brand": "", "category": "", "color": ""}
+        if "match_score" not in parsed:
             parsed["match_score"] = None
+        if "reasoning_match" not in parsed:
+            parsed["reasoning_match"] = ""
+        if "linesheet_score" not in parsed:
+            parsed["linesheet_score"] = None
+        if "reasoning_linesheet" not in parsed:
+            parsed["reasoning_linesheet"] = ""
+            
+        # Ensure user_provided and extracted_features have all necessary fields
+        for field_dict in ["user_provided", "extracted_features"]:
+            if field_dict in parsed and isinstance(parsed[field_dict], dict):
+                for field in ["brand", "category", "color"]:
+                    if field not in parsed[field_dict]:
+                        parsed[field_dict][field] = ""
 
         return json.dumps(parsed)  # Return cleaned JSON as a string
 
-    except json.JSONDecodeError:
-        return None  # Return NULL for invalid JSON
-
+    except json.JSONDecodeError as e:
+        logging.warning(f"JSON decoding error: {e} for value: {value[:50]}...")
+        # Return a valid default JSON structure
+        return json.dumps({
+            "description": "",
+            "user_provided": {"brand": "", "category": "", "color": ""},
+            "extracted_features": {"brand": "", "category": "", "color": ""},
+            "match_score": None,
+            "reasoning_match": "",
+            "linesheet_score": None,
+            "reasoning_linesheet": ""
+        })
 
 def update_sort_order(file_id):
     """
-    Updates the SortOrder column for images:
-    - `SortOrder = 1` for the best image.
-    - Sequential `SortOrder` (2, 3, 4...) for others.
-    - Cleans invalid JSON before processing.
+    Updates the SortOrder column for images with improved performance and logging.
+    Includes robust error handling and JSON cleaning for problematic data.
     """
+    start_time = time.time()
     try:
         connection = pyodbc.connect(conn_str)
+        connection.timeout = 300  # Set command timeout to 5 minutes
         cursor = connection.cursor()
 
         logging.info(f"🔄 Updating sort order for FileID: {file_id}")
+        step_time = time.time()
 
-        # Step 1: Identify and Fix Invalid JSON
-        fetch_invalid_json = """
-            SELECT ResultID, aijson FROM utb_ImageScraperResult
-            WHERE ISJSON(aijson) = 0 
-               OR JSON_VALUE(aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
-               OR JSON_VALUE(aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
-        """
-        cursor.execute(fetch_invalid_json)
-        invalid_rows = cursor.fetchall()
-
-        if invalid_rows:
-            logging.warning(f"⚠️ Found {len(invalid_rows)} invalid JSON entries in aijson column!")
-            
-            # Fix invalid JSON in batch update
-            updates = []
-            for row in invalid_rows:
-                cleaned_json = clean_json(row[1])
-                if cleaned_json:
-                    updates.append((cleaned_json, row[0]))
-            
-            if updates:
-                cursor.executemany(
-                    "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
-                    updates
-                )
-                connection.commit()
-                logging.info("✅ Invalid JSON entries cleaned.")
-
-        # Step 2: Assign Unique SortOrder per EntryID
-        update_sort_order_query = """
-        WITH RankedResults AS (
-            SELECT 
-                t.ResultID, 
-                t.EntryID, 
-                r.FileID,
-                -- Convert JSON safely, replacing NaN with NULL
-                CASE 
-                    WHEN JSON_VALUE(t.aijson, '$.match_score') IS NULL 
-                    OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined') 
-                    THEN NULL 
-                    ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT) 
-                END AS match_score,
-                CASE 
-                    WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL 
-                    OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined') 
-                    THEN NULL 
-                    ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT) 
-                END AS linesheet_score,
-                ROW_NUMBER() OVER (
-                    PARTITION BY t.EntryID 
-                    ORDER BY 
-                        CASE 
-                            WHEN JSON_VALUE(t.aijson, '$.match_score') IS NULL 
-                            THEN -1 
-                            ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT) 
-                        END DESC,
-                        CASE 
-                            WHEN JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL 
-                            THEN -1 
-                            ELSE TRY_CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT) 
-                        END DESC
-                ) AS rank
+        # Step 1: Get a count of records to process
+        count_query = """
+            SELECT COUNT(*) 
             FROM utb_ImageScraperResult t 
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
             WHERE r.FileID = ?
+        """
+        cursor.execute(count_query, (file_id,))
+        record_count = cursor.fetchone()[0]
+        logging.info(f"📊 Found {record_count} records to process for FileID: {file_id}")
+        
+        if record_count == 0:
+            logging.warning(f"⚠️ No records found for FileID: {file_id}")
+            return []
+            
+        # Step 2: Find all records with potentially problematic JSON
+        fetch_all_json_query = """
+            SELECT TOP 1000 ResultID, aijson 
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE r.FileID = ? AND (
+                t.aijson IS NULL
+                OR ISJSON(t.aijson) = 0 
+                OR t.aijson = ''
+                OR LEFT(t.aijson, 1) = '.'
+                OR LEFT(t.aijson, 1) = ','
+                OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
+                OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
+            )
+        """
+        
+        try:
+            cursor.execute(fetch_all_json_query, (file_id,))
+            problematic_rows = cursor.fetchall()
+            logging.info(f"Found {len(problematic_rows)} potentially problematic JSON entries")
+        except Exception as e:
+            # If the query itself fails (likely due to badly malformed JSON), use a simpler query
+            logging.warning(f"Error querying for problematic JSON: {e}, using simplified query")
+            simplified_query = """
+                SELECT TOP 1000 ResultID, aijson 
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+            """
+            cursor.execute(simplified_query, (file_id,))
+            problematic_rows = cursor.fetchall()
+            logging.info(f"Retrieved {len(problematic_rows)} rows using simplified query")
+        
+        # Step 3: Attempt to clean and fix all JSON in batches
+        batch_size = min(500, max(50, len(problematic_rows)))
+        updated_count = 0
+        
+        for i in range(0, len(problematic_rows), batch_size):
+            batch = problematic_rows[i:i+batch_size]
+            updates = []
+            
+            for row in batch:
+                result_id, aijson_value = row
+                cleaned_json = clean_json(aijson_value)
+                if cleaned_json:
+                    updates.append((cleaned_json, result_id))
+            
+            if updates:
+                try:
+                    cursor.executemany(
+                        "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
+                        updates
+                    )
+                    connection.commit()
+                    updated_count += len(updates)
+                    logging.info(f"Batch updated {len(updates)} JSON entries (total: {updated_count})")
+                except Exception as batch_error:
+                    logging.error(f"Error updating batch: {batch_error}")
+                    # If batch update fails, try individual updates
+                    for cleaned_json, result_id in updates:
+                        try:
+                            cursor.execute(
+                                "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
+                                (cleaned_json, result_id)
+                            )
+                            connection.commit()
+                            updated_count += 1
+                        except Exception as individual_error:
+                            logging.error(f"Error updating individual row {result_id}: {individual_error}")
+        
+        logging.info(f"Total JSON entries updated: {updated_count}")
+        
+        # Step 4: Use a more robust query for updating sort order
+        logging.info("Updating sort order using robust query")
+        safe_sort_query = """
+        WITH CleanedResults AS (
+            SELECT 
+                t.ResultID, 
+                t.EntryID, 
+                CASE 
+                    WHEN ISJSON(t.aijson) = 1 AND JSON_VALUE(t.aijson, '$.match_score') IS NOT NULL 
+                    AND ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1
+                    THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
+                    ELSE -1
+                END AS match_score,
+                CASE 
+                    WHEN ISJSON(t.aijson) = 1 AND JSON_VALUE(t.aijson, '$.linesheet_score') IS NOT NULL 
+                    AND ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1
+                    THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
+                    ELSE -1
+                END AS linesheet_score
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE r.FileID = ?
+        ),
+        RankedResults AS (
+            SELECT 
+                ResultID,
+                EntryID,
+                ROW_NUMBER() OVER (
+                    PARTITION BY EntryID 
+                    ORDER BY match_score DESC, linesheet_score DESC
+                ) AS rank
+            FROM CleanedResults
         )
         UPDATE utb_ImageScraperResult
         SET SortOrder = rr.rank
         FROM utb_ImageScraperResult t
-        INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID
-        WHERE rr.FileID = ?;
+        INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID;
         """
-
-        cursor.execute(update_sort_order_query, (file_id, file_id))
-        connection.commit()
-
-        logging.info(f"✅ Successfully updated sort order for FileID: {file_id}")
-
-        # Step 3: Return updated sort order
+        
+        try:
+            cursor.execute(safe_sort_query, (file_id,))
+            connection.commit()
+            logging.info(f"✅ Successfully updated sort order")
+        except Exception as sort_error:
+            logging.error(f"Error updating sort order: {sort_error}")
+            # If the main query fails, try with a basic ranking approach
+            try:
+                basic_sort_query = """
+                WITH BasicRank AS (
+                    SELECT 
+                        t.ResultID, 
+                        t.EntryID,
+                        ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS rank
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                    WHERE r.FileID = ?
+                )
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = br.rank
+                FROM utb_ImageScraperResult t
+                INNER JOIN BasicRank br ON t.ResultID = br.ResultID;
+                """
+                cursor.execute(basic_sort_query, (file_id,))
+                connection.commit()
+                logging.info(f"✅ Updated sort order using basic ranking as fallback")
+            except Exception as basic_sort_error:
+                logging.error(f"Even basic sort update failed: {basic_sort_error}")
+                return None
+        
+        # Step 5: Return a sample of the sort order
         fetch_sort_order_query = """
-            SELECT ResultID, EntryID, SortOrder 
-            FROM utb_ImageScraperResult 
-            WHERE ResultID IN (SELECT ResultID FROM utb_ImageScraperRecords WHERE FileID = ?)
+            SELECT TOP 100 ResultID, EntryID, SortOrder 
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE r.FileID = ?
             ORDER BY EntryID, SortOrder;
         """
+        
         cursor.execute(fetch_sort_order_query, (file_id,))
         results = cursor.fetchall()
 
-        sort_order_list = [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
-
+        sort_order_list = [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2] if row[2] is not None else 999} for row in results]
+        
+        total_time = time.time() - start_time
+        logging.info(f"🎉 Sort order update completed in {total_time:.2f} seconds")
+        
         return sort_order_list
 
     except Exception as e:
-        logging.error(f"❌ Error updating sort order: {e}")
-        import traceback
+        total_time = time.time() - start_time
+        logging.error(f"❌ Error during sort order update after {total_time:.2f} seconds: {e}")
+    
         logging.error(traceback.format_exc())
         return None
 
     finally:
-        cursor.close()
-        connection.close()
-
-
-
+        if 'cursor' in locals():
+            cursor.close()
+        if 'connection' in locals():
+            connection.close()
 
 
 def update_file_generate_complete(file_id):
@@ -2483,6 +2642,177 @@ def process_image_batch(payload):
 #################################################
 # API ROUTES
 #################################################
+@app.get("/check_json_status/{file_id}")
+async def check_json_status(file_id: str):
+    """
+    API endpoint to check the JSON data quality status for a specific file.
+    
+    Args:
+        file_id (str): FileID to check
+        
+    Returns:
+        dict: Information about JSON data quality
+    """
+    try:
+        connection = pyodbc.connect(conn_str)
+        cursor = connection.cursor()
+        
+        # Try to get a count of all records for this file
+        total_query = """
+            SELECT COUNT(*) 
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE r.FileID = ?
+        """
+        cursor.execute(total_query, (file_id,))
+        total_count = cursor.fetchone()[0]
+        
+        if total_count == 0:
+            cursor.close()
+            connection.close()
+            return {
+                "file_id": file_id,
+                "status": "no_records",
+                "message": "No records found for this file ID"
+            }
+        
+        # Try to get counts of potential JSON issues, broken down by type
+        # Use a more defensive approach with try/except for each query
+        issues_data = {}
+        
+        try:
+            # Check for NULL aijson
+            null_query = """
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ? AND t.aijson IS NULL
+            """
+            cursor.execute(null_query, (file_id,))
+            issues_data["null_json"] = cursor.fetchone()[0]
+        except Exception as e:
+            logger.warning(f"Error in null_json query: {e}")
+            issues_data["null_json"] = "error"
+        
+        try:
+            # Check for empty aijson
+            empty_query = """
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ? AND t.aijson = ''
+            """
+            cursor.execute(empty_query, (file_id,))
+            issues_data["empty_json"] = cursor.fetchone()[0]
+        except Exception as e:
+            logger.warning(f"Error in empty_json query: {e}")
+            issues_data["empty_json"] = "error"
+        
+        try:
+            # Check for invalid JSON format
+            invalid_format_query = """
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ? AND t.aijson IS NOT NULL AND ISJSON(t.aijson) = 0
+            """
+            cursor.execute(invalid_format_query, (file_id,))
+            issues_data["invalid_format"] = cursor.fetchone()[0]
+        except Exception as e:
+            logger.warning(f"Error in invalid_format query: {e}")
+            issues_data["invalid_format"] = "error"
+        
+        try:
+            # Check for missing or invalid match_score
+            invalid_match_score_query = """
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ? 
+                AND t.aijson IS NOT NULL 
+                AND ISJSON(t.aijson) = 1
+                AND (
+                    JSON_VALUE(t.aijson, '$.match_score') IS NULL
+                    OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
+                    OR ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 0
+                )
+            """
+            cursor.execute(invalid_match_score_query, (file_id,))
+            issues_data["invalid_match_score"] = cursor.fetchone()[0]
+        except Exception as e:
+            logger.warning(f"Error in invalid_match_score query: {e}")
+            issues_data["invalid_match_score"] = "error"
+        
+        try:
+            # Check for missing or invalid linesheet_score
+            invalid_linesheet_score_query = """
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ? 
+                AND t.aijson IS NOT NULL 
+                AND ISJSON(t.aijson) = 1
+                AND (
+                    JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL
+                    OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
+                    OR ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 0
+                )
+            """
+            cursor.execute(invalid_linesheet_score_query, (file_id,))
+            issues_data["invalid_linesheet_score"] = cursor.fetchone()[0]
+        except Exception as e:
+            logger.warning(f"Error in invalid_linesheet_score query: {e}")
+            issues_data["invalid_linesheet_score"] = "error"
+        
+        # Calculate total issues (considering that some records might have multiple issues)
+        total_issues = 0
+        for key, value in issues_data.items():
+            if isinstance(value, int):
+                total_issues += value
+        
+        # Get a sample of problematic records for debugging
+        sample_query = """
+            SELECT TOP 5 t.ResultID, t.aijson
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE r.FileID = ? AND (
+                t.aijson IS NULL
+                OR t.aijson = ''
+                OR ISJSON(t.aijson) = 0
+            )
+        """
+        
+        try:
+            cursor.execute(sample_query, (file_id,))
+            samples = cursor.fetchall()
+            sample_data = [{"ResultID": row[0], "aijson_prefix": str(row[1])[:100] if row[1] else None} for row in samples]
+        except Exception as e:
+            logger.warning(f"Error getting sample data: {e}")
+            sample_data = [{"error": str(e)}]
+        
+        cursor.close()
+        connection.close()
+        
+        # Calculate percentage of records with issues
+        issue_percentage = (total_issues / total_count * 100) if total_count > 0 else 0
+        
+        return {
+            "file_id": file_id,
+            "total_records": total_count,
+            "total_issues": total_issues,
+            "issue_percentage": round(issue_percentage, 2),
+            "status": "needs_fixing" if issue_percentage > 0 else "healthy",
+            "issue_breakdown": issues_data,
+            "sample_issues": sample_data
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking JSON status: {e}")
+        return {
+            "file_id": file_id,
+            "status": "error",
+            "error_message": str(e)
+        }
 @app.post("/update_sort_llama/")
 async def api_update_sort(background_tasks: BackgroundTasks, file_id_db: str):
     """
@@ -2520,7 +2850,155 @@ async def api_update_sort(background_tasks: BackgroundTasks, file_id_db: str):
     except Exception as e:
         logger.error(f"Error setting up sort order update: {e}")
         return {"error": f"An error occurred: {str(e)}"}
-
+@app.post("/fix_json_data/")
+async def fix_json_data(background_tasks: BackgroundTasks, file_id: str = None, limit: int = 1000):
+    """
+    API endpoint to fix invalid JSON data in the database.
+    Can target a specific file_id or scan the entire database.
+    
+    Args:
+        background_tasks: FastAPI background tasks
+        file_id (str, optional): Specific FileID to fix, or None for all files
+        limit (int, optional): Maximum number of records to process
+        
+    Returns:
+        dict: Status information about the fix operation
+    """
+    try:
+        logger.info(f"Received request to fix JSON data" + (f" for FileID: {file_id}" if file_id else " across all files"))
+        
+        def background_fix_json():
+            try:
+                connection = pyodbc.connect(conn_str)
+                cursor = connection.cursor()
+                
+                # Build the query based on whether a file_id was provided
+                if file_id:
+                    query = """
+                        SELECT TOP ? t.ResultID, t.aijson 
+                        FROM utb_ImageScraperResult t
+                        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                        WHERE r.FileID = ? AND (
+                            t.aijson IS NULL
+                            OR ISJSON(t.aijson) = 0 
+                            OR t.aijson = ''
+                            OR LEFT(t.aijson, 1) = '.'
+                            OR LEFT(t.aijson, 1) = ','
+                            OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
+                            OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
+                        )
+                    """
+                    try:
+                        cursor.execute(query, (limit, file_id))
+                    except Exception as e:
+                        logger.warning(f"Error in complex query: {e}, falling back to simpler query")
+                        # Fallback to simpler query if JSON validation fails
+                        query = """
+                            SELECT TOP ? t.ResultID, t.aijson 
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                            WHERE r.FileID = ?
+                        """
+                        cursor.execute(query, (limit, file_id))
+                else:
+                    # When no file_id is provided, scan across all files
+                    query = """
+                        SELECT TOP ? t.ResultID, t.aijson 
+                        FROM utb_ImageScraperResult t
+                        WHERE 
+                            t.aijson IS NULL
+                            OR ISJSON(t.aijson) = 0 
+                            OR t.aijson = ''
+                            OR LEFT(t.aijson, 1) = '.'
+                            OR LEFT(t.aijson, 1) = ','
+                    """
+                    try:
+                        cursor.execute(query, (limit,))
+                    except Exception as e:
+                        logger.warning(f"Error in complex query: {e}, falling back to simpler query")
+                        # Fallback to simpler query
+                        query = "SELECT TOP ? ResultID, aijson FROM utb_ImageScraperResult"
+                        cursor.execute(query, (limit,))
+                
+                rows = cursor.fetchall()
+                logger.info(f"Found {len(rows)} records with potentially invalid JSON")
+                
+                # Process in batches to avoid overwhelming the database
+                batch_size = 100
+                total_fixed = 0
+                error_count = 0
+                
+                for i in range(0, len(rows), batch_size):
+                    batch = rows[i:i+batch_size]
+                    updates = []
+                    
+                    for row in batch:
+                        result_id, aijson_value = row
+                        try:
+                            cleaned_json = clean_json(aijson_value)
+                            if cleaned_json:
+                                updates.append((cleaned_json, result_id))
+                        except Exception as e:
+                            logger.error(f"Error cleaning JSON for ResultID {result_id}: {e}")
+                            error_count += 1
+                    
+                    if updates:
+                        try:
+                            cursor.executemany(
+                                "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
+                                updates
+                            )
+                            connection.commit()
+                            batch_fixed = len(updates)
+                            total_fixed += batch_fixed
+                            logger.info(f"Fixed {batch_fixed} records in batch (total: {total_fixed})")
+                        except Exception as batch_error:
+                            logger.error(f"Error in batch update: {batch_error}")
+                            # If batch fails, try individual updates
+                            for cleaned_json, result_id in updates:
+                                try:
+                                    cursor.execute(
+                                        "UPDATE utb_ImageScraperResult SET aijson = ? WHERE ResultID = ?",
+                                        (cleaned_json, result_id)
+                                    )
+                                    connection.commit()
+                                    total_fixed += 1
+                                except Exception as row_error:
+                                    logger.error(f"Error updating ResultID {result_id}: {row_error}")
+                                    error_count += 1
+                
+                logger.info(f"JSON fix operation completed. Fixed: {total_fixed}, Errors: {error_count}")
+                
+                cursor.close()
+                connection.close()
+                
+                return {
+                    "status": "completed",
+                    "records_processed": len(rows),
+                    "records_fixed": total_fixed,
+                    "errors": error_count
+                }
+                
+            except Exception as e:
+                logger.error(f"Error in background JSON fix: {e}")
+                logger.error(traceback.format_exc())
+                return {
+                    "status": "error",
+                    "error_message": str(e)
+                }
+        
+        # Run the fix operation in the background
+        background_tasks.add_task(background_fix_json)
+        
+        return {
+            "message": f"JSON fix operation initiated in background" + (f" for FileID: {file_id}" if file_id else " across all files"),
+            "status": "processing",
+            "limit": limit
+        }
+        
+    except Exception as e:
+        logger.error(f"Error initiating JSON fix operation: {e}")
+        return {"error": f"An error occurred: {str(e)}"}
 @app.post("/restart-failed-batch/")
 async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str):
     """
