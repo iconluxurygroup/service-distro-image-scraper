@@ -1360,7 +1360,7 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
     linesheet_analysis_prompt = """
     Evaluate the visual composition of this product image.
 
-    Score the image on these 4 criteria (provide a score for EACH):
+    Score the image on these 3 criteria (provide a score for EACH):
     1. Angle (max 50 points)
         50: Perfect straight-on side view, fully centered
         25: Front view or slight 3/4 angle
@@ -1371,9 +1371,9 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
         5: Complex, textured, or colorful background
     3. Composition (max 50 points)
         50: Clear product-only shot (no models, mannequins, hands, or props)
-        25: Product displayed with a model or mannequin but still fully visible
+        5: Product displayed with a model or mannequin but still fully visible
         5: Product is partially obstructed by hands, accessories, or other objects
-        1: Product is barely not in natural state, is opened - This describes a situation where the product has been slightly altered from its original state or packaging (perhaps opened for display).
+        1: Product is barely is opened or unzipped, folded, etc - This describes a situation where the product has been slightly altered from its original state or packaging (perhaps opened for display).
 
     IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
     {
