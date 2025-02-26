@@ -1,12 +1,11 @@
 from fastapi import FastAPI, BackgroundTasks
-import asyncio, os,threading,uuid,requests,openpyxl,uvicorn,shutil,mimetypes,time
-from icon_image_lib.utility import process_row  # Assuming this is correctly implemented
+import asyncio, os, threading, uuid, requests, openpyxl, uvicorn, shutil, mimetypes, time
 from openpyxl import load_workbook
 from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
-import datetime
+import datetime, re
 import boto3
 import logging
 from io import BytesIO
@@ -16,127 +15,201 @@ from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.util.retry import Retry
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition,Personalization,Cc,To
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition, Personalization, Cc, To
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import aiohttp
 from aiohttp import ClientTimeout
 from aiohttp_retry import RetryClient, ExponentialRetry
-#logging.basicConfig(level=logging.INFO)
-#logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-# Example usage
-logger.info("Informational message")
-logger.error("Error message")
-from sqlalchemy import create_engine
-import urllib.parse
+import pandas as pd
 import pyodbc
 from dotenv import load_dotenv
-import pandas as pd
-#load_dotenv()
-import base64,zlib
-from threading import Thread
-AWS_ACCESS_KEY_ID='AKIAZQ3DSIQ5BGLY355N'
-AWS_SECRET_ACCESS_KEY='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'
-REGION='us-east-2'
+import base64, zlib
+import json
+import ray
+import tldextract
+from collections import Counter
+from sqlalchemy import create_engine
+import urllib.parse  # For URL encoding/decoding
+import base64  # For base64 encoding/decoding
+import zlib  # Fo
+import traceback
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+# Environment settings
+AWS_ACCESS_KEY_ID = 'AKIAZQ3DSIQ5BGLY355N'
+AWS_SECRET_ACCESS_KEY = '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'
+REGION = 'us-east-2'
+MSSQLS_PWD = "Ftu5675FDG54hjhiuu$"
+global engine
+global conn
+# Database connection strings
+pwd_str = f"Pwd={MSSQLS_PWD};"
+conn_str = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
+conn = conn_str
+engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
+app = FastAPI(title="SuperScraper")
+
+#################################################
+# AWS S3 FUNCTIONS
+#################################################
 def get_spaces_client():
-    logger.info("Creating spaces client")
-    # session = boto3.session.Session()
-    # client = boto3.client(service_name='s3',
-    #                         region_name=os.getenv('REGION'),
-    #                         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    #                         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
-    client = boto3.client(service_name='s3',
-                            region_name=REGION,
-                            aws_access_key_id=AWS_ACCESS_KEY_ID,
-                            aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
-    logger.info("Spaces client created successfully")
-    return client
-
-def upload_file_to_space(file_src, save_as, is_public):
-    spaces_client = get_spaces_client()
-    space_name = 'iconluxurygroup-s3'  # Your space name
-
-    # if not content_type:
-    #     content_type_guess = mimetypes.guess_type(file_src)[0]
-    #     if not content_type_guess:
-    #         raise Exception("Content type could not be guessed. Please specify it directly.")
-    #     content_type = content_type_guess
-    spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
-    print(f"File uploaded successfully to {space_name}/{save_as}")
-    # Generate and return the public URL if the file is public
-    if is_public:
-        # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
-        upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
-        print(f"Public URL: {upload_url}")
-        return upload_url
-
-
-
-
-def send_email(to_emails, subject, download_url,jobId):
-    # Encode the URL if necessary (example shown, adjust as needed)
-    # from urllib.parse import quote
-    # download_url = quote(download_url, safe='')
-
-
-    html_content = f"""
-<html>
-<body>
-<div class="container">
-    <p>Your file is ready for download.</p>
-     <a href="{download_url}" class="download-button">Download File</a>
-
-    <p><br>Please use the link below to modify the file<br></p
-    <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
-    <br>  
+    """
+    Create an AWS S3 client for file storage.
     
-    <p>--</p>
-    <p>CMS:v1.1</p>
-</div>
-</body>
-</html>
-"""
-    message = Mail(
-        from_email='nik@iconluxurygroup.com',
-        subject=subject,
-        html_content=html_content
-    )
-    # # Read and encode the Excel file
-    # with open(excel_file_path, 'rb') as f:
-    #     excel_data = f.read()
-    # encoded_excel_data = b64encode(excel_data).decode()
-
-    # attachment = Attachment(
-    #     FileContent(encoded_excel_data),
-    #     FileName(excel_file_path.split('/')[-1]),
-    #     FileType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
-    #     Disposition('attachment')
-    # )
-    # message.attachment = attachment
-    
-    cc_recipient = 'nik@iconluxurygroup.com'
-    if to_emails == cc_recipient:
-        cc_recipient = 'notifications@popovtech.com'
-    
-    personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
-    personalization.add_to(To(to_emails))
-    message.add_personalization(personalization)
-    print("trying")
+    Returns:
+        boto3.client: AWS S3 client
+    """
     try:
-        #
+        logger.info("Creating S3 client")
+        client = boto3.client(
+            service_name='s3',
+            region_name=REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        )
+        logger.info("S3 client created successfully")
+        return client
+    except Exception as e:
+        logger.error(f"Error creating S3 client: {e}")
+        raise
+def upload_file_to_space(file_src, save_as, is_public):
+    """
+    Upload a file to AWS S3.
+    
+    Args:
+        file_src (str): Path to the file to upload
+        save_as (str): Name to save the file as in S3
+        is_public (bool): Whether the file should be publicly accessible
+        
+    Returns:
+        str: Public URL of the uploaded file if is_public is True
+    """
+    try:
+        spaces_client = get_spaces_client()
+        space_name = 'iconluxurygroup-s3'
+        
+        spaces_client.upload_file(
+            file_src, 
+            space_name,
+            save_as,
+            ExtraArgs={'ACL': 'public-read'} if is_public else {}
+        )
+        
+        logger.info(f"File uploaded successfully to {space_name}/{save_as}")
+        
+        # Generate and return the public URL if the file is public
+        if is_public:
+            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
+            logger.info(f"Public URL: {upload_url}")
+            return upload_url
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error uploading file to S3: {e}")
+        raise
+
+#################################################
+# EMAIL FUNCTIONS
+#################################################
+
+def send_email(to_emails, subject, download_url, jobId):
+    """
+    Send an email notification with file download link.
+    
+    Args:
+        to_emails (str): Email address to send to
+        subject (str): Email subject
+        download_url (str): URL to download the file
+        jobId (str): Job ID for editing the file
+    """
+    try:
+        html_content = f"""
+        <html>
+        <body>
+        <div class="container">
+            <p>Your file is ready for download.</p>
+             <a href="{download_url}" class="download-button">Download File</a>
+
+            <p><br>Please use the link below to modify the file<br></p
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
+            <br>  
+            
+            <p>--</p>
+            <p>CMS:v1.1</p>
+        </div>
+        </body>
+        </html>
+        """
+        
+        message = Mail(
+            from_email='nik@iconluxurygroup.com',
+            subject=subject,
+            html_content=html_content
+        )
+        
+        cc_recipient = 'nik@iconluxurygroup.com'
+        if to_emails == cc_recipient:
+            cc_recipient = 'notifications@popovtech.com'
+        
+        personalization = Personalization()
+        personalization.add_cc(Cc(cc_recipient))
+        personalization.add_to(To(to_emails))
+        message.add_personalization(personalization)
+        
+        logger.info(f"Sending email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
+        
         sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
         response = sg.send(message)
-        print(response.status_code)
-        print(response.body)
-        print(response.headers)
-    except Exception as e:
-        print(e)
-        #raise
         
+        logger.info(f"Email sent successfully: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+
+def send_message_email(to_emails, subject, message):
+    """
+    Send a simple message email.
+    
+    Args:
+        to_emails (str): Email address to send to
+        subject (str): Email subject
+        message (str): Email message content
+    """
+    try:
+        message_with_breaks = message.replace("\n", "<br>")
+
+        html_content = f"""
+        <html>
+        <body>
+        <div class="container">
+            <p>Message details:<br>{message_with_breaks}</p>
+            <p>CMS:v1</p>
+        </div>
+        </body>
+        </html>
+        """
+        
+        message_obj = Mail(
+            from_email='distrotool@iconluxurygroup.com',
+            subject=subject,
+            html_content=html_content
+        )
+        
+        cc_recipient = 'notifications@popovtech.com'
+        personalization = Personalization()
+        personalization.add_cc(Cc(cc_recipient))
+        personalization.add_to(To(to_emails))
+        message_obj.add_personalization(personalization)
+        
+        logger.info(f"Sending message email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
+        
+        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+        response = sg.send(message_obj)
+        
+        logger.info(f"Message email sent successfully: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error sending message email: {e}")
 def send_message_email(to_emails, subject,message):
     message_with_breaks = message.replace("\n", "<br>")
 
@@ -165,11 +238,11 @@ def send_message_email(to_emails, subject,message):
     try:
         sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
         response = sg.send(message)
-        print(response.status_code)
-        print(response.body)
-        print(response.headers)
+        logger.info(response.status_code)
+        logger.info(response.body)
+        logger.info(response.headers)
     except Exception as e:
-        print(e)
+        logger.info(e)
         #raise
         
         
@@ -189,13 +262,7 @@ async def cleanup_temp_dirs(directories):
     for dir_path in directories:
         await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
 
-pwd_value = str(os.environ.get('MSSQLS_PWD'))
-pwd_str =f"Pwd={pwd_value};"
-global conn
-conn = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
-global engine
-engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
-app = FastAPI(title="SuperScraper")
+
 def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
@@ -213,7 +280,7 @@ def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com
     return file_id
 def get_records_to_search(file_id,engine):
     sql_query = f"Select EntryID, ProductModel as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null UNION ALL Select EntryID, ProductModel + ' '  + ProductBrand as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null Order by 1"
-    print(sql_query)
+    logger.info(sql_query)
     df = pd.read_sql_query(sql_query, con=engine)
     return df
 
@@ -233,7 +300,7 @@ def load_payload_db(rows, file_id):
     # Insert new column 'FileID' at the beginning with all values set to file_id
     df.insert(0, 'FileID', file_id)
     df = df.drop(columns=['imageValue'], axis=1)
-    print(df)
+    logger.info(df)
     # Load DataFrame into SQL database
     df.to_sql(name='utb_ImageScraperRecords', con=engine, index=False, if_exists='append')
 
@@ -249,10 +316,10 @@ def get_endpoint():
      connection.close()
      if endpoint_url:
          (endpoint,) = endpoint_url
-         print(endpoint_url)
-         print(datetime.datetime.now())
+         logger.info(endpoint_url)
+         logger.info(datetime.datetime.now())
      else:
-         print("No EndpointURL")
+         logger.info("No EndpointURL")
          endpoint = "No EndpointURL"
      return endpoint
 def remove_endpoint(endpoint):
@@ -273,13 +340,13 @@ def unpack_content(encoded_content):
     return None
 def process_search_row(search_string,endpoint,entry_id):
         search_url = f"{endpoint}?query={search_string}"
-        print(search_url)
+        logger.info(search_url)
 
         try:
             response = requests.get(search_url, timeout=60)
-            print(response.status_code)
+            logger.info(response.status_code)
             if response.status_code != 200 or response.json().get('body') is None:
-                print('trying again 1')
+                logger.info('trying again 1')
                 remove_endpoint(endpoint)
                 n_endpoint = get_endpoint()
                 return process_search_row(search_string,n_endpoint,entry_id)  # Add return here
@@ -288,27 +355,27 @@ def process_search_row(search_string,endpoint,entry_id):
                 result = response_json.get('body', None)
                 if result:
                     unpacked_html = unpack_content(result)
-                    print(len(unpacked_html))
+                    logger.info(len(unpacked_html))
                     parsed_data = GP(unpacked_html)
                     if parsed_data is None:
-                        print('trying again 2')
+                        logger.info('trying again 2')
                         remove_endpoint(endpoint)
                         n_endpoint = get_endpoint()
                         return process_search_row(search_string,n_endpoint,entry_id)  # Add return here
                     if type(parsed_data)==list:
                         if parsed_data[0][0] == 'No start_tag or end_tag':
-                            print('trying again 3')
+                            logger.info('trying again 3')
                             remove_endpoint(endpoint)
                             n_endpoint = get_endpoint()
                             return process_search_row(search_string,n_endpoint,entry_id)
                     else:
-                        print('parsed data!')
+                        logger.info('parsed data!')
                         image_url = parsed_data[0]
                         image_desc = parsed_data[1]
                         image_source = parsed_data[2]
                         image_thumb = parsed_data[3]
 
-                        print(
+                        logger.info(
                             f'Image URL: {type(image_url)} {image_url}\nImage Desc:  {type(image_desc)} {image_desc}\nImage Source:{type(image_source)}  {image_source}')
                         if image_url:
                             df = pd.DataFrame({
@@ -337,16 +404,16 @@ def process_search_row(search_string,endpoint,entry_id):
                                     # Close the connection
                                     connection.close()
                         else:
-                            print('trying again 4')
+                            logger.info('trying again 4')
 
                             remove_endpoint(endpoint)
                             n_endpoint = get_endpoint()
                             return process_search_row(search_string,n_endpoint,entry_id)
         except requests.RequestException as e:
-            print('trying again 5')
+            logger.info('trying again 5')
             remove_endpoint(endpoint)
             n_endpoint = get_endpoint()
-            print(f"Error making request: {e}\nTrying Again: {n_endpoint}")
+            logger.info(f"Error making request: {e}\nTrying Again: {n_endpoint}")
             return process_search_row(search_string,n_endpoint,entry_id)
         
         
@@ -378,7 +445,7 @@ def get_file_location(file_id):
     connection.close()
     if file_location_url:
         (file_location_url,) = file_location_url
-        print(file_location_url)
+        logger.info(file_location_url)
     else:
 
         file_location_url = "No File Found"
@@ -397,32 +464,37 @@ def update_file_location_complete(file_id,file_location):
     connection.close()
     
 def get_images_excel_db(file_id):
-    update_file_start_query = f"update utb_ImageScraperFiles set CreateFileStartTime = getdate() Where ID = {file_id}"
+    update_file_start_query = f"UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = {file_id}"
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
-
-    # Execute the update query
     cursor.execute(update_file_start_query)
-
-    # Commit the changes
     connection.commit()
     connection.close()
 
-    query_get_images_to_excel = """Select s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail from utb_ImageScraperFiles f
-inner join utb_ImageScraperRecords s on s.FileID = f.ID 
-inner join utb_ImageScraperResult r on r.EntryID = s.EntryID 
-Where f.ID = $FileID$ and r.SortOrder = 1
-Order by s.ExcelRowID"""
+    query_get_images_to_excel = """
+    SELECT s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail 
+    FROM utb_ImageScraperFiles f
+    INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
+    INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
+    WHERE f.ID = ? AND r.SortOrder = 1
+    ORDER BY s.ExcelRowID
+    """
 
-    query_get_images_to_excel = query_get_images_to_excel.replace('$FileID$',str(file_id))
-    print(query_get_images_to_excel)
-    # Close the connection
+    logger.info(f"🔍 Query: {query_get_images_to_excel}")
+    logger.info(f"🔍 Params: {file_id} (Type: {type(file_id)})")
+    df = pd.read_sql_query(query_get_images_to_excel, con=engine, params=(file_id,))
 
-    df = pd.read_sql_query(query_get_images_to_excel, con=engine)
+
+    
+    # **🔹 Add Logging to Identify Issues**
+    logger.info(f"⚠️ Retrieved {len(df)} rows from the database")
+    logger.info(df.head())  # Print first few rows to see if there are any `None` values
+
     return df
 
+
 def update_sort_order(file_id):
-    print('executing update sort order')
+    logger.info('executing update sort order')
     query = """with toupdate as (
 select t.*,
 row_number() over (partition by t.EntryID order by t.ResultID) as seqnum
@@ -461,7 +533,7 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
 
     # Close the connection
     connection.close()
-    print('completed update sort order')
+    logger.info('completed update sort order')
 def get_send_to_email(file_id_db):
     
     query = f"Select UserEmail from utb_ImageScraperFiles where ID = {file_id_db}"
@@ -478,7 +550,7 @@ def get_send_to_email(file_id_db):
     connection.close()
     if send_to_email:
         (send_to_email,) = send_to_email
-        print(send_to_email)
+        logger.info(send_to_email)
     else:
 
         send_to_email = "No Email Found"
@@ -493,12 +565,13 @@ async def generate_download_file(file_id):
     selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
     selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe,selected_images_df )
     
-    print(selected_images_df.head())
-    print(selected_image_list)
+    logger.info(selected_images_df.head())
+    logger.info(selected_image_list)
     
     provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location,file_id )
     decoded_string = urllib.parse.unquote(provided_file_path)
-    print(provided_file_path,' ',decoded_string)
+    logger.info("{} {}".format(provided_file_path, decoded_string))
+
     file_name = provided_file_path.split('/')[-1]
     temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
     local_filename = os.path.join(temp_excel_dir, file_name)
@@ -513,10 +586,10 @@ async def generate_download_file(file_id):
         
     logger.info("Writing images to Excel")
     failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-    print(f"failed rows: {failed_rows}")
+    logger.info(f"failed rows: {failed_rows}")
     #if failed_rows != []:
     if failed_img_urls:
-        print(failed_img_urls)
+        logger.info(failed_img_urls)
         #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
         fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
         logger.error(f"Failed to write images for rows: {failed_rows}")
@@ -531,14 +604,14 @@ async def generate_download_file(file_id):
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
   
     subject_line = f"{file_name} Job Notification"
-    print(subject_line)
+    logger.info(subject_line)
     
     
     
     
     send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id)
     await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email,subject_line,public_url,file_id)
-    print('Sending email:\n',send_to_email)
+    logger.info('Sending email:\n',send_to_email)
 
     #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, 'Your File Is Ready', public_url, local_filename)
     if os.listdir(temp_images_dir) !=[]:
@@ -566,14 +639,14 @@ async def generate_download_file(file_id):
 #     send_to_email = payload.get('sendToEmail', 'nik@iconluxurygroup.com')
 #     preferred_image_method = payload.get('preferredImageMethod', 'append')
 #     file_id_db = insert_file_db(file_name, provided_file_path)
-#     print(file_id_db)
+#     logger.info(file_id_db)
 #     load_payload_db(rows, file_id_db)
 #     search_df = get_records_to_search(file_id_db, engine)
-#     print(search_df)
+#     logger.info(search_df)
 #
 #     semaphore = asyncio.Semaphore(int(os.environ.get('MAX_THREAD')))  # Limit concurrent tasks to avoid overloading
 #     loop = asyncio.get_running_loop()
-#     print(rows)
+#     logger.info(rows)
 #     try:
 #     #    # Create a temporary directory to save downloaded images
 #     #
@@ -588,7 +661,7 @@ async def generate_download_file(file_id):
 #          #if any(isinstance(result, Exception) for result in results):
 #              #logger.error("Error occurred during image processing.")
 #              #return {"error": "An error occurred during processing."}
-#          #print(results)
+#          #logger.info(results)
 #
 #          # logger.info("Downloading images")
 #          #
@@ -596,7 +669,7 @@ async def generate_download_file(file_id):
 #          # clean_results = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_downloadV2, results)
 #          # if clean_results == []:
 #          #     send_message_email(send_to_email,f'Started {file_name}','No images found\nPlease make sure correct column values are provided\nIf api is disabled this reponse will be sent')
-#          # print(clean_results)
+#          # logger.info(clean_results)
 #          # logger.info("clean_results: {}".format(clean_results))
 #
 #
@@ -616,10 +689,10 @@ async def generate_download_file(file_id):
 #
 #     #     logger.info("Writing images to Excel")
 #     #     failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-#     #     print(f"failed rows: {failed_rows}")
+#     #     logger.info(f"failed rows: {failed_rows}")
 #     #     #if failed_rows != []:
 #     #     if failed_img_urls:
-#     #         print(failed_img_urls)
+#     #         logger.info(failed_img_urls)
 #     #         #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
 #     #         fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
 #     #         logger.error(f"Failed to write images for rows: {failed_rows}")
@@ -656,7 +729,7 @@ def get_lm_products(file_id):
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
     query = f"exec usp_ImageScrapergetMatchFromRetail {file_id}"
-    print(query)
+    logger.info(query)
     # Execute the update query
     cursor.execute(query)
 
@@ -666,20 +739,20 @@ def get_lm_products(file_id):
     
 def process_restart_batch(file_id_db):
     search_df = get_records_to_search(file_id_db, engine)
-    print(search_df)
+    logger.info(search_df)
     search_list=list(search_df.T.to_dict().values())
     ####
     start = datetime.datetime.now()
-    print(f"Start of whole process: {start}")
+    logger.info(f"Start of whole process: {start}")
     BATCH_SIZE=100
     batches=[search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-    print(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+    logger.info(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
     futures=[process_batch.remote(batch) for batch in batches]
     ray.get(futures)
     end = datetime.datetime.now()
     
     
-    print("executing generate in restart")
+    logger.info("executing generate in restart")
     
     
     
@@ -689,8 +762,8 @@ def process_restart_batch(file_id_db):
     
 
     
-    print(f"End of whole process: {end}")
-    print(f"It took {end - start} to complete")
+    logger.info(f"End of whole process: {end}")
+    logger.info(f"It took {end - start} to complete")
     #####
 
     
@@ -701,32 +774,32 @@ def process_image_batch(payload: dict):
     logger.info("Received request to process image batch")
     file_name = provided_file_path.split('/')[-1]
     send_to_email = payload.get('sendToEmail', 'nik@iconluxurygroup.com')
-    print(f"Send To: {send_to_email}")
+    logger.info(f"Send To: {send_to_email}")
     preferred_image_method = payload.get('preferredImageMethod', 'append')
     file_id_db = insert_file_db(file_name, provided_file_path,send_to_email)
-    print(file_id_db)
+    logger.info(file_id_db)
     load_payload_db(rows, file_id_db)
     get_lm_products(file_id_db)
     search_df = get_records_to_search(file_id_db, engine)
-    print(search_df)
+    logger.info(search_df)
     search_list=list(search_df.T.to_dict().values())
     ####
     start = datetime.datetime.now()
-    print(f"Start of whole process: {start}")
+    logger.info(f"Start of whole process: {start}")
     BATCH_SIZE=100
     batches=[search_list[i:i+BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-    print(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+    logger.info(f"Batches: {batches} CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
     futures=[process_batch.remote(batch) for batch in batches]
     ray.get(futures)
     end = datetime.datetime.now()
-    print("executing generate")
+    logger.info("executing generate")
 
     #####
     update_sort_order(file_id_db)
     
     asyncio.run(generate_download_file(file_id_db))
-    print(f"End of whole process: {end}")
-    print(f"It took {end - start} to complete")
+    logger.info(f"End of whole process: {end}")
+    logger.info(f"It took {end - start} to complete")
     
 @app.post("/restart-failed-batch/")
 async def process_restart(background_tasks: BackgroundTasks, file_id_db: str):
@@ -752,14 +825,14 @@ async def process_file(background_tasks: BackgroundTasks, file_id: int):
 def process_db_row(row):
     entry_id = row['EntryID']
     searchString = row['SearchString']
-    print(f"Entry Id: {entry_id}\nSearch String {searchString}")
+    logger.info(f"Entry Id: {entry_id}\nSearch String {searchString}")
     endpoint = get_endpoint()
     process_search_row(searchString, endpoint, entry_id)
 @ray.remote
 def process_batch(batch):
     # Process each item in the batch in parallel
     futures = [process_db_row.remote(data) for data in batch]
-    print(futures)
+    logger.info(futures)
     results = ray.get(futures)
     return results
 
@@ -822,7 +895,7 @@ def prepare_images_for_download_dataframe(df):
     images_to_download = []
 
     for row in df.itertuples(index=False,name=None):
-        print(row)
+        logger.info(row)
         if row[1] != 'No google image results found':
             images_to_download.append(row)
 
@@ -852,18 +925,51 @@ def prepare_images_for_download(results,send_to_email):
 import tldextract
 from collections import Counter
 def extract_domains_and_counts(data):
-    """Extract domains from URLs and count their occurrences."""
-    domains = [tldextract.extract(url).registered_domain for _, url,thumb in data]
-    domain_counts = Counter(domains)
-    return domain_counts
+    """Extract domains from URLs and count occurrences."""
+    valid_data = []
+
+    for item in data:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            logger.info(f"⚠️ Skipping malformed entry: {item}")
+            continue
+        
+        url = item[1]  # Extract URL
+        
+        if not url or not isinstance(url, str) or not url.strip():
+            logger.info(f"⚠️ Skipping invalid URL: {item}")
+            continue
+
+        valid_data.append(url)
+
+    # **🔹 Add Debugging for Unexpected Cases**
+    logger.info(f"✅ Valid URLs count: {len(valid_data)}")
+
+    # Extract domains safely
+    domains = []
+    for url in valid_data:
+        try:
+            extracted = tldextract.extract(url)
+            domain = extracted.registered_domain
+
+            if domain:  # Ensure domain extraction is valid
+                domains.append(domain)
+            else:
+                logger.info(f"⚠️ Unable to extract domain from URL: {url}")  
+
+        except Exception as e:
+            logger.info(f"❌ Error extracting domain from {url}: {e}")  
+
+    return Counter(domains)
+
+
 
 def analyze_data(data):
     domain_counts = extract_domains_and_counts(data)
     logger.info("Domain counts: %s", domain_counts)
     unique_domains = len(domain_counts)
-    print(f"Unique Domain Len: {unique_domains}")
+    logger.info(f"Unique Domain Len: {unique_domains}")
     pool_size = min(500, max(10, unique_domains * 2))  # Adjust as needed
-    print(f"Pool size: {pool_size}")
+    logger.info(f"Pool size: {pool_size}")
     return pool_size
 def build_headers(url):
     domain_info = tldextract.extract(url)
@@ -879,7 +985,7 @@ def build_headers(url):
     }
     #if domain:
         #headers["Referer"] = f"https://{domain}/"
-        #print(f"Headers: {headers['Referer']}")
+        #logger.info(f"Headers: {headers['Referer']}")
     # Additional dynamic header settings can go here.
     # Example for Referer (if applicable):
     # headers["Referer"] = f"https://{domain}/"
@@ -899,11 +1005,17 @@ def try_convert_to_png(image_path, new_path, image_name):
         return False
 async def download_all_images(data, save_path):
     failed_downloads = []
-    pool_size = analyze_data(data)  # Placeholder for your actual data analysis function
+    
+    # ✅ **Filter Out `None` URLs**
+    valid_data = [item for item in data if item[1] and isinstance(item[1], str) and item[1].strip()]
+    
+    if not valid_data:
+        logger.info("❌ No valid image URLs found. Exiting early!")
+        return failed_downloads
 
-    logger.info(f"Setting up session with pool size: {pool_size}")
+    pool_size = analyze_data(valid_data)
+    logger.info(f"✅ Pool Size: {pool_size} | Processing {len(valid_data)} images")
 
-    # Setup async session with retry policy
     timeout = ClientTimeout(total=60)
     retry_options = ExponentialRetry(attempts=3, start_timeout=3)
     connector = aiohttp.TCPConnector(ssl=False)
@@ -913,15 +1025,16 @@ async def download_all_images(data, save_path):
 
         logger.info("Scheduling image downloads")
         tasks = [
-            image_download(semaphore, str(item[1]),str(item[2]), str(item[0]), save_path, session)
-            for index, item in enumerate(data, start=1)
+            image_download(semaphore, str(item[1]), str(item[2]), str(item[0]), save_path, session, index)
+            for index, item in enumerate(valid_data, start=1)
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        logger.info("Processing download results")
         for index, result in enumerate(results):
             if isinstance(result, Exception):
+                logger.error(f"❌ Download error: {result}")
+                failed_downloads.append((valid_data[index][1], valid_data[index][0]))
                 #THUMBNAIL DOWNLOAD ON FAIL
                 print(data[index])
                 logger.error(f"Download task generated an exception: {result}")
@@ -935,7 +1048,6 @@ async def download_all_images(data, save_path):
                 logger.info(f"Download task completed with result: {result}")
                 if result is False:
                     failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
-
     return failed_downloads
 
 
@@ -989,8 +1101,7 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
         except TimeoutError as exc:
             # Handle the timeout specifically
             logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
-            print('timeout error inside the downlaod function')
-            print(exc)
+            logger.info('timeout error inside the downlaod function ',str(exc))
             # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
             # return False
             return False
@@ -1103,7 +1214,7 @@ def write_excel_image(local_filename, temp_dir,preferred_image_method):
     # Load the workbook and select the active worksheet
     wb = load_workbook(local_filename)
     ws = wb.active
-    print(os.listdir(temp_dir))
+    logger.info(os.listdir(temp_dir))
     
     # Iterate through each file in the temporary directory
     for image_file in os.listdir(temp_dir):
@@ -1146,7 +1257,7 @@ def write_excel_image(local_filename, temp_dir,preferred_image_method):
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server")
-    print(os.environ)
+    logger.info(os.environ)
     #uvicorn.run("main:app", port=8000, host='0.0.0.0', reload=True)
     uvicorn.run("main:app", port=8080, host='0.0.0.0')
     if ray.is_initialized():
