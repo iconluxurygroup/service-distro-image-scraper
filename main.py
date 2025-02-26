@@ -842,31 +842,25 @@ def prepare_images_for_download(results,send_to_email):
     return images_to_download
 import tldextract
 from collections import Counter
-
-import tldextract
-from collections import Counter
-
-import tldextract
-from collections import Counter
-
 def extract_domains_and_counts(data):
     """Extract domains from URLs and count occurrences."""
     valid_data = []
 
     for item in data:
-        # Ensure item has at least two elements (id, url)
         if not isinstance(item, (list, tuple)) or len(item) < 2:
-            print(f"⚠️ Skipping malformed entry (not a tuple/list or too short): {item}")
+            print(f"⚠️ Skipping malformed entry: {item}")
             continue
         
         url = item[1]  # Extract URL
         
-        # Ensure URL is a valid string
         if not url or not isinstance(url, str) or not url.strip():
             print(f"⚠️ Skipping invalid URL: {item}")
             continue
 
         valid_data.append(url)
+
+    # **🔹 Add Debugging for Unexpected Cases**
+    print(f"✅ Valid URLs count: {len(valid_data)}")
 
     # Extract domains safely
     domains = []
@@ -878,12 +872,12 @@ def extract_domains_and_counts(data):
             if domain:  # Ensure domain extraction is valid
                 domains.append(domain)
             else:
-                print(f"⚠️ Unable to extract domain from URL: {url}")  # Log failed extractions
+                print(f"⚠️ Unable to extract domain from URL: {url}")  
+
         except Exception as e:
-            print(f"❌ Error extracting domain from {url}: {e}")  # Debugging any extraction issues
-    
-    domain_counts = Counter(domains)
-    return domain_counts
+            print(f"❌ Error extracting domain from {url}: {e}")  
+
+    return Counter(domains)
 
 
 
@@ -929,11 +923,17 @@ def try_convert_to_png(image_path, new_path, image_name):
         return False
 async def download_all_images(data, save_path):
     failed_downloads = []
-    pool_size = analyze_data(data)  # Placeholder for your actual data analysis function
+    
+    # ✅ **Filter Out `None` URLs**
+    valid_data = [item for item in data if item[1] and isinstance(item[1], str) and item[1].strip()]
+    
+    if not valid_data:
+        print("❌ No valid image URLs found. Exiting early!")
+        return failed_downloads
 
-    logger.info(f"Setting up session with pool size: {pool_size}")
+    pool_size = analyze_data(valid_data)
+    print(f"✅ Pool Size: {pool_size} | Processing {len(valid_data)} images")
 
-    # Setup async session with retry policy
     timeout = ClientTimeout(total=60)
     retry_options = ExponentialRetry(attempts=3, start_timeout=3)
     connector = aiohttp.TCPConnector(ssl=False)
@@ -943,28 +943,16 @@ async def download_all_images(data, save_path):
 
         logger.info("Scheduling image downloads")
         tasks = [
-            image_download(semaphore, str(item[1]),str(item[2]), str(item[0]), save_path, session, index)
-            for index, item in enumerate(data, start=1)
+            image_download(semaphore, str(item[1]), str(item[2]), str(item[0]), save_path, session, index)
+            for index, item in enumerate(valid_data, start=1)
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        logger.info("Processing download results")
         for index, result in enumerate(results):
             if isinstance(result, Exception):
-                #THUMBNAIL DOWNLOAD ON FAIL
-                print(data[index])
-                logger.error(f"Download task generated an exception: {result}")
-                logger.error(f"Trying again with :{str(data[index][2])}")
-                print(f"Download task generated an exception: {result}")
-                print(f"Trying again with :{str(data[index][2])}")
-                await thumbnail_download(semaphore, str(data[index][2]),str(data[index][0]), save_path, session, fallback_formats=None)
-                #THUMBNAIL DOWNLOAD ON FAIL
-                failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
-            else:
-                logger.info(f"Download task completed with result: {result}")
-                if result is False:
-                    failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
+                logger.error(f"❌ Download error: {result}")
+                failed_downloads.append((valid_data[index][1], valid_data[index][0]))
 
     return failed_downloads
 
