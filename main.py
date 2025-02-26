@@ -1,12 +1,11 @@
 from fastapi import FastAPI, BackgroundTasks
-import asyncio, os,threading,uuid,requests,openpyxl,uvicorn,shutil,mimetypes,time
-from icon_image_lib.utility import process_row  # Assuming this is correctly implemented
+import asyncio, os, threading, uuid, requests, openpyxl, uvicorn, shutil, mimetypes, time
 from openpyxl import load_workbook
 from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
-import datetime
+import datetime, re
 import boto3
 import logging
 from io import BytesIO
@@ -16,118 +15,204 @@ from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.util.retry import Retry
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition,Personalization,Cc,To
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition, Personalization, Cc, To
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import aiohttp
 from aiohttp import ClientTimeout
 from aiohttp_retry import RetryClient, ExponentialRetry
-#logging.basicConfig(level=logging.INFO)
-#logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-# Example usage
-logger.info("Informational message")
-logger.error("Error message")
-from sqlalchemy import create_engine
-import urllib.parse
+import pandas as pd
 import pyodbc
 from dotenv import load_dotenv
-import pandas as pd
-load_dotenv()
-import base64,zlib
-from threading import Thread
+import base64, zlib
+import json
+import ray
+import tldextract
+from collections import Counter
+from sqlalchemy import create_engine
+import urllib.parse  # For URL encoding/decoding
+import base64  # For base64 encoding/decoding
+import zlib  # Fo
+import traceback
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Environment settings
+AWS_ACCESS_KEY_ID = 'AKIAZQ3DSIQ5BGLY355N'
+AWS_SECRET_ACCESS_KEY = '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'
+REGION = 'us-east-2'
+MSSQLS_PWD = "Ftu5675FDG54hjhiuu$"
+
+# Database connection strings
+pwd_str = f"Pwd={MSSQLS_PWD};"
+conn_str = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
+conn = conn_str
+engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
+
+# Initialize FastAPI app
+app = FastAPI()
+
+#################################################
+# AWS S3 FUNCTIONS
+#################################################
+
 def get_spaces_client():
-    logger.info("Creating spaces client")
-    # session = boto3.session.Session()
-    client = boto3.client(service_name='s3',
-                            region_name=os.getenv('REGION'),
-                            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
-    logger.info("Spaces client created successfully")
-    return client
+    """
+    Create an AWS S3 client for file storage.
+    
+    Returns:
+        boto3.client: AWS S3 client
+    """
+    try:
+        logger.info("Creating S3 client")
+        client = boto3.client(
+            service_name='s3',
+            region_name=REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        )
+        logger.info("S3 client created successfully")
+        return client
+    except Exception as e:
+        logger.error(f"Error creating S3 client: {e}")
+        raise
 
 def upload_file_to_space(file_src, save_as, is_public):
-    spaces_client = get_spaces_client()
-    space_name = 'iconluxurygroup-s3'  # Your space name
-
-    # if not content_type:
-    #     content_type_guess = mimetypes.guess_type(file_src)[0]
-    #     if not content_type_guess:
-    #         raise Exception("Content type could not be guessed. Please specify it directly.")
-    #     content_type = content_type_guess
-    spaces_client.upload_file(file_src, space_name,save_as,ExtraArgs={'ACL': 'public-read'})
-    logger.info(f"File uploaded successfully to {space_name}/{save_as}")
-    # Generate and return the public URL if the file is public
-    if is_public:
-        # upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
-        upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
-        logger.info(f"Public URL: {upload_url}")
-        return upload_url
-
-
-
-def send_email(to_emails, subject, download_url,jobId):
-    # Encode the URL if necessary (example shown, adjust as needed)
-    # from urllib.parse import quote
-    # download_url = quote(download_url, safe='')
-
-
-    html_content = f"""
-<html>
-<body>
-<div class="container">
-    <p>Your file is ready for download.</p>
-     <a href="{download_url}" class="download-button">Download File</a>
-
-    <p><br>Please use the link below to modify the file<br></p
-    <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
-    <br>  
+    """
+    Upload a file to AWS S3.
     
-    <p>--</p>
-    <p>CMS:v1.1</p>
-</div>
-</body>
-</html>
-"""
-    message = Mail(
-        from_email='nik@iconluxurygroup.com',
-        subject=subject,
-        html_content=html_content
-    )
-    # # Read and encode the Excel file
-    # with open(excel_file_path, 'rb') as f:
-    #     excel_data = f.read()
-    # encoded_excel_data = b64encode(excel_data).decode()
-
-    # attachment = Attachment(
-    #     FileContent(encoded_excel_data),
-    #     FileName(excel_file_path.split('/')[-1]),
-    #     FileType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
-    #     Disposition('attachment')
-    # )
-    # message.attachment = attachment
-    
-    cc_recipient = 'nik@iconluxurygroup.com'
-    if to_emails == cc_recipient:
-        cc_recipient = 'notifications@popovtech.com'
-    
-    personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
-    personalization.add_to(To(to_emails))
-    message.add_personalization(personalization)
-    logger.info("trying")
+    Args:
+        file_src (str): Path to the file to upload
+        save_as (str): Name to save the file as in S3
+        is_public (bool): Whether the file should be publicly accessible
+        
+    Returns:
+        str: Public URL of the uploaded file if is_public is True
+    """
     try:
-        #
+        spaces_client = get_spaces_client()
+        space_name = 'iconluxurygroup-s3'
+        
+        spaces_client.upload_file(
+            file_src, 
+            space_name,
+            save_as,
+            ExtraArgs={'ACL': 'public-read'} if is_public else {}
+        )
+        
+        logger.info(f"File uploaded successfully to {space_name}/{save_as}")
+        
+        # Generate and return the public URL if the file is public
+        if is_public:
+            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
+            logger.info(f"Public URL: {upload_url}")
+            return upload_url
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error uploading file to S3: {e}")
+        raise
+
+#################################################
+# EMAIL FUNCTIONS
+#################################################
+
+def send_email(to_emails, subject, download_url, jobId):
+    """
+    Send an email notification with file download link.
+    
+    Args:
+        to_emails (str): Email address to send to
+        subject (str): Email subject
+        download_url (str): URL to download the file
+        jobId (str): Job ID for editing the file
+    """
+    try:
+        html_content = f"""
+        <html>
+        <body>
+        <div class="container">
+            <p>Your file is ready for download.</p>
+             <a href="{download_url}" class="download-button">Download File</a>
+
+            <p><br>Please use the link below to modify the file<br></p
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
+            <br>  
+            
+            <p>--</p>
+            <p>CMS:v1.1</p>
+        </div>
+        </body>
+        </html>
+        """
+        
+        message = Mail(
+            from_email='nik@iconluxurygroup.com',
+            subject=subject,
+            html_content=html_content
+        )
+        
+        cc_recipient = 'nik@iconluxurygroup.com'
+        if to_emails == cc_recipient:
+            cc_recipient = 'notifications@popovtech.com'
+        
+        personalization = Personalization()
+        personalization.add_cc(Cc(cc_recipient))
+        personalization.add_to(To(to_emails))
+        message.add_personalization(personalization)
+        
+        logger.info(f"Sending email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
+        
         sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
         response = sg.send(message)
-        logger.info(response.status_code)
-        logger.info(response.body)
-        logger.info(response.headers)
-    except Exception as e:
-        logger.info(e)
-        #raise
         
+        logger.info(f"Email sent successfully: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+
+def send_message_email(to_emails, subject, message):
+    """
+    Send a simple message email.
+    
+    Args:
+        to_emails (str): Email address to send to
+        subject (str): Email subject
+        message (str): Email message content
+    """
+    try:
+        message_with_breaks = message.replace("\n", "<br>")
+
+        html_content = f"""
+        <html>
+        <body>
+        <div class="container">
+            <p>Message details:<br>{message_with_breaks}</p>
+            <p>CMS:v1</p>
+        </div>
+        </body>
+        </html>
+        """
+        
+        message_obj = Mail(
+            from_email='distrotool@iconluxurygroup.com',
+            subject=subject,
+            html_content=html_content
+        )
+        
+        cc_recipient = 'notifications@popovtech.com'
+        personalization = Personalization()
+        personalization.add_cc(Cc(cc_recipient))
+        personalization.add_to(To(to_emails))
+        message_obj.add_personalization(personalization)
+        
+        logger.info(f"Sending message email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
+        
+        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+        response = sg.send(message_obj)
+        
+        logger.info(f"Message email sent successfully: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error sending message email: {e}")
 def send_message_email(to_emails, subject,message):
     message_with_breaks = message.replace("\n", "<br>")
 
@@ -180,13 +265,6 @@ async def cleanup_temp_dirs(directories):
     for dir_path in directories:
         await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
 
-pwd_value = str(os.environ.get('MSSQLS_PWD'))
-pwd_str =f"Pwd={pwd_value};"
-global conn
-conn = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
-global engine
-engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
-app = FastAPI()
 def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
@@ -494,7 +572,8 @@ async def generate_download_file(file_id):
     
     provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location,file_id )
     decoded_string = urllib.parse.unquote(provided_file_path)
-    logger.info(provided_file_path,' ',decoded_string)
+    logger.info("{} {}".format(provided_file_path, decoded_string))
+
     file_name = provided_file_path.split('/')[-1]
     temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
     local_filename = os.path.join(temp_excel_dir, file_name)
