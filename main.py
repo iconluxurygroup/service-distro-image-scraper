@@ -841,10 +841,19 @@ def prepare_images_for_download(results,send_to_email):
     return images_to_download
 import tldextract
 from collections import Counter
+
 def extract_domains_and_counts(data):
     """Extract domains from URLs and count occurrences."""
-    valid_data = [url for _, url, _ in data if url]  # Filter out None URLs
-    domains = [tldextract.extract(url).registered_domain for url in valid_data]
+    valid_data = [url for _, url, _ in data if url and isinstance(url, str) and url.strip()]
+    
+    # Extract domains safely
+    domains = []
+    for url in valid_data:
+        extracted = tldextract.extract(url)
+        domain = extracted.registered_domain
+        if domain:  # Ensure domain extraction is valid
+            domains.append(domain)
+    
     domain_counts = Counter(domains)
     return domain_counts
 
