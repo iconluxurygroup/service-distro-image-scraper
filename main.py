@@ -563,7 +563,6 @@ def clean_json(value):
     try:
         # Try to parse the JSON
         parsed = json.loads(value)
-=======
     return file_id
 def get_records_to_search(file_id,engine):
     sql_query = f"Select EntryID, ProductModel as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null UNION ALL Select EntryID, ProductModel + ' '  + ProductBrand as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null Order by 1"
@@ -702,71 +701,7 @@ def process_search_row(search_string,endpoint,entry_id):
             n_endpoint = get_endpoint()
             logger.info(f"Error making request: {e}\nTrying Again: {n_endpoint}")
             return process_search_row(search_string,n_endpoint,entry_id)
->>>>>>> main
-        
-        # Ensure it's a dictionary
-        if not isinstance(parsed, dict):
-            logging.warning("JSON is not a dictionary - replacing with default structure")
-            return json.dumps({
-                "description": "",
-                "user_provided": {"brand": "", "category": "", "color": ""},
-                "extracted_features": {"brand": "", "category": "", "color": ""},
-                "match_score": None,
-                "reasoning_match": "",
-                "linesheet_score": None,
-                "reasoning_linesheet": ""
-            })
-        
-        # Convert NaN to None
-        if "linesheet_score" in parsed:
-            if isinstance(parsed["linesheet_score"], float) and math.isnan(parsed["linesheet_score"]):
-                parsed["linesheet_score"] = None
-            elif parsed["linesheet_score"] in ["NaN", "null", "undefined", ""]:
-                parsed["linesheet_score"] = None
-                
-        if "match_score" in parsed:
-            if isinstance(parsed["match_score"], float) and math.isnan(parsed["match_score"]):
-                parsed["match_score"] = None
-            elif parsed["match_score"] in ["NaN", "null", "undefined", ""]:
-                parsed["match_score"] = None
-        
-        # Ensure all required fields exist
-        if "description" not in parsed:
-            parsed["description"] = ""
-        if "user_provided" not in parsed:
-            parsed["user_provided"] = {"brand": "", "category": "", "color": ""}
-        if "extracted_features" not in parsed:
-            parsed["extracted_features"] = {"brand": "", "category": "", "color": ""}
-        if "match_score" not in parsed:
-            parsed["match_score"] = None
-        if "reasoning_match" not in parsed:
-            parsed["reasoning_match"] = ""
-        if "linesheet_score" not in parsed:
-            parsed["linesheet_score"] = None
-        if "reasoning_linesheet" not in parsed:
-            parsed["reasoning_linesheet"] = ""
-            
-        # Ensure user_provided and extracted_features have all necessary fields
-        for field_dict in ["user_provided", "extracted_features"]:
-            if field_dict in parsed and isinstance(parsed[field_dict], dict):
-                for field in ["brand", "category", "color"]:
-                    if field not in parsed[field_dict]:
-                        parsed[field_dict][field] = ""
 
-        return json.dumps(parsed)  # Return cleaned JSON as a string
-
-    except json.JSONDecodeError as e:
-        logging.warning(f"JSON decoding error: {e} for value: {value[:50]}...")
-        # Return a valid default JSON structure
-        return json.dumps({
-            "description": "",
-            "user_provided": {"brand": "", "category": "", "color": ""},
-            "extracted_features": {"brand": "", "category": "", "color": ""},
-            "match_score": None,
-            "reasoning_match": "",
-            "linesheet_score": None,
-            "reasoning_linesheet": ""
-        })
 def update_sort_order(file_id):
     """
     Updates the SortOrder column for images with improved debugging and validation.
@@ -1609,7 +1544,6 @@ def create_default_result(product_brand: str = "", product_category: str = "", p
         "linesheet_score": float('nan'),
         "reasoning_linesheet": ""
     }
-=======
     # Close the connection
     connection.close()
     logger.info('completed update sort order')
