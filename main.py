@@ -1065,6 +1065,8 @@ def get_file_location(file_id):
     except Exception as e:
         logging.error(f"Error getting file location URL: {e}")
         return "Error retrieving file location"
+
+        
 def update_file_generate_complete(file_id):
     """
     Update file generation completion time.
