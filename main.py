@@ -388,29 +388,30 @@ def update_file_location_complete(file_id,file_location):
     connection.close()
     
 def get_images_excel_db(file_id):
-    update_file_start_query = f"update utb_ImageScraperFiles set CreateFileStartTime = getdate() Where ID = {file_id}"
+    update_file_start_query = f"UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = {file_id}"
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
-
-    # Execute the update query
     cursor.execute(update_file_start_query)
-
-    # Commit the changes
     connection.commit()
     connection.close()
 
-    query_get_images_to_excel = """Select s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail from utb_ImageScraperFiles f
-inner join utb_ImageScraperRecords s on s.FileID = f.ID 
-inner join utb_ImageScraperResult r on r.EntryID = s.EntryID 
-Where f.ID = $FileID$ and r.SortOrder = 1
-Order by s.ExcelRowID"""
+    query_get_images_to_excel = """
+    SELECT s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail 
+    FROM utb_ImageScraperFiles f
+    INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
+    INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
+    WHERE f.ID = ? AND r.SortOrder = 1
+    ORDER BY s.ExcelRowID
+    """
 
-    query_get_images_to_excel = query_get_images_to_excel.replace('$FileID$',str(file_id))
-    print(query_get_images_to_excel)
-    # Close the connection
+    df = pd.read_sql_query(query_get_images_to_excel, con=engine, params=[file_id])
+    
+    # **🔹 Add Logging to Identify Issues**
+    print(f"⚠️ Retrieved {len(df)} rows from the database")
+    print(df.head())  # Print first few rows to see if there are any `None` values
 
-    df = pd.read_sql_query(query_get_images_to_excel, con=engine)
     return df
+
 
 def update_sort_order(file_id):
     print('executing update sort order')
@@ -845,6 +846,9 @@ from collections import Counter
 import tldextract
 from collections import Counter
 
+import tldextract
+from collections import Counter
+
 def extract_domains_and_counts(data):
     """Extract domains from URLs and count occurrences."""
     valid_data = []
@@ -867,13 +871,16 @@ def extract_domains_and_counts(data):
     # Extract domains safely
     domains = []
     for url in valid_data:
-        extracted = tldextract.extract(url)
-        domain = extracted.registered_domain
+        try:
+            extracted = tldextract.extract(url)
+            domain = extracted.registered_domain
 
-        if domain:  # Ensure domain extraction is valid
-            domains.append(domain)
-        else:
-            print(f"⚠️ Unable to extract domain from URL: {url}")  # Log failed extractions
+            if domain:  # Ensure domain extraction is valid
+                domains.append(domain)
+            else:
+                print(f"⚠️ Unable to extract domain from URL: {url}")  # Log failed extractions
+        except Exception as e:
+            print(f"❌ Error extracting domain from {url}: {e}")  # Debugging any extraction issues
     
     domain_counts = Counter(domains)
     return domain_counts
