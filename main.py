@@ -195,7 +195,7 @@ global conn
 conn = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
 global engine
 engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
-app = FastAPI(title="super scraper")
+app = FastAPI(title="SuperScraper")
 def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
