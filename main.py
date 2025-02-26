@@ -842,20 +842,42 @@ def prepare_images_for_download(results,send_to_email):
 import tldextract
 from collections import Counter
 
+import tldextract
+from collections import Counter
+
 def extract_domains_and_counts(data):
     """Extract domains from URLs and count occurrences."""
-    valid_data = [url for _, url, _ in data if url and isinstance(url, str) and url.strip()]
-    
+    valid_data = []
+
+    for item in data:
+        # Ensure item has at least two elements (id, url)
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            print(f"⚠️ Skipping malformed entry (not a tuple/list or too short): {item}")
+            continue
+        
+        url = item[1]  # Extract URL
+        
+        # Ensure URL is a valid string
+        if not url or not isinstance(url, str) or not url.strip():
+            print(f"⚠️ Skipping invalid URL: {item}")
+            continue
+
+        valid_data.append(url)
+
     # Extract domains safely
     domains = []
     for url in valid_data:
         extracted = tldextract.extract(url)
         domain = extracted.registered_domain
+
         if domain:  # Ensure domain extraction is valid
             domains.append(domain)
+        else:
+            print(f"⚠️ Unable to extract domain from URL: {url}")  # Log failed extractions
     
     domain_counts = Counter(domains)
     return domain_counts
+
 
 
 def analyze_data(data):
