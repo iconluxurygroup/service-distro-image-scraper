@@ -1527,35 +1527,47 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
     # Create prompts
     match_analysis_prompt = f"""
     Analyze this product image and extract key features.
-
     Compare these features to the user-provided values:
     - Brand: {product_brand}
     - Category: {product_category}
     - Color: {product_color}
 
+    IMPORTANT: When evaluating matches, use these guidelines:
+    - Brand: Must be exact match (case insensitive)
+    - Category: Evaluate using hierarchical matching:
+    * 100% match: Exact match (e.g., "CROSSBODY BAG" = "CROSSBODY BAG") 
+    * 50% match: Parent/child category (e.g., "CROSSBODY BAG" ~ "HANDBAG", "RUNNING SHOE" ~ "ATHLETIC FOOTWEAR")
+    * 0% match: Completely different categories
+    - Color: Main color must match (allowing for descriptive variations)
+
     IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
     {{
-      "description": "Brief description of what you see in the image",
-      "user_provided": {{
+    "description": "Brief description of what you see in the image",
+    "user_provided": {{
         "brand": "{product_brand}",
         "category": "{product_category}",
         "color": "{product_color}"
-      }},
-      "extracted_features": {{
+    }},
+    "extracted_features": {{
         "brand": "The brand you see in the image",
         "category": "The product category you see",
         "color": "The main colors you see"
-      }},
-      "match_score": 0,
-      "reasoning_match": "Explanation of your score"
+    }},
+    "match_scores": {{
+        "brand": 0,
+        "category": 0,
+        "color": 0
+    }},
+    "match_score": 0,
+    "reasoning_match": "Explanation of your individual scores and final match score"
     }}
 
-    Calculate the match_score as follows:
-    - 100: All three features match
-    - 67: Two features match
-    - 33: One feature matches
-    - 0: No features match
+    Calculate each individual score:
+    - brand: 33 if match, 0 if not
+    - category: 33 if exact match, 16.5 if partial match (parent/child category), 0 if no match
+    - color: 33 if match, 0 if not
 
+    The final match_score should be the sum of all three individual scores.
     Only return the JSON object, nothing else.
     """
 
