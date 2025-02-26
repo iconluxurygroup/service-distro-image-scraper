@@ -842,7 +842,7 @@ def prepare_images_for_download(results,send_to_email):
 import tldextract
 from collections import Counter
 def extract_domains_and_counts(data):
-    """Extract domains from URLs and count their occurrences."""
+    """Extract domains from URLs and count occurrences."""
     valid_data = [url for _, url, _ in data if url]  # Filter out None URLs
     domains = [tldextract.extract(url).registered_domain for url in valid_data]
     domain_counts = Counter(domains)
