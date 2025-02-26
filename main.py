@@ -1035,25 +1035,36 @@ def update_sort_order(file_id):
         
         return sort_order_list
 
+
 def get_file_location(file_id):
-    query = f"Select FileLocationUrl from utb_ImageScraperFiles where ID = {file_id}"
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-
-    # Execute the update query
-    cursor.execute(query)
-    file_location_url = cursor.fetchone()
-    # Commit the changes
-    connection.commit()
-
-    # Close the connection
-    connection.close()
-    if file_location_url:
-        (file_location_url,) = file_location_url
-        logger.info(file_location_url)
-    else:
-
-
+    """
+    Get the file location URL for a file.
+    
+    Args:
+        file_id (int): The FileID to get the location for
+        
+    Returns:
+        str: The file location URL
+    """
+    try:
+        query = "SELECT FileLocationUrl FROM utb_ImageScraperFiles WHERE ID = ?"
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(query, (file_id,))
+        file_location_url = cursor.fetchone()
+        connection.close()
+        
+        if file_location_url:
+            file_location_url = file_location_url[0]
+            logging.info(f"Got file location URL for FileID: {file_id}: {file_location_url}")
+            return file_location_url
+        else:
+            logging.warning(f"No file location URL found for FileID: {file_id}")
+            return "No File Found"
+    except Exception as e:
+        logging.error(f"Error getting file location URL: {e}")
+        return "Error retrieving file location"
 def update_file_generate_complete(file_id):
     """
     Update file generation completion time.
