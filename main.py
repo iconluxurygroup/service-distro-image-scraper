@@ -42,20 +42,18 @@ AWS_ACCESS_KEY_ID = 'AKIAZQ3DSIQ5BGLY355N'
 AWS_SECRET_ACCESS_KEY = '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'
 REGION = 'us-east-2'
 MSSQLS_PWD = "Ftu5675FDG54hjhiuu$"
-
+global engine
+global conn
 # Database connection strings
 pwd_str = f"Pwd={MSSQLS_PWD};"
 conn_str = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
 conn = conn_str
 engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
-
-# Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(title="SuperScraper")
 
 #################################################
 # AWS S3 FUNCTIONS
 #################################################
-
 def get_spaces_client():
     """
     Create an AWS S3 client for file storage.
@@ -76,7 +74,6 @@ def get_spaces_client():
     except Exception as e:
         logger.error(f"Error creating S3 client: {e}")
         raise
-
 def upload_file_to_space(file_src, save_as, is_public):
     """
     Upload a file to AWS S3.
@@ -264,6 +261,7 @@ async def cleanup_temp_dirs(directories):
     loop = asyncio.get_running_loop()  # Get the current loop directly
     for dir_path in directories:
         await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
+
 
 def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
     connection = pyodbc.connect(conn)
@@ -601,6 +599,7 @@ async def generate_download_file(file_id):
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
     is_public = True
     public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name,is_public)  
+
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
     await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
   
@@ -1036,7 +1035,19 @@ async def download_all_images(data, save_path):
             if isinstance(result, Exception):
                 logger.error(f"❌ Download error: {result}")
                 failed_downloads.append((valid_data[index][1], valid_data[index][0]))
-
+                #THUMBNAIL DOWNLOAD ON FAIL
+                print(data[index])
+                logger.error(f"Download task generated an exception: {result}")
+                logger.error(f"Trying again with :{str(data[index][2])}")
+                print(f"Download task generated an exception: {result}")
+                print(f"Trying again with :{str(data[index][2])}")
+                await thumbnail_download(semaphore, str(data[index][2]),str(data[index][0]), save_path, session)
+                #THUMBNAIL DOWNLOAD ON FAIL
+                failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
+            else:
+                logger.info(f"Download task completed with result: {result}")
+                if result is False:
+                    failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
     return failed_downloads
 
 
@@ -1081,23 +1092,26 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
                                     return True
                             except Exception as fallback_exc:
                                 logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                        return False
                 else:
                     logger.error(f"Download failed with status code {response.status} for URL: {url}")
-                    await thumbnail_download(semaphore, thumbnail, image_name, save_path, session,
-                                             fallback_formats=None)
+                    await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
+                    return False
 
         except TimeoutError as exc:
             # Handle the timeout specifically
             logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
-            logger.info('timeout error inside the downlaod function')
+            logger.info('timeout error inside the downlaod function ',str(exc))
             # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
             # return False
-            return exc
+            return False
+
         except Exception as exc:
             logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
             # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
             # return False
-            return exc
+            print(exc)
+            return False
 async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
@@ -1139,6 +1153,7 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
                                     return True
                             except Exception as fallback_exc:
                                 logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                    return False
                 else:
                     logger.error(f"Download failed with status code {response.status} for URL: {url}")
 
