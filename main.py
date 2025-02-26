@@ -1011,7 +1011,7 @@ def update_sort_order(file_id):
                 return Nonu
 
             finally:
-                if 'cursor' in locals():j
+                if 'cursor' in locals():
                     cursor.close()
                 if 'connection' in locals():
                     connection.close()
