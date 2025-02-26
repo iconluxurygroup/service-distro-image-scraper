@@ -414,35 +414,21 @@ def update_database(result_id, aijson, aicaption):
         logging.error(f"Error updating database for ResultID {result_id}: {e}")
         return False
 
-def insert_file_db(file_name, file_source, send_to_email="nik@iconluxurygroup.com"):
-    """
-    Insert a new file record into the database.
-    
-    Args:
-        file_name (str): The name of the file
-        file_source (str): The URL of the file
-        send_to_email (str): The email to send notifications to
-        
-    Returns:
-        int: The ID of the newly inserted file
-    """
-    try:
-        connection = pyodbc.connect(conn)
-        cursor = connection.cursor()
-        insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
-        values = (file_name, file_source, send_to_email)
+def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
+    connection = pyodbc.connect(conn)
+    cursor = connection.cursor()
+    insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl,UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
+    values = (file_name, file_source,send_to_email)
 
-        cursor.execute(insert_query, values)
-        file_id = cursor.fetchval()
-        connection.commit()
-        cursor.close()
-        connection.close()
-        logging.info(f"Inserted new file record with ID: {file_id}")
-        return file_id
-    except Exception as e:
-        logging.error(f"Error inserting file record: {e}")
-        raise
+    cursor.execute(insert_query, values)
 
+    file_id = cursor.fetchval()
+
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+    return file_id
 def load_payload_db(rows, file_id):
     """
     Load payload data into the database.
