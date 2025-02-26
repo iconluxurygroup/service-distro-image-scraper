@@ -843,9 +843,11 @@ import tldextract
 from collections import Counter
 def extract_domains_and_counts(data):
     """Extract domains from URLs and count their occurrences."""
-    domains = [tldextract.extract(url).registered_domain for _, url,thumb in data]
+    valid_data = [url for _, url, _ in data if url]  # Filter out None URLs
+    domains = [tldextract.extract(url).registered_domain for url in valid_data]
     domain_counts = Counter(domains)
     return domain_counts
+
 
 def analyze_data(data):
     domain_counts = extract_domains_and_counts(data)
