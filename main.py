@@ -156,11 +156,11 @@ def send_email(to_emails, subject, download_url, jobId):
             <p><br>Please use the link below to modify the file<br></p>
             <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}">Edit / View</a> 
             <br>  
+        <p>For support, please <a href="mailto:nik@iconluxurygroup.com?subject=Support Ticket for Job ID {str(jobId)}&body=Job ID: {str(jobId)}%0A%0ADescription of Issue:%0A">submit a ticket here</a>.</p>
         <p>--</p>
         <p><small>This is an automated system notification.</small></p>
-        <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a> 
+        <p><small><a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
 
-        <p>For support, please <a href="mailto:nik@iconluxurygroup.com?subject=Support Ticket for Job ID {str(jobId)}&body=Job ID: {str(jobId)}%0A%0ADescription of Issue:%0A">submit a ticket here</a>.</p>
         """
         
         message = Mail(
