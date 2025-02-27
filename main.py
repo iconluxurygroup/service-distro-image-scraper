@@ -691,7 +691,26 @@ def get_file_location(file_id):
     except Exception as e:
         logging.error(f"Error getting file location URL: {e}")
         return "Error retrieving file location"
-
+def update_image_complete(file_id):
+    """
+    Update file image search completion time.
+    
+    Args:
+        file_id (int): The FileID to update
+    """
+    try:
+        query = "UPDATE utb_ImageScraperFiles SET ImageCompleteTime  = GETDATE() WHERE ID = ?"
+        
+        connection = pyodbc.connect(conn)
+        cursor = connection.cursor()
+        cursor.execute(query, (file_id,))
+        connection.commit()
+        cursor.close()
+        connection.close()
+        
+        logging.info(f"Marked file image search as complete for FileID: {file_id}")
+    except Exception as e:
+        logging.error(f"Error updating file image search completion time: {e}")
         
 def update_file_generate_complete(file_id):
     """
@@ -1672,7 +1691,8 @@ def process_restart_batch(file_id_db):
     
     
     update_sort_order(file_id_db)
-    
+    logger.info(f"Updating timestamp for FileID: {file_id_db}")
+    update_image_complete(file_id_db)
     asyncio.run(generate_download_file(file_id_db))
     
 
@@ -1711,7 +1731,8 @@ def process_image_batch(payload: dict):
 
     #####
     update_sort_order(file_id_db)
-    
+    logger.info(f"Updating timestamp for FileID: {file_id_db}")
+    update_image_complete(file_id_db)
     asyncio.run(generate_download_file(file_id_db))
     logger.info(f"End of whole process: {end}")
     logger.info(f"It took {end - start} to complete")
@@ -3175,7 +3196,8 @@ async def process_restart_batch(file_id_db):
         # Update sort order after processing is complete
         logger.info(f"Updating sort order for FileID: {file_id_db}")
         update_sort_order(file_id_db)
-        
+        logger.info(f"Updating timestamp for FileID: {file_id_db}")
+        update_image_complete(file_id_db)
         # Generate download file
         logger.info(f"Generating download file for FileID: {file_id_db}")
         await generate_download_file(file_id_db)
@@ -3245,6 +3267,8 @@ def process_image_batch(payload):
         
         # Update sort order and process images
         update_sort_order(file_id_db)
+        logger.info(f"Updating timestamp for FileID: {file_id_db}")
+        update_image_complete(file_id_db)
         #process_images(file_id_db)
         
         # Generate download file
@@ -3684,6 +3708,8 @@ async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str
             
             # Call the sort order update directly
             sort_order_list = update_sort_order(file_id_db)
+            logger.info(f"Updating timestamp for FileID: {file_id_db}")
+            update_image_complete(file_id_db)
             
             # Generate download file in the background
             background_tasks.add_task(generate_download_file, file_id_db)
