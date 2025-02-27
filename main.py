@@ -35,7 +35,10 @@ import zlib  # Fo
 import traceback
 import math
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG,  # Change to DEBUG for more verbose logs
+    format='%(asctime)s - %(levelname)s - %(pathname)s:%(lineno)d - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Environment settings
@@ -2532,20 +2535,16 @@ def extract_domains_and_counts(data):
 
 def analyze_data(data):
     """
-    Analyze image data to determine optimal connection pool size.
-    
-    Args:
-        data (list): List of image data to analyze
-        
-    Returns:
-        int: Optimal connection pool size
+    Analyze image data to determine optimal connection pool size with conservative limits.
     """
     domain_counts = extract_domains_and_counts(data)
-    logger.info("Domain counts: %s", domain_counts)
+    logger.info(f"Domain counts: {dict(domain_counts)}")
     unique_domains = len(domain_counts)
-    logger.info(f"Unique Domain Len: {unique_domains}")
-    pool_size = min(500, max(10, unique_domains * 2))  # Adjust as needed
-    logger.info(f"Pool size: {pool_size}")
+    
+    # Calculate a more conservative pool size with a lower maximum
+    pool_size = min(100, max(10, unique_domains * 2))
+    logger.info(f"Conservative pool size: {pool_size}")
+    
     return pool_size
 
 def build_headers(url):
@@ -2585,84 +2584,105 @@ def try_convert_to_png(image_path, new_path, image_name):
 async def download_all_images(data, save_path):
     failed_downloads = []
     
-    # ✅ **Filter Out `None` URLs**
+    # Filter out None URLs
     valid_data = [item for item in data if item[1] and isinstance(item[1], str) and item[1].strip()]
     
     if not valid_data:
         logger.info("❌ No valid image URLs found. Exiting early!")
         return failed_downloads
 
-    pool_size = analyze_data(valid_data)
-    logger.info(f"✅ Pool Size: {pool_size} | Processing {len(valid_data)} images")
+    # Get a more conservative pool size
+    pool_size = min(100, analyze_data(valid_data))
+    logger.info(f"✅ Using conservative pool size: {pool_size} | Processing {len(valid_data)} images")
 
+    # Configure more conservative connection timeout
     timeout = ClientTimeout(total=60)
-    retry_options = ExponentialRetry(attempts=3, start_timeout=3)
-    connector = aiohttp.TCPConnector(ssl=False)
+    
+    # Use better retry options with backoff
+    retry_options = ExponentialRetry(attempts=2, start_timeout=1)
+    
+    # Configure connector with improved settings
+    connector = aiohttp.TCPConnector(
+        ssl=False,
+        limit=pool_size,
+        force_close=True,  # Force close connections to prevent fd reuse
+        enable_cleanup_closed=True  # Clean up closed connections
+    )
 
-    async with RetryClient(raise_for_status=False, retry_options=retry_options, timeout=timeout, connector=connector) as session:
-        semaphore = asyncio.Semaphore(pool_size)
+    # Create a strict semaphore to prevent overwhelming connections
+    main_semaphore = asyncio.Semaphore(min(20, pool_size))  # Limit to 20 max concurrent downloads
 
-        logger.info("Scheduling image downloads")
-        tasks = [
-            image_download(semaphore, str(item[1]), str(item[2]), str(item[0]), save_path, session, index)
-            for index, item in enumerate(valid_data, start=1)
-        ]
+    async with RetryClient(
+        raise_for_status=False, 
+        retry_options=retry_options, 
+        timeout=timeout, 
+        connector=connector
+    ) as session:
+        logger.info("Processing downloads in batches")
+        
+        # Process in batches for better management
+        batch_size = 30
+        total_images = len(valid_data)
+        
+        for i in range(0, total_images, batch_size):
+            batch = valid_data[i:i+batch_size]
+            batch_end = min(i+batch_size, total_images)
+            logger.info(f"Processing batch {i//batch_size + 1}/{(total_images+batch_size-1)//batch_size} | Items {i} to {batch_end-1}")
+            
+            tasks = [
+                image_download(main_semaphore, str(item[1]), str(item[2]), str(item[0]), save_path, session)
+                for item in batch
+            ]
+            
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results
+            for idx, result in enumerate(batch_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Download task generated an exception: {result}")
+                    failed_downloads.append((batch[idx][1], batch[idx][0]))
+                    try:
+                        # Try thumbnail as fallback
+                        await thumbnail_download(main_semaphore, str(batch[idx][2]), str(batch[idx][0]), save_path, session)
+                    except Exception as thumb_exc:
+                        logger.error(f"Thumbnail download also failed: {thumb_exc}")
+                elif result is False:
+                    logger.warning(f"Download failed for URL: {batch[idx][1]}")
+                    failed_downloads.append((batch[idx][1], batch[idx][0]))
+            
+            # Add a small delay between batches to allow resource cleanup
+            await asyncio.sleep(0.5)
+            
+            logger.info(f"Completed batch {i//batch_size + 1}/{(total_images+batch_size-1)//batch_size} | " +
+                       f"Success: {sum(1 for r in batch_results if r is True)}, " +
+                       f"Failed: {sum(1 for r in batch_results if r is False or isinstance(r, Exception))}")
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for index, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"❌ Download error: {result}")
-                failed_downloads.append((valid_data[index][1], valid_data[index][0]))
-                #THUMBNAIL DOWNLOAD ON FAIL
-                print(data[index])
-                logger.error(f"Download task generated an exception: {result}")
-                logger.error(f"Trying again with :{str(data[index][2])}")
-                print(f"Download task generated an exception: {result}")
-                print(f"Trying again with :{str(data[index][2])}")
-                await thumbnail_download(semaphore, str(data[index][2]),str(data[index][0]), save_path, session)
-                #THUMBNAIL DOWNLOAD ON FAIL
-                failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
-            else:
-                logger.info(f"Download task completed with result: {result}")
-                if result is False:
-                    failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
+    logger.info(f"Download process completed | Total failed: {len(failed_downloads)} out of {len(valid_data)}")
     return failed_downloads
 async def image_download(semaphore, url, thumbnail, image_name, save_path, session, index=None, fallback_formats=None):
-    """
-    Download an image from a URL.
-    
-    Args:
-        semaphore (asyncio.Semaphore): Semaphore to limit concurrent downloads
-        url (str): URL to download the image from
-        thumbnail (str): Thumbnail URL to fall back to if main URL fails
-        image_name (str): Name to save the image as
-        save_path (str): Path to save the image to
-        session (aiohttp.ClientSession): HTTP session to use for the request
-        index (int, optional): Index of the image in the batch
-        fallback_formats (list, optional): List of image formats to try if the default format fails
-        
-    Returns:
-        bool: True if download was successful, False otherwise
-    """
+    """Improved image download function with better error handling and resource management"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close"  # Important: helps clean up connections
     }
+    
     async with semaphore:
         if fallback_formats is None:
             fallback_formats = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
 
         logger.info(f"Initiating download for URL: {url} Img: {image_name}")
         try:
-            async with session.get(url, headers=headers) as response:
+            # Use a shorter timeout to prevent hanging connections
+            async with session.get(url, headers=headers, timeout=30) as response:
                 logger.info(f"Received response: {response.status} for URL: {url}")
 
                 if response.status == 200:
                     logger.info(f"Processing content from URL: {url}")
                     data = await response.read()
                     image_data = BytesIO(data)
+                    
                     try:
                         logger.info(f"Attempting to open image stream and save as PNG for {image_name}")
                         with IMG2.open(image_data) as img:
@@ -2673,159 +2693,74 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
                     except UnidentifiedImageError as e:
                         logger.error(f"Image file type unidentified, trying fallback formats for {image_name}: {e}")
                         for fmt in fallback_formats:
-                            image_data.seek(0)  # Reset stream position
                             try:
-                                logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
+                                image_data.seek(0)  # Reset stream position
                                 with IMG2.open(image_data) as img:
                                     final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
                                     img.save(final_image_path)
-                                    logger.info(f"Successfully saved with fallback format {fmt}: {final_image_path}")
+                                    logger.info(f"Successfully saved with format {fmt}: {final_image_path}")
                                     return True
                             except Exception as fallback_exc:
-                                logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                                logger.error(f"Failed with format {fmt} for {image_name}: {fallback_exc}")
+                                
                         return False
                 else:
-                    logger.error(f"Download failed with status code {response.status} for URL: {url}")
-                    if thumbnail:
-                        try:
-                            thumbnail_result = await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
-                            return thumbnail_result
-                        except Exception as thumb_exc:
-                            logger.error(f"Thumbnail download failed: {thumb_exc}")
+                    logger.error(f"Download failed with status {response.status} for URL: {url}")
                     return False
 
-        except TimeoutError as exc:
-            # Handle the timeout specifically
-            logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
-            logger.info(f'Timeout error inside the download function: {str(exc)}')
-            if thumbnail:
-                try:
-                    return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
-                except Exception as thumb_exc:
-                    logger.error(f"Thumbnail download failed after timeout: {thumb_exc}")
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout downloading {url} for Image: {image_name}")
             return False
-
         except Exception as exc:
-            logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
-            if thumbnail:
-                try:
-                    return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
-                except Exception as thumb_exc:
-                    logger.error(f"Thumbnail download failed after exception: {thumb_exc}")
+            logger.error(f"Exception downloading URL: {url}: {exc}")
             return False
-
+        finally:
+            # Small delay to help with resource cleanup
+            await asyncio.sleep(0.01)
 async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
-    """
-    Download a thumbnail image as a fallback.
-    
-    Args:
-        semaphore (asyncio.Semaphore): Semaphore to limit concurrent downloads
-        url (str): URL to download the thumbnail from
-        image_name (str): Name to save the image as
-        save_path (str): Path to save the image to
-        session (aiohttp.ClientSession): HTTP session to use for the request
-        fallback_formats (list): List of image formats to try if the default format fails
+    """Improved thumbnail download function with better resource management"""
+    if not url or url == "None":
+        return False
         
-    Returns:
-        bool: True if download was successful, False otherwise
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close"
     }
-    async with semaphore:
+    
+    try:
         if fallback_formats is None:
             fallback_formats = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
 
         logger.info(f"Initiating thumbnail download for URL: {url} Img: {image_name}")
-        try:
-            async with session.get(url, headers=headers) as response:
-                logger.info(f"Received response: {response.status} for URL: {url}")
-
-                if response.status == 200:
-                    logger.info(f"Processing content from URL: {url}")
-                    data = await response.read()
-                    image_data = BytesIO(data)
-                    try:
-                        logger.info(f"Attempting to open image stream and save as PNG for {image_name}")
-                        with IMG2.open(image_data) as img:
-                            final_image_path = os.path.join(save_path, f"{image_name}.png")
-                            img.save(final_image_path)
-                            logger.info(f"Successfully saved: {final_image_path}")
-                            return True
-                    except UnidentifiedImageError as e:
-                        logger.error(f"Image file type unidentified, trying fallback formats for {image_name}: {e}")
-                        for fmt in fallback_formats:
-                            image_data.seek(0)  # Reset stream position
-                            try:
-                                logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
-                                with IMG2.open(image_data) as img:
-                                    final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
-                                    img.save(final_image_path)
-                                    logger.info(f"Successfully saved with fallback format {fmt}: {final_image_path}")
-                                    return True
-                            except Exception as fallback_exc:
-                                logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
-                    return False
-                else:
-                    logger.error(f"Thumbnail download failed with status code {response.status} for URL: {url}")
-
-        except TimeoutError:
-            # Handle the timeout specifically
-            logger.error(f"Timeout occurred while downloading thumbnail {url} Image: {image_name}")
-            return False
-        except Exception as exc:
-            logger.error(f"Exception occurred during thumbnail download or processing for URL: {url}: {exc}", exc_info=True)
-            return False
-
-async def download_all_images(data, save_path):
-    """
-    Download all images in the data list.
-    
-    Args:
-        data (list): List of image data to download
-        save_path (str): Path to save downloaded images to
         
-    Returns:
-        list: List of failed downloads (URL, row ID pairs)
-    """
-    failed_downloads = []
-    pool_size = analyze_data(data)  # Get optimal pool size based on data analysis
+        # Use a shorter timeout for thumbnail downloads
+        async with session.get(url, headers=headers, timeout=20) as response:
+            logger.info(f"Received thumbnail response: {response.status} for URL: {url}")
 
-    logger.info(f"Setting up session with pool size: {pool_size}")
-
-    # Setup async session with retry policy
-    timeout = ClientTimeout(total=60)
-    retry_options = ExponentialRetry(attempts=3, start_timeout=3)
-    connector = aiohttp.TCPConnector(ssl=False, limit=pool_size)
-
-    async with RetryClient(raise_for_status=False, retry_options=retry_options, 
-                          timeout=timeout, connector=connector) as session:
-        semaphore = asyncio.Semaphore(pool_size)
-
-        logger.info("Scheduling image downloads")
-        tasks = [
-            image_download(semaphore, str(item[1]), str(item[2]), str(item[0]), save_path, session)
-            for index, item in enumerate(data, start=1)
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        logger.info("Processing download results")
-        for index, result in enumerate(results):
-            if isinstance(result, Exception):
-                # Try thumbnail download on failure
-                logger.error(f"Download task generated an exception: {result}")
-                logger.error(f"Trying again with thumbnail: {str(data[index][2])}")
-                await thumbnail_download(semaphore, str(data[index][2]), str(data[index][0]), save_path, session)
-                failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
+            if response.status == 200:
+                data = await response.read()
+                image_data = BytesIO(data)
+                
+                try:
+                    with IMG2.open(image_data) as img:
+                        final_image_path = os.path.join(save_path, f"{image_name}.png")
+                        img.save(final_image_path)
+                        logger.info(f"Successfully saved thumbnail: {final_image_path}")
+                        return True
+                except Exception as e:
+                    logger.error(f"Error processing thumbnail: {e}")
+                    return False
             else:
-                logger.info(f"Download task completed with result: {result}")
-                if result is False:
-                    failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
-
-    return failed_downloads
+                logger.error(f"Thumbnail download failed with status {response.status}")
+                return False
+    except Exception as exc:
+        logger.error(f"Exception in thumbnail download: {exc}")
+        return False
+    finally:
+        # Small delay to help with resource cleanup
+        await asyncio.sleep(0.01)
 
 def verify_png_image_single(image_path):
     """
