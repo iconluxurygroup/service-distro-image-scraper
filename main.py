@@ -2762,9 +2762,117 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
         # Small delay to help with resource cleanup
         await asyncio.sleep(0.01)
 
+def write_excel_image(local_filename, temp_dir, preferred_image_method):
+    """
+    Write images to an Excel file with improved debugging and error handling.
+    
+    Args:
+        local_filename (str): Path to the Excel file
+        temp_dir (str): Path to the directory containing images
+        preferred_image_method (str): Preferred method for inserting images ('append', 'overwrite', 'NewColumn')
+        
+    Returns:
+        list: List of row numbers that failed
+    """
+    failed_rows = []
+    successful_rows = []
+    
+    try:
+        # Load the workbook and select the active worksheet
+        wb = load_workbook(local_filename)
+        ws = wb.active
+        logger.info(f"Processing images in {temp_dir} for Excel file {local_filename}")
+        
+        # Check if temp directory exists and has files
+        if not os.path.exists(temp_dir):
+            logger.error(f"Temp directory does not exist: {temp_dir}")
+            return failed_rows
+            
+        image_files = os.listdir(temp_dir)
+        if not image_files:
+            logger.warning(f"No image files found in directory: {temp_dir}")
+            return failed_rows
+            
+        logger.info(f"Found {len(image_files)} image files to process")
+        
+        # Iterate through each file in the temporary directory
+        for image_file in image_files:
+            image_path = os.path.join(temp_dir, image_file)
+            
+            # Extract row number from the image file name
+            try:
+                # Assuming the file name can be directly converted to an integer row number
+                row_number = int(image_file.split('.')[0])
+                logger.info(f"Processing row {row_number}, image path: {image_path}")
+                
+                # Check if file exists and has size
+                if not os.path.exists(image_path) or os.path.getsize(image_path) < 100:
+                    logger.warning(f"Image file missing or too small: {image_path}")
+                    failed_rows.append(row_number)
+                    continue
+                    
+            except ValueError:
+                logger.warning(f"Skipping file {image_file}: does not match expected naming convention")
+                continue  # Skip files that do not match the expected naming convention
+            
+            # Verify the image meets criteria to be added
+            verify_image = verify_png_image_single(image_path)    
+            if verify_image:
+                logger.info(f'Inserting image for row {row_number}')
+                try:
+                    # Explicitly use the openpyxl.drawing.image.Image class to avoid conflicts
+                    img = Image(image_path)
+                    
+                    # Determine the anchor point based on the preferred image method
+                    if preferred_image_method in ["overwrite", "append"]:
+                        column = "A"
+                    elif preferred_image_method == "NewColumn":
+                        column = "B"
+                    else:
+                        logger.error(f'Unrecognized preferred image method: {preferred_image_method}')
+                        column = "A"  # Default to column A
+                        
+                    anchor = f"{column}{row_number}"
+                    logger.info(f'Anchor assigned: {anchor}')
+                    
+                    # Add the image to the worksheet
+                    img.anchor = anchor
+                    ws.add_image(img)
+                    
+                    # Highlight the cell (optional)
+                    try:
+                        # Create a fill pattern
+                        fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
+                        
+                        # Apply the fill to the cell
+                        cell = ws[anchor]
+                        cell.fill = fill
+                        logger.info(f'Cell {anchor} highlighted')
+                    except Exception as highlight_error:
+                        logger.warning(f'Error highlighting cell {anchor}: {highlight_error}')
+                    
+                    successful_rows.append(row_number)
+                    logger.info(f'Image successfully added at {anchor} for row {row_number}')
+                except Exception as img_error:
+                    logger.error(f'Error adding image at {anchor} for row {row_number}: {img_error}')
+                    failed_rows.append(row_number)
+            else:
+                failed_rows.append(row_number)
+                logger.warning(f'Inserting image skipped due to verify_png_image_single failure for row {row_number}')   
+        
+        # Save the workbook
+        logger.info(f'Finished processing all images. Successful: {len(successful_rows)}, Failed: {len(failed_rows)}')
+        wb.save(local_filename)
+        
+        # Return only after successful save
+        return failed_rows
+    except Exception as e:
+        logger.error(f"Error writing images to Excel: {e}", exc_info=True)
+        return failed_rows
+
 def verify_png_image_single(image_path):
     """
-    Verify that an image is a valid PNG.
+    Verify that an image is a valid PNG and resize if necessary.
     
     Args:
         image_path (str): Path to the image to verify
@@ -2773,27 +2881,86 @@ def verify_png_image_single(image_path):
         bool: True if the image is valid, False otherwise
     """
     try:
-        img = IMG2.open(image_path)
-        img.verify()  # Verify it's a valid image
-        logging.info(f"Image verified successfully: {image_path}")
+        with IMG2.open(image_path) as img:
+            # Just opening the image verifies it's a valid image
+            # We can also check format, size, etc. here
+            logger.info(f"Image verified successfully: {image_path}, format: {img.format}, size: {img.size}")
+            
+            # Check image size
+            imageSize = os.path.getsize(image_path)
+            logger.info(f"Image file size: {imageSize} bytes")
+            
+            if imageSize < 3000:
+                logger.warning(f"File may be corrupted or too small: {image_path}")
+                return False
+                
+            # Resize the image if needed
+            MAXSIZE = 145  # Maximum size in pixels
+            h, w = img.height, img.width  # original size
+            
+            if h > MAXSIZE or w > MAXSIZE:
+                if h > w:
+                    w = int(w * MAXSIZE / h)
+                    h = MAXSIZE
+                else:
+                    h = int(h * MAXSIZE / w)
+                    w = MAXSIZE
+                
+                logger.info(f"Resizing image from {img.size} to {w}x{h}")
+                newImg = img.resize((w, h))
+                newImg.save(image_path)
+                logger.info(f"Image resized and saved: {image_path}")
+            
+            return True
     except Exception as e:
-        logging.error(f"IMAGE verify ERROR: {e}, for image: {image_path}")
+        logger.error(f"Error verifying/resizing image: {e}, for image: {image_path}")
         return False
 
-    imageSize = os.path.getsize(image_path)
-    logging.debug(f"Image size: {imageSize} bytes")
-
-    if imageSize < 3000:
-        logging.warning(f"File may be corrupted or too small: {image_path}")
-        return False
-
+def write_failed_downloads_to_excel(failed_downloads, excel_file):
+    """
+    Write failed downloads to an Excel file with improved error handling.
+    
+    Args:
+        failed_downloads (list): List of failed downloads (URL, row ID pairs)
+        excel_file (str): Path to the Excel file
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
     try:
-        resize_image(image_path)
+        if not failed_downloads:
+            logger.info("No failed downloads to write to Excel.")
+            return True
+            
+        workbook = load_workbook(excel_file)
+        worksheet = workbook.active
+        logger.info(f"Writing {len(failed_downloads)} failed downloads to Excel")
+        
+        for i, row in enumerate(failed_downloads):
+            try:
+                url = row[0]
+                row_id = row[1]
+                
+                if url and url != 'None found in this filter':
+                    # Write the URL to column A of the failed row
+                    cell_reference = f"{get_column_letter(1)}{row_id}"  # Column A, row number
+                    worksheet[cell_reference] = str(url)
+                    
+                    # Highlight the cell
+                    fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+                    worksheet[cell_reference].fill = fill
+                    
+                    logger.info(f"Added failed download URL to cell {cell_reference}")
+            except Exception as row_error:
+                logger.error(f"Error processing failed download row {i}: {row_error}")
+                # Continue with next row
+        
+        workbook.save(excel_file)
+        logger.info(f"Failed downloads written to Excel file: {excel_file}")
+        return True
     except Exception as e:
-        logging.error(f"Error resizing image: {e}, for image: {image_path}")
+        logger.error(f"Error writing failed downloads to Excel: {e}")
         return False
-    return True
-
 def resize_image(image_path):
     """
     Resize an image to a maximum size.
@@ -2842,102 +3009,6 @@ def highlight_cell(excel_file, cell_reference):
         logging.info(f"Highlighted cell {cell_reference} in {excel_file}")
     except Exception as e:
         logging.error(f"Error highlighting cell: {e}")
-def write_excel_image(local_filename, temp_dir, preferred_image_method):
-    """
-    Write images to an Excel file.
-    
-    Args:
-        local_filename (str): Path to the Excel file
-        temp_dir (str): Path to the directory containing images
-        preferred_image_method (str): Preferred method for inserting images ('append', 'overwrite', 'NewColumn')
-        
-    Returns:
-        list: List of row numbers that failed
-    """
-    failed_rows = []
-    try:
-        # Load the workbook and select the active worksheet
-        wb = load_workbook(local_filename)
-        ws = wb.active
-        logger.info(f"Processing images in {temp_dir} for Excel file {local_filename}")
-        
-        # Iterate through each file in the temporary directory
-        for image_file in os.listdir(temp_dir):
-            image_path = os.path.join(temp_dir, image_file)
-            # Extract row number from the image file name
-            try:
-                # Assuming the file name can be directly converted to an integer row number
-                row_number = int(image_file.split('.')[0])
-                logger.info(f"Processing row {row_number}, image path: {image_path}")
-            except ValueError:
-                logger.warning(f"Skipping file {image_file}: does not match expected naming convention")
-                continue  # Skip files that do not match the expected naming convention
-            
-            # Verify the image meets criteria to be added
-            verify_image = verify_png_image_single(image_path)    
-            if verify_image:
-                logger.info('Inserting image')
-                # Explicitly use the openpyxl.drawing.image.Image class to avoid conflicts
-                img = openpyxl.drawing.image.Image(image_path)
-                # Determine the anchor point based on the preferred image method
-                if preferred_image_method in ["overwrite", "append"]:
-                    anchor = "A" + str(row_number)
-                    logger.info('Anchor assigned')
-                elif preferred_image_method == "NewColumn":
-                    anchor = "B" + str(row_number)  # Example adjustment for a different method
-                else:
-                    logger.error(f'Unrecognized preferred image method: {preferred_image_method}')
-                    continue  # Skip if the method is not recognized
-                    
-                img.anchor = anchor
-                ws.add_image(img)
-                logger.info(f'Image added at {anchor}')
-            else:
-                failed_rows.append(row_number)
-                logger.warning('Inserting image skipped due to verify_png_image_single failure.')   
-        
-        # Save the workbook
-        logger.info('Finished processing all images.')
-        wb.save(local_filename)
-        return failed_rows
-    except Exception as e:
-        logger.error(f"Error writing images to Excel: {e}", exc_info=True)
-        return failed_rows
-
-def write_failed_downloads_to_excel(failed_downloads, excel_file):
-    """
-    Write failed downloads to an Excel file.
-    
-    Args:
-        failed_downloads (list): List of failed downloads (URL, row ID pairs)
-        excel_file (str): Path to the Excel file
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    try:
-        if not failed_downloads:
-            logger.info("No failed downloads to write to Excel.")
-            return True
-            
-        workbook = load_workbook(excel_file)
-        worksheet = workbook.active
-        
-        for row in failed_downloads:
-            url = row[0]
-            row_id = row[1]
-            if url and url != 'None found in this filter':
-                # Write the URL to column A of the failed row
-                cell_reference = f"{get_column_letter(1)}{row_id}"  # Column A, row number
-                worksheet[cell_reference] = str(url)
-                highlight_cell(excel_file, cell_reference)
-        
-        workbook.save(excel_file)
-        logger.info(f"Failed downloads written to Excel file: {excel_file}")
-        return True
-    except Exception as e:
-        logger.error(f"Error writing failed downloads to Excel: {e}")
-        return False
 
 
 def prepare_images_for_download_dataframe(df):
