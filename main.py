@@ -158,7 +158,7 @@ def send_email(to_emails, subject, download_url, jobId):
             
             <p>--</p>
             <p><small>This is an automated system notification.</small></p>
-            <p><small>Notified Users: {to_emails}\nJobId: {jobId}\nFrom: System\n<a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
+            <p><small>Notified Users: {to_emails}\nJobId: {jobId}\nFrom: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
         """
         
         message = Mail(
