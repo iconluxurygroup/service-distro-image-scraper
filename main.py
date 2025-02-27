@@ -150,15 +150,15 @@ def send_email(to_emails, subject, download_url, jobId):
         <html>
         <body>
         <div class="container">
-            <p>Your file is ready for download.</p>
-             <a href="{download_url}" class="download-button">Download File</a>
+            <p>Your file is ready for download.<br>
+            <a href="{download_url}" class="download-button">Download File</a></p>
 
-            <p>Please use the link below to modify the file<br></p>
-            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}">Edit / View</a> 
+            <p>Please use the link below to modify the file<br>
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}">Edit / View</a></p>
             
             <p>--</p>
-            <p><small>This is an automated system notification.</small></p>
-            <p><small>Notified Users: {to_emails}\nJobId: {jobId}\nFrom: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
+            <p><small>This is an automated system notification.<br>
+            Notified Users: {to_emails} JobId: {jobId} From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
         """
         
         message = Mail(
