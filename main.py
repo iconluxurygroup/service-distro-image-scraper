@@ -3246,7 +3246,7 @@ def process_image_batch(payload):
         
         # Update sort order and process images
         update_sort_order(file_id_db)
-        process_images(file_id_db)
+        #process_images(file_id_db)
         
         # Generate download file
         asyncio.run(generate_download_file(file_id_db))
