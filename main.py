@@ -1569,9 +1569,9 @@ async def generate_download_file(file_id):
     if failed_img_urls:
         logger.info(failed_img_urls)
         #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-        fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
+        #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
         logger.error(f"Failed to write images for rows: {failed_rows}")
-        logger.error(f"Failed rows added to excel: {fail_rows_written})")
+        #logger.error(f"Failed rows added to excel: {fail_rows_written})")
         
     logger.info("Uploading file to space")
     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
@@ -2763,7 +2763,7 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
         await asyncio.sleep(0.01)
 def write_excel_image(local_filename, temp_dir, preferred_image_method):
     """
-    Write images to an Excel file.
+    Write images to an Excel file with proper imports and error handling.
     
     Args:
         local_filename (str): Path to the Excel file
@@ -2773,6 +2773,11 @@ def write_excel_image(local_filename, temp_dir, preferred_image_method):
     Returns:
         list: List of row numbers that failed
     """
+    import os
+    import logging
+    from openpyxl import load_workbook
+    from openpyxl.drawing.image import Image
+    
     failed_rows = []
     # Load the workbook and select the active worksheet
     wb = load_workbook(local_filename)
@@ -2790,31 +2795,38 @@ def write_excel_image(local_filename, temp_dir, preferred_image_method):
         except ValueError:
             logging.warning(f"Skipping file {image_file}: does not match expected naming convention")
             continue  # Skip files that do not match the expected naming convention
+            
         verify_image = verify_png_image_single(image_path)    
         # Check if the image meets the criteria to be added
         if verify_image:
             logging.info('Inserting image')
-            img = openpyxl.drawing.image.Image(image_path)
-            # Determine the anchor point based on the preferred image method
-            if preferred_image_method in ["overwrite", "append"]:
-                anchor = "A" + str(row_number)
-                logging.info('Anchor assigned')
-            elif preferred_image_method == "NewColumn":
-                anchor = "B" + str(row_number)  # Example adjustment for a different method
-            else:
-                logging.error(f'Unrecognized preferred image method: {preferred_image_method}')
-                continue  # Skip if the method is not recognized
-                
-            img.anchor = anchor
-            ws.add_image(img)
-            #wb.save(local_filename)
-            logging.info(f'Image saved at {anchor}')
+            try:
+                img = Image(image_path)
+                # Determine the anchor point based on the preferred image method
+                if preferred_image_method in ["overwrite", "append"]:
+                    anchor = "A" + str(row_number)
+                    logging.info('Anchor assigned')
+                elif preferred_image_method == "NewColumn":
+                    anchor = "B" + str(row_number)  # Example adjustment for a different method
+                else:
+                    logging.error(f'Unrecognized preferred image method: {preferred_image_method}')
+                    continue  # Skip if the method is not recognized
+                    
+                img.anchor = anchor
+                ws.add_image(img)
+                logging.info(f'Image added at {anchor}')
+            except Exception as e:
+                logging.error(f"Error adding image: {e}")
+                failed_rows.append(row_number)
+                continue
         else:
             failed_rows.append(row_number)
             logging.warning('Inserting image skipped due to verify_png_image_single failure.')   
+    
     # Finalize changes to the workbook
-    logging.info('Finished processing all images.')
+    logging.info('Finished processing all images. Saving workbook...')
     wb.save(local_filename)
+    logging.info('Workbook saved successfully.')
     return failed_rows
 
 def verify_png_image_single(image_path):
