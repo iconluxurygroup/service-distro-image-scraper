@@ -78,6 +78,24 @@ def get_spaces_client():
     except Exception as e:
         logger.error(f"Error creating S3 client: {e}")
         raise
+def double_encode_plus(filename):
+    """
+    Explicitly double-encode the '+' character while preserving other characters.
+    
+    Args:
+        filename (str): Filename to encode
+    
+    Returns:
+        str: Double-encoded filename
+    """
+    # First, replace '+' with its percent-encoded representation
+    first_pass = filename.replace('+', '%2B')
+    
+    # Then percent-encode the result again
+    second_pass = urllib.parse.quote(first_pass)
+    
+    return second_pass
+
 def upload_file_to_space(file_src, save_as, is_public=True):
     """
     Upload a file to AWS S3.
@@ -102,10 +120,10 @@ def upload_file_to_space(file_src, save_as, is_public=True):
         )
         
         logger.info(f"File uploaded successfully to {space_name}/{save_as}")
-        
+        double_encoded_filename = double_encode_plus(save_as)
         # Generate and return the public URL if the file is public
         if is_public:
-            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{urllib.parse.quote(urllib.parse.quote(save_as))}"
+            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{double_encoded_filename}"
             logger.info(f"Public URL (double-encoded): {upload_url}")
             return upload_url
         
