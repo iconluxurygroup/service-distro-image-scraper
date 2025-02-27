@@ -1010,7 +1010,7 @@ def update_sort_order(file_id):
                 total_time = time.time() - start_time
                 logging.error(f"❌ Error during sort order update after {total_time:.2f} seconds: {e}")
                 logging.error(traceback.format_exc())
-                return Nonu
+                return None
 
             finally:
                 if 'cursor' in locals():
