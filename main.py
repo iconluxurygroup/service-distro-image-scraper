@@ -158,7 +158,7 @@ def send_email(to_emails, subject, download_url, jobId):
             <br>  
             
             <p>--</p>
-            <p>CMS:v1.1</p>
+            <p>ImageDistro:v13.3</p>
         </div>
         </body>
         </html>
