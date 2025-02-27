@@ -153,17 +153,15 @@ def send_email(to_emails, subject, download_url, jobId):
             <p>Your file is ready for download.</p>
              <a href="{download_url}" class="download-button">Download File</a>
 
-            <p><br>Please use the link below to modify the file<br></p>
+            <p>Please use the link below to modify the file<br></p>
             <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}">Edit / View</a> 
             
+            <p>For support, please <a href="mailto:nik@iconluxurygroup.com?subject=Support Ticket for Job ID {str(jobId)}&body=Job ID: {str(jobId)}%0A%0ADescription of Issue:%0A">submit a ticket here</a>.</p>
             <br>  
-            
-        <p>For support, please <a href="mailto:nik@iconluxurygroup.com?subject=Support Ticket for Job ID {str(jobId)}&body=Job ID: {str(jobId)}%0A%0ADescription of Issue:%0A">submit a ticket here</a>.</p>
-        <br>  
-        <p>--</p>
-        <p><small>This is an automated system notification.</small></p>
-        <p><small><a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&rts=nik&ID={str(jobId)}">Debug View</a></small></p>
-        <p><small><a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
+            <p>--</p>
+            <p><small>This is an automated system notification.</small></p>
+            <p><small><a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&rts=nik&ID={str(jobId)}">Debug View</a></small></p>
+            <p><small><a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
         
         <p>Notified Users: {to_emails}\nJobId: {jobId}\nFrom: System</p>
         """
