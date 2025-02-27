@@ -3,7 +3,7 @@ import asyncio, os, threading, uuid, requests, openpyxl, uvicorn, shutil, mimety
 from openpyxl import load_workbook
 from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
-from openpyxl.drawing.image import Image
+from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import PatternFill
 import datetime, re
 import boto3
@@ -2842,7 +2842,6 @@ def highlight_cell(excel_file, cell_reference):
         logging.info(f"Highlighted cell {cell_reference} in {excel_file}")
     except Exception as e:
         logging.error(f"Error highlighting cell: {e}")
-
 def write_excel_image(local_filename, temp_dir, preferred_image_method):
     """
     Write images to an Excel file.
@@ -2869,39 +2868,40 @@ def write_excel_image(local_filename, temp_dir, preferred_image_method):
             try:
                 # Assuming the file name can be directly converted to an integer row number
                 row_number = int(image_file.split('.')[0])
-                logging.info(f"Processing row {row_number}, image path: {image_path}")
+                logger.info(f"Processing row {row_number}, image path: {image_path}")
             except ValueError:
-                logging.warning(f"Skipping file {image_file}: does not match expected naming convention")
+                logger.warning(f"Skipping file {image_file}: does not match expected naming convention")
                 continue  # Skip files that do not match the expected naming convention
             
             # Verify the image meets criteria to be added
             verify_image = verify_png_image_single(image_path)    
             if verify_image:
-                logging.info('Inserting image')
-                img = Image(image_path)
+                logger.info('Inserting image')
+                # Explicitly use the openpyxl.drawing.image.Image class to avoid conflicts
+                img = openpyxl.drawing.image.OpenpyxlImage(image_path)
                 # Determine the anchor point based on the preferred image method
                 if preferred_image_method in ["overwrite", "append"]:
                     anchor = "A" + str(row_number)
-                    logging.info('Anchor assigned')
+                    logger.info('Anchor assigned')
                 elif preferred_image_method == "NewColumn":
                     anchor = "B" + str(row_number)  # Example adjustment for a different method
                 else:
-                    logging.error(f'Unrecognized preferred image method: {preferred_image_method}')
+                    logger.error(f'Unrecognized preferred image method: {preferred_image_method}')
                     continue  # Skip if the method is not recognized
                     
                 img.anchor = anchor
                 ws.add_image(img)
-                logging.info(f'Image added at {anchor}')
+                logger.info(f'Image added at {anchor}')
             else:
                 failed_rows.append(row_number)
-                logging.warning('Inserting image skipped due to verify_png_image_single failure.')   
+                logger.warning('Inserting image skipped due to verify_png_image_single failure.')   
         
         # Save the workbook
-        logging.info('Finished processing all images.')
+        logger.info('Finished processing all images.')
         wb.save(local_filename)
         return failed_rows
     except Exception as e:
-        logging.error(f"Error writing images to Excel: {e}")
+        logger.error(f"Error writing images to Excel: {e}", exc_info=True)
         return failed_rows
 
 def write_failed_downloads_to_excel(failed_downloads, excel_file):
