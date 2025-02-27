@@ -78,7 +78,7 @@ def get_spaces_client():
     except Exception as e:
         logger.error(f"Error creating S3 client: {e}")
         raise
-def upload_file_to_space(file_src, save_as, is_public):
+def upload_file_to_space(file_src, save_as, is_public=True):
     """
     Upload a file to AWS S3.
     
@@ -105,8 +105,8 @@ def upload_file_to_space(file_src, save_as, is_public):
         
         # Generate and return the public URL if the file is public
         if is_public:
-            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{save_as}"
-            logger.info(f"Public URL: {upload_url}")
+            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{urllib.parse.quote(urllib.parse.quote(save_as))}"
+            logger.info(f"Public URL (double-encoded): {upload_url}")
             return upload_url
         
         return None
@@ -301,21 +301,13 @@ def update_database(result_id, aijson, aicaption):
         logging.error(f"Error updating database for ResultID {result_id}: {e}")
         return False
 def insert_file_db(file_name, file_source, send_to_email="nik@iconluxurygroup.com"):
-    """
-    Insert a file record into the database.
+    # Double-encode the file source
+    double_encoded_source = urllib.parse.quote(urllib.parse.quote(file_source))
     
-    Args:
-        file_name (str): Name of the file
-        file_source (str): Source URL of the file
-        send_to_email (str): Email address to send notifications to
-        
-    Returns:
-        int: The ID of the inserted record
-    """
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
     insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
-    values = (file_name, file_source, send_to_email)
+    values = (file_name, double_encoded_source, send_to_email)
 
     cursor.execute(insert_query, values)
     file_id = cursor.fetchval()
@@ -3071,6 +3063,7 @@ async def generate_download_file(file_id):
 
         # Upload file to S3 with the new filename
         logger.info(f"Uploading processed file to S3 as {processed_file_name}")
+     # Double-encode the filename when uploading
         public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, processed_file_name, True)
         # Update database
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
