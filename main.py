@@ -317,12 +317,11 @@ def update_database(result_id, aijson, aicaption):
         return False
 def insert_file_db(file_name, file_source, send_to_email="nik@iconluxurygroup.com"):
     # Double-encode the file source
-    double_encoded_source = urllib.parse.quote(urllib.parse.quote(file_source))
     
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
     insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
-    values = (file_name, double_encoded_source, send_to_email)
+    values = (file_name, file_source, send_to_email)
 
     cursor.execute(insert_query, values)
     file_id = cursor.fetchval()
