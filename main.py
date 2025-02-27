@@ -769,6 +769,8 @@ def update_sort_order(file_id):
 
         logging.info(f"🔄 Updating sort order for FileID: {file_id}")
         
+        # Step 1: Verify current sort order
+        
         # Step 1: Verify current sort order before making changes
         current_order_query = """
         SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
@@ -1540,7 +1542,7 @@ def extract_match_data(text: str) -> Dict[str, Any]:
                 result["match_score"] = float(score_match.group(1))
             except ValueError:
                 pass
-        
+                
         # Extract reasoning
         reasoning_match = re.search(r'"reasoning_match"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
         if reasoning_match:
@@ -2156,7 +2158,9 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
 
     IMPORTANT: Your response MUST be a valid JSON object with exactly this structure:
     {{
-    "description": "Brief description of what you see in the image",
+    	
+    	  
+        "description": "Brief description of what you see in the image",
     "user_provided": {{
         "brand": "{product_brand}",
         "category": "{product_category}",
@@ -2430,13 +2434,6 @@ def batch_process_images(file_id=None, limit=8):
                     if result.get('match_score') == 100:
                         perfect_matches.add(entry_id)
                         logging.info(f"Perfect match found for EntryID {entry_id}, skipping further images")
-    for row in df.itertuples(index=False,name=None):
-        logger.info(row)
-        if row[1] != 'No google image results found':
-            images_to_download.append(row)
-                else:
-                    logging.warning(f"Database update failed for image {result_id}")
-
             except Exception as e:
                 logging.error(f"Error processing image {result_id}: {e}")
 
@@ -2673,12 +2670,6 @@ def build_headers(url):
         "Upgrade-Insecure-Requests": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     }
-    #if domain:
-        #headers["Referer"] = f"https://{domain}/"
-        #logger.info(f"Headers: {headers['Referer']}")
-    # Additional dynamic header settings can go here.
-    # Example for Referer (if applicable):
-    # headers["Referer"] = f"https://{domain}/"
     
     return headers
 def try_convert_to_png(image_path, new_path, image_name):
@@ -2857,7 +2848,10 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
                         for fmt in fallback_formats:
                             image_data.seek(0)  # Reset stream position
                             try:
-                                logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
+                                log
+                          
+                          
+                          logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
                                 with IMG2.open(image_data) as img:
                                     final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
                                     img.save(final_image_path)
@@ -3606,6 +3600,10 @@ async def check_json_status(file_id: str):
                 )
             """
             cursor.execute(invalid_match_score_query, (file_id,))
+            issues_data["invalid_match
+            
+            
+            cursor.execute(invalid_match_score_query, (file_id,))
             issues_data["invalid_match_score"] = cursor.fetchone()[0]
         except Exception as e:
             logger.warning(f"Error in invalid_match_score query: {e}")
@@ -3993,9 +3991,3 @@ if __name__ == "__main__":
     # Start the FastAPI server
     import uvicorn
     uvicorn.run("main:app", port=8080, host='0.0.0.0')
-    # API headers
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer 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"
-    }
-  
