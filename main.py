@@ -1532,76 +1532,7 @@ def get_send_to_email(file_id_db):
     else:
 
         send_to_email = "No Email Found"
-    return send_to_email  
-
-async def generate_download_file(file_id):
-    preferred_image_method = 'append'
-    
-    start_time = time.time()
-    loop = asyncio.get_running_loop()
-    
-    selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
-    selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe,selected_images_df )
-    
-    logger.info(selected_images_df.head())
-    logger.info(selected_image_list)
-    
-    provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location,file_id )
-    decoded_string = urllib.parse.unquote(provided_file_path)
-    logger.info("{} {}".format(provided_file_path, decoded_string))
-
-    file_name = provided_file_path.split('/')[-1]
-    temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
-    local_filename = os.path.join(temp_excel_dir, file_name)
-    failed_img_urls = await download_all_images(selected_image_list, temp_images_dir)
-    contenttype = os.path.splitext(local_filename)[1]
-    response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
-    if response.status_code != 200:
-        logger.error(f"Failed to download file: {response.status_code}")
-        return {"error": "Failed to download the provided file."}
-    with open(local_filename, "wb") as file:
-        file.write(response.content)
-        
-    logger.info("Writing images to Excel")
-    failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-    logger.info(f"failed rows: {failed_rows}")
-    #if failed_rows != []:
-    if failed_img_urls:
-        logger.info(failed_img_urls)
-        #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-        #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
-        logger.error(f"Failed to write images for rows: {failed_rows}")
-        #logger.error(f"Failed rows added to excel: {fail_rows_written})")
-        
-    logger.info("Uploading file to space")
-    #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
-    is_public = True
-    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name,is_public)  
-
-    await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
-    await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
-  
-    subject_line = f"{file_name} Job Notification"
-    logger.info(subject_line)
-    
-    
-    
-    
-    send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id)
-    await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email,subject_line,public_url,file_id)
-    logger.info('Sending email:\n',send_to_email)
-
-    #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, 'Your File Is Ready', public_url, local_filename)
-    if os.listdir(temp_images_dir) !=[]:
-        logger.info("Sending email")
-        #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, f'Started {file_name}', public_url, local_filename,execution_time,'')
-    #await send_email(send_to_email, 'Your File Is Ready', public_url, local_filename)
-    logger.info("Cleaning up temporary directories")
-    await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
-    
-    logger.info("Processing completed successfully")
-    
-    return {"message": "Processing completed successfully.", "results": 'hardcoded result value', "public_url": public_url}
+    return send_to_email 
     
 # async def process_image_batch(payload: dict):
 #     start_time = time.time()
@@ -3149,8 +3080,8 @@ async def generate_download_file(file_id):
         await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, subject_line, public_url, file_id)
         
         # Clean up temporary directories
-        logger.info("Cleaning up temporary directories")
-        await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
+        # logger.info("Cleaning up temporary directories")
+        # await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
         
         end_time = time.time()
         execution_time = end_time - start_time
