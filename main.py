@@ -3164,17 +3164,17 @@ async def process_restart_batch(file_id_db):
                     success = process_search_row(search_string, endpoint, entry_id)
                     if not success:
                         logger.warning(f"Failed to generate URL for EntryID: {entry_id}")
+        #AI 
+        # # Now check for images with URLs but missing AI analysis
+        # missing_analysis_df = fetch_missing_images(file_id_db, limit=100, ai_analysis_only=True)
         
-        # Now check for images with URLs but missing AI analysis
-        missing_analysis_df = fetch_missing_images(file_id_db, limit=100, ai_analysis_only=True)
-        
-        if not missing_analysis_df.empty:
-            logger.info(f"Processing {len(missing_analysis_df)} images with missing AI analysis for FileID: {file_id_db}")
+        # if not missing_analysis_df.empty:
+        #     logger.info(f"Processing {len(missing_analysis_df)} images with missing AI analysis for FileID: {file_id_db}")
             
-            # Process the missing images
-            batch_process_images(file_id=file_id_db, limit=len(missing_analysis_df))
-        else:
-            logger.info(f"No images with missing AI analysis for FileID: {file_id_db}")
+        #     # Process the missing images
+        #     batch_process_images(file_id=file_id_db, limit=len(missing_analysis_df))
+        # else:
+        #     logger.info(f"No images with missing AI analysis for FileID: {file_id_db}")
         
         # Update sort order after processing is complete
         logger.info(f"Updating sort order for FileID: {file_id_db}")
