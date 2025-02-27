@@ -36,7 +36,7 @@ import traceback
 import math
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Change to DEBUG for more verbose logs
+    level=logging.INFO,  # Change to DEBUG for more verbose logs
     format='%(asctime)s - %(levelname)s - %(pathname)s:%(lineno)d - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -155,8 +155,11 @@ def send_email(to_emails, subject, download_url, jobId):
 
             <p><br>Please use the link below to modify the file<br></p>
             <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}">Edit / View</a> 
+            
             <br>  
+            
         <p>For support, please <a href="mailto:nik@iconluxurygroup.com?subject=Support Ticket for Job ID {str(jobId)}&body=Job ID: {str(jobId)}%0A%0ADescription of Issue:%0A">submit a ticket here</a>.</p>
+        <br>  
         <p>--</p>
         <p><small>This is an automated system notification.</small></p>
         <p><small><a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
