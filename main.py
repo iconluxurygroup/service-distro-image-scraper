@@ -393,7 +393,7 @@ def load_payload_db(rows, file_id):
         logging.error(f"Error loading payload data: {e}")
         raise
 
-def get_records_to_search(file_id, engine=None):
+def get_records_to_search(file_id):
     """
     Get records that need to be searched for images.
     
@@ -527,7 +527,7 @@ def clean_json(value):
             "linesheet_score": None,
             "reasoning_linesheet": ""
         })
-def get_records_to_search(file_id,engine):
+def get_records_to_search(file_id):
     sql_query = f"Select EntryID, ProductModel as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null UNION ALL Select EntryID, ProductModel + ' '  + ProductBrand as SearchString from utb_ImageScraperRecords where FileID = {file_id} and Step1 is null Order by 1"
     logger.info(sql_query)
     df = pd.read_sql_query(sql_query, con=engine)
@@ -1657,7 +1657,7 @@ def get_lm_products(file_id):
     connection.close()
     
 def process_restart_batch(file_id_db):
-    search_df = get_records_to_search(file_id_db, engine)
+    search_df = get_records_to_search(file_id_db)
     logger.info(search_df)
     search_list=list(search_df.T.to_dict().values())
     ####
@@ -1699,7 +1699,7 @@ def process_image_batch(payload: dict):
     logger.info(file_id_db)
     load_payload_db(rows, file_id_db)
     get_lm_products(file_id_db)
-    search_df = get_records_to_search(file_id_db, engine)
+    search_df = get_records_to_search(file_id_db)
     logger.info(search_df)
     search_list=list(search_df.T.to_dict().values())
     ####
