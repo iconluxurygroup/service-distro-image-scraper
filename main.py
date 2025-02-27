@@ -154,11 +154,12 @@ def send_email(to_emails, subject, download_url, jobId):
              <a href="{download_url}" class="download-button">Download File</a>
 
             <p><br>Please use the link below to modify the file<br></p>
-            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}">Edit / View</a> 
             <br>  
             
             <p>--</p>
-            <p>ImageDistro:v13.3</p>
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a> 
+            
         </div>
         </body>
         </html>
