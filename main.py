@@ -1535,8 +1535,8 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
     IMPORTANT: When evaluating matches, use these guidelines:
     - Brand: Must be exact match (case insensitive)
     - Category: Evaluate using hierarchical matching:
-    * 100% match: Exact match (e.g., "CROSSBODY BAG" = "CROSSBODY BAG") 
-    * 50% match: Parent/child category (e.g., "CROSSBODY BAG" ~ "HANDBAG", "RUNNING SHOE" ~ "ATHLETIC FOOTWEAR")
+    * 100% match: Exact match (e.g., "BAG" = "BAG") 
+    * 50% match: Parent/child category (e.g., "CROSSBODY BAG" ~ "HANDBAGS", "RUNNING SHOE" ~ "ATHLETIC FOOTWEAR")
     * 0% match: Completely different categories
     - Color: Main color must match (allowing for descriptive variations)
 
@@ -1568,6 +1568,7 @@ def process_image(image_path_or_url: str, product_details: Dict[str, str], max_r
     - color: 33 if match, 0 if not
 
     The final match_score should be the sum of all three individual scores.
+    Max score of 100
     Only return the JSON object, nothing else.
     """
 
