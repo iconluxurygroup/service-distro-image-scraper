@@ -2761,10 +2761,9 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
     finally:
         # Small delay to help with resource cleanup
         await asyncio.sleep(0.01)
-
 def write_excel_image(local_filename, temp_dir, preferred_image_method):
     """
-    Write images to an Excel file with improved debugging and error handling.
+    Write images to an Excel file.
     
     Args:
         local_filename (str): Path to the Excel file
@@ -2775,100 +2774,48 @@ def write_excel_image(local_filename, temp_dir, preferred_image_method):
         list: List of row numbers that failed
     """
     failed_rows = []
-    successful_rows = []
+    # Load the workbook and select the active worksheet
+    wb = load_workbook(local_filename)
+    ws = wb.active
+    print(os.listdir(temp_dir))
     
-    try:
-        # Load the workbook and select the active worksheet
-        wb = load_workbook(local_filename)
-        ws = wb.active
-        logger.info(f"Processing images in {temp_dir} for Excel file {local_filename}")
-        
-        # Check if temp directory exists and has files
-        if not os.path.exists(temp_dir):
-            logger.error(f"Temp directory does not exist: {temp_dir}")
-            return failed_rows
-            
-        image_files = os.listdir(temp_dir)
-        if not image_files:
-            logger.warning(f"No image files found in directory: {temp_dir}")
-            return failed_rows
-            
-        logger.info(f"Found {len(image_files)} image files to process")
-        
-        # Iterate through each file in the temporary directory
-        for image_file in image_files:
-            image_path = os.path.join(temp_dir, image_file)
-            
-            # Extract row number from the image file name
-            try:
-                # Assuming the file name can be directly converted to an integer row number
-                row_number = int(image_file.split('.')[0])
-                logger.info(f"Processing row {row_number}, image path: {image_path}")
-                
-                # Check if file exists and has size
-                if not os.path.exists(image_path) or os.path.getsize(image_path) < 100:
-                    logger.warning(f"Image file missing or too small: {image_path}")
-                    failed_rows.append(row_number)
-                    continue
-                    
-            except ValueError:
-                logger.warning(f"Skipping file {image_file}: does not match expected naming convention")
-                continue  # Skip files that do not match the expected naming convention
-            
-            # Verify the image meets criteria to be added
-            verify_image = verify_png_image_single(image_path)    
-            if verify_image:
-                logger.info(f'Inserting image for row {row_number}')
-                try:
-                    # Explicitly use the openpyxl.drawing.image.Image class to avoid conflicts
-                    img = Image(image_path)
-                    
-                    # Determine the anchor point based on the preferred image method
-                    if preferred_image_method in ["overwrite", "append"]:
-                        column = "A"
-                    elif preferred_image_method == "NewColumn":
-                        column = "B"
-                    else:
-                        logger.error(f'Unrecognized preferred image method: {preferred_image_method}')
-                        column = "A"  # Default to column A
-                        
-                    anchor = f"{column}{row_number}"
-                    logger.info(f'Anchor assigned: {anchor}')
-                    
-                    # Add the image to the worksheet
-                    img.anchor = anchor
-                    ws.add_image(img)
-                    
-                    # Highlight the cell (optional)
-                    try:
-                        # Create a fill pattern
-                        fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
-                        
-                        # Apply the fill to the cell
-                        cell = ws[anchor]
-                        cell.fill = fill
-                        logger.info(f'Cell {anchor} highlighted')
-                    except Exception as highlight_error:
-                        logger.warning(f'Error highlighting cell {anchor}: {highlight_error}')
-                    
-                    successful_rows.append(row_number)
-                    logger.info(f'Image successfully added at {anchor} for row {row_number}')
-                except Exception as img_error:
-                    logger.error(f'Error adding image at {anchor} for row {row_number}: {img_error}')
-                    failed_rows.append(row_number)
+    # Iterate through each file in the temporary directory
+    for image_file in os.listdir(temp_dir):
+        image_path = os.path.join(temp_dir, image_file)
+        # Extract row number or other identifier from the image file name
+        try:
+            # Assuming the file name can be directly converted to an integer row number
+            row_number = int(image_file.split('.')[0])
+            logging.info(f"Processing row {row_number}, image path: {image_path}")
+        except ValueError:
+            logging.warning(f"Skipping file {image_file}: does not match expected naming convention")
+            continue  # Skip files that do not match the expected naming convention
+        verify_image = verify_png_image_single(image_path)    
+        # Check if the image meets the criteria to be added
+        if verify_image:
+            logging.info('Inserting image')
+            img = openpyxl.drawing.image.Image(image_path)
+            # Determine the anchor point based on the preferred image method
+            if preferred_image_method in ["overwrite", "append"]:
+                anchor = "A" + str(row_number)
+                logging.info('Anchor assigned')
+            elif preferred_image_method == "NewColumn":
+                anchor = "B" + str(row_number)  # Example adjustment for a different method
             else:
-                failed_rows.append(row_number)
-                logger.warning(f'Inserting image skipped due to verify_png_image_single failure for row {row_number}')   
-        
-        # Save the workbook
-        logger.info(f'Finished processing all images. Successful: {len(successful_rows)}, Failed: {len(failed_rows)}')
-        wb.save(local_filename)
-        
-        # Return only after successful save
-        return failed_rows
-    except Exception as e:
-        logger.error(f"Error writing images to Excel: {e}", exc_info=True)
-        return failed_rows
+                logging.error(f'Unrecognized preferred image method: {preferred_image_method}')
+                continue  # Skip if the method is not recognized
+                
+            img.anchor = anchor
+            ws.add_image(img)
+            #wb.save(local_filename)
+            logging.info(f'Image saved at {anchor}')
+        else:
+            failed_rows.append(row_number)
+            logging.warning('Inserting image skipped due to verify_png_image_single failure.')   
+    # Finalize changes to the workbook
+    logging.info('Finished processing all images.')
+    wb.save(local_filename)
+    return failed_rows
 
 def verify_png_image_single(image_path):
     """
