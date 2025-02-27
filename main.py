@@ -3,7 +3,7 @@ import asyncio, os, threading, uuid, requests, openpyxl, uvicorn, shutil, mimety
 from openpyxl import load_workbook
 from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
-from openpyxl.drawing.image import Image as OpenpyxlImage
+from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
 import datetime, re
 import boto3
@@ -2878,7 +2878,7 @@ def write_excel_image(local_filename, temp_dir, preferred_image_method):
             if verify_image:
                 logger.info('Inserting image')
                 # Explicitly use the openpyxl.drawing.image.Image class to avoid conflicts
-                img = openpyxl.drawing.image.OpenpyxlImage(image_path)
+                img = openpyxl.drawing.image.Image(image_path)
                 # Determine the anchor point based on the preferred image method
                 if preferred_image_method in ["overwrite", "append"]:
                     anchor = "A" + str(row_number)
