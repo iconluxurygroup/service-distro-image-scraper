@@ -33,6 +33,7 @@ import urllib.parse  # For URL encoding/decoding
 import base64  # For base64 encoding/decoding
 import zlib  # Fo
 import traceback
+import math
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -113,7 +114,6 @@ def upload_file_to_space(file_src, save_as, is_public):
 #################################################
 # EMAIL FUNCTIONS
 #################################################
-
 def send_email(to_emails, subject, download_url, jobId):
     """
     Send an email notification with file download link.
@@ -132,7 +132,7 @@ def send_email(to_emails, subject, download_url, jobId):
             <p>Your file is ready for download.</p>
              <a href="{download_url}" class="download-button">Download File</a>
 
-            <p><br>Please use the link below to modify the file<br></p
+            <p><br>Please use the link below to modify the file<br></p>
             <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
             <br>  
             
@@ -163,115 +163,6 @@ def send_email(to_emails, subject, download_url, jobId):
         sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
         response = sg.send(message)
         
-        logger.info(f"Email sent successfully: {response.status_code}")
-    except Exception as e:
-        logger.error(f"Error sending email: {e}")
-
-def send_message_email(to_emails, subject, message):
-    """
-    Send a simple message email.
-    Args:
-        to_emails (str): Email address to send to
-        subject (str): Email subject
-        message (str): Email message content
-    """
-    try:
-        message_with_breaks = message.replace("\n", "<br>")
-
-        html_content = f"""
-        <html>
-        <body>
-        <div class="container">
-            <p>Message details:<br>{message_with_breaks}</p>
-            <p>CMS:v1</p>
-        </div>
-        </body>
-        </html>
-        """
-        
-        message_obj = Mail(
-            from_email='distrotool@iconluxurygroup.com',
-            subject=subject,
-            html_content=html_content
-        )
-        
-        cc_recipient = 'notifications@popovtech.com'
-        personalization = Personalization()
-        personalization.add_cc(Cc(cc_recipient))
-        personalization.add_to(To(to_emails))
-        message_obj.add_personalization(personalization)
-        
-        logger.info(f"Sending message email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
-        
-        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
-        response = sg.send(message_obj)
-        
-        logger.info(f"Message email sent successfully: {response.status_code}")
-    except Exception as e:
-        logger.error(f"Error sending message email: {e}")
-def send_message_email(to_emails, subject,message):
-    message_with_breaks = message.replace("\n", "<br>")
-
-    html_content = f"""
-<html>
-<body>
-<div class="container">
-    <!-- Use the modified message with <br> for line breaks -->
-    <p>Message details:<br>{message_with_breaks}</p>
-    <p>CMS:v1</p>
-</div>
-</body>
-</html>
-"""
-    message = Mail(
-        from_email='distrotool@iconluxurygroup.com',
-        subject=subject,
-        html_content=html_content
-    )
-    
-    cc_recipient = 'notifications@popovtech.com'
-    personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
-    personalization.add_to(To(to_emails))
-    message.add_personalization(personalization)
-    try:
-        html_content = f"""
-        <html>
-        <body>
-        <div class="container">
-            <p>Your file is ready for download.</p>
-             <a href="{download_url}" class="download-button">Download File</a>
-
-            <p><br>Please use the link below to modify the file<br></p
-            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(jobId)}" class="download-button">Edit / View</a> 
-            <br>  
-            
-            <p>--</p>
-            <p>CMS:v1.1</p>
-        </div>
-        </body>
-        </html>
-        """
-        
-        message = Mail(
-            from_email='nik@iconluxurygroup.com',
-            subject=subject,
-            html_content=html_content
-        )
-        
-        cc_recipient = 'nik@iconluxurygroup.com'
-        if to_emails == cc_recipient:
-            cc_recipient = 'notifications@popovtech.com'
-        
-        personalization = Personalization()
-        personalization.add_cc(Cc(cc_recipient))
-        personalization.add_to(To(to_emails))
-        message.add_personalization(personalization)
-        
-        logger.info(f"Sending email to: {to_emails}, CC: {cc_recipient}, Subject: {subject}")
-        
-        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
-        response = sg.send(message)
         logger.info(f"Email sent successfully: {response.status_code}")
     except Exception as e:
         logger.error(f"Error sending email: {e}")
@@ -324,13 +215,6 @@ async def cleanup_temp_dirs(directories):
     loop = asyncio.get_running_loop()  # Get the current loop directly
     for dir_path in directories:
         await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
-
-
-def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
-    connection = pyodbc.connect(conn)
-    cursor = connection.cursor()
-    insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl,UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
-    values = (file_name, file_source,send_to_email)
 
 def fetch_pending_images(limit=10):
     """
@@ -413,15 +297,24 @@ def update_database(result_id, aijson, aicaption):
     except Exception as e:
         logging.error(f"Error updating database for ResultID {result_id}: {e}")
         return False
-
-def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com"):
+def insert_file_db(file_name, file_source, send_to_email="nik@iconluxurygroup.com"):
+    """
+    Insert a file record into the database.
+    
+    Args:
+        file_name (str): Name of the file
+        file_source (str): Source URL of the file
+        send_to_email (str): Email address to send notifications to
+        
+    Returns:
+        int: The ID of the inserted record
+    """
     connection = pyodbc.connect(conn)
     cursor = connection.cursor()
-    insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl,UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
-    values = (file_name, file_source,send_to_email)
+    insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl, UserEmail) OUTPUT INSERTED.Id VALUES (?, ?, ?)"
+    values = (file_name, file_source, send_to_email)
 
     cursor.execute(insert_query, values)
-
     file_id = cursor.fetchval()
 
     connection.commit()
@@ -429,6 +322,7 @@ def insert_file_db (file_name,file_source,send_to_email="nik@iconluxurygroup.com
     connection.close()
 
     return file_id
+
 def load_payload_db(rows, file_id):
     """
     Load payload data into the database.
@@ -455,22 +349,30 @@ def load_payload_db(rows, file_id):
 
         # Insert new column 'FileID' at the beginning with all values set to file_id
         df.insert(0, 'FileID', file_id)
+        
+        # Handle potential imageValue column
         if 'imageValue' in df.columns:
             df = df.drop(columns=['imageValue'], axis=1)
         
-        # Load DataFrame into SQL database using pyodbc instead of to_sql
-        connection = pyodbc.connect(conn)
-        cursor = connection.cursor()
-        
-        for _, row in df.iterrows():
-            columns = ', '.join(df.columns)
-            placeholders = ', '.join(['?'] * len(df.columns))
-            insert_query = f"INSERT INTO utb_ImageScraperRecords ({columns}) VALUES ({placeholders})"
-            cursor.execute(insert_query, tuple(row))
-        
-        connection.commit()
-        cursor.close()
-        connection.close()
+        # Choose between SQLAlchemy and pyodbc based on global engine availability
+        global engine
+        if 'engine' in globals() and engine:
+            # Load DataFrame into SQL database using SQLAlchemy
+            df.to_sql(name='utb_ImageScraperRecords', con=engine, index=False, if_exists='append')
+        else:
+            # Load DataFrame into SQL database using pyodbc
+            connection = pyodbc.connect(conn)
+            cursor = connection.cursor()
+            
+            for _, row in df.iterrows():
+                columns = ', '.join(df.columns)
+                placeholders = ', '.join(['?'] * len(df.columns))
+                insert_query = f"INSERT INTO utb_ImageScraperRecords ({columns}) VALUES ({placeholders})"
+                cursor.execute(insert_query, tuple(row))
+            
+            connection.commit()
+            cursor.close()
+            connection.close()
         
         logging.info(f"Loaded {len(df)} rows into utb_ImageScraperRecords for FileID: {file_id}")
         return df
@@ -478,12 +380,13 @@ def load_payload_db(rows, file_id):
         logging.error(f"Error loading payload data: {e}")
         raise
 
-def get_records_to_search(file_id):
+def get_records_to_search(file_id, engine=None):
     """
     Get records that need to be searched for images.
     
     Args:
         file_id (int): The FileID to get records for
+        engine (SQLAlchemy engine, optional): Database engine to use
         
     Returns:
         pd.DataFrame: DataFrame containing records to search
@@ -500,21 +403,19 @@ def get_records_to_search(file_id):
             ORDER BY 1
         """
         
-        with pyodbc.connect(conn) as connection:
-            df = pd.read_sql_query(sql_query, connection)
+        if engine:
+            df = pd.read_sql_query(sql_query, con=engine)
+        else:
+            with pyodbc.connect(conn_str) as connection:
+                df = pd.read_sql_query(sql_query, connection)
         
         logging.info(f"Got {len(df)} records to search for FileID: {file_id}")
         return df
     except Exception as e:
         logging.error(f"Error getting records to search: {e}")
         return pd.DataFrame()
+    
 
-import math
-import pandas as pd
-import json
-import math
-import pyodbc
-import logging
 def clean_json(value):
     """
     Cleans JSON text by replacing invalid values like NaN, undefined, or incorrect formatting.
@@ -750,292 +651,6 @@ def process_search_row(search_string,endpoint,entry_id):
             n_endpoint = get_endpoint()
             logger.info(f"Error making request: {e}\nTrying Again: {n_endpoint}")
             return process_search_row(search_string,n_endpoint,entry_id)
-
-def update_sort_order(file_id):
-    """
-    Updates the SortOrder column for images with improved debugging and validation.
-    
-    Args:
-        file_id: The file ID to update sort order for
-        
-    Returns:
-        List of sorted results for verification
-    """
-    start_time = time.time()
-    try:
-        connection = pyodbc.connect(conn_str)
-        connection.timeout = 300  # Set command timeout to 5 minutes
-        cursor = connection.cursor()
-
-        logging.info(f"🔄 Updating sort order for FileID: {file_id}")
-        
-        # Step 1: Verify current sort order
-        
-        # Step 1: Verify current sort order before making changes
-        current_order_query = """
-        SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
-               CASE 
-                   WHEN ISJSON(t.aijson) = 1 THEN 
-                       CASE 
-                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1 
-                               THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
-                           ELSE -1
-                       END
-                   ELSE -1
-               END AS match_score,
-               CASE 
-                   WHEN ISJSON(t.aijson) = 1 THEN 
-                       CASE 
-                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1 
-                               THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
-                           ELSE -1
-                       END
-                   ELSE -1
-               END AS linesheet_score
-        FROM utb_ImageScraperResult t
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-        WHERE r.FileID = ?
-        ORDER BY t.EntryID, t.SortOrder
-        """
-        
-        cursor.execute(current_order_query, (file_id,))
-        current_order = cursor.fetchall()
-        logging.info(f"Current sort order (first 20 records):")
-        for record in current_order:
-            logging.info(f"EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[3]}, LinesheetScore: {record[4]}")
-
-        # Step 2: Get a count of records to process
-        count_query = """
-            SELECT COUNT(*) 
-            FROM utb_ImageScraperResult t 
-            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-            WHERE r.FileID = ?
-        """
-        cursor.execute(count_query, (file_id,))
-        record_count = cursor.fetchone()[0]
-        logging.info(f"📊 Found {record_count} records to process for FileID: {file_id}")
-        
-        if record_count == 0:
-            logging.warning(f"⚠️ No records found for FileID: {file_id}")
-            return []
-        
-        # Step 3: Use a more robust query for updating sort order
-        logging.info("Updating sort order using robust query")
-        
-        # Begin transaction
-        cursor.execute("BEGIN TRANSACTION")
-        
-        # First reset all SortOrder values to ensure clean update
-        reset_query = """
-        UPDATE utb_ImageScraperResult
-        SET SortOrder = NULL
-        FROM utb_ImageScraperResult t
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-        WHERE r.FileID = ?
-        """
-        
-        try:
-            cursor.execute(reset_query, (file_id,))
-            logging.info(f"Reset all SortOrder values to NULL for FileID {file_id}")
-        except Exception as reset_error:
-            logging.error(f"Error resetting SortOrder values: {reset_error}")
-            cursor.execute("ROLLBACK")
-            return None
-
-        # Log the exact SQL query that will be executed
-        safe_sort_query = """
-        WITH CleanedResults AS (
-            SELECT 
-                t.ResultID, 
-                t.EntryID, 
-                CASE 
-                    WHEN ISJSON(t.aijson) = 1 AND JSON_VALUE(t.aijson, '$.match_score') IS NOT NULL 
-                    AND ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1
-                    THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
-                    ELSE -1
-                END AS match_score,
-                CASE 
-                    WHEN ISJSON(t.aijson) = 1 AND JSON_VALUE(t.aijson, '$.linesheet_score') IS NOT NULL 
-                    AND ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1
-                    THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
-                    ELSE -1
-                END AS linesheet_score
-            FROM utb_ImageScraperResult t
-            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE r.FileID = ?
-        ),
-        RankedResults AS (
-            SELECT 
-                ResultID,
-                EntryID,
-                ROW_NUMBER() OVER (
-                    PARTITION BY EntryID 
-                    ORDER BY match_score DESC, linesheet_score DESC
-                ) AS rank
-            FROM CleanedResults
-        )
-        UPDATE utb_ImageScraperResult
-        SET SortOrder = rr.rank
-        FROM utb_ImageScraperResult t
-        INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID;
-        """
-        
-        logger.info("Query prepared, attempting execution")
-        
-        # Log parameters and connection details
-        logger.info(f"Connection details: {connection}")
-        logger.info(f"File ID parameter: {file_id}")
-        
-        try:
-            # Execute and log rows affected
-            cursor.execute(safe_sort_query, (file_id,))
-            rows_affected = cursor.rowcount
-            logger.info(f"Rows affected by update: {rows_affected}")
-            
-            # Explicitly commit the transaction
-            connection.commit()
-            logger.info("Transaction committed successfully")
-            
-        except Exception as exec_error:
-            logger.error(f"Execution error: {exec_error}")
-            connection.rollback()
-            raise
-        
-        try:
-            cursor.execute(safe_sort_query, (file_id,))
-            cursor.execute("COMMIT")
-            logging.info(f"✅ Successfully updated sort order")
-        except Exception as sort_error:
-            logging.error(f"Error updating sort order: {sort_error}")
-            cursor.execute("ROLLBACK")
-            
-            # If the main query fails, try with a basic ranking approach
-            try:
-                cursor.execute("BEGIN TRANSACTION")
-                basic_sort_query = """
-                WITH BasicRank AS (
-                    SELECT 
-                        t.ResultID, 
-                        t.EntryID,
-                        ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS rank
-                    FROM utb_ImageScraperResult t
-                    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                    WHERE r.FileID = ?
-                )
-                UPDATE utb_ImageScraperResult
-                SET SortOrder = br.rank
-                FROM utb_ImageScraperResult t
-                INNER JOIN BasicRank br ON t.ResultID = br.ResultID;
-                """
-                cursor.execute(basic_sort_query, (file_id,))
-                cursor.execute("COMMIT")
-                logging.info(f"✅ Updated sort order using basic ranking as fallback")
-            except Exception as basic_sort_error:
-                logging.error(f"Even basic sort update failed: {basic_sort_error}")
-                cursor.execute("ROLLBACK")
-                return None
-        # Step 4: Verify the sort order has actually changed
-        verify_query = """
-        SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
-               CASE 
-                   WHEN ISJSON(t.aijson) = 1 THEN 
-                       CASE 
-                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1 
-                               THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
-                           ELSE -1
-                       END
-                   ELSE -1
-               END AS match_score,
-               CASE 
-                   WHEN ISJSON(t.aijson) = 1 THEN 
-                       CASE 
-                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1 
-                               THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
-                           ELSE -1
-                       END
-                   ELSE -1
-               END AS linesheet_score
-        FROM utb_ImageScraperResult t
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-        WHERE r.FileID = ?
-        ORDER BY t.EntryID, t.SortOrder
-        """
-        
-        cursor.execute(verify_query, (file_id,))
-        updated_order = cursor.fetchall()
-        
-        logging.info(f"Updated sort order (first 20 records):")
-        for record in updated_order:
-            logging.info(f"EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[3]}, LinesheetScore: {record[4]}")
-            
-        # Step 5: Check for any NULL SortOrder values that might have been missed
-        null_check_query = """
-        SELECT COUNT(*) 
-        FROM utb_ImageScraperResult t
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-        WHERE r.FileID = ? AND t.SortOrder IS NULL
-        """
-        
-        cursor.execute(null_check_query, (file_id,))
-        null_count = cursor.fetchone()[0]
-        
-        if null_count > 0:
-            logging.warning(f"⚠️ Found {null_count} records with NULL SortOrder values after update")
-            
-            # Try to fix any remaining NULL values
-            fix_null_query = """
-            WITH NullFix AS (
-                SELECT 
-                    t.ResultID, 
-                    t.EntryID,
-                    ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS rank
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = ? AND t.SortOrder IS NULL
-            )
-            UPDATE utb_ImageScraperResult
-            SET SortOrder = nf.rank + 100  -- Adding 100 to distinguish from regular rankings
-            FROM utb_ImageScraperResult t
-            INNER JOIN NullFix nf ON t.ResultID = nf.ResultID;
-            """
-            
-            try:
-                cursor.execute(fix_null_query, (file_id,))
-                connection.commit()
-                logging.info(f"✅ Fixed {null_count} NULL SortOrder values")
-            except Exception as null_fix_error:
-                logging.error(f"Error fixing NULL SortOrder values: {null_fix_error}")
-                
-            except Exception as e:
-                total_time = time.time() - start_time
-                logging.error(f"❌ Error during sort order update after {total_time:.2f} seconds: {e}")
-                logging.error(traceback.format_exc())
-                return None
-
-            finally:
-                if 'cursor' in locals():
-                    cursor.close()
-                if 'connection' in locals():
-                    connection.close()
-        
-        # Step 6: Return a sample of the sort order
-        fetch_sort_order_query = """
-        SELECT TOP 100 t.ResultID, t.EntryID, t.SortOrder 
-        FROM utb_ImageScraperResult t
-        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-        WHERE r.FileID = ?
-        ORDER BY t.EntryID, t.SortOrder;
-        """
-        
-        cursor.execute(fetch_sort_order_query, (file_id,))
-        results = cursor.fetchall()
-
-        sort_order_list = [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2] if row[2] is not None else 999} for row in results]
-        
-        total_time = time.time() - start_time
-        logging.info(f"🎉 Sort order update completed in {total_time:.2f} seconds")
-        
-        return sort_order_list
 
 
 def get_file_location(file_id):
@@ -1301,7 +916,292 @@ def get_images_excel_db(file_id):
     logger.info(df.head())  # Print first few rows to see if there are any `None` values
 
     return df
+def update_sort_order(file_id):
+    """
+    Updates the SortOrder column for images with improved debugging and validation.
+    
+    Args:
+        file_id: The file ID to update sort order for
+        
+    Returns:
+        List of sorted results for verification
+    """
+    start_time = time.time()
+    try:
+        connection = pyodbc.connect(conn_str)
+        connection.timeout = 300  # Set command timeout to 5 minutes
+        cursor = connection.cursor()
 
+        logging.info(f"🔄 Updating sort order for FileID: {file_id}")
+        
+        # Step 1: Verify current sort order
+        
+        # Step 1: Verify current sort order before making changes
+        current_order_query = """
+        SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS match_score,
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS linesheet_score
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
+        ORDER BY t.EntryID, t.SortOrder
+        """
+        
+        cursor.execute(current_order_query, (file_id,))
+        current_order = cursor.fetchall()
+        logging.info(f"Current sort order (first 20 records):")
+        for record in current_order:
+            logging.info(f"EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[3]}, LinesheetScore: {record[4]}")
+
+        # Step 2: Get a count of records to process
+        count_query = """
+            SELECT COUNT(*) 
+            FROM utb_ImageScraperResult t 
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+            WHERE r.FileID = ?
+        """
+        cursor.execute(count_query, (file_id,))
+        record_count = cursor.fetchone()[0]
+        logging.info(f"📊 Found {record_count} records to process for FileID: {file_id}")
+        
+        if record_count == 0:
+            logging.warning(f"⚠️ No records found for FileID: {file_id}")
+            return []
+        
+        # Step 3: Use a more robust query for updating sort order
+        logging.info("Updating sort order using robust query")
+        
+        # Begin transaction
+        cursor.execute("BEGIN TRANSACTION")
+        
+        # First reset all SortOrder values to ensure clean update
+        reset_query = """
+        UPDATE utb_ImageScraperResult
+        SET SortOrder = NULL
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
+        """
+        
+        try:
+            cursor.execute(reset_query, (file_id,))
+            logging.info(f"Reset all SortOrder values to NULL for FileID {file_id}")
+        except Exception as reset_error:
+            logging.error(f"Error resetting SortOrder values: {reset_error}")
+            cursor.execute("ROLLBACK")
+            return None
+
+        # Log the exact SQL query that will be executed
+        safe_sort_query = """
+        WITH CleanedResults AS (
+            SELECT 
+                t.ResultID, 
+                t.EntryID, 
+                CASE 
+                    WHEN ISJSON(t.aijson) = 1 AND JSON_VALUE(t.aijson, '$.match_score') IS NOT NULL 
+                    AND ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1
+                    THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
+                    ELSE -1
+                END AS match_score,
+                CASE 
+                    WHEN ISJSON(t.aijson) = 1 AND JSON_VALUE(t.aijson, '$.linesheet_score') IS NOT NULL 
+                    AND ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1
+                    THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
+                    ELSE -1
+                END AS linesheet_score
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+            WHERE r.FileID = ?
+        ),
+        RankedResults AS (
+            SELECT 
+                ResultID,
+                EntryID,
+                ROW_NUMBER() OVER (
+                    PARTITION BY EntryID 
+                    ORDER BY match_score DESC, linesheet_score DESC
+                ) AS rank
+            FROM CleanedResults
+        )
+        UPDATE utb_ImageScraperResult
+        SET SortOrder = rr.rank
+        FROM utb_ImageScraperResult t
+        INNER JOIN RankedResults rr ON t.ResultID = rr.ResultID;
+        """
+        
+        logger.info("Query prepared, attempting execution")
+        
+        # Log parameters and connection details
+        logger.info(f"Connection details: {connection}")
+        logger.info(f"File ID parameter: {file_id}")
+        
+        try:
+            # Execute and log rows affected
+            cursor.execute(safe_sort_query, (file_id,))
+            rows_affected = cursor.rowcount
+            logger.info(f"Rows affected by update: {rows_affected}")
+            
+            # Explicitly commit the transaction
+            connection.commit()
+            logger.info("Transaction committed successfully")
+            
+        except Exception as exec_error:
+            logger.error(f"Execution error: {exec_error}")
+            connection.rollback()
+            raise
+        
+        try:
+            cursor.execute(safe_sort_query, (file_id,))
+            cursor.execute("COMMIT")
+            logging.info(f"✅ Successfully updated sort order")
+        except Exception as sort_error:
+            logging.error(f"Error updating sort order: {sort_error}")
+            cursor.execute("ROLLBACK")
+            
+            # If the main query fails, try with a basic ranking approach
+            try:
+                cursor.execute("BEGIN TRANSACTION")
+                basic_sort_query = """
+                WITH BasicRank AS (
+                    SELECT 
+                        t.ResultID, 
+                        t.EntryID,
+                        ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS rank
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                    WHERE r.FileID = ?
+                )
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = br.rank
+                FROM utb_ImageScraperResult t
+                INNER JOIN BasicRank br ON t.ResultID = br.ResultID;
+                """
+                cursor.execute(basic_sort_query, (file_id,))
+                cursor.execute("COMMIT")
+                logging.info(f"✅ Updated sort order using basic ranking as fallback")
+            except Exception as basic_sort_error:
+                logging.error(f"Even basic sort update failed: {basic_sort_error}")
+                cursor.execute("ROLLBACK")
+                return None
+        # Step 4: Verify the sort order has actually changed
+        verify_query = """
+        SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, 
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS match_score,
+               CASE 
+                   WHEN ISJSON(t.aijson) = 1 THEN 
+                       CASE 
+                           WHEN ISNUMERIC(JSON_VALUE(t.aijson, '$.linesheet_score')) = 1 
+                               THEN CAST(JSON_VALUE(t.aijson, '$.linesheet_score') AS FLOAT)
+                           ELSE -1
+                       END
+                   ELSE -1
+               END AS linesheet_score
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
+        ORDER BY t.EntryID, t.SortOrder
+        """
+        
+        cursor.execute(verify_query, (file_id,))
+        updated_order = cursor.fetchall()
+        
+        logging.info(f"Updated sort order (first 20 records):")
+        for record in updated_order:
+            logging.info(f"EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[3]}, LinesheetScore: {record[4]}")
+            
+        # Step 5: Check for any NULL SortOrder values that might have been missed
+        null_check_query = """
+        SELECT COUNT(*) 
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ? AND t.SortOrder IS NULL
+        """
+        
+        cursor.execute(null_check_query, (file_id,))
+        null_count = cursor.fetchone()[0]
+        
+        if null_count > 0:
+            logging.warning(f"⚠️ Found {null_count} records with NULL SortOrder values after update")
+            
+            # Try to fix any remaining NULL values
+            fix_null_query = """
+            WITH NullFix AS (
+                SELECT 
+                    t.ResultID, 
+                    t.EntryID,
+                    ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS rank
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ? AND t.SortOrder IS NULL
+            )
+            UPDATE utb_ImageScraperResult
+            SET SortOrder = nf.rank + 100  -- Adding 100 to distinguish from regular rankings
+            FROM utb_ImageScraperResult t
+            INNER JOIN NullFix nf ON t.ResultID = nf.ResultID;
+            """
+            
+            try:
+                cursor.execute(fix_null_query, (file_id,))
+                connection.commit()
+                logging.info(f"✅ Fixed {null_count} NULL SortOrder values")
+            except Exception as null_fix_error:
+                logging.error(f"Error fixing NULL SortOrder values: {null_fix_error}")
+        
+        # Step 6: Return a sample of the sort order
+        fetch_sort_order_query = """
+        SELECT TOP 100 t.ResultID, t.EntryID, t.SortOrder 
+        FROM utb_ImageScraperResult t
+        INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+        WHERE r.FileID = ?
+        ORDER BY t.EntryID, t.SortOrder;
+        """
+        
+        cursor.execute(fetch_sort_order_query, (file_id,))
+        results = cursor.fetchall()
+
+        sort_order_list = [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2] if row[2] is not None else 999} for row in results]
+        
+        total_time = time.time() - start_time
+        logging.info(f"🎉 Sort order update completed in {total_time:.2f} seconds")
+        
+        return sort_order_list
+        
+    except Exception as e:
+        total_time = time.time() - start_time
+        logging.error(f"❌ Error during sort order update after {total_time:.2f} seconds: {e}")
+        logging.error(traceback.format_exc())
+        return None
+        
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'connection' in locals():
+            connection.close()
+        logger.info('completed update sort order')
 
 # def update_sort_order(file_id):
 #     logger.info('executing update sort order')
@@ -1608,9 +1508,7 @@ def create_default_result(product_brand: str = "", product_category: str = "", p
         "linesheet_score": float('nan'),
         "reasoning_linesheet": ""
     }
-    # Close the connection
-    connection.close()
-    logger.info('completed update sort order')
+
 def get_send_to_email(file_id_db):
     
     query = f"Select UserEmail from utb_ImageScraperFiles where ID = {file_id_db}"
@@ -2730,7 +2628,7 @@ async def download_all_images(data, save_path):
                 if result is False:
                     failed_downloads.append((data[index][1], data[index][0]))  # Append the image URL and row ID
     return failed_downloads
-async def image_download(semaphore, url, thumbnail, image_name, save_path, session, fallback_formats=None):
+async def image_download(semaphore, url, thumbnail, image_name, save_path, session, index=None, fallback_formats=None):
     """
     Download an image from a URL.
     
@@ -2741,7 +2639,8 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
         image_name (str): Name to save the image as
         save_path (str): Path to save the image to
         session (aiohttp.ClientSession): HTTP session to use for the request
-        fallback_formats (list): List of image formats to try if the default format fails
+        index (int, optional): Index of the image in the batch
+        fallback_formats (list, optional): List of image formats to try if the default format fails
         
     Returns:
         bool: True if download was successful, False otherwise
@@ -2787,20 +2686,32 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
                         return False
                 else:
                     logger.error(f"Download failed with status code {response.status} for URL: {url}")
-                    await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
+                    if thumbnail:
+                        try:
+                            thumbnail_result = await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
+                            return thumbnail_result
+                        except Exception as thumb_exc:
+                            logger.error(f"Thumbnail download failed: {thumb_exc}")
                     return False
 
         except TimeoutError as exc:
             # Handle the timeout specifically
             logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
-            logger.info('timeout error inside the downlaod function ',str(exc))
-            # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
-            # return False
+            logger.info(f'Timeout error inside the download function: {str(exc)}')
+            if thumbnail:
+                try:
+                    return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
+                except Exception as thumb_exc:
+                    logger.error(f"Thumbnail download failed after timeout: {thumb_exc}")
             return False
 
         except Exception as exc:
             logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
-            print(exc)
+            if thumbnail:
+                try:
+                    return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session)
+                except Exception as thumb_exc:
+                    logger.error(f"Thumbnail download failed after exception: {thumb_exc}")
             return False
 
 async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
@@ -2848,10 +2759,7 @@ async def thumbnail_download(semaphore, url, image_name, save_path, session, fal
                         for fmt in fallback_formats:
                             image_data.seek(0)  # Reset stream position
                             try:
-                                log
-                          
-                          
-                          logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
+                                logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
                                 with IMG2.open(image_data) as img:
                                     final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
                                     img.save(final_image_path)
@@ -3000,50 +2908,6 @@ def highlight_cell(excel_file, cell_reference):
     except Exception as e:
         logging.error(f"Error highlighting cell: {e}")
 
-def write_failed_downloads_to_excel(failed_downloads, excel_file):
-    """
-    Write failed downloads to an Excel file.
-    
-    Args:
-        failed_downloads (list): List of failed downloads (URL, row ID pairs)
-        excel_file (str): Path to the Excel file
-    """
-    if failed_downloads:
-        return False               
-def write_excel_image(local_filename, temp_dir,preferred_image_method):
-    failed_rows = []
-    # Load the workbook and select the active worksheet
-    wb = load_workbook(local_filename)
-    ws = wb.active
-    logger.info(os.listdir(temp_dir))
-    
-    # Iterate through each file in the temporary directory
-    for image_file in os.listdir(temp_dir):
-        image_path = os.path.join(temp_dir, image_file)
-        # Extract row number or other identifier from the image file namej
-        try:
-            workbook = load_workbook(excel_file)
-            worksheet = workbook.active
-            
-            for row in failed_downloads:
-                url = row[0]
-                row_id = row[1]
-                if url and url != 'None found in this filter':
-                    # Write the URL to column A of the failed row
-                    cell_reference = f"{get_column_letter(1)}{row_id}"  # Column A, row number
-                    worksheet[cell_reference] = str(url)
-                    highlight_cell(excel_file, cell_reference)
-            
-            workbook.save(excel_file)
-            logger.info(f"Failed downloads written to Excel file: {excel_file}")
-            return True
-        except Exception as e:
-            logger.error(f"Error writing failed downloads to Excel: {e}")
-            return False
-    else:
-        logger.info("No failed downloads to write to Excel.")
-        return True
-
 def write_excel_image(local_filename, temp_dir, preferred_image_method):
     """
     Write images to an Excel file.
@@ -3105,47 +2969,41 @@ def write_excel_image(local_filename, temp_dir, preferred_image_method):
         logging.error(f"Error writing images to Excel: {e}")
         return failed_rows
 
-def write_failed_img_urls(excel_file_path, clean_results, failed_rows):
+def write_failed_downloads_to_excel(failed_downloads, excel_file):
     """
-    Write failed image URLs to an Excel file.
+    Write failed downloads to an Excel file.
     
     Args:
-        excel_file_path (str): Path to the Excel file
-        clean_results (list): List of (row, URL) pairs
-        failed_rows (list): List of row numbers that failed
+        failed_downloads (list): List of failed downloads (URL, row ID pairs)
+        excel_file (str): Path to the Excel file
         
     Returns:
-        list: List of row numbers that were added
+        bool: True if successful, False otherwise
     """
-    added_rows = [] 
     try:
-        # Load the workbook
-        workbook = load_workbook(excel_file_path)
-        
-        # Select the active worksheet
-        worksheet = workbook.active  
-        
-        # Convert clean_results to a dictionary for easier lookup
-        clean_results_dict = {row: url for row, url in clean_results}
-        
-        # Iterate over the failed rows
-        for row in failed_rows:
-            # Look up the URL in the clean_results_dict using the row as a key
-            url = clean_results_dict.get(row)
+        if not failed_downloads:
+            logger.info("No failed downloads to write to Excel.")
+            return True
             
-            if url:
-                # Write the URL to column A of the failed row
-                cell_reference = f"{get_column_letter(1)}{row}"  # Column A, row number
-                worksheet[cell_reference] = str(url)
-                highlight_cell(excel_file_path, cell_reference)
-                added_rows.append(row)
+        workbook = load_workbook(excel_file)
+        worksheet = workbook.active
         
-        # Save the workbook
-        workbook.save(excel_file_path)
-        return added_rows
+        for row in failed_downloads:
+            url = row[0]
+            row_id = row[1]
+            if url and url != 'None found in this filter':
+                # Write the URL to column A of the failed row
+                cell_reference = f"{get_column_letter(1)}{row_id}"  # Column A, row number
+                worksheet[cell_reference] = str(url)
+                highlight_cell(excel_file, cell_reference)
+        
+        workbook.save(excel_file)
+        logger.info(f"Failed downloads written to Excel file: {excel_file}")
+        return True
     except Exception as e:
-        logging.error(f"Error writing failed image URLs to Excel: {e}")
-        return added_rows
+        logger.error(f"Error writing failed downloads to Excel: {e}")
+        return False
+
 
 def prepare_images_for_download_dataframe(df):
     """
@@ -3221,7 +3079,6 @@ def process_batch(batch):
 #################################################
 # ASYNC WORKFLOW FUNCTIONS
 #################################################
-
 async def create_temp_dirs(unique_id):
     """
     Create temporary directories for file processing.
@@ -3238,6 +3095,7 @@ async def create_temp_dirs(unique_id):
         temp_images_dir = os.path.join(base_dir, 'images', str(unique_id))
         temp_excel_dir = os.path.join(base_dir, 'excel', str(unique_id))
 
+        # Create directories using run_in_executor to avoid blocking
         await loop.run_in_executor(None, lambda: os.makedirs(temp_images_dir, exist_ok=True))
         await loop.run_in_executor(None, lambda: os.makedirs(temp_excel_dir, exist_ok=True))
 
@@ -3261,7 +3119,6 @@ async def cleanup_temp_dirs(directories):
         logger.info(f"Cleaned up temporary directories: {directories}")
     except Exception as e:
         logger.error(f"Error cleaning up temporary directories: {e}")
-
 async def generate_download_file(file_id):
     """
     Generate a download file for a processed file.
@@ -3599,10 +3456,6 @@ async def check_json_status(file_id: str):
                     OR ISNUMERIC(JSON_VALUE(t.aijson, '$.match_score')) = 0
                 )
             """
-            cursor.execute(invalid_match_score_query, (file_id,))
-            issues_data["invalid_match
-            
-            
             cursor.execute(invalid_match_score_query, (file_id,))
             issues_data["invalid_match_score"] = cursor.fetchone()[0]
         except Exception as e:
