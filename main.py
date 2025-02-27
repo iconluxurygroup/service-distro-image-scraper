@@ -3040,7 +3040,10 @@ async def generate_download_file(file_id):
         provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id)
         decoded_string = urllib.parse.unquote(provided_file_path)
         file_name = provided_file_path.split('/')[-1]
-        
+        # Generate a new filename for the processed file
+        base_name, extension = os.path.splitext(file_name)
+        processed_file_name = f"{base_name}_processed{extension}"
+
         # Create temporary directories
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
         local_filename = os.path.join(temp_excel_dir, file_name)
@@ -3065,11 +3068,10 @@ async def generate_download_file(file_id):
         if failed_img_urls:
             await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls, local_filename)
             logger.warning(f"Failed to download {len(failed_img_urls)} images")
-        
-        # Upload file to S3
-        logger.info("Uploading file to S3")
-        public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, file_name, True)
-        
+
+        # Upload file to S3 with the new filename
+        logger.info(f"Uploading processed file to S3 as {processed_file_name}")
+        public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, processed_file_name, True)
         # Update database
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
