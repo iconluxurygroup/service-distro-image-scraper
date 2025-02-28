@@ -8,7 +8,7 @@ load_dotenv()
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID', 'AKIAZQ3DSIQ5BGLY355N')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', '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')
 REGION = os.getenv('REGION', 'us-east-2')
-SENDGRID_API_KEY= os.getenv('SENDGRID_API_KEY', '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')
+SENDGRID_API_KEY= os.getenv('SENDGRID_API_KEY', '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')
 # Database credentials
 MSSQLS_PWD = os.getenv('MSSQLS_PWD', 'Ftu5675FDG54hjhiuu$')
 
