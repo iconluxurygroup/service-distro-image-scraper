@@ -20,9 +20,10 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
 
 async def run_job_with_logging(job_func, file_id, *args, **kwargs):
+    # Remove 'file_id' from kwargs if present to avoid duplication
+    kwargs.pop('file_id', None)
     logger, log_filename = setup_job_logger(job_id=file_id or str(uuid.uuid4()))
     logger.info(f"Starting job {job_func.__name__} for FileID: {file_id}")
-    # Use file_id explicitly, no duplicate keyword
     result = await job_func(file_id, *args, logger=logger, **kwargs)
     if os.path.exists(log_filename):
         upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
@@ -61,7 +62,7 @@ async def api_fix_json_data(background_tasks: BackgroundTasks, file_id: str = No
 async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str):
     logger, _ = setup_job_logger(job_id=file_id_db)
     logger.info(f"Queueing restart of failed batch for FileID: {file_id_db}")
-    background_tasks.add_task(run_job_with_logging, process_restart_batch, file_id_db, file_id=file_id_db)
+    background_tasks.add_task(run_job_with_logging, process_restart_batch, file_id_db)
     return {"message": f"Processing restart initiated for FileID: {file_id_db}"}
 
 @app.post("/process-image-batch/")
