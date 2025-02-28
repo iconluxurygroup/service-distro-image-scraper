@@ -3,6 +3,7 @@ import logging
 from config import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, REGION
 import urllib.parse  # For URL encoding/decoding
 logging.getLogger(__name__)
+
 def get_spaces_client():
     """
     Create an AWS S3 client for file storage.
@@ -11,17 +12,17 @@ def get_spaces_client():
         boto3.client: AWS S3 client
     """
     try:
-        logging.info("Creating S3 client")
+        logger.info("Creating S3 client")
         client = boto3.client(
-            service_name='s3',
+            "s3",
             region_name=REGION,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY
         )
-        logging.info("S3 client created successfully")
+        logger.info("S3 client created successfully")
         return client
     except Exception as e:
-        logging.error(f"Error creating S3 client: {e}")
+        logger.error(f"Error creating S3 client: {e}", exc_info=True)
         raise
 def double_encode_plus(filename):
     """
