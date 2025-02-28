@@ -48,7 +48,7 @@ async def create_temp_dirs(unique_id, logger=None):
         logger.info(f"Created temporary directories for ID: {unique_id}")
         return temp_images_dir, temp_excel_dir
     except Exception as e:
-        logger.error(f"Failed to create temp directories for ID {unique_id}: {e}")
+        logger.error(f"🔴 Failed to create temp directories for ID {unique_id}: {e}")
         raise
 
 async def cleanup_temp_dirs(directories, logger=None):
@@ -61,7 +61,7 @@ async def cleanup_temp_dirs(directories, logger=None):
                 await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
                 logger.info(f"Cleaned up directory: {dir_path}")
         except Exception as e:
-            logger.error(f"Failed to clean up directory {dir_path}: {e}")
+            logger.error(f"🔴 Failed to clean up directory {dir_path}: {e}")
 
 async def download_all_images(data, save_path, logger=None):
     """Download images with retry logic and limited concurrency."""
@@ -85,9 +85,9 @@ async def download_all_images(data, save_path, logger=None):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for idx, result in enumerate(results):
             if not result or isinstance(result, Exception):
-                logger.warning(f"Failed to download image for row {valid_data[idx][0]}: {valid_data[idx][1]}")
+                logger.warning(f"🟨 Failed to download image for row {valid_data[idx][0]}: {valid_data[idx][1]}")
                 failed_downloads.append((valid_data[idx][1], valid_data[idx][0]))
-    logger.info(f"Completed image downloads. Failed: {len(failed_downloads)}/{len(valid_data)}")
+    logger.info(f"✅ Completed image downloads. 📒 Failed: {len(failed_downloads)}/{len(valid_data)}")
     return failed_downloads
 
 async def image_download(semaphore, url, thumbnail, image_name, save_path, session, logger=None):
@@ -127,7 +127,7 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
                                     os.remove(img_path)
                 return False
         except Exception as e:
-            logger.error(f"Error downloading {url}: {e}")
+            logger.error(f"🔴 Error downloading {url}: {e}")
             return False
 
 async def generate_download_file(file_id, logger=None, file_id_param=None):
@@ -148,7 +148,7 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         
         provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id, logger)
         if provided_file_path == "No File Found":
-            logger.error(f"No file location found for FileID {file_id}")
+            logger.error(f"🔴 No file location found for FileID {file_id}")
             return {"error": "Original file not found"}
         
         file_name = provided_file_path.split('/')[-1]
@@ -162,7 +162,7 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         
         response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
         if response.status_code != 200:
-            logger.error(f"Failed to download file {provided_file_path}: {response.status_code}")
+            logger.error(f"🔴 Failed to download file {provided_file_path}: {response.status_code}")
             return {"error": "Failed to download the provided file"}
         
         with open(local_filename, "wb") as file:
@@ -178,7 +178,7 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         
         public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, processed_file_name, True, logger, file_id)
         if not public_url:
-            logger.error(f"Failed to upload processed file for FileID {file_id}")
+            logger.error(f"🔴 Failed to upload processed file for FileID {file_id}")
             return {"error": "Failed to upload processed file"}
         
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url, logger)
@@ -193,7 +193,7 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         
         return {"message": "Processing completed successfully", "public_url": public_url}
     except Exception as e:
-        logger.error(f"Error generating download file for FileID {file_id}: {e}")
+        logger.error(f"🔴 Error generating download file for FileID {file_id}: {e}")
         return {"error": f"An error occurred: {str(e)}"}
     finally:
         if temp_images_dir and temp_excel_dir:
@@ -203,66 +203,65 @@ async def process_restart_batch(file_id_db, logger=None, file_id=None):
     """Restart processing for a failed batch."""
     logger = logger or default_logger
     try:
-        logger.info(f"Restarting processing for FileID: {file_id_db}")
+        logger.info(f"🔁 Restarting processing for FileID: {file_id_db}")
         file_id_db = int(file_id_db)
         
-        # Stage 1: Check for missing URLs and process searches
-        logger.info(f"Fetching missing images for FileID: {file_id_db}")
+        logger.info(f"🖼️ Fetching missing images for FileID: {file_id_db}")
         missing_urls_df = fetch_missing_images(file_id_db, limit=1000, ai_analysis_only=False, logger=logger)
-        logger.debug(f"Missing URLs DataFrame columns: {missing_urls_df.columns.tolist()}")
-        logger.debug(f"Missing URLs DataFrame sample: {missing_urls_df.head().to_dict()}")
+        logger.debug(f"🟨 🕵️‍♂️Missing URLs DataFrame columns: {missing_urls_df.columns.tolist()}")
+        logger.debug(f"🟨 🕵️‍♂️Missing URLs DataFrame sample: {missing_urls_df.head().to_dict()}")
 
-        # Use consistent column name
-        image_url_col = 'ImageUrl'  # Match database.py's fetch_missing_images
+        image_url_col = 'ImageUrl'  # Standardized to match process_search_row
         if image_url_col not in missing_urls_df.columns:
-            logger.error(f"'ImageUrl' not found in DataFrame columns: {missing_urls_df.columns.tolist()}")
+            logger.error(f"🔴 'ImageUrl' not found in DataFrame columns: {missing_urls_df.columns.tolist()}")
             raise KeyError(f"'ImageUrl' column not found in DataFrame")
 
         needs_url_generation = missing_urls_df[missing_urls_df[image_url_col].isnull() | (missing_urls_df[image_url_col] == '')]
         
         if not needs_url_generation.empty:
-            logger.info(f"Found {len(needs_url_generation)} records needing URL generation for FileID: {file_id_db}")
+            logger.info(f"🔗 Found {len(needs_url_generation)} records needing URL generation for FileID: {file_id_db}")
+            # ... rest of the function remains unchanged
             search_df = get_records_to_search(file_id_db, logger=logger)
             if not search_df.empty:
                 search_list = search_df.to_dict('records')
-                logger.info(f"Preparing {len(search_list)} searches (2 per EntryID) for FileID: {file_id_db}")
+                logger.info(f"🔬🔍 Preparing {len(search_list)} searches (2 per EntryID) for FileID: {file_id_db}")
                 
                 BATCH_SIZE = 100
                 batches = [search_list[i:i + BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-                logger.info(f"Processing {len(batches)} batches with Ray")
+                logger.info(f"📋 Processing {len(batches)} batches with Ray")
                 futures = [process_batch.remote(batch, logger=logger) for batch in batches]
                 batch_results = ray.get(futures)
                 all_results = [result for batch_result in batch_results for result in batch_result]
                 
                 success_count = sum(1 for r in all_results if r['status'] == 'success')
-                logger.info(f"Completed {success_count}/{len(all_results)} searches successfully")
+                logger.info(f"🟢 Completed {success_count}/{len(all_results)} searches successfully")
             else:
-                logger.info(f"No records to search for FileID: {file_id_db}")
+                logger.info(f"🟡 No records to search for FileID: {file_id_db}")
             
-            logger.info(f"Updating initial sort order for FileID: {file_id_db}")
+            logger.debug(f"Updating initial sort order for FileID: {file_id_db}")
             initial_sort_result = update_initial_sort_order(file_id_db, logger=logger)
             if initial_sort_result is None:
-                logger.error(f"Initial SortOrder update failed for FileID: {file_id_db}")
+                logger.error(f"🔴 Initial SortOrder update failed for FileID: {file_id_db}")
                 raise Exception("Initial SortOrder update failed")
         
         # Stage 2: Update search sort order
-        logger.info(f"Updating search sort order for FileID: {file_id_db}")
+        logger.info(f"🔍🔀Updating search sort order for FileID: {file_id_db}")
         sort_result = update_search_sort_order(file_id_db, logger=logger)
         if sort_result is None:
-            logger.error(f"Search sort order update failed for FileID: {file_id_db}")
+            logger.error(f"🔴 Search sort order update failed for FileID: {file_id_db}")
             raise Exception("Search sort order update failed")
         
         # Stage 3: Generate download file
-        logger.info(f"Generating download file for FileID: {file_id_db}")
+        logger.info(f"💾 Generating download file for FileID: {file_id_db}")
         result = await generate_download_file(file_id_db, logger=logger)
         if "error" in result:
-            logger.error(f"Failed to generate download file: {result['error']}")
+            logger.error(f"🔴 Failed to generate download file: {result['error']}")
             raise Exception(result["error"])
         
         logger.info(f"Restart processing completed successfully for FileID: {file_id_db}")
         return {"message": "Restart processing completed successfully", "file_id": file_id_db}
     except Exception as e:
-        logger.error(f"Error restarting processing for FileID {file_id_db}: {e}", exc_info=True)
+        logger.error(f"🔴 Error restarting processing for FileID {file_id_db}: {e}", exc_info=True)
         send_to_email = get_send_to_email(file_id_db, logger=logger)
         file_name = f"FileID: {file_id_db}"
         # Remove logger parameter from send_message_email call
@@ -313,7 +312,7 @@ async def process_image_batch(payload, logger=None, file_id=None):
         logger.info(f"Processing completed for FileID: {file_id_db}")
         return {"message": "Processing completed successfully"}
     except Exception as e:
-        logger.error(f"Error processing batch: {e}")
+        logger.error(f"🔴 Error processing batch: {e}")
         send_message_email(send_to_email, f"Error processing {file_name}", f"An error occurred while processing your file: {str(e)}", logger=logger)
         return {"error": str(e)}
 
@@ -333,5 +332,5 @@ def prepare_images_for_download_dataframe(df, logger=None):
         logger.info(f"Prepared {len(images_to_download)} images for download")
         return images_to_download
     except Exception as e:
-        logger.error(f"Error preparing images for download: {e}")
+        logger.error(f"🔴 🔴 Error preparing images for download: {e}")
         return []

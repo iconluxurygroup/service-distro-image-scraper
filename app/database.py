@@ -15,7 +15,8 @@ from icon_image_lib.google_parser import get_original_images as GP
 from image_processing import get_image_data, analyze_image_with_grok_vision
 from config import conn_str, engine
 from logging_config import setup_job_logger
-
+import base64  # Added import
+import zlib    # Added import for unpack_content
 # Fallback logger for standalone calls
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -38,7 +39,7 @@ def insert_file_db(file_name, file_source, send_to_email="nik@iconluxurygroup.co
             logger.info(f"Inserted new file record with ID: {file_id}")
             return file_id
     except Exception as e:
-        logger.error(f"Error inserting file record: {e}")
+        logger.error(f"🔴 Error inserting file record: {e}")
         raise
 
 def update_database(result_id, ai_json, ai_caption=None, logger=None):
@@ -55,7 +56,7 @@ def update_database(result_id, ai_json, ai_caption=None, logger=None):
             conn.commit()
             logger.info(f"Updated database for ResultID: {result_id}")
     except Exception as e:
-        logger.error(f"Error updating database: {e}")
+        logger.error(f"🔴 Error updating database: {e}")
         raise
 
 def load_payload_db(rows, file_id, logger=None):
@@ -77,7 +78,7 @@ def load_payload_db(rows, file_id, logger=None):
             })
             
             if 'ProductBrand' not in df.columns or df['ProductBrand'].isnull().all():
-                logger.warning(f"No valid ProductBrand data found in payload for FileID {file_id}")
+                logger.warning(f"⚠️ No valid ProductBrand data found in payload for FileID {file_id}")
                 df['ProductBrand'] = df.get('ProductBrand', '')
             
             df.insert(0, 'FileID', file_id)
@@ -94,7 +95,7 @@ def load_payload_db(rows, file_id, logger=None):
         logger.info(f"Loaded {len(df)} rows into utb_ImageScraperRecords for FileID: {file_id}")
         return df
     except Exception as e:
-        logger.error(f"Error loading payload data: {e}")
+        logger.error(f"🔴 Error loading payload data: {e}")
         raise
 
 def unpack_content(encoded_content, logger=None):
@@ -106,9 +107,9 @@ def unpack_content(encoded_content, logger=None):
             return original_content
         return None
     except Exception as e:
-        logger.error(f"Error unpacking content: {e}")
+        logger.error(f"🔴 Error unpacking content: {e}")
         return None
-
+# database.py (partial update)
 def get_records_to_search(file_id, logger=None):
     logger = logger or default_logger
     try:
@@ -131,6 +132,17 @@ def get_records_to_search(file_id, logger=None):
             ORDER BY EntryID, SearchType
         """
         with pyodbc.connect(conn_str) as connection:
+            # Debug: Check total records for FileID
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = ?", (file_id,))
+            total_records = cursor.fetchone()[0]
+            logger.debug(f"Total records for FileID {file_id}: {total_records}")
+            
+            # Debug: Check records with Step1 IS NULL
+            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = ? AND Step1 IS NULL", (file_id,))
+            unprocessed_records = cursor.fetchone()[0]
+            logger.debug(f"Unprocessed records (Step1 IS NULL) for FileID {file_id}: {unprocessed_records}")
+            
             df = pd.read_sql_query(sql_query, connection, params=[file_id, file_id])
         
         if not df.empty:
@@ -139,29 +151,29 @@ def get_records_to_search(file_id, logger=None):
                 logger.error(f"Found {len(invalid_rows)} rows with incorrect FileID for requested FileID {file_id}: {invalid_rows[['EntryID', 'FileID']].to_dict()}")
                 df = df[df['FileID'] == file_id]
         
-        logger.info(f"Got {len(df)} search records (2 per EntryID) for FileID: {file_id}")
+        logger.info(f"📋 Got {len(df)} search records (2 per EntryID) for FileID: {file_id}")
         return df[['EntryID', 'SearchString', 'SearchType']]
     except Exception as e:
-        logger.error(f"Error getting records to search for FileID {file_id}: {e}")
+        logger.error(f"🔴 Error getting records to search for FileID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
 
 def process_search_row(search_string, endpoint, entry_id, logger=None):
     logger = logger or default_logger
     logger.debug(f"Entering process_search_row with search_string={search_string}, endpoint={endpoint}, entry_id={entry_id}")
-    logger.info(f"🔎Search started for {search_string}")
-    logger.info(f"👺Search Proxy: {endpoint}")
-    logger.info(f"📓Entry ID: {entry_id}")
+    logger.info(f"🔎 Search started for {search_string}")
+    logger.info(f"👺 Search Proxy: {endpoint}")
+    logger.info(f"📘Entry ID: {entry_id}")
     try:
         if not search_string or len(search_string.strip()) < 3:
-            logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
+            logger.warning(f"⚠️ Invalid search string for EntryID {entry_id}: '{search_string}'")
             return False
         
         search_url = f"{endpoint}?query={urllib.parse.quote(search_string)}"
-        logger.info(f"Searching URL: {search_url}")
+        logger.info(f"🔍 Searching URL: {search_url}")
         
         response = requests.get(search_url, timeout=60)
         if response.status_code != 200:
-            logger.warning(f"Non-200 status {response.status_code} for {search_url}")
+            logger.warning(f"⚠️ Non-200 status {response.status_code} for {search_url}")
             remove_endpoint(endpoint, logger=logger)
             new_endpoint = get_endpoint(logger=logger)
             return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
@@ -170,27 +182,28 @@ def process_search_row(search_string, endpoint, entry_id, logger=None):
             response_json = response.json()
             result = response_json.get('body', None)
         except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON response for {search_url}")
+            logger.warning(f"⚠️ Invalid JSON response for {search_url}")
             remove_endpoint(endpoint, logger=logger)
             new_endpoint = get_endpoint(logger=logger)
             return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
         
         if not result:
-            logger.warning(f"No body in response for {search_url}")
+            logger.warning(f"⚠️ No body in response for {search_url}")
             remove_endpoint(endpoint, logger=logger)
             new_endpoint = get_endpoint(logger=logger)
             return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
         
         unpacked_html = unpack_content(result, logger=logger)
         if not unpacked_html or len(unpacked_html) < 100:
-            logger.warning(f"Invalid unpacked HTML for {search_url}")
+            logger.warning(f"⚠️ Invalid unpacked HTML for {search_url} (length: {len(unpacked_html) if unpacked_html else 'None'})")
             remove_endpoint(endpoint, logger=logger)
             new_endpoint = get_endpoint(logger=logger)
             return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
         
-        parsed_data = GP(unpacked_html)
+        # Pass raw bytes to GP (get_original_images), which handles decoding
+        parsed_data = GP(unpacked_html)  # unpacked_html is bytes
         if not parsed_data or not isinstance(parsed_data, tuple) or not parsed_data[0]:
-            logger.warning(f"No valid parsed data for {search_url}")
+            logger.warning(f"⚠️ No valid parsed data for {search_url}")
             remove_endpoint(endpoint, logger=logger)
             new_endpoint = get_endpoint(logger=logger)
             return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
@@ -210,23 +223,23 @@ def process_search_row(search_string, endpoint, entry_id, logger=None):
                 cursor = connection.cursor()
                 cursor.execute(f"UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = {entry_id}")
                 connection.commit()
-            logger.info(f"Processed EntryID {entry_id} with {len(df)} images")
-            return df  # Return DataFrame for Ray to use result_count
+            logger.info(f"✅ Processed EntryID {entry_id} with {len(df)} images")
+            return df
         
-        logger.warning('No valid image URL, trying again with new endpoint')
+        logger.warning(f"⚠️ No valid image URL, trying again with new endpoint")
         remove_endpoint(endpoint, logger=logger)
         new_endpoint = get_endpoint(logger=logger)
         return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
     
     except requests.RequestException as e:
-        logger.error(f"Request error: {e}")
+        logger.error(f"🔴 Request error: {e}", exc_info=True)
         remove_endpoint(endpoint, logger=logger)
         new_endpoint = get_endpoint(logger=logger)
         logger.info(f"Trying again with new endpoint: {new_endpoint}")
         return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
     
     except Exception as e:
-        logger.error(f"Error processing search row: {e}")
+        logger.error(f"🔴 Error processing search row: {e}", exc_info=True)
         remove_endpoint(endpoint, logger=logger)
         new_endpoint = get_endpoint(logger=logger)
         logger.info(f"Trying again with new endpoint: {new_endpoint}")
@@ -251,7 +264,7 @@ async def batch_process_images(file_id, limit, logger=None):
                     if features and "error" not in features:
                         ai_json = json.dumps(features)
                     else:
-                        logger.warning(f"Invalid Grok Vision response for ResultID {result_id}: {features}")
+                        logger.warning(f"⚠️ Invalid Grok Vision response for ResultID {result_id}: {features}")
                         ai_json = json.dumps({
                             "description": "Failed to analyze",
                             "user_provided": {"brand": row['ProductBrand'], "category": row['ProductCategory'], "color": row['ProductColor']},
@@ -264,7 +277,7 @@ async def batch_process_images(file_id, limit, logger=None):
                     update_database(result_id, ai_json, "AI analysis failed", logger=logger)
                     processed_count += 1
                 else:
-                    logger.warning(f"No image data retrieved for ResultID {result_id}")
+                    logger.warning(f"⚠️ No image data retrieved for ResultID {result_id}")
             except Exception as e:
                 logger.error(f"Failed to process image for ResultID {result_id} (URL: {image_url}): {e}")
                 ai_json = json.dumps({
@@ -281,7 +294,7 @@ async def batch_process_images(file_id, limit, logger=None):
         
         logger.info(f"Processed {processed_count} out of {len(missing_df)} images for AI analysis for FileID: {file_id}")
     except Exception as e:
-        logger.error(f"Error in batch_process_images: {e}")
+        logger.error(f"🔴 Error in batch_process_images: {e}")
         raise
 
 async def process_images(file_id, logger=None):
@@ -305,12 +318,12 @@ async def process_images(file_id, logger=None):
                         update_database(result_id, ai_json, "AI-generated caption", logger=logger)
                         processed_count += 1
                 except Exception as e:
-                    logger.error(f"Failed to process image for ResultID {result_id} (URL: {image_url}): {e}")
+                    logger.error(f"🔴 Error Failed to process image for ResultID {result_id} (URL: {image_url}): {e}")
                     continue
         
         logger.info(f"Completed image processing for FileID: {file_id}, processed {processed_count} images")
     except Exception as e:
-        logger.error(f"Error in process_images: {e}")
+        logger.error(f"🔴 Error in process_images: {e}")
         raise
 
 def fetch_images_by_file_id(file_id, logger=None):
@@ -329,37 +342,23 @@ def fetch_images_by_file_id(file_id, logger=None):
             logger.info(f"Fetched {len(df)} images for FileID {file_id}")
             return df
     except Exception as e:
-        logger.error(f"Error fetching images for FileID {file_id}: {e}")
+        logger.error(f"🔴 Error fetching images for FileID {file_id}: {e}")
         return pd.DataFrame()
 # database.py (partial update)
 def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=None):
     logger = logger or default_logger
-    """
-    Fetch images with missing or NaN JSON fields from the database.
-    
-    Args:
-        file_id (int, optional): The FileID to fetch missing images for
-        limit (int, optional): Maximum number of records to fetch
-        ai_analysis_only (bool, optional): If True, only fetch images missing AI analysis but with URLs.
-                                          If False, fetch all missing records including those without URLs.
-        
-    Returns:
-        pd.DataFrame: DataFrame containing missing image records
-    """
     try:
-        connection = pyodbc.connect(conn_str)
+        connection = pyodbc.connect(conn_str, timeout=60)
         query_params = []
 
-        # Base SQL query depends on whether we're looking for just AI analysis issues or also missing URLs
         if ai_analysis_only:
-            # Only looking for images with URLs but missing AI analysis
             query = """
-            SELECT t.ResultID, t.EntryID, t.ImageURL, r.ProductBrand, r.ProductCategory, r.ProductColor
+            SELECT t.ResultID, t.EntryID, t.ImageUrl AS ImageUrl, r.ProductBrand, r.ProductCategory, r.ProductColor
             FROM utb_ImageScraperResult t
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
             WHERE (
-                t.ImageURL IS NOT NULL 
-                AND t.ImageURL <> ''
+                t.ImageUrl IS NOT NULL 
+                AND t.ImageUrl <> ''
                 AND (
                     ISJSON(t.aijson) = 0 
                     OR t.aijson IS NULL
@@ -371,10 +370,9 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
             )
             """
         else:
-            # Looking for records missing either URLs or AI analysis
             query = """
             -- Records missing in result table completely
-            SELECT NULL as ResultID, r.EntryID, NULL as ImageURL, 
+            SELECT NULL AS ResultID, r.EntryID, NULL AS ImageUrl, 
                    r.ProductBrand, r.ProductCategory, r.ProductColor
             FROM utb_ImageScraperRecords r
             LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
@@ -382,22 +380,22 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
             
             UNION ALL
             
-            -- Records with empty or NULL ImageURL
-            SELECT t.ResultID, t.EntryID, t.ImageURL, 
+            -- Records with empty or NULL ImageUrl
+            SELECT t.ResultID, t.EntryID, t.ImageUrl AS ImageUrl, 
                    r.ProductBrand, r.ProductCategory, r.ProductColor
             FROM utb_ImageScraperResult t
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE t.ImageURL IS NULL OR t.ImageURL = ''
+            WHERE t.ImageUrl IS NULL OR t.ImageUrl = ''
             
             UNION ALL
             
             -- Records with URLs but missing AI analysis
-            SELECT t.ResultID, t.EntryID, t.ImageURL, 
+            SELECT t.ResultID, t.EntryID, t.ImageUrl AS ImageUrl, 
                    r.ProductBrand, r.ProductCategory, r.ProductColor
             FROM utb_ImageScraperResult t
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE t.ImageURL IS NOT NULL 
-              AND t.ImageURL <> ''
+            WHERE t.ImageUrl IS NOT NULL 
+              AND t.ImageUrl <> ''
               AND (
                   ISJSON(t.aijson) = 0 
                   OR t.aijson IS NULL
@@ -408,28 +406,33 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
               )
             """
 
-        # Add FileID filter if provided
         if file_id:
             query += " AND r.FileID = ?"
             query_params.append(file_id)
 
-        # Limit number of results
         query += " ORDER BY r.EntryID ASC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY"
         query_params.append(limit)
 
-        # Fetch data
         df = pd.read_sql_query(query, connection, params=query_params)
         connection.close()
         
         if df.empty:
-            logger.info(f"No missing images found" + (f" for FileID: {file_id}" if file_id else ""))
+            logger.info(f"🟩 No missing images found" + (f" for FileID: {file_id}" if file_id else ""))
         else:
-            logger.info(f"Found {len(df)} missing images" + (f" for FileID: {file_id}" if file_id else ""))
-            
+            logger.info(f"📒 Found {len(df)} missing images" + (f" for FileID: {file_id}" if file_id else ""))
+            logger.debug(f"Fetched DataFrame columns: {df.columns.tolist()}")
+        
+        # Force rename to 'ImageUrl' regardless of case
+        if 'ImageURL' in df.columns:
+            df.rename(columns={'ImageURL': 'ImageUrl'}, inplace=True)
+            logger.debug(f"Renamed 'ImageURL' to 'ImageUrl' in DataFrame")
+        elif 'ImageUrl' not in df.columns:
+            logger.error(f"🔴 Expected 'ImageUrl' or 'ImageURL' column not found: {df.columns.tolist()}")
+            raise KeyError("ImageUrl column missing in DataFrame")
+        
         return df
-
     except Exception as e:
-        logger.error(f"Error fetching missing images: {e}")
+        logger.error(f"🔴 Error fetching missing images: {e}")
         return pd.DataFrame()
     
 def update_initial_sort_order(file_id, logger=None):
@@ -439,16 +442,16 @@ def update_initial_sort_order(file_id, logger=None):
         with pyodbc.connect(conn_str) as connection:
             connection.timeout = 300
             cursor = connection.cursor()
-            logger.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
+            logger.info(f"🔀 Setting initial SortOrder for FileID: {file_id}")
             
             cursor.execute("BEGIN TRANSACTION")
             cursor.execute("UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE FileID = ?", (file_id,))
             reset_step1_count = cursor.rowcount
-            logger.info(f"Reset Step1 for {reset_step1_count} rows in utb_ImageScraperRecords")
+            logger.info(f"🔄Reset Step1 for {reset_step1_count} rows in utb_ImageScraperRecords")
             
             cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)", (file_id,))
             reset_sort_count = cursor.rowcount
-            logger.info(f"Reset SortOrder for {reset_sort_count} rows in utb_ImageScraperResult")
+            logger.info(f"🔄Reset SortOrder for {reset_sort_count} rows in utb_ImageScraperResult")
             
             initial_sort_query = """
                 WITH toupdate AS (
@@ -463,7 +466,7 @@ def update_initial_sort_order(file_id, logger=None):
             """
             cursor.execute(initial_sort_query, (file_id,))
             update_count = cursor.rowcount
-            logger.info(f"Set initial SortOrder for {update_count} rows")
+            logger.info(f"🟢 Set initial SortOrder for {update_count} rows")
             
             cursor.execute("COMMIT")
             
@@ -477,18 +480,18 @@ def update_initial_sort_order(file_id, logger=None):
             cursor.execute(verify_query, (file_id,))
             results = cursor.fetchall()
             for record in results:
-                logger.info(f"Initial - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
+                logger.info(f"✍️ Initial - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
             
             count_query = "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)"
             cursor.execute(count_query, (file_id,))
             total_results = cursor.fetchone()[0]
-            logger.info(f"Total results after initial sort for FileID {file_id}: {total_results}")
+            logger.info(f"🟩 Total results after initial sort for FileID {file_id}: {total_results}")
             if total_results < 16:
-                logger.warning(f"Expected at least 16 results (8 per search type), got {total_results}")
+                logger.warning(f"⚠️  Expected at least 16 results (8 per search type), got {total_results}")
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
     except Exception as e:
-        logger.error(f"Error setting initial SortOrder: {e}")
+        logger.error(f"🔴 Error setting initial SortOrder: {e}")
         if 'cursor' in locals():
             cursor.execute("ROLLBACK")
         return None
@@ -505,7 +508,7 @@ def update_search_sort_order(file_id, logger=None):
         with pyodbc.connect(conn_str) as connection:
             connection.timeout = 300
             cursor = connection.cursor()
-            logger.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
+            logger.debug(f"🔍🔀 Updating Search SortOrder for FileID: {file_id}")
             
             initial_sort_query = """
                 WITH toupdate AS (
@@ -522,7 +525,7 @@ def update_search_sort_order(file_id, logger=None):
             cursor.execute(initial_sort_query, (file_id,))
             update_count = cursor.rowcount
             cursor.execute("COMMIT")
-            logger.info(f"Set Search SortOrder for {update_count} rows")
+            logger.info(f"🟢 Set Search SortOrder for {update_count} rows")
             
             verify_query = """
                 SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder
@@ -534,11 +537,11 @@ def update_search_sort_order(file_id, logger=None):
             cursor.execute(verify_query, (file_id,))
             results = cursor.fetchall()
             for record in results:
-                logger.info(f"Search - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
+                logger.info(f"✍️ Search - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
     except Exception as e:
-        logger.error(f"Error setting Search SortOrder: {e}")
+        logger.error(f"🔴 Error setting Search SortOrder: {e}")
         return None
     finally:
         if 'cursor' in locals():
@@ -605,7 +608,7 @@ def update_ai_sort_order(file_id, logger=None):
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in updated_order]
     except Exception as e:
-        logger.error(f"Error updating AI SortOrder: {e}")
+        logger.error(f"🔴 Error updating AI SortOrder: {e}")
         return None
     finally:
         if 'cursor' in locals():
@@ -624,7 +627,7 @@ def update_file_location_complete(file_id, file_location, logger=None):
             cursor.execute("COMMIT")
             logger.info(f"Updated file location URL for FileID: {file_id}")
     except Exception as e:
-        logger.error(f"Error updating file location URL: {e}")
+        logger.error(f"🔴 Error updating file location URL: {e}")
         if 'cursor' in locals():
             cursor.execute("ROLLBACK")
         raise
@@ -639,7 +642,7 @@ def update_file_generate_complete(file_id, logger=None):
             conn.commit()
             logger.info(f"Marked file generation as complete for FileID: {file_id}")
     except Exception as e:
-        logger.error(f"Error updating file generation completion time: {e}")
+        logger.error(f"🔴 Error updating file generation completion time: {e}")
         raise
 
 def get_file_location(file_id, logger=None):
@@ -653,10 +656,10 @@ def get_file_location(file_id, logger=None):
             if file_location_url:
                 logger.info(f"Got file location URL for FileID: {file_id}: {file_location_url[0]}")
                 return file_location_url[0]
-            logger.warning(f"No file location URL found for FileID: {file_id}")
+            logger.warning(f"⚠️ No file location URL found for FileID: {file_id}")
             return "No File Found"
     except Exception as e:
-        logger.error(f"Error getting file location URL: {e}")
+        logger.error(f"🔴 Error getting file location URL: {e}")
         return "Error retrieving file location"
 
 def get_send_to_email(file_id, logger=None):
@@ -670,10 +673,10 @@ def get_send_to_email(file_id, logger=None):
             if send_to_email:
                 logger.info(f"Got email address for FileID: {file_id}: {send_to_email[0]}")
                 return send_to_email[0]
-            logger.warning(f"No email address found for FileID: {file_id}")
+            logger.warning(f"⚠️ No email address found for FileID: {file_id}")
             return "No Email Found"
     except Exception as e:
-        logger.error(f"Error getting email address: {e}")
+        logger.error(f"🔴 Error getting email address: {e}")
         return "nik@iconluxurygroup.com"
 
 def get_images_excel_db(file_id, logger=None):
@@ -694,10 +697,10 @@ def get_images_excel_db(file_id, logger=None):
                 ORDER BY s.ExcelRowID
             """
             df = pd.read_sql_query(query, connection, params=[file_id])
-            logger.info(f"Queried FileID: {file_id}, retrieved {len(df)} images for Excel export")
+            logger.info(f"🕵️ Queried FileID: {file_id}, retrieved {len(df)} images for Excel export")
         return df
     except Exception as e:
-        logger.error(f"Error getting images for Excel export: {e}")
+        logger.error(f"🔴 Error getting images for Excel export: {e}")
         return pd.DataFrame()
 
 def get_lm_products(file_id, logger=None):
@@ -710,7 +713,7 @@ def get_lm_products(file_id, logger=None):
             conn.commit()
             logger.info(f"Executed stored procedure to match products for FileID: {file_id}")
     except Exception as e:
-        logger.error(f"Error executing stored procedure to match products: {e}")
+        logger.error(f"🔴 Error executing stored procedure to match products: {e}")
 
 def get_endpoint(logger=None):
     logger = logger or default_logger
@@ -722,13 +725,13 @@ def get_endpoint(logger=None):
             endpoint_url = cursor.fetchone()
             if endpoint_url:
                 endpoint = endpoint_url[0]
-                logger.info(f"Got endpoint URL: {endpoint}")
+                logger.debug(f"Got endpoint URL: {endpoint}")
                 return endpoint
             else:
                 logger.warning("No endpoint URL found")
                 return "No EndpointURL"
     except Exception as e:
-        logger.error(f"Error getting endpoint URL: {e}")
+        logger.error(f"🔴 Error getting endpoint URL: {e}")
         return "No EndpointURL"
 
 def remove_endpoint(endpoint, logger=None):
@@ -741,7 +744,7 @@ def remove_endpoint(endpoint, logger=None):
             conn.commit()
             logger.info(f"Marked endpoint as blocked: {endpoint}")
     except Exception as e:
-        logger.error(f"Error marking endpoint as blocked: {e}")
+        logger.error(f"🔴 Error marking endpoint as blocked: {e}")
 
 def check_json_status(file_id, logger=None):
     logger = logger or default_logger
@@ -859,7 +862,7 @@ def check_json_status(file_id, logger=None):
             "sample_issues": sample_data
         }
     except Exception as e:
-        logger.error(f"Error checking JSON status: {e}")
+        logger.error(f"🔴 Error checking JSON status: {e}")
         return {
             "file_id": file_id,
             "status": "error",
@@ -891,7 +894,7 @@ def fix_json_data(background_tasks: BackgroundTasks, file_id=None, limit=1000, l
                 try:
                     cursor.execute(query, (file_id,))
                 except Exception as e:
-                    logger.warning(f"Error in complex query: {e}, falling back to simpler query")
+                    logger.warning(f"⚠️ 🔴 Error in complex query: {e}, falling back to simpler query")
                     query = f"""
                         SELECT TOP {limit} t.ResultID, t.aijson 
                         FROM utb_ImageScraperResult t
@@ -913,7 +916,7 @@ def fix_json_data(background_tasks: BackgroundTasks, file_id=None, limit=1000, l
                 try:
                     cursor.execute(query, (limit,))
                 except Exception as e:
-                    logger.warning(f"Error in complex query: {e}, falling back to simpler query")
+                    logger.warning(f"⚠️ 🔴 Error in complex query: {e}, falling back to simpler query")
                     query = "SELECT TOP ? ResultID, aijson FROM utb_ImageScraperResult"
                     cursor.execute(query, (limit,))
             
@@ -935,7 +938,7 @@ def fix_json_data(background_tasks: BackgroundTasks, file_id=None, limit=1000, l
                         if cleaned_json:
                             updates.append((cleaned_json, result_id))
                     except Exception as e:
-                        logger.error(f"Error cleaning JSON for ResultID {result_id}: {e}")
+                        logger.error(f"🔴 Error cleaning JSON for ResultID {result_id}: {e}")
                         error_count += 1
                 
                 if updates:
@@ -949,7 +952,7 @@ def fix_json_data(background_tasks: BackgroundTasks, file_id=None, limit=1000, l
                         total_fixed += batch_fixed
                         logger.info(f"Fixed {batch_fixed} records in batch (total: {total_fixed})")
                     except Exception as batch_error:
-                        logger.error(f"Error in batch update: {batch_error}")
+                        logger.error(f"🔴 Error in batch update: {batch_error}")
                         for cleaned_json, result_id in updates:
                             try:
                                 cursor.execute(
@@ -959,7 +962,7 @@ def fix_json_data(background_tasks: BackgroundTasks, file_id=None, limit=1000, l
                                 connection.commit()
                                 total_fixed += 1
                             except Exception as row_error:
-                                logger.error(f"Error updating ResultID {result_id}: {row_error}")
+                                logger.error(f"🔴 Error updating ResultID {result_id}: {row_error}")
                                 error_count += 1
             
             logger.info(f"JSON fix operation completed. Fixed: {total_fixed}, Errors: {error_count}")
@@ -973,7 +976,7 @@ def fix_json_data(background_tasks: BackgroundTasks, file_id=None, limit=1000, l
                 "errors": error_count
             }
         except Exception as e:
-            logger.error(f"Error in background JSON fix: {e}")
+            logger.error(f"🔴 Error in background JSON fix: {e}")
             logger.error(traceback.format_exc())
             return {
                 "status": "error",
@@ -1002,7 +1005,7 @@ def clean_json(value, logger=None):
     
     value = value.strip()
     if value and value[0] not in ['{', '[', '"']:
-        logger.warning(f"Invalid JSON starting with '{value[0:10]}...' - replacing with default")
+        logger.warning(f"⚠️ Invalid JSON starting with '{value[0:10]}...' - replacing with default")
         return json.dumps({
             "description": "",
             "user_provided": {"brand": "", "category": "", "color": ""},
@@ -1062,7 +1065,7 @@ def clean_json(value, logger=None):
         
         return json.dumps(parsed)
     except json.JSONDecodeError as e:
-        logger.warning(f"JSON decoding error: {e} for value: {value[:50]}...")
+        logger.warning(f"⚠️ JSON decoding error: {e} for value: {value[:50]}...")
         return json.dumps({
             "description": "",
             "user_provided": {"brand": "", "category": "", "color": ""},

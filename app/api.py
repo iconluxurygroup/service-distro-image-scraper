@@ -26,7 +26,7 @@ async def run_job_with_logging(job_func, *args, file_id=None, **kwargs):
     if os.path.exists(log_filename):
         upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
         logger.info(f"Log file uploaded to: {upload_url}")
-    logger.info(f"Job {job_func.__name__} completed")
+    logger.info(f"✅✅Job {job_func.__name__} completed")
     return result
 
 @app.get("/check_json_status/{file_id}")
