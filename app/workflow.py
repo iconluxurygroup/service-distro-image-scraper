@@ -251,6 +251,7 @@ async def process_restart_batch(file_id_db):
         send_message_email(send_to_email, f"Error processing {file_name}", f"An error occurred while reprocessing your file: {str(e)}")
 
 async def process_image_batch(payload):
+    from database import fetch_missing_images, update_initial_sort_order, update_ai_sort_order, get_records_to_search,update_search_sort_order
     """Process a new image batch from payload."""
     try:
         rows = payload.get('rowData', [])
