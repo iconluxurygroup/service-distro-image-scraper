@@ -349,7 +349,7 @@ async def process_image_batch(payload, logger=None, file_id=None):
             logger.info(f"No records to search for FileID: {file_id_db}")
         
         update_search_sort_order(file_id_db, logger=logger)
-        await process_images(file_id_db, logger=logger)
+        # await process_images(file_id_db, logger=logger)
         result = await generate_download_file(file_id_db, logger=logger)
         if "error" in result:
             raise Exception(result["error"])
