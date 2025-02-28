@@ -21,10 +21,14 @@ if not default_logger.handlers:
 
 async def run_job_with_logging(job_func, file_id, *args, **kwargs):
     # Remove 'file_id' from kwargs if present to avoid duplication
-    kwargs.pop('file_id', None)
+    file_id = str(file_id)  # Convert to string if it’s not already
     logger, log_filename = setup_job_logger(job_id=file_id or str(uuid.uuid4()))
     logger.info(f"Starting job {job_func.__name__} for FileID: {file_id}")
-    result = await job_func(file_id, *args, logger=logger, **kwargs)
+    # Pass the first arg from *args as the primary positional argument, file_id as keyword
+    if args:
+        result = await job_func(args[0], logger=logger, file_id=file_id, **kwargs)
+    else:
+        result = await job_func(logger=logger, file_id=file_id, **kwargs)
     if os.path.exists(log_filename):
         upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
         logger.info(f"Log file uploaded to: {upload_url}")
@@ -71,12 +75,13 @@ async def api_process_payload(background_tasks: BackgroundTasks, payload: dict):
     logger, _ = setup_job_logger(job_id=file_id)
     logger.info(f"Received request to process image batch for FileID: {file_id}")
     try:
-        background_tasks.add_task(run_job_with_logging, process_image_batch, payload, file_id)
+        background_tasks.add_task(run_job_with_logging, process_image_batch, file_id, payload)
         return {"message": "Processing started successfully"}
     except Exception as e:
         logger.error(f"Error processing payload: {e}")
         return {"error": f"An error occurred: {str(e)}"}
-
+    
+    
 @app.post("/generate-download-file/")
 async def api_generate_download_file(background_tasks: BackgroundTasks, file_id: int):
     file_id_str = str(file_id)
