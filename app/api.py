@@ -81,7 +81,8 @@ async def api_generate_download_file(background_tasks: BackgroundTasks, file_id:
     logger, _ = setup_job_logger(job_id=file_id_str)
     logger.info(f"Received request to generate download file for FileID: {file_id}")
     try:
-        background_tasks.add_task(run_job_with_logging, generate_download_file, file_id_str, file_id=file_id_str)
+        # Pass file_id_str positionally, no redundant keyword
+        background_tasks.add_task(run_job_with_logging, generate_download_file, file_id_str)
         return {"message": "Processing started successfully"}
     except Exception as e:
         logger.error(f"Error generating download file: {e}")
