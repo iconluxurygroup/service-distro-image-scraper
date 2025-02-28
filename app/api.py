@@ -3,8 +3,15 @@ import logging
 from workflow import process_image_batch, generate_download_file, process_restart_batch
 from database import update_ai_sort_order, update_initial_sort_order,check_json_status, fix_json_data
 
-logging.basicConfig(level=logging.INFO)
-
+# Configure logging globally (add this at the top of your script)
+logging.basicConfig(
+    level=logging.INFO,  # Set to DEBUG for more detail
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Output to console
+        # Optionally add: logging.FileHandler('app.log') for file output
+    ]
+)
 app = FastAPI()
 
 @app.get("/check_json_status/{file_id}")

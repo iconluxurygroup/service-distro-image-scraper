@@ -187,6 +187,7 @@ def get_records_to_search(file_id):
         return pd.DataFrame()
     
 def process_search_row(search_string, endpoint, entry_id):
+    logging.debug(f"Entering process_search_row with search_string={search_string}, endpoint={endpoint}, entry_id={entry_id}")
     logging.info(f"🔎Search started for {search_string}")
     logging.info(f"👺Search Proxy: {endpoint}")
     logging.info(f"📓Entry ID: {entry_id}")
