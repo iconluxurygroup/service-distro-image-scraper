@@ -9,7 +9,7 @@ COPY app/requirements.txt /app/requirements.txt
 
 # Install Python dependencies
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install -r requirements.txt
 
 # Clean the apt cache and update with --fix-missing
 RUN apt-get clean && \
