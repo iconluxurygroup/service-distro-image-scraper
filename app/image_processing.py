@@ -7,7 +7,7 @@ from config import GROK_API_KEY, GROK_ENDPOINT
 import requests
 from urllib.parse import urlparse
 
-logging.basicConfig(level=logging.INFO)
+logging.getLogger(__name__)
 
 async def analyze_image_with_grok_vision(image_data: bytes) -> dict:
     headers = {

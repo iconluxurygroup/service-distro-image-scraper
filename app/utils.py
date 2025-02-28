@@ -4,7 +4,7 @@ import pyodbc
 from config import conn_str
 from openpyxl.utils import get_column_letter
 
-logging.basicConfig(level=logging.INFO)
+logging.getLogger(__name__)
 
 def clean_json(value):
     if not value or not isinstance(value, str) or value.strip() in ["None", "null", "NaN", "undefined"]:

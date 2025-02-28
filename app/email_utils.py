@@ -4,7 +4,7 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Personalization, Cc, To
 from config import SENDGRID_API_KEY
 
-logging.basicConfig(level=logging.INFO)
+logging.getLogger(__name__)
 
 def send_email(to_emails, subject, download_url, job_id):
     try:
