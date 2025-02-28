@@ -71,7 +71,7 @@ async def api_process_payload(background_tasks: BackgroundTasks, payload: dict):
     logger, _ = setup_job_logger(job_id=file_id)
     logger.info(f"Received request to process image batch for FileID: {file_id}")
     try:
-        background_tasks.add_task(run_job_with_logging, process_image_batch, payload, file_id=file_id)
+        background_tasks.add_task(run_job_with_logging, process_image_batch, payload, file_id)
         return {"message": "Processing started successfully"}
     except Exception as e:
         logger.error(f"Error processing payload: {e}")
