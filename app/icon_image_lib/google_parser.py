@@ -5,10 +5,6 @@ from icon_image_lib.LR import LR
 import logging
 
 def get_original_images(html_bytes, logger=None):
-    logger = logger or logging.getLogger(__name__)
-    # ... rest as provided previously
-
-def get_original_images(html_bytes, logger=None):
     """Parse Google image search HTML and return image data."""
     logger = logger or logging.getLogger(__name__)
     try:

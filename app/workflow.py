@@ -332,5 +332,5 @@ def prepare_images_for_download_dataframe(df, logger=None):
         logger.info(f"Prepared {len(images_to_download)} images for download")
         return images_to_download
     except Exception as e:
-        logger.error(f"🔴 🔴 Error preparing images for download: {e}")
+        logger.error(f"🔴 Error preparing images for download: {e}")
         return []
