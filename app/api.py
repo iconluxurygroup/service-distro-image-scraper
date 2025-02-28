@@ -3,7 +3,7 @@ import logging
 from workflow import process_image_batch, generate_download_file, process_restart_batch
 from database import update_ai_sort_order, update_initial_sort_order,check_json_status, fix_json_data
 
-logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
