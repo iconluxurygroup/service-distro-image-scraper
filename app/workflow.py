@@ -2,7 +2,7 @@ import asyncio
 import os
 import logging
 import json
-import pyodbc
+import pyodbc,httpx
 import time
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
@@ -62,34 +62,59 @@ async def cleanup_temp_dirs(directories, logger=None):
                 logger.info(f"Cleaned up directory: {dir_path}")
         except Exception as e:
             logger.error(f"🔴 Failed to clean up directory {dir_path}: {e}")
-
-async def download_all_images(data, save_path, logger=None):
-    """Download images with retry logic and limited concurrency."""
+async def download_all_images(image_list, temp_dir, logger=None):
+    """Download all images concurrently with main-to-thumbnail fallback."""
     logger = logger or default_logger
-    failed_downloads = []
-    valid_data = [item for item in data if item[1] and isinstance(item[1], str) and item[1].strip()]
-    if not valid_data:
-        logger.info("No valid image URLs to download")
-        return failed_downloads
+    failed_img_urls = []
     
-    pool_size = min(10, len(valid_data))  # Conservative pool size
-    timeout = ClientTimeout(total=60)
-    retry_options = ExponentialRetry(attempts=3, start_timeout=3)
+    if not image_list:
+        logger.warning("⚠️ No images to download")
+        return failed_img_urls
     
-    async with RetryClient(timeout=timeout, retry_options=retry_options) as session:
-        semaphore = asyncio.Semaphore(pool_size)
+    logger.info(f"📥 Starting download of {len(image_list)} images for {temp_dir}")
+    async with httpx.AsyncClient() as client:
         tasks = [
-            image_download(semaphore, item[1], item[2], str(item[0]), save_path, session, logger=logger)
-            for item in valid_data
+            download_image(client, item, temp_dir, logger)
+            for item in image_list
+            if item.get('ExcelRowID') and (item.get('ImageUrl') or item.get('ImageUrlThumbnail'))
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for idx, result in enumerate(results):
-            if not result or isinstance(result, Exception):
-                logger.warning(f"🟨 Failed to download image for row {valid_data[idx][0]}: {valid_data[idx][1]}")
-                failed_downloads.append((valid_data[idx][1], valid_data[idx][0]))
-    logger.info(f"✅ Completed image downloads. 📒 Failed: {len(failed_downloads)}/{len(valid_data)}")
-    return failed_downloads
-
+        
+        # Filter out successful downloads (None) and collect failures
+        failed_img_urls = [result for result in results if result is not None]
+    
+    logger.info(f"📸 Completed image downloads. Failed: {len(failed_img_urls)}/{len(image_list)}")
+    return failed_img_urls
+async def download_image(client, item, temp_dir, logger):
+    """Download a single image with main-to-thumbnail fallback."""
+    row_id = item.get('ExcelRowID')
+    main_url = item.get('ImageUrl')
+    thumb_url = item.get('ImageUrlThumbnail')
+    image_path = os.path.join(temp_dir, f"{row_id}.png")
+    timeout = httpx.Timeout(30, connect=10)
+    
+    # Try main URL
+    try:
+        response = await client.get(main_url, timeout=timeout)
+        response.raise_for_status()
+        with open(image_path, 'wb') as f:
+            f.write(response.content)
+        logger.info(f"✅ Downloaded main image for row {row_id}")
+        return None  # Success, no failure
+    except (httpx.RequestError, httpx.HTTPStatusError) as e:
+        logger.warning(f"⚠️ Failed main image for row {row_id}: {e}")
+        
+        # Try thumbnail URL
+        try:
+            response = await client.get(thumb_url, timeout=timeout)
+            response.raise_for_status()
+            with open(image_path, 'wb') as f:
+                f.write(response.content)
+            logger.info(f"✅ Downloaded thumbnail for row {row_id}")
+            return None  # Success, no failure
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            logger.error(f"❌ Failed thumbnail for row {row_id}: {e}")
+            return (main_url, row_id)  # Return failed URL and row ID
 async def image_download(semaphore, url, thumbnail, image_name, save_path, session, logger=None):
     """Download a single image with retry logic."""
     logger = logger or default_logger
@@ -129,7 +154,6 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
         except Exception as e:
             logger.error(f"🔴 Error downloading {url}: {e}")
             return False
-
 async def generate_download_file(file_id, logger=None, file_id_param=None):
     """Generate and upload a processed Excel file with images."""
     logger = logger or default_logger
@@ -139,27 +163,37 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         start_time = time.time()
         loop = asyncio.get_running_loop()
         
+        logger.info(f"🕵️ Fetching images for Excel export for FileID: {file_id}")
         selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id, logger)
         if selected_images_df.empty:
-            logger.warning(f"No images found for FileID {file_id} to generate download file")
+            logger.warning(f"⚠️ No images found for FileID {file_id} to generate download file")
             return {"error": f"No images found for FileID {file_id}"}
         
-        selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe, selected_images_df, logger)
+        logger.info(f"📋 Preparing images for download")
+        selected_image_list = [
+            {
+                'ExcelRowID': row['ExcelRowID'],
+                'ImageUrl': row['ImageUrl'],
+                'ImageUrlThumbnail': row['ImageUrlThumbnail']
+            } for _, row in selected_images_df.iterrows()
+        ]
         
+        logger.info(f"📍 Retrieving file location for FileID: {file_id}")
         provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id, logger)
         if provided_file_path == "No File Found":
-            logger.error(f"🔴 No file location found for FileID {file_id}")
+            logger.error(f"❌ No file location found for FileID {file_id}")
             return {"error": "Original file not found"}
         
         file_name = provided_file_path.split('/')[-1]
         base_name, extension = os.path.splitext(file_name)
         processed_file_name = f"{base_name}_processed{extension}"
         
+        logger.info(f"📂 Creating temporary directories for FileID: {file_id}")
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
         local_filename = os.path.join(temp_excel_dir, file_name)
         
+        logger.info(f"📥 Downloading images for FileID: {file_id}")
         failed_img_urls = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
-        
         response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
         if response.status_code != 200:
             logger.error(f"🔴 Failed to download file {provided_file_path}: {response.status_code}")
@@ -187,13 +221,10 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         subject_line = f"{file_name} Job Notification"
         send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id, logger)
         await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, subject_line, public_url, file_id)
-        
-        execution_time = time.time() - start_time
-        logger.info(f"Processing completed for FileID {file_id} in {execution_time:.2f} seconds")
-        
+        logger.info(f"🏁 Processing completed for FileID {file_id} in {(time.time() - start_time):.2f} seconds")
         return {"message": "Processing completed successfully", "public_url": public_url}
     except Exception as e:
-        logger.error(f"🔴 Error generating download file for FileID {file_id}: {e}")
+        logger.error(f"🔴 Error generating download file for FileID {file_id}: {e}", exc_info=True)
         return {"error": f"An error occurred: {str(e)}"}
     finally:
         if temp_images_dir and temp_excel_dir:
@@ -257,8 +288,7 @@ async def process_restart_batch(file_id_db, logger=None, file_id=None):
         if "error" in result:
             logger.error(f"🔴 Failed to generate download file: {result['error']}")
             raise Exception(result["error"])
-        
-        logger.info(f"Restart processing completed successfully for FileID: {file_id_db}")
+        logger.info(f"✅ Restart processing completed successfully for FileID: {file_id_db}")
         return {"message": "Restart processing completed successfully", "file_id": file_id_db}
     except Exception as e:
         logger.error(f"🔴 Error restarting processing for FileID {file_id_db}: {e}", exc_info=True)
