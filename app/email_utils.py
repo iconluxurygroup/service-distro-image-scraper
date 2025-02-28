@@ -21,13 +21,15 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         <html>
         <body>
         <div class="container">
-            <p>Your file is ready for download.</p>
-            <a href="{download_url}" class="download-button">Download File</a>
-            <p><br>Please use the link below to modify the file<br></p>
-            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={job_id}" class="download-button">Edit / View</a> 
-            <br>  
+            <p>Your file is ready for download.<br>
+            <a href="{download_url}" class="download-button">Download File</a></p>
+
+            <p>Please use the link below to modify the file<br>
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">Edit / View</a></p>
+            
             <p>--</p>
-            <p>CMS:v1.1</p>
+            <p><small>This is an automated system notification.<br>
+            Notified Users: {to_emails} JobId: {job_id} From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
         </div>
         </body>
         </html>
@@ -57,7 +59,7 @@ def send_message_email(to_emails, subject, message, logger=None):
             <p>Message details:<br>{message_with_breaks}</p>
             <p>--</p>
             <p><small>This is an automated system notification.<br>
-            Notified Users: {to_emails} JobId: From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
+            Notified Users: {to_emails} From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
         </div>
         </body>
         </html>

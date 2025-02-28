@@ -157,7 +157,7 @@ def get_records_to_search(file_id, logger=None):
         logger.error(f"🔴 Error getting records to search for FileID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
 
-def process_search_row(search_string, endpoint, entry_id, logger=None):
+def process_search_row(search_string, endpoint, entry_id, retries=0, max_retries=10,logger=None):
     logger = logger or default_logger
     logger.debug(f"Entering process_search_row with search_string={search_string}, endpoint={endpoint}, entry_id={entry_id}")
     logger.info(f"🔎 Search started for {search_string}")
@@ -199,16 +199,17 @@ def process_search_row(search_string, endpoint, entry_id, logger=None):
             remove_endpoint(endpoint, logger=logger)
             new_endpoint = get_endpoint(logger=logger)
             return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
-        
-        # Pass raw bytes to GP (get_original_images), which handles decoding
+    
         parsed_data = GP(unpacked_html)  # unpacked_html is bytes
+        
         if not parsed_data or not isinstance(parsed_data, tuple) or not parsed_data[0]:
             logger.warning(f"⚠️ No valid parsed data for {search_url}")
             remove_endpoint(endpoint, logger=logger)
             new_endpoint = get_endpoint(logger=logger)
-            return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
+            return process_search_row(search_string, new_endpoint, entry_id, logger=logger, retries=retries)
         
         urls, descriptions, sources, thumbnails = parsed_data
+        
         if urls and urls[0] != 'No google image results found':
             df = pd.DataFrame({
                 'EntryId': [entry_id] * len(urls),
@@ -223,27 +224,35 @@ def process_search_row(search_string, endpoint, entry_id, logger=None):
                 cursor = connection.cursor()
                 cursor.execute(f"UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = {entry_id}")
                 connection.commit()
+            
             logger.info(f"✅ Processed EntryID {entry_id} with {len(df)} images")
             return df
         
-        logger.warning(f"⚠️ No valid image URL, trying again with new endpoint")
-        remove_endpoint(endpoint, logger=logger)
-        new_endpoint = get_endpoint(logger=logger)
-        return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
-    
+        # No valid image URLs found
+        if retries < max_retries:
+            logger.warning(f"⚠️ No valid image URL, retrying ({retries + 1}/{max_retries}) with new endpoint")
+            remove_endpoint(endpoint, logger=logger)
+            new_endpoint = get_endpoint(logger=logger)
+            return process_search_row(search_string, new_endpoint, entry_id, logger=logger, retries=retries + 1)
+        else:
+            # Max retries reached, update Step1 and skip
+            with pyodbc.connect(conn_str) as connection:
+                cursor = connection.cursor()
+                cursor.execute(f"UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = {entry_id}")
+                connection.commit()
+            logger.warning(f"⚠️ Max retries ({max_retries}) reached for EntryID {entry_id}, marked as completed with no results")
+            return None  # Or pd.DataFrame() if you prefer an empty DataFrame
+
     except requests.RequestException as e:
         logger.error(f"🔴 Request error: {e}", exc_info=True)
         remove_endpoint(endpoint, logger=logger)
         new_endpoint = get_endpoint(logger=logger)
         logger.info(f"Trying again with new endpoint: {new_endpoint}")
-        return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
-    
-    except Exception as e:
-        logger.error(f"🔴 Error processing search row: {e}", exc_info=True)
-        remove_endpoint(endpoint, logger=logger)
-        new_endpoint = get_endpoint(logger=logger)
-        logger.info(f"Trying again with new endpoint: {new_endpoint}")
-        return process_search_row(search_string, new_endpoint, entry_id, logger=logger)
+        return process_search_row(search_string, new_endpoint, entry_id, logger=logger, retries=retries)
+    except pyodbc.Error as e:
+        logger.error(f"🔴 Database error: {e}", exc_info=True)
+        raise  # Re-raise the exception to let the caller handle it
+
 
 async def batch_process_images(file_id, limit, logger=None):
     logger = logger or default_logger
