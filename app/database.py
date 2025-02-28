@@ -196,7 +196,7 @@ def process_search_row(search_string, endpoint, entry_id):
             logging.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
             return False
         
-        search_url = f"{endpoint}?query={urllib.parse.quote(search_string + ' brand')}"  # Append 'brand' to prioritize
+        search_url = f"{endpoint}?query={urllib.parse.quote(search_string)}"  # Append 'brand' to prioritize
         logging.info(f"Searching URL: {search_url}")
         
         response = requests.get(search_url, timeout=60)
