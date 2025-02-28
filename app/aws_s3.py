@@ -2,7 +2,7 @@ import boto3
 import logging
 from config import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, REGION
 import urllib.parse  # For URL encoding/decoding
-logger = logging.getLogger(__name__)
+logging.getLogger(__name__)
 def get_spaces_client():
     """
     Create an AWS S3 client for file storage.
@@ -11,17 +11,17 @@ def get_spaces_client():
         boto3.client: AWS S3 client
     """
     try:
-        logger.info("Creating S3 client")
+        logging.info("Creating S3 client")
         client = boto3.client(
             service_name='s3',
             region_name=REGION,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY
         )
-        logger.info("S3 client created successfully")
+        logging.info("S3 client created successfully")
         return client
     except Exception as e:
-        logger.error(f"Error creating S3 client: {e}")
+        logging.error(f"Error creating S3 client: {e}")
         raise
 def double_encode_plus(filename):
     """
@@ -64,15 +64,15 @@ def upload_file_to_space(file_src, save_as, is_public=True):
             ExtraArgs={'ACL': 'public-read'} if is_public else {}
         )
         
-        logger.info(f"File uploaded successfully to {space_name}/{save_as}")
+        logging.info(f"File uploaded successfully to {space_name}/{save_as}")
         double_encoded_filename = double_encode_plus(save_as)
         # Generate and return the public URL if the file is public
         if is_public:
             upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{double_encoded_filename}"
-            logger.info(f"Public URL (double-encoded): {upload_url}")
+            logging.info(f"Public URL (double-encoded): {upload_url}")
             return upload_url
         
         return None
     except Exception as e:
-        logger.error(f"Error uploading file to S3: {e}")
+        logging.error(f"Error uploading file to S3: {e}")
         raise

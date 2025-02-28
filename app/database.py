@@ -36,7 +36,7 @@ import asyncio
 from fastapi import BackgroundTasks
 from image_processing import get_image_data, analyze_image_with_grok_vision
 from config import conn_str,engine
-logger = logging.getLogger(__name__)
+logging.getLogger(__name__)
 
 def fetch_pending_images(limit=10):
     query = """
@@ -176,13 +176,13 @@ def get_records_to_search(file_id):
         if not df.empty:
             invalid_rows = df[df['FileID'] != file_id]
             if not invalid_rows.empty:
-                logger.error(f"Found {len(invalid_rows)} rows with incorrect FileID for requested FileID {file_id}: {invalid_rows[['EntryID', 'FileID']].to_dict()}")
+                logging.error(f"Found {len(invalid_rows)} rows with incorrect FileID for requested FileID {file_id}: {invalid_rows[['EntryID', 'FileID']].to_dict()}")
                 df = df[df['FileID'] == file_id]
         
-        logger.info(f"Got {len(df)} search records (2 per EntryID) for FileID: {file_id}")
+        logging.info(f"Got {len(df)} search records (2 per EntryID) for FileID: {file_id}")
         return df[['EntryID', 'SearchString', 'SearchType']]
     except Exception as e:
-        logger.error(f"Error getting records to search for FileID {file_id}: {e}")
+        logging.error(f"Error getting records to search for FileID {file_id}: {e}")
         return pd.DataFrame()
     
 def process_search_row(search_string, endpoint, entry_id):
@@ -286,7 +286,7 @@ async def batch_process_images(file_id, limit):
                     if features and "error" not in features:  # Check for valid response
                         ai_json = json.dumps(features)
                     else:
-                        logger.warning(f"Invalid Grok Vision response for ResultID {result_id}: {features}")
+                        logging.warning(f"Invalid Grok Vision response for ResultID {result_id}: {features}")
                         ai_json = json.dumps({
                             "description": "Failed to analyze",
                             "user_provided": {"brand": row['ProductBrand'], "category": row['ProductCategory'], "color": row['ProductColor']},
@@ -299,9 +299,9 @@ async def batch_process_images(file_id, limit):
                     update_database(result_id, ai_json, "AI analysis failed")
                     processed_count += 1
                 else:
-                    logger.warning(f"No image data retrieved for ResultID {result_id}")
+                    logging.warning(f"No image data retrieved for ResultID {result_id}")
             except Exception as e:
-                logger.error(f"Failed to process image for ResultID {result_id} (URL: {image_url}): {e}")
+                logging.error(f"Failed to process image for ResultID {result_id} (URL: {image_url}): {e}")
                 ai_json = json.dumps({
                     "description": "Download or API error",
                     "user_provided": {"brand": row['ProductBrand'], "category": row['ProductCategory'], "color": row['ProductColor']},
@@ -453,14 +453,14 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True):
         connection.close()
         
         if df.empty:
-            logger.info(f"No missing images found" + (f" for FileID: {file_id}" if file_id else ""))
+            logging.info(f"No missing images found" + (f" for FileID: {file_id}" if file_id else ""))
         else:
-            logger.info(f"Found {len(df)} missing images" + (f" for FileID: {file_id}" if file_id else ""))
+            logging.info(f"Found {len(df)} missing images" + (f" for FileID: {file_id}" if file_id else ""))
             
         return df
 
     except Exception as e:
-        logger.error(f"Error fetching missing images: {e}")
+        logging.error(f"Error fetching missing images: {e}")
         return pd.DataFrame()
 def update_initial_sort_order(file_id):
     """Set initial SortOrder based on ResultID after fetching image results."""
@@ -469,7 +469,7 @@ def update_initial_sort_order(file_id):
         with pyodbc.connect(conn_str) as connection:
             connection.timeout = 300
             cursor = connection.cursor()
-            logger.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
+            logging.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
             
             # Begin transaction
             cursor.execute("BEGIN TRANSACTION")
@@ -477,12 +477,12 @@ def update_initial_sort_order(file_id):
             # Reset Step1 in utb_ImageScraperRecords to allow reprocessing
             cursor.execute("UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE FileID = ?", (file_id,))
             reset_step1_count = cursor.rowcount
-            logger.info(f"Reset Step1 for {reset_step1_count} rows in utb_ImageScraperRecords")
+            logging.info(f"Reset Step1 for {reset_step1_count} rows in utb_ImageScraperRecords")
             
             # Reset existing SortOrder in utb_ImageScraperResult
             cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)", (file_id,))
             reset_sort_count = cursor.rowcount
-            logger.info(f"Reset SortOrder for {reset_sort_count} rows in utb_ImageScraperResult")
+            logging.info(f"Reset SortOrder for {reset_sort_count} rows in utb_ImageScraperResult")
             
             # Set initial SortOrder based on ResultID
             initial_sort_query = """
@@ -498,7 +498,7 @@ def update_initial_sort_order(file_id):
             """
             cursor.execute(initial_sort_query, (file_id,))
             update_count = cursor.rowcount
-            logger.info(f"Set initial SortOrder for {update_count} rows")
+            logging.info(f"Set initial SortOrder for {update_count} rows")
             
             # Commit transaction
             cursor.execute("COMMIT")
@@ -514,19 +514,19 @@ def update_initial_sort_order(file_id):
             cursor.execute(verify_query, (file_id,))
             results = cursor.fetchall()
             for record in results:
-                logger.info(f"Initial - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
+                logging.info(f"Initial - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
             
             # Check total result count
             count_query = "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)"
             cursor.execute(count_query, (file_id,))
             total_results = cursor.fetchone()[0]
-            logger.info(f"Total results after initial sort for FileID {file_id}: {total_results}")
+            logging.info(f"Total results after initial sort for FileID {file_id}: {total_results}")
             if total_results < 16:  # Assuming 1 EntryID
-                logger.warning(f"Expected at least 16 results (8 per search type), got {total_results}")
+                logging.warning(f"Expected at least 16 results (8 per search type), got {total_results}")
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
     except Exception as e:
-        logger.error(f"Error setting initial SortOrder: {e}")
+        logging.error(f"Error setting initial SortOrder: {e}")
         if 'cursor' in locals():
             cursor.execute("ROLLBACK")
         return None
@@ -542,7 +542,7 @@ def update_search_sort_order(file_id):
         with pyodbc.connect(conn_str) as connection:  
             connection.timeout = 300
             cursor = connection.cursor()
-            logger.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
+            logging.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
                    
             # Set initial SortOrder based on ResultID
             initial_sort_query = """
@@ -560,7 +560,7 @@ def update_search_sort_order(file_id):
             cursor.execute(initial_sort_query, (file_id,))
             update_count = cursor.rowcount
             cursor.execute("COMMIT")
-            logger.info(f"Set Search SortOrder for {update_count} rows")
+            logging.info(f"Set Search SortOrder for {update_count} rows")
             
             # Verify
             verify_query = """
@@ -573,11 +573,11 @@ def update_search_sort_order(file_id):
             cursor.execute(verify_query, (file_id,))
             results = cursor.fetchall()
             for record in results:
-                logger.info(f"Search - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
+                logging.info(f"Search - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
     except Exception as e:
-        logger.error(f"Error setting Search SortOrder: {e}")
+        logging.error(f"Error setting Search SortOrder: {e}")
         return None
     finally:
         if 'cursor' in locals():
@@ -592,7 +592,7 @@ def update_ai_sort_order(file_id):
         with pyodbc.connect(conn_str) as connection:
             connection.timeout = 300
             cursor = connection.cursor()
-            logger.info(f"🔄 Updating AI-based SortOrder for FileID: {file_id}")
+            logging.info(f"🔄 Updating AI-based SortOrder for FileID: {file_id}")
             
             # Debug current state
             debug_query = """
@@ -607,7 +607,7 @@ def update_ai_sort_order(file_id):
             cursor.execute(debug_query, (file_id,))
             current_order = cursor.fetchall()
             for record in current_order:
-                logger.info(f"Pre-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
+                logging.info(f"Pre-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
             
             # Update SortOrder based on AI scores
             ai_sort_query = """
@@ -637,17 +637,17 @@ def update_ai_sort_order(file_id):
             cursor.execute(ai_sort_query, (file_id,))
             update_count = cursor.rowcount
             cursor.execute("COMMIT")
-            logger.info(f"Updated AI SortOrder for {update_count} rows")
+            logging.info(f"Updated AI SortOrder for {update_count} rows")
             
             # Verify
             cursor.execute(debug_query, (file_id,))
             updated_order = cursor.fetchall()
             for record in updated_order:
-                logger.info(f"Post-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
+                logging.info(f"Post-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in updated_order]
     except Exception as e:
-        logger.error(f"Error updating AI SortOrder: {e}")
+        logging.error(f"Error updating AI SortOrder: {e}")
         return None
     finally:
         if 'cursor' in locals():

@@ -8,7 +8,7 @@ from PIL import Image as IMG2
 from PIL import UnidentifiedImageError
 from io import BytesIO
 
-logger = logging.getLogger(__name__)
+logging.getLogger(__name__)
 
 
 def verify_png_image_single(image_path):
@@ -91,7 +91,7 @@ def write_excel_image(local_filename, temp_dir, preferred_image_method):
         # Load the workbook and select the active worksheet
         wb = load_workbook(local_filename)
         ws = wb.active
-        logger.info(f"Processing images in {temp_dir} for Excel file {local_filename}")
+        logging.info(f"Processing images in {temp_dir} for Excel file {local_filename}")
         
         # Iterate through each file in the temporary directory
         for image_file in os.listdir(temp_dir):
