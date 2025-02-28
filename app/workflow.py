@@ -3,7 +3,7 @@ import os
 import logging
 import json
 import pyodbc,httpx
-import time
+import time,uuid
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from database import (
@@ -155,7 +155,7 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
             logger.error(f"🔴 Error downloading {url}: {e}")
             return False
 async def generate_download_file(file_id, logger=None, file_id_param=None):
-    """Generate and upload a processed Excel file with images."""
+    """Generate and upload a processed Excel file with images, appending a UUID to the filename."""
     logger = logger or default_logger
     temp_images_dir, temp_excel_dir = None, None
     try:
@@ -177,6 +177,7 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
                 'ImageUrlThumbnail': row['ImageUrlThumbnail']
             } for _, row in selected_images_df.iterrows()
         ]
+        logger.debug(f"📋 Selected image list: {len(selected_image_list)} items")
         
         logger.info(f"📍 Retrieving file location for FileID: {file_id}")
         provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id, logger)
@@ -186,7 +187,9 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         
         file_name = provided_file_path.split('/')[-1]
         base_name, extension = os.path.splitext(file_name)
-        processed_file_name = f"{base_name}_processed{extension}"
+        unique_id = uuid.uuid4().hex[:8]
+        processed_file_name = f"{base_name}_processed_{unique_id}{extension}"
+        logger.info(f"🆔 Generated unique filename with UUID: {processed_file_name}")
         
         logger.info(f"📂 Creating temporary directories for FileID: {file_id}")
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
@@ -194,33 +197,45 @@ async def generate_download_file(file_id, logger=None, file_id_param=None):
         
         logger.info(f"📥 Downloading images for FileID: {file_id}")
         failed_img_urls = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
-        response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
-        if response.status_code != 200:
-            logger.error(f"🔴 Failed to download file {provided_file_path}: {response.status_code}")
-            return {"error": "Failed to download the provided file"}
         
-        with open(local_filename, "wb") as file:
-            file.write(response.content)
+        logger.info(f"📥 Downloading original file from {provided_file_path}")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(provided_file_path, timeout=httpx.Timeout(30, connect=10))
+            response.raise_for_status()
+            with open(local_filename, "wb") as file:
+                file.write(response.content)
         
-        failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-        if failed_rows:
-            logger.warning(f"Failed to write images for {len(failed_rows)} rows: {failed_rows}")
-        
+        logger.info(f"🖼️ Writing images to Excel for FileID: {file_id}")
+        failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method, logger)
         if failed_img_urls:
-            await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls, local_filename)
-            logger.info(f"Logged {len(failed_img_urls)} failed downloads to Excel")
+            logger.info(f"📝 Logging {len(failed_img_urls)} failed downloads to Excel")
+            await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls, local_filename, logger)
         
+        logger.info(f"📤 Uploading processed file to S3: {processed_file_name}")
         public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, processed_file_name, True, logger, file_id)
         if not public_url:
-            logger.error(f"🔴 Failed to upload processed file for FileID {file_id}")
+            logger.error(f"❌ Failed to upload processed file for FileID {file_id}")
             return {"error": "Failed to upload processed file"}
         
+        logger.info(f"📝 Updating file location and completion status for FileID: {file_id}")
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url, logger)
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id, logger)
         
         subject_line = f"{file_name} Job Notification"
         send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id, logger)
-        await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, subject_line, public_url, file_id)
+        logger.info(f"📧 Sending email to {send_to_email} with download URL: {public_url}")
+        # Fixed call with lambda to use keyword arguments
+        await loop.run_in_executor(
+            ThreadPoolExecutor(),
+            lambda: send_email(
+                to_emails=send_to_email,
+                subject=subject_line,
+                download_url=public_url,
+                job_id=file_id,
+                logger=logger
+            )
+        )
+        
         logger.info(f"🏁 Processing completed for FileID {file_id} in {(time.time() - start_time):.2f} seconds")
         return {"message": "Processing completed successfully", "public_url": public_url}
     except Exception as e:

@@ -1,19 +1,28 @@
+# email_utils.py
 import os
 import logging
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Personalization, Cc, To
 from config import SENDGRID_API_KEY
 
-logging.getLogger(__name__)
+# Module-level logger
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 
-def send_email(to_emails, subject, download_url, job_id):
+def send_email(to_emails, subject, download_url, job_id, logger=None):
+    """Send an email notification with the download URL."""
+    logger = logger or default_logger
     try:
         html_content = f"""
         <html>
         <body>
         <div class="container">
             <p>Your file is ready for download.</p>
-             <a href="{download_url}" class="download-button">Download File</a>
+            <a href="{download_url}" class="download-button">Download File</a>
             <p><br>Please use the link below to modify the file<br></p>
             <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={job_id}" class="download-button">Edit / View</a> 
             <br>  
@@ -31,28 +40,27 @@ def send_email(to_emails, subject, download_url, job_id):
         message.add_personalization(personalization)
         sg = SendGridAPIClient(SENDGRID_API_KEY)
         response = sg.send(message)
-        logging.info(f"Email sent successfully: {response.status_code}")
+        logger.info(f"📧 Email sent successfully to {to_emails} with status code: {response.status_code}")
     except Exception as e:
-        logging.error(f"Error sending email: {e}")
+        logger.error(f"🔴 Error sending email to {to_emails}: {e}", exc_info=True)
         raise
 
-def send_message_email(to_emails, subject, message):
+def send_message_email(to_emails, subject, message, logger=None):
+    """Send a plain message email (e.g., for errors)."""
+    logger = logger or default_logger
     try:
         message_with_breaks = message.replace("\n", "<br>")
         html_content = f"""
         <html>
         <body>
-       <div class="container">
+        <div class="container">
             <p>Message details:<br>{message_with_breaks}</p>
-            
             <p>--</p>
             <p><small>This is an automated system notification.<br>
-            Notified Users: {to_emails} JobId:  From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>   
-        
-        
-        
-        
-        
+            Notified Users: {to_emails} JobId: From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v13.3</a></small></p>
+        </div>
+        </body>
+        </html>
         """
         message_obj = Mail(from_email='nik@iconluxurygroup.com', subject=subject, html_content=html_content)
         cc_recipient = 'nik@luxurymarket.com'
@@ -62,7 +70,7 @@ def send_message_email(to_emails, subject, message):
         message_obj.add_personalization(personalization)
         sg = SendGridAPIClient(SENDGRID_API_KEY)
         response = sg.send(message_obj)
-        logging.info(f"Message email sent successfully: {response.status_code}")
+        logger.info(f"📧 Message email sent successfully to {to_emails} with status code: {response.status_code}")
     except Exception as e:
-        logging.error(f"Error sending message email: {e}")
+        logger.error(f"🔴 Error sending message email to {to_emails}: {e}", exc_info=True)
         raise
