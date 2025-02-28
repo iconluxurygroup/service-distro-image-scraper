@@ -3,13 +3,11 @@ FROM python:3.10-slim
 
 # Set the working directory in the container
 WORKDIR /app
-
-# Copy requirements.txt from the app directory to leverage Docker cache
+# Upgrade pip in its own layer
+RUN pip install --upgrade pip
+# Copy and install requirements
 COPY app/requirements.txt /app/requirements.txt
-
-# Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+RUN pip install -r requirements.txt
 
 # Clean the apt cache and update with --fix-missing
 RUN apt-get clean && \
