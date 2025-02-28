@@ -471,28 +471,96 @@ def update_initial_sort_order(file_id):
             cursor = connection.cursor()
             logger.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
             
-            # Reset existing SortOrder
+            # Begin transaction
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # Reset Step1 in utb_ImageScraperRecords to allow reprocessing
+            cursor.execute("UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE FileID = ?", (file_id,))
+            reset_step1_count = cursor.rowcount
+            logger.info(f"Reset Step1 for {reset_step1_count} rows in utb_ImageScraperRecords")
+            
+            # Reset existing SortOrder in utb_ImageScraperResult
             cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)", (file_id,))
-            reset_count = cursor.rowcount
-            logger.info(f"Reset SortOrder for {reset_count} rows")
+            reset_sort_count = cursor.rowcount
+            logger.info(f"Reset SortOrder for {reset_sort_count} rows in utb_ImageScraperResult")
             
             # Set initial SortOrder based on ResultID
             initial_sort_query = """
-WITH toupdate AS (
-    SELECT t.*, 
-           ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS seqnum
-    FROM utb_ImageScraperResult t 
-    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
-    WHERE r.FileID = ?
-) 
-UPDATE toupdate 
-SET SortOrder = seqnum;
+                WITH toupdate AS (
+                    SELECT t.*, 
+                           ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS seqnum
+                    FROM utb_ImageScraperResult t 
+                    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+                    WHERE r.FileID = ?
+                ) 
+                UPDATE toupdate 
+                SET SortOrder = seqnum;
+            """
+            cursor.execute(initial_sort_query, (file_id,))
+            update_count = cursor.rowcount
+            logger.info(f"Set initial SortOrder for {update_count} rows")
+            
+            # Commit transaction
+            cursor.execute("COMMIT")
+            
+            # Verify results
+            verify_query = """
+                SELECT t.ResultID, t.EntryID, t.SortOrder
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+                ORDER BY t.EntryID, t.SortOrder
+            """
+            cursor.execute(verify_query, (file_id,))
+            results = cursor.fetchall()
+            for record in results:
+                logger.info(f"Initial - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
+            
+            # Check total result count
+            count_query = "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)"
+            cursor.execute(count_query, (file_id,))
+            total_results = cursor.fetchone()[0]
+            logger.info(f"Total results after initial sort for FileID {file_id}: {total_results}")
+            if total_results < 16:  # Assuming 1 EntryID
+                logger.warning(f"Expected at least 16 results (8 per search type), got {total_results}")
+            
+            return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
+    except Exception as e:
+        logger.error(f"Error setting initial SortOrder: {e}")
+        if 'cursor' in locals():
+            cursor.execute("ROLLBACK")
+        return None
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'connection' in locals():
+            connection.close()  
+def update_search_sort_order(file_id):   
+    """Set initial SortOrder based on ResultID after fetching image results."""
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as connection:  
+            connection.timeout = 300
+            cursor = connection.cursor()
+            logger.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
+                   
+            # Set initial SortOrder based on ResultID
+            initial_sort_query = """
+                WITH toupdate AS (
+                    SELECT t.*, 
+                        ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS seqnum
+                    FROM utb_ImageScraperResult t 
+                    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID 
+                    WHERE r.FileID = ?
+                ) 
+                UPDATE toupdate 
+                SET SortOrder = seqnum;
             """
             cursor.execute("BEGIN TRANSACTION")
             cursor.execute(initial_sort_query, (file_id,))
             update_count = cursor.rowcount
             cursor.execute("COMMIT")
-            logger.info(f"Set initial SortOrder for {update_count} rows")
+            logger.info(f"Set Search SortOrder for {update_count} rows")
             
             # Verify
             verify_query = """
@@ -505,11 +573,11 @@ SET SortOrder = seqnum;
             cursor.execute(verify_query, (file_id,))
             results = cursor.fetchall()
             for record in results:
-                logger.info(f"Initial - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
+                logger.info(f"Search - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
     except Exception as e:
-        logger.error(f"Error setting initial SortOrder: {e}")
+        logger.error(f"Error setting Search SortOrder: {e}")
         return None
     finally:
         if 'cursor' in locals():

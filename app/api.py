@@ -1,7 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks
 import logging
 from workflow import process_image_batch, generate_download_file, process_restart_batch
-from database import update_ai_sort_order, check_json_status, fix_json_data
+from database import update_ai_sort_order, update_initial_sort_order,check_json_status, fix_json_data
 
 logging.basicConfig(level=logging.INFO)
 
@@ -10,7 +10,9 @@ app = FastAPI()
 @app.get("/check_json_status/{file_id}")
 async def api_check_json_status(file_id: str):
     return check_json_status(file_id)
-
+@app.get("/initial_sort/{file_id}")
+async def api_initial_sort(file_id: str):
+    return update_initial_sort_order(file_id)
 @app.post("/update_sort_llama/")
 async def api_update_sort(background_tasks: BackgroundTasks, file_id_db: str):
     background_tasks.add_task(update_ai_sort_order, file_id_db)

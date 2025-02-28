@@ -191,7 +191,7 @@ async def generate_download_file(file_id):
 
 # Example integration with process_restart_batch (for context)
 async def process_restart_batch(file_id_db):
-    from database import fetch_missing_images, update_initial_sort_order, update_ai_sort_order, get_records_to_search
+    from database import fetch_missing_images, update_initial_sort_order, update_ai_sort_order, get_records_to_search,update_search_sort_order
     from workflow import generate_download_file
     
     try:
@@ -231,12 +231,12 @@ async def process_restart_batch(file_id_db):
         #     logger.info(f"Processing {len(missing_analysis_df)} images with missing AI analysis for FileID: {file_id_db}")
         #     await batch_process_images(file_id_db, len(missing_analysis_df))
         
-        # Update sort order and generate file
-        # logger.info(f"Updating sort order for FileID: {file_id_db}")
-        # sort_result = update_ai_sort_order(file_id_db)
-        # if sort_result is None:
-        #     logger.error(f"Sort order update failed for FileID: {file_id_db}")
-        #     raise Exception("Sort order update failed")
+        #Update sort order and generate file
+        logger.info(f"Updating sort order for FileID: {file_id_db}")
+        sort_result = update_search_sort_order(file_id_db)
+        if sort_result is None:
+            logger.error(f"Sort order update failed for FileID: {file_id_db}")
+            raise Exception("Sort order update failed")
         
         logger.info(f"Generating download file for FileID: {file_id_db}")
         result = await generate_download_file(file_id_db)
