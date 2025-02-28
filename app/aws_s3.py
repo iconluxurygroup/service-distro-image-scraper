@@ -12,17 +12,17 @@ def get_spaces_client():
         boto3.client: AWS S3 client
     """
     try:
-        logger.info("Creating S3 client")
+        logging.info("Creating S3 client")
         client = boto3.client(
             "s3",
             region_name=REGION,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY
         )
-        logger.info("S3 client created successfully")
+        logging.info("S3 client created successfully")
         return client
     except Exception as e:
-        logger.error(f"Error creating S3 client: {e}", exc_info=True)
+        logging.error(f"Error creating S3 client: {e}", exc_info=True)
         raise
 def double_encode_plus(filename):
     """
