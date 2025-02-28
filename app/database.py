@@ -36,6 +36,7 @@ import asyncio
 from fastapi import BackgroundTasks
 from image_processing import get_image_data, analyze_image_with_grok_vision
 from config import conn_str,engine
+
 logging.getLogger(__name__)
 
 def fetch_pending_images(limit=10):
@@ -271,6 +272,7 @@ def process_search_row(search_string, endpoint, entry_id):
         n_endpoint = get_endpoint()
         logging.info(f"Trying again with new endpoint: {n_endpoint}")
         return process_search_row(search_string, n_endpoint, entry_id)
+    
 async def batch_process_images(file_id, limit):
     try:
         missing_df = fetch_missing_images(file_id=file_id, limit=limit, ai_analysis_only=True)
