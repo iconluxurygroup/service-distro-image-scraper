@@ -33,9 +33,6 @@ RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
 # Verify installation of unixODBC
 RUN which odbcinst
 
-# Now copy the rest of the application into the container
-COPY icon_image_lib/ icon_image_lib/
-COPY main.py .
 COPY install_sql_server_dev.sh .
 
 # Make the install script executable and run it
