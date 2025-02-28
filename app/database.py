@@ -186,6 +186,9 @@ def get_records_to_search(file_id):
         return pd.DataFrame()
     
 def process_search_row(search_string, endpoint, entry_id):
+    logging.info(f"🔎Search started for {search_string}")
+    logging.info(f"👺Search Proxy: {endpoint}")
+    logging.info(f"📓Entry ID: {entry_id}")
     try:
         # Ensure search string is valid and includes brand context
         if not search_string or len(search_string.strip()) < 3:
