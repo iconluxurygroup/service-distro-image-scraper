@@ -10,4 +10,4 @@ if __name__ == "__main__":
     if ray.is_initialized():
         ray.shutdown()
     ray.init()  # Start a local Ray cluster
-    uvicorn.run("main:app", port=8080, host='0.0.0.0',reload=True)
+    uvicorn.run("main:app", port=8080, host='0.0.0.0')
