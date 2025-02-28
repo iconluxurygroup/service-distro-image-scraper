@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 # Load environment variables from a .env file
-load_dotenv()
+#load_dotenv()
 
 # AWS credentials and region
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID', 'AKIAZQ3DSIQ5BGLY355N')
