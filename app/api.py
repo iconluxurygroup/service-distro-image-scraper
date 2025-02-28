@@ -18,17 +18,14 @@ ray.init(ignore_reinit_error=True)
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
-
 async def run_job_with_logging(job_func, file_id, *args, **kwargs):
-    # Remove 'file_id' from kwargs if present to avoid duplication
     file_id = str(file_id)  # Convert to string if it’s not already
     logger, log_filename = setup_job_logger(job_id=file_id or str(uuid.uuid4()))
     logger.info(f"Starting job {job_func.__name__} for FileID: {file_id}")
-    # Pass the first arg from *args as the primary positional argument, file_id as keyword
     if args:
         result = await job_func(args[0], logger=logger, file_id=file_id, **kwargs)
     else:
-        result = await job_func(logger=logger, file_id=file_id, **kwargs)
+        result = await job_func(file_id, logger=logger, **kwargs)  # Pass file_id as first positional arg
     if os.path.exists(log_filename):
         upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
         logger.info(f"Log file uploaded to: {upload_url}")
@@ -51,7 +48,7 @@ async def api_initial_sort(file_id: str):
 async def api_update_sort(background_tasks: BackgroundTasks, file_id_db: str):
     logger, _ = setup_job_logger(job_id=file_id_db)
     logger.info(f"Queueing AI sort order update for FileID: {file_id_db}")
-    background_tasks.add_task(run_job_with_logging, update_ai_sort_order, file_id_db, file_id=file_id_db)
+    background_tasks.add_task(run_job_with_logging, update_ai_sort_order, file_id_db)
     return {"message": f"Sort order update for FileID: {file_id_db} initiated", "status": "processing"}
 
 @app.post("/fix_json_data/")
@@ -80,8 +77,7 @@ async def api_process_payload(background_tasks: BackgroundTasks, payload: dict):
     except Exception as e:
         logger.error(f"Error processing payload: {e}")
         return {"error": f"An error occurred: {str(e)}"}
-    
-    
+
 @app.post("/generate-download-file/")
 async def api_generate_download_file(background_tasks: BackgroundTasks, file_id: int):
     file_id_str = str(file_id)
