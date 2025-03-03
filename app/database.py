@@ -10,15 +10,19 @@ import re
 import chardet
 import json
 import math
+import asyncio
 from fastapi import BackgroundTasks
 from icon_image_lib.google_parser import get_original_images as GP
-from image_processing import get_image_data, analyze_image_with_grok_vision
+from image_processing import get_image_data, analyze_image_with_gemini,evaluate_with_grok_text
 from config import conn_str, engine
 from logging_config import setup_job_logger
 import base64  # Added import
 import zlib    # Added import for unpack_content
 # Fallback logger for standalone calls
+
+from config import GOOGLE_API_KEY
 default_logger = logging.getLogger(__name__)
+
 if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -254,85 +258,105 @@ def process_search_row(search_string, endpoint, entry_id, retries=0, max_retries
         raise  # Re-raise the exception to let the caller handle it
 
 
-async def batch_process_images(file_id, limit, logger=None):
+def convert_sets_to_lists(obj):
+    """Recursively convert sets to lists in a dictionary."""
+    if isinstance(obj, set):
+        return list(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_sets_to_lists(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_sets_to_lists(item) for item in obj]
+    return obj
+# database.py
+async def batch_process_images(file_id, limit=1000, logger=None, rpm_limit=15):
     logger = logger or default_logger
+    logger.info(f"Starting AI Batch for FileID: {file_id}")
     try:
         missing_df = fetch_missing_images(file_id=file_id, limit=limit, ai_analysis_only=True, logger=logger)
         if missing_df.empty:
             logger.info(f"No images need AI processing for FileID: {file_id}")
             return
-        
+
         processed_count = 0
+        delay_between_requests = 60 / rpm_limit
+        completed_entry_ids = set()
+
         for _, row in missing_df.iterrows():
             result_id = row['ResultID']
-            image_url = row['ImageURL']
+            entry_id = row['EntryID']
+            image_url = row['ImageUrl']
+
+            logger.debug(f"Processing ResultID: {result_id}, EntryID: {entry_id}, URL: {image_url}")
             try:
                 image_data = get_image_data(image_url)
-                if image_data:
-                    features = await analyze_image_with_grok_vision(image_data)
-                    if features and "error" not in features:
-                        ai_json = json.dumps(features)
-                    else:
-                        logger.warning(f"⚠️ Invalid Grok Vision response for ResultID {result_id}: {features}")
-                        ai_json = json.dumps({
-                            "description": "Failed to analyze",
-                            "user_provided": {"brand": row['ProductBrand'], "category": row['ProductCategory'], "color": row['ProductColor']},
-                            "extracted_features": {"brand": "", "category": "", "color": ""},
-                            "match_score": None,
-                            "reasoning_match": "API failure",
-                            "linesheet_score": None,
-                            "reasoning_linesheet": "API failure"
-                        })
-                    update_database(result_id, ai_json, "AI analysis failed", logger=logger)
-                    processed_count += 1
-                else:
+                if not image_data:
                     logger.warning(f"⚠️ No image data retrieved for ResultID {result_id}")
+                    ai_json = json.dumps({"error": "Failed to fetch image"})
+                    update_database(result_id, ai_json, "Failed to fetch image", logger=logger)
+                    continue
+
+                image_data_base64 = base64.b64encode(image_data).decode('utf-8')
+                features = await analyze_image_with_gemini(image_data_base64, api_key=GOOGLE_API_KEY)
+                logger.debug(f"Gemini result for ResultID {result_id}: {features}")
+
+                if features["success"]:
+                    extracted_features = features["features"]["extracted_features"]
+                    description = features["features"]["description"]
+                    
+                    product_details = {
+                        "brand": row.get('ProductBrand', ''),
+                        "category": row.get('ProductCategory', ''),
+                        "color": row.get('ProductColor', '')
+                    }
+                    logger.debug(f"Product details for ResultID {result_id}: {product_details}")
+
+                    scores = await evaluate_with_grok_text(extracted_features, product_details)
+                    if scores.get("match_score") is None or scores.get("linesheet_score") is None:
+                        logger.warning(f"Grok returned invalid scores for ResultID {result_id}: {scores}")
+                        scores = {
+                            "match_score": None,
+                            "linesheet_score": None,
+                            "reasoning_match": "Invalid or missing score",
+                            "reasoning_linesheet": "Invalid or missing score"
+                        }
+
+                    ai_json_dict = {
+                        "description": description,
+                        "user_provided": product_details,
+                        "extracted_features": extracted_features,
+                        "match_score": scores.get("match_score"),
+                        "reasoning_match": scores.get("reasoning_match", ""),
+                        "linesheet_score": scores.get("linesheet_score"),
+                        "reasoning_linesheet": scores.get("reasoning_linesheet", "")
+                    }
+                    ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
+                    update_database(result_id, ai_json, description, logger=logger)
+                    processed_count += 1
+
+                    match_score = scores.get("match_score")
+                    linesheet_score = scores.get("linesheet_score")
+                    if (match_score is not None and linesheet_score is not None and
+                        match_score >= 95 and linesheet_score >= 80):
+                        completed_entry_ids.add(entry_id)
+                        logger.info(f"EntryID {entry_id} marked complete: match={match_score}, linesheet={linesheet_score}")
+                else:
+                    logger.warning(f"Gemini failed for ResultID {result_id}: {features['text']}")
+                    ai_json_dict = {"error": features["text"]}
+                    ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
+                    update_database(result_id, ai_json, features["text"], logger=logger)
+
+                await asyncio.sleep(delay_between_requests)
+
             except Exception as e:
-                logger.error(f"Failed to process image for ResultID {result_id} (URL: {image_url}): {e}")
-                ai_json = json.dumps({
-                    "description": "Download or API error",
-                    "user_provided": {"brand": row['ProductBrand'], "category": row['ProductCategory'], "color": row['ProductColor']},
-                    "extracted_features": {"brand": "", "category": "", "color": ""},
-                    "match_score": None,
-                    "reasoning_match": str(e),
-                    "linesheet_score": None,
-                    "reasoning_linesheet": str(e)
-                })
+                logger.error(f"Failed to process ResultID {result_id} (URL: {image_url}): {e}")
+                ai_json_dict = {"error": str(e)}
+                ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
                 update_database(result_id, ai_json, "AI analysis failed", logger=logger)
                 continue
-        
-        logger.info(f"Processed {processed_count} out of {len(missing_df)} images for AI analysis for FileID: {file_id}")
-    except Exception as e:
-        logger.error(f"🔴 Error in batch_process_images: {e}")
-        raise
 
-async def process_images(file_id, logger=None):
-    logger = logger or default_logger
-    try:
-        images_df = fetch_images_by_file_id(file_id, logger=logger)
-        if images_df.empty:
-            logger.info(f"No images found for FileID: {file_id}")
-            return
-        
-        processed_count = 0
-        for _, row in images_df.iterrows():
-            result_id = row['ResultID']
-            image_url = row['ImageURL']
-            if not row.get('aijson'):
-                try:
-                    image_data = get_image_data(image_url)
-                    if image_data:
-                        features = await analyze_image_with_grok_vision(image_data)
-                        ai_json = json.dumps(features)
-                        update_database(result_id, ai_json, "AI-generated caption", logger=logger)
-                        processed_count += 1
-                except Exception as e:
-                    logger.error(f"🔴 Error Failed to process image for ResultID {result_id} (URL: {image_url}): {e}")
-                    continue
-        
-        logger.info(f"Completed image processing for FileID: {file_id}, processed {processed_count} images")
+        logger.info(f"Processed {processed_count} out of {len(missing_df)} images for FileID: {file_id}")
     except Exception as e:
-        logger.error(f"🔴 Error in process_images: {e}")
+        logger.error(f"🔴 Error in batch_process_images for FileID {file_id}: {e}")
         raise
 
 def fetch_images_by_file_id(file_id, logger=None):
@@ -353,8 +377,21 @@ def fetch_images_by_file_id(file_id, logger=None):
     except Exception as e:
         logger.error(f"🔴 Error fetching images for FileID {file_id}: {e}")
         return pd.DataFrame()
-# database.py (partial update)
-def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=None):
+def fetch_missing_images(file_id, limit=8, ai_analysis_only=True, logger=None):
+    """
+    Fetch missing images for a specific file identified by file_id.
+    
+    Args:
+        file_id (int): The ID of the file to fetch missing images for (required).
+        limit (int): Maximum number of records to return (default: 8).
+        ai_analysis_only (bool): If True, only fetch records with an existing ImageUrl but invalid or missing AI analysis.
+                                 If False, fetch records missing in the result table, with empty ImageUrl, or with invalid AI analysis.
+                                 (default: True).
+        logger: Logger instance (default: None, uses default_logger).
+    
+    Returns:
+        pd.DataFrame: DataFrame containing missing image records for the specified file.
+    """
     logger = logger or default_logger
     try:
         connection = pyodbc.connect(conn_str, timeout=60)
@@ -365,19 +402,19 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
             SELECT t.ResultID, t.EntryID, t.ImageUrl AS ImageUrl, r.ProductBrand, r.ProductCategory, r.ProductColor
             FROM utb_ImageScraperResult t
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE (
-                t.ImageUrl IS NOT NULL 
-                AND t.ImageUrl <> ''
-                AND (
-                    ISJSON(t.aijson) = 0 
-                    OR t.aijson IS NULL
-                    OR JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL
-                    OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
-                    OR JSON_VALUE(t.aijson, '$.match_score') IS NULL
-                    OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
-                )
-            )
+            WHERE t.ImageUrl IS NOT NULL 
+              AND t.ImageUrl <> ''
+              AND (
+                  ISJSON(t.aijson) = 0 
+                  OR t.aijson IS NULL
+                  OR JSON_VALUE(t.aijson, '$.linesheet_score') IS NULL
+                  OR JSON_VALUE(t.aijson, '$.linesheet_score') IN ('NaN', 'null', 'undefined')
+                  OR JSON_VALUE(t.aijson, '$.match_score') IS NULL
+                  OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
+              )
+              AND r.FileID = ?
             """
+            query_params.append(file_id)
         else:
             query = """
             -- Records missing in result table completely
@@ -385,7 +422,7 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
                    r.ProductBrand, r.ProductCategory, r.ProductColor
             FROM utb_ImageScraperRecords r
             LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
-            WHERE t.EntryID IS NULL
+            WHERE t.EntryID IS NULL AND r.FileID = ?
             
             UNION ALL
             
@@ -394,7 +431,7 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
                    r.ProductBrand, r.ProductCategory, r.ProductColor
             FROM utb_ImageScraperResult t
             INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE t.ImageUrl IS NULL OR t.ImageUrl = ''
+            WHERE (t.ImageUrl IS NULL OR t.ImageUrl = '') AND r.FileID = ?
             
             UNION ALL
             
@@ -413,25 +450,23 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
                   OR JSON_VALUE(t.aijson, '$.match_score') IS NULL
                   OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
               )
+              AND r.FileID = ?
             """
+            query_params.extend([file_id, file_id, file_id])
 
-        if file_id:
-            query += " AND r.FileID = ?"
-            query_params.append(file_id)
-
-        query += " ORDER BY r.EntryID ASC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY"
+        query += " ORDER BY EntryID ASC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY"
         query_params.append(limit)
 
         df = pd.read_sql_query(query, connection, params=query_params)
         connection.close()
         
         if df.empty:
-            logger.info(f"🟩 No missing images found" + (f" for FileID: {file_id}" if file_id else ""))
+            logger.info(f"🟩 No missing images found for FileID: {file_id}")
         else:
-            logger.info(f"📒 Found {len(df)} missing images" + (f" for FileID: {file_id}" if file_id else ""))
+            logger.info(f"📒 Found {len(df)} missing images for FileID: {file_id}")
             logger.debug(f"Fetched DataFrame columns: {df.columns.tolist()}")
         
-        # Force rename to 'ImageUrl' regardless of case
+        # Ensure 'ImageUrl' column consistency
         if 'ImageURL' in df.columns:
             df.rename(columns={'ImageURL': 'ImageUrl'}, inplace=True)
             logger.debug(f"Renamed 'ImageURL' to 'ImageUrl' in DataFrame")
@@ -441,7 +476,7 @@ def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, logger=No
         
         return df
     except Exception as e:
-        logger.error(f"🔴 Error fetching missing images: {e}")
+        logger.error(f"🔴 Error fetching missing images for FileID {file_id}: {e}")
         return pd.DataFrame()
     
 def update_initial_sort_order(file_id, logger=None):
@@ -565,7 +600,7 @@ def update_ai_sort_order(file_id, logger=None):
         with pyodbc.connect(conn_str) as connection:
             connection.timeout = 300
             cursor = connection.cursor()
-            logger.info(f"🔄 Updating AI-based SortOrder for FileID: {file_id}")
+            logger.info(f"🔀 Updating AI-based SortOrder for FileID: {file_id}")
             
             debug_query = """
                 SELECT TOP 20 t.ResultID, t.EntryID, t.SortOrder, t.aijson,
@@ -579,7 +614,7 @@ def update_ai_sort_order(file_id, logger=None):
             cursor.execute(debug_query, (file_id,))
             current_order = cursor.fetchall()
             for record in current_order:
-                logger.info(f"Pre-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
+                logger.info(f"✍️ Pre-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
             
             ai_sort_query = """
                 WITH RankedResults AS (
@@ -613,7 +648,7 @@ def update_ai_sort_order(file_id, logger=None):
             cursor.execute(debug_query, (file_id,))
             updated_order = cursor.fetchall()
             for record in updated_order:
-                logger.info(f"Post-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
+                logger.info(f"✍️ Post-AI - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}, MatchScore: {record[4]}, LinesheetScore: {record[5]}, aijson: {record[3][:100] if record[3] else 'None'}")
             
             return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in updated_order]
     except Exception as e:

@@ -18,14 +18,23 @@ ray.init(ignore_reinit_error=True)
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
+import asyncio
+
 async def run_job_with_logging(job_func, file_id, *args, **kwargs):
-    file_id = str(file_id)  # Convert to string if it’s not already
+    file_id = str(file_id)
     logger, log_filename = setup_job_logger(job_id=file_id or str(uuid.uuid4()))
     logger.info(f"Starting job {job_func.__name__} for FileID: {file_id}")
+    logger.info(f"job_func type: {type(job_func)}")  # Debug: Check if async or sync
     if args:
-        result = await job_func(args[0], logger=logger, file_id=file_id, **kwargs)
+        result = job_func(args[0], logger=logger, file_id=file_id, **kwargs)
     else:
-        result = await job_func(file_id, logger=logger, **kwargs)  # Pass file_id as first positional arg
+        result = job_func(file_id, logger=logger, **kwargs)
+    logger.info(f"Result type: {type(result)}, Result: {result}")  # Debug: Inspect return value
+    if asyncio.iscoroutine(result):
+        logger.info("Result is awaitable, awaiting it")
+        result = await result
+    else:
+        logger.info("Result is not awaitable, skipping await")
     if os.path.exists(log_filename):
         upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
         logger.info(f"Log file uploaded to: {upload_url}")

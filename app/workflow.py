@@ -7,17 +7,18 @@ import time,uuid
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from database import (
-    insert_file_db, load_payload_db, get_records_to_search, process_images, 
+    insert_file_db, load_payload_db, get_records_to_search, 
     batch_process_images, fetch_missing_images, 
     update_file_location_complete, update_file_generate_complete, 
     get_send_to_email, get_file_location, get_images_excel_db, get_lm_products,
-    process_search_row, get_endpoint, update_search_sort_order, update_initial_sort_order
+    process_search_row, get_endpoint, update_search_sort_order, update_initial_sort_order,update_ai_sort_order
 )
+import asyncio
 from config import conn_str
 from aws_s3 import upload_file_to_space
 from email_utils import send_email, send_message_email
 from excel_utils import write_excel_image, write_failed_downloads_to_excel, verify_png_image_single
-from image_processing import get_image_data, analyze_image_with_grok_vision, evaluate_with_grok_text
+from image_processing import get_image_data, analyze_image_with_gemini, evaluate_with_grok_text
 from ray_workers import process_batch
 import requests
 import urllib.parse
@@ -296,7 +297,15 @@ async def process_restart_batch(file_id_db, logger=None, file_id=None):
         if sort_result is None:
             logger.error(f"🔴 Search sort order update failed for FileID: {file_id_db}")
             raise Exception("Search sort order update failed")
-        
+        logger.info(f" Starting AI Batch for FileID: {file_id_db}")
+        ai_batch = await batch_process_images (file_id_db,logger=logger)
+        logger.info(ai_batch)
+        # Update ai sort order
+        logger.info(f"🔍🔀Updating AI sort order for FileID: {file_id_db}")
+        sort_result = update_ai_sort_order(file_id_db, logger=logger)
+        if sort_result is None:
+            logger.error(f"🔴 Search sort order update failed for FileID: {file_id_db}")
+            raise Exception("Search sort order update failed")
         # Stage 3: Generate download file
         logger.info(f"💾 Generating download file for FileID: {file_id_db}")
         result = await generate_download_file(file_id_db, logger=logger)
@@ -305,6 +314,7 @@ async def process_restart_batch(file_id_db, logger=None, file_id=None):
             raise Exception(result["error"])
         logger.info(f"✅ Restart processing completed successfully for FileID: {file_id_db}")
         return {"message": "Restart processing completed successfully", "file_id": file_id_db}
+        
     except Exception as e:
         logger.error(f"🔴 Error restarting processing for FileID {file_id_db}: {e}", exc_info=True)
         send_to_email = get_send_to_email(file_id_db, logger=logger)

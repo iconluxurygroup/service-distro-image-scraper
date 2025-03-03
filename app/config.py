@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 # Load environment variables from a .env file
 #load_dotenv()
-
+GOOGLE_API_KEY='AIzaSyBE3VOxl4bG6aLlPbbHphIbh8eoBdA2jwE'
 # AWS credentials and region
 AWS_ACCESS_KEY_ID ='AKIAZQ3DSIQ5BGLY355N'
 AWS_SECRET_ACCESS_KEY = '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'

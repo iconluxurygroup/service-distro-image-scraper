@@ -22,3 +22,5 @@ accelerate
 safetensors
 torch
 openai
+google-generativeai
+google-genai
