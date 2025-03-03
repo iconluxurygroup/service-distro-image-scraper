@@ -112,7 +112,7 @@ async def analyze_image_with_gemini(
                 )
             )
             response_text = response.text if hasattr(response, "text") else ""
-            logger.debug(f"Gemini raw response: '{response_text[:500]}'")
+            logger.info(f"Gemini raw response: '{response_text[:500]}'")
 
             if response_text:
                 try:
