@@ -24,3 +24,4 @@ torch
 openai
 google-generativeai
 google-genai
+aiolimiter

@@ -23,7 +23,7 @@ Analyze this image and provide the following information in JSON format:
     "brand": "Extracted brand name from the image, if any.",
     "category": "Extracted category of the product, if identifiable.",
     "color": "Primary color of the product.",
-    "composition": "Any composition details visible in the image as well as angle and scale, background."
+    "composition": "Any composition details visible in the image as well as angle and scale/zoom, background color, people,items,text"
   }
 }
 Ensure the response is a valid JSON object. Return only the JSON object, no additional text.
@@ -32,7 +32,7 @@ Ensure the response is a valid JSON object. Return only the JSON object, no addi
 # Pydantic schema for Grok response
 class GrokScore(BaseModel):
     match_score: Optional[int] = Field(description="A score from 0-100 indicating how well the extracted features match the user-provided details", ge=0, le=100)
-    linesheet_score: Optional[int] = Field(description="A score from 0-100 indicating suitability for a linesheet", ge=0, le=100)
+    linesheet_score: Optional[int] = Field(description="A score from 0-100 indicating suitability for a linesheet based on composition", ge=0, le=100)
     reasoning_match: str = Field(description="Explanation for the match score")
     reasoning_linesheet: str = Field(description="Explanation for the linesheet score")
 
@@ -40,10 +40,10 @@ async def analyze_image_with_gemini(
     image_base64: str,
     prompt: str = prompt,
     api_key: str = None,
-    model_name: str = "gemini-2.0-pro-exp-02-05",
+    model_name: str = "gemini-2.0-flash",
     mime_type: str = "image/jpeg",
     max_retries: int = 5,
-    initial_delay: float = 4.0
+    initial_delay: float = 0.5
 ) -> Dict[str, Optional[str | int | bool]]:
     api_key = api_key or GOOGLE_API_KEY
     if not api_key:
@@ -147,22 +147,44 @@ async def evaluate_with_grok_text(features: dict, product_details: dict) -> dict
         base_url="https://api.x.ai/v1",
     )
     prompt = (
-        "Evaluate the match between the extracted image features and user-provided product details.\n"
-        f"Extracted features: {json.dumps(features)}\n"
-        f"User-provided details: {json.dumps(product_details)}\n"
-        "First, calculate a match_score from 0 to 100 indicating how well the extracted features match the user-provided details based on fields like brand, category, color, and any other overlapping fields. If no elements align match_score is 0\n"
-        "Then, if the match_score is at least 50, calculate a linesheet_score from 0 to 100 indicating the suitability of the image for a linesheet (a clean product shot with no models, no extra items, and a solid white background. Full visability of product, no zoom, straight on angle shot of front or side of product), using the composition field to assess the image quality.\n"
-        "If the match_score is less than 50, set linesheet_score to null and explain that it’s not applicable due to insufficient matching.\n"
-        "Provide reasoning for both scores.\n"
-        "Return a JSON object with the following structure:\n"
-        "{\n"
-        "  \"match_score\": \"An integer from 0-100\",\n"
-        "  \"linesheet_score\": \"An integer from 0-100 or null\",\n"
-        "  \"reasoning_match\": \"Explanation for the match score\",\n"
-        "  \"reasoning_linesheet\": \"Explanation for the linesheet score or why it’s not applicable\"\n"
-        "}\n"
-        "Ensure the response is a valid JSON object. Return only the JSON object, no additional text."
-    )
+    "Evaluate the match between the extracted image features and user-provided product details.\n"
+    f"Extracted features: {json.dumps(features)}\n"
+    f"User-provided details: {json.dumps(product_details)}\n"
+    "First, calculate a match_score from 0 to 100 based on the brand, category, and color fields, using the following rubric:\n"
+    "- Brand matching (max 40 points):\n"
+    "  - Excellent (40 points): Exact match (e.g., 'Nike' vs. 'Nike').\n"
+    "  - Good (30 points): Minor variations (e.g., 'Nike' vs. 'NIKE', 'Nike Shoes' vs. 'Nike').\n"
+    "  - Fair (20 points): Related or slight mismatch (e.g., 'Nike' vs. 'Nike - Official Store').\n"
+    "  - Poor (0 points): No match (e.g., 'Nike' vs. 'Adidas').\n"
+    "- Category matching (max 40 points):\n"
+    "  - Excellent (40 points): Exact match (e.g., 'Shoes' vs. 'Shoes').\n"
+    "  - Good (30 points): Slightly broader/narrower (e.g., 'Running Shoes' vs. 'Shoes', 'Shoes' vs. 'Footwear').\n"
+    "  - Fair (20 points): Related but not direct (e.g., 'Sneakers' vs. 'Shoes').\n"
+    "  - Poor (0 points): No match (e.g., 'Electronics' vs. 'Shoes').\n"
+    "- Color matching (max 20 points):\n"
+    "  - Excellent (20 points): Exact match (e.g., 'Red' vs. 'Red').\n"
+    "  - Good (15 points): Minor shade difference (e.g., 'Red' vs. 'Crimson').\n"
+    "  - Fair (10 points): Related color family (e.g., 'Red' vs. 'Pink').\n"
+    "  - Poor (0 points): No match (e.g., 'Red' vs. 'Blue').\n"
+    "Sum the points from brand, category, and color to get the match_score. If no fields align, match_score is 0.\n"
+    "Then, if the match_score is at least 50, calculate a linesheet_score from 0 to 100 indicating the suitability of the image for a linesheet. A suitable linesheet image is a clean product shot with no models, no extra items, solid white background, full visibility of the product, no zoom-in detail shots, and a straight-on angle shot of the front or side. Use the composition field to assess the image.\n"
+    "For the linesheet_score, evaluate the composition field against the following four criteria:\n"
+    "1. No models or extra items (25 points).\n"
+    "2. Solid white background (25 points).\n"
+    "3. Full visibility of the product (not a detail shot) (25 points).\n"
+    "4. Straight-on angle shot of the front or side (25 points).\n"
+    "Assign 25 points for each criterion clearly met based on the composition description. If a criterion is not mentioned or unclear, do not award points for that criterion. The linesheet_score is the sum of points for the four criteria.\n"
+    "If the match_score is less than 50, set linesheet_score to 0 and explain that it’s not applicable due to insufficient matching.\n"
+    "Provide reasoning for both scores, specifying how the points were assigned for each field or criterion.\n"
+    "Return a JSON object with the following structure:\n"
+    "{\n"
+    "  \"match_score\": <integer from 0 to 100>,\n"
+    "  \"linesheet_score\": <integer from 0 to 100 or null>,\n"
+    "  \"reasoning_match\": \"Explanation for the match score\",\n"
+    "  \"reasoning_linesheet\": \"Explanation for the linesheet score or why it’s not applicable\"\n"
+    "}\n"
+    "Ensure the response is a valid JSON object. Return only the JSON object, no additional text."
+)
     try:
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(

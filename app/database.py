@@ -19,7 +19,8 @@ from logging_config import setup_job_logger
 import base64  # Added import
 import zlib    # Added import for unpack_content
 # Fallback logger for standalone calls
-
+import asyncio
+from aiolimiter import AsyncLimiter
 from config import GOOGLE_API_KEY
 default_logger = logging.getLogger(__name__)
 
@@ -257,9 +258,8 @@ def process_search_row(search_string, endpoint, entry_id, retries=0, max_retries
         logger.error(f"🔴 Database error: {e}", exc_info=True)
         raise  # Re-raise the exception to let the caller handle it
 
-
+# Helper function to convert any sets in a dictionary to lists for JSON serialization
 def convert_sets_to_lists(obj):
-    """Recursively convert sets to lists in a dictionary."""
     if isinstance(obj, set):
         return list(obj)
     elif isinstance(obj, dict):
@@ -267,98 +267,106 @@ def convert_sets_to_lists(obj):
     elif isinstance(obj, list):
         return [convert_sets_to_lists(item) for item in obj]
     return obj
-# database.py
-async def batch_process_images(file_id, limit=1000, logger=None, rpm_limit=15):
-    logger = logger or default_logger
+
+# Process a single image asynchronously
+async def process_image(row, semaphore, gemini_limiter, grok_limiter, logger):
+    result_id = row['ResultID']
+    image_url = row['ImageUrl']
+    logger.debug(f"Processing ResultID: {result_id}, URL: {image_url}")
+    
+    # Limit concurrent tasks
+    async with semaphore:
+        try:
+            # Download image (synchronous, run in a thread)
+            image_data = await asyncio.to_thread(get_image_data, image_url)
+            if not image_data:
+                logger.warning(f"⚠️ No image data for ResultID {result_id}")
+                ai_json = json.dumps({"error": "Failed to fetch image"})
+                await asyncio.to_thread(update_database, result_id, ai_json, "Failed to fetch image", logger)
+                return
+            
+            # Encode image data for API calls
+            image_data_base64 = base64.b64encode(image_data).decode('utf-8')
+            
+            # Analyze with Gemini API, respecting rate limit
+            async with gemini_limiter:
+                features = await analyze_image_with_gemini(image_data_base64, api_key=GOOGLE_API_KEY)
+            
+            if features["success"]:
+                extracted_features = features["features"]["extracted_features"]
+                description = features["features"]["description"]
+                product_details = {
+                    "brand": row.get('ProductBrand', ''),
+                    "category": row.get('ProductCategory', ''),
+                    "color": row.get('ProductColor', '')
+                }
+                
+                # Evaluate with Grok API, respecting rate limit
+                async with grok_limiter:
+                    scores = await evaluate_with_grok_text(extracted_features, product_details)
+                
+                # Ensure scores are valid
+                if scores.get("match_score") is None or scores.get("linesheet_score") is None:
+                    logger.warning(f"Invalid scores for ResultID {result_id}: {scores}")
+                    scores = {
+                        "match_score": None,
+                        "linesheet_score": None,
+                        "reasoning_match": "Invalid score",
+                        "reasoning_linesheet": "Invalid score"
+                    }
+                
+                # Prepare data for database
+                ai_json_dict = {
+                    "description": description,
+                    "user_provided": product_details,
+                    "extracted_features": extracted_features,
+                    "match_score": scores.get("match_score"),
+                    "reasoning_match": scores.get("reasoning_match", ""),
+                    "linesheet_score": scores.get("linesheet_score"),
+                    "reasoning_linesheet": scores.get("reasoning_linesheet", "")
+                }
+                ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
+                # Update database (synchronous, run in a thread)
+                await asyncio.to_thread(update_database, result_id, ai_json, description, logger)
+            else:
+                logger.warning(f"Gemini failed for ResultID {result_id}: {features['text']}")
+                ai_json_dict = {"error": features["text"]}
+                ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
+                await asyncio.to_thread(update_database, result_id, ai_json, features["text"], logger)
+        except Exception as e:
+            logger.error(f"Failed to process ResultID {result_id}: {e}", exc_info=True)
+            ai_json_dict = {"error": str(e)}
+            ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
+            await asyncio.to_thread(update_database, result_id, ai_json, "AI analysis failed", logger)
+
+# Main batch processing function
+async def batch_process_images(file_id, limit=1000, logger=None, rpm_limit=60, concurrent_limit=150):
+    logger = logger or logging.getLogger(__name__)  # Use a default logger if none provided
     logger.info(f"Starting AI Batch for FileID: {file_id}")
     try:
+        # Fetch images that need processing
         missing_df = fetch_missing_images(file_id=file_id, limit=limit, ai_analysis_only=True, logger=logger)
         if missing_df.empty:
             logger.info(f"No images need AI processing for FileID: {file_id}")
             return
 
-        processed_count = 0
-        delay_between_requests = 60 / rpm_limit
-        completed_entry_ids = set()
+        # Set up concurrency and rate limiting
+        semaphore = asyncio.Semaphore(concurrent_limit)  # Limit to 10 concurrent tasks
+        gemini_limiter = AsyncLimiter(max_rate=rpm_limit, time_period=60)  # e.g., 15 calls/min for Gemini
+        grok_limiter = AsyncLimiter(max_rate=rpm_limit, time_period=60)    # e.g., 15 calls/min for Grok
 
-        for _, row in missing_df.iterrows():
-            result_id = row['ResultID']
-            entry_id = row['EntryID']
-            image_url = row['ImageUrl']
+        # Create tasks for each image
+        tasks = [
+            process_image(row, semaphore, gemini_limiter, grok_limiter, logger)
+            for _, row in missing_df.iterrows()
+        ]
+        # Run all tasks concurrently, respecting semaphore and rate limits
+        await asyncio.gather(*tasks)
 
-            logger.debug(f"Processing ResultID: {result_id}, EntryID: {entry_id}, URL: {image_url}")
-            try:
-                image_data = get_image_data(image_url)
-                if not image_data:
-                    logger.warning(f"⚠️ No image data retrieved for ResultID {result_id}")
-                    ai_json = json.dumps({"error": "Failed to fetch image"})
-                    update_database(result_id, ai_json, "Failed to fetch image", logger=logger)
-                    continue
-
-                image_data_base64 = base64.b64encode(image_data).decode('utf-8')
-                features = await analyze_image_with_gemini(image_data_base64, api_key=GOOGLE_API_KEY)
-                logger.debug(f"Gemini result for ResultID {result_id}: {features}")
-
-                if features["success"]:
-                    extracted_features = features["features"]["extracted_features"]
-                    description = features["features"]["description"]
-                    
-                    product_details = {
-                        "brand": row.get('ProductBrand', ''),
-                        "category": row.get('ProductCategory', ''),
-                        "color": row.get('ProductColor', '')
-                    }
-                    logger.debug(f"Product details for ResultID {result_id}: {product_details}")
-
-                    scores = await evaluate_with_grok_text(extracted_features, product_details)
-                    if scores.get("match_score") is None or scores.get("linesheet_score") is None:
-                        logger.warning(f"Grok returned invalid scores for ResultID {result_id}: {scores}")
-                        scores = {
-                            "match_score": None,
-                            "linesheet_score": None,
-                            "reasoning_match": "Invalid or missing score",
-                            "reasoning_linesheet": "Invalid or missing score"
-                        }
-
-                    ai_json_dict = {
-                        "description": description,
-                        "user_provided": product_details,
-                        "extracted_features": extracted_features,
-                        "match_score": scores.get("match_score"),
-                        "reasoning_match": scores.get("reasoning_match", ""),
-                        "linesheet_score": scores.get("linesheet_score"),
-                        "reasoning_linesheet": scores.get("reasoning_linesheet", "")
-                    }
-                    ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
-                    update_database(result_id, ai_json, description, logger=logger)
-                    processed_count += 1
-
-                    match_score = scores.get("match_score")
-                    linesheet_score = scores.get("linesheet_score")
-                    if (match_score is not None and linesheet_score is not None and
-                        match_score >= 95 and linesheet_score >= 80):
-                        completed_entry_ids.add(entry_id)
-                        logger.info(f"EntryID {entry_id} marked complete: match={match_score}, linesheet={linesheet_score}")
-                else:
-                    logger.warning(f"Gemini failed for ResultID {result_id}: {features['text']}")
-                    ai_json_dict = {"error": features["text"]}
-                    ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
-                    update_database(result_id, ai_json, features["text"], logger=logger)
-
-                await asyncio.sleep(delay_between_requests)
-
-            except Exception as e:
-                logger.error(f"Failed to process ResultID {result_id} (URL: {image_url}): {e}")
-                ai_json_dict = {"error": str(e)}
-                ai_json = json.dumps(convert_sets_to_lists(ai_json_dict))
-                update_database(result_id, ai_json, "AI analysis failed", logger=logger)
-                continue
-
-        logger.info(f"Processed {processed_count} out of {len(missing_df)} images for FileID: {file_id}")
+        logger.info(f"Processed {len(missing_df)} images for FileID: {file_id}")
     except Exception as e:
-        logger.error(f"🔴 Error in batch_process_images for FileID {file_id}: {e}")
+        logger.error(f"🔴 Error in batch_process_images for FileID {file_id}: {e}", exc_info=True)
         raise
-
 def fetch_images_by_file_id(file_id, logger=None):
     logger = logger or default_logger
     query = """
