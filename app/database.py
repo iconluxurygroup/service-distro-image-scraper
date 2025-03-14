@@ -479,9 +479,9 @@ import json
 import base64
 import json
 import logging
-import cv2
-import numpy as np
-from skimage.metrics import structural_similarity as ssim
+# import cv2
+# import numpy as np
+# from skimage.metrics import structural_similarity as ssim
 
 # Assuming these are defined elsewhere
 from image_processing import get_image_data, analyze_image_with_gemini, evaluate_with_grok_text
@@ -541,14 +541,14 @@ reference_images = {
         }
     }
 }
-def decode_image_data(image_data):
-    """Decode image data into a grayscale NumPy array for similarity comparison."""
-    img_array = np.frombuffer(image_data, dtype=np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise ValueError("Could not decode image")
-    img = cv2.resize(img, (100, 100))  # Resize for uniform comparison
-    return img
+# def decode_image_data(image_data):
+#     """Decode image data into a grayscale NumPy array for similarity comparison."""
+#     img_array = np.frombuffer(image_data, dtype=np.uint8)
+#     img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+#     if img is None:
+#         raise ValueError("Could not decode image")
+#     img = cv2.resize(img, (100, 100))  # Resize for uniform comparison
+#     return img
 import base64
 import json
 import requests
@@ -611,89 +611,89 @@ def find_category(extracted_category, reference_images, gender=None):
     
     return results if results else None
 
-async def process_single_image(result_id, image_url, thumbnail_url, user_provided, logger=None):
-    logger = logger or default_logger
-    try:
-        # Step 1: Try processing the primary image
-        image_data = get_image_data(image_url)
-        if image_data:
-            return await analyze_and_compute_similarity(result_id, image_url, image_data, user_provided, logger)
-        else:
-            logger.warning(f"No image data for primary URL: {image_url}, falling back to thumbnail")
-            # Step 2: Fallback to thumbnail
-            thumbnail_data = get_image_data(thumbnail_url)
-            if thumbnail_data:
-                return await analyze_and_compute_similarity(result_id, thumbnail_url, thumbnail_data, user_provided, logger)
-            else:
-                logger.warning(f"No image data for thumbnail URL: {thumbnail_url}")
-                # Step 3: Handle complete failure
-                return await handle_failure(result_id, user_provided, "No image data available", logger)
-    except Exception as e:
-        logger.error(f"Error processing image for ResultID {result_id}: {str(e)}")
-        return await handle_failure(result_id, user_provided, str(e), logger)
+# async def process_single_image(result_id, image_url, thumbnail_url, user_provided, logger=None):
+#     logger = logger or default_logger
+#     try:
+#         # Step 1: Try processing the primary image
+#         image_data = get_image_data(image_url)
+#         if image_data:
+#             return await analyze_and_compute_similarity(result_id, image_url, image_data, user_provided, logger)
+#         else:
+#             logger.warning(f"No image data for primary URL: {image_url}, falling back to thumbnail")
+#             # Step 2: Fallback to thumbnail
+#             thumbnail_data = get_image_data(thumbnail_url)
+#             if thumbnail_data:
+#                 return await analyze_and_compute_similarity(result_id, thumbnail_url, thumbnail_data, user_provided, logger)
+#             else:
+#                 logger.warning(f"No image data for thumbnail URL: {thumbnail_url}")
+#                 # Step 3: Handle complete failure
+#                 return await handle_failure(result_id, user_provided, "No image data available", logger)
+#     except Exception as e:
+#         logger.error(f"Error processing image for ResultID {result_id}: {str(e)}")
+#         return await handle_failure(result_id, user_provided, str(e), logger)
 
-async def analyze_and_compute_similarity(result_id, image_url, image_data, user_provided, logger):
-    """Analyze image and compute similarity score."""
-    base64_image_data = base64.b64encode(image_data).decode('utf-8')
-    gemini_result = await analyze_image_with_gemini(base64_image_data)
+# async def analyze_and_compute_similarity(result_id, image_url, image_data, user_provided, logger):
+#     """Analyze image and compute similarity score."""
+#     base64_image_data = base64.b64encode(image_data).decode('utf-8')
+#     gemini_result = await analyze_image_with_gemini(base64_image_data)
     
-    if gemini_result['success']:
-        features = gemini_result['features']
-        grok_result = await evaluate_with_grok_text(features['extracted_features'], user_provided)
+#     if gemini_result['success']:
+#         features = gemini_result['features']
+#         grok_result = await evaluate_with_grok_text(features['extracted_features'], user_provided)
         
-        combined_result = {
-            "description": features['description'],
-            "user_provided": user_provided,
-            "extracted_features": features['extracted_features'],
-            "gemini_confidence_score": features['gemini_confidence_score'],
-            "reasoning_confidence": features['reasoning_confidence'],
-            "match_score": grok_result['match_score'],
-            "reasoning_match": grok_result['reasoning_match'],
-        }
+#         combined_result = {
+#             "description": features['description'],
+#             "user_provided": user_provided,
+#             "extracted_features": features['extracted_features'],
+#             "gemini_confidence_score": features['gemini_confidence_score'],
+#             "reasoning_confidence": features['reasoning_confidence'],
+#             "match_score": grok_result['match_score'],
+#             "reasoning_match": grok_result['reasoning_match'],
+#         }
         
-        # Compute similarity score if category matches a reference
-        extracted_category = features['extracted_features'].get('category', '').lower()
-        mapped_categories = find_category(extracted_category, reference_images)
+#         # Compute similarity score if category matches a reference
+#         extracted_category = features['extracted_features'].get('category', '').lower()
+#         mapped_categories = find_category(extracted_category, reference_images)
         
-        if mapped_categories:
-            # Default to Men’s if multiple matches; take the first match for Men’s
-            target_gender = "Men’s"
-            reference_result = next((r for r in mapped_categories if r["gender"] == target_gender), mapped_categories[0])
-            reference_url = reference_result["reference_image"]
-            reference_data = get_image_data(reference_url)
+#         if mapped_categories:
+#             # Default to Men’s if multiple matches; take the first match for Men’s
+#             target_gender = "Men’s"
+#             reference_result = next((r for r in mapped_categories if r["gender"] == target_gender), mapped_categories[0])
+#             reference_url = reference_result["reference_image"]
+#             reference_data = get_image_data(reference_url)
             
-            if reference_data:
-                try:
-                    current_img = decode_image_data(image_data)
-                    reference_img = decode_image_data(reference_data)
-                    similarity_score = ssim(current_img, reference_img)
-                    combined_result["similarity_score"] = similarity_score
-                    logger.info(f"Computed similarity score {similarity_score} for {target_gender} {reference_result['category']} (ResultID: {result_id})")
-                except Exception as e:
-                    logger.warning(f"Failed to compute similarity for '{extracted_category}' (ResultID: {result_id}): {str(e)}")
-                    combined_result["similarity_score"] = -1
-            else:
-                logger.warning(f"Failed to retrieve reference image for '{extracted_category}' at {reference_url} (ResultID: {result_id})")
-                combined_result["similarity_score"] = -1
-        else:
-            logger.warning(f"No reference category found for '{extracted_category}' (ResultID: {result_id})")
-            combined_result["similarity_score"] = -1
+#             if reference_data:
+#                 try:
+#                     current_img = decode_image_data(image_data)
+#                     reference_img = decode_image_data(reference_data)
+#                     similarity_score = ssim(current_img, reference_img)
+#                     combined_result["similarity_score"] = similarity_score
+#                     logger.info(f"Computed similarity score {similarity_score} for {target_gender} {reference_result['category']} (ResultID: {result_id})")
+#                 except Exception as e:
+#                     logger.warning(f"Failed to compute similarity for '{extracted_category}' (ResultID: {result_id}): {str(e)}")
+#                     combined_result["similarity_score"] = -1
+#             else:
+#                 logger.warning(f"Failed to retrieve reference image for '{extracted_category}' at {reference_url} (ResultID: {result_id})")
+#                 combined_result["similarity_score"] = -1
+#         else:
+#             logger.warning(f"No reference category found for '{extracted_category}' (ResultID: {result_id})")
+#             combined_result["similarity_score"] = -1
         
-        ai_json = json.dumps(combined_result)
-        ai_caption = features['description']
-    else:
-        logger.warning(f"Gemini analysis failed for {image_url} (ResultID: {result_id})")
-        ai_json = json.dumps({
-            "description": "Failed to analyze",
-            "user_provided": user_provided,
-            "extracted_features": {"brand": "", "category": "", "color": "", "composition": ""},
-            "match_score": None,
-            "similarity_score": -1
-        })
-        ai_caption = "AI analysis failed"
+#         ai_json = json.dumps(combined_result)
+#         ai_caption = features['description']
+#     else:
+#         logger.warning(f"Gemini analysis failed for {image_url} (ResultID: {result_id})")
+#         ai_json = json.dumps({
+#             "description": "Failed to analyze",
+#             "user_provided": user_provided,
+#             "extracted_features": {"brand": "", "category": "", "color": "", "composition": ""},
+#             "match_score": None,
+#             "similarity_score": -1
+#         })
+#         ai_caption = "AI analysis failed"
     
-    update_database(result_id, ai_json, ai_caption, logger=logger)
-    return True
+#     update_database(result_id, ai_json, ai_caption, logger=logger)
+#     return True
 
 async def handle_failure(result_id, user_provided, error_message, logger):
     """Handle processing failure with default values."""
