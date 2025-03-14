@@ -14,7 +14,7 @@ RUN apt-get clean && \
     apt-get update --fix-missing
 
 # Install necessary packages
-RUN apt-get install -y apt-transport-https curl gnupg lsb-release unixodbc unixodbc-dev libgl1-mesa-glx
+RUN apt-get install -y apt-transport-https curl gnupg lsb-release unixodbc unixodbc-dev libglib2.0-0
 # Add Microsoft package repository and install msodbcsql17
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
     curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
