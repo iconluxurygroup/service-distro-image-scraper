@@ -25,4 +25,5 @@ openai
 google-generativeai
 google-genai
 aiolimiter
+opencv-python
 ray[default]
