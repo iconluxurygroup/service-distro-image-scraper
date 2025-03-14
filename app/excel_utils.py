@@ -17,18 +17,9 @@ if not default_logger.handlers:
     )
 
 def verify_png_image_single(image_path, logger=None):
-    """
-    Verify that an image is a valid PNG.
-    
-    Args:
-        image_path (str): Path to the image to verify
-        logger (logging.Logger, optional): Logger instance to use
-        
-    Returns:
-        bool: True if the image is valid, False otherwise
-    """
     logger = logger or default_logger
     try:
+        logger.debug(f"🔎 Verifying image: {image_path}")
         img = IMG2.open(image_path)
         img.verify()  # Verify it's a valid image
         logger.info(f"✅ Image verified successfully: {image_path}")
@@ -44,27 +35,33 @@ def verify_png_image_single(image_path, logger=None):
         return False
 
     try:
-        resize_image(image_path, logger=logger)
+        if not resize_image(image_path, logger=logger):
+            logger.warning(f"⚠️ Resize failed for: {image_path}")
+            return False
+        # Re-verify after resizing
+        img = IMG2.open(image_path)
+        img.verify()
+        logger.info(f"✅ Post-resize verification successful: {image_path}")
+        return True
     except Exception as e:
-        logger.error(f"❌ Error resizing image: {e}, for image: {image_path}", exc_info=True)
+        logger.error(f"❌ Error during verification or resizing: {e}, for image: {image_path}", exc_info=True)
         return False
-    return True
 
 def resize_image(image_path, logger=None):
-    """
-    Resize an image to a maximum size.
-    
-    Args:
-        image_path (str): Path to the image to resize
-        logger (logging.Logger, optional): Logger instance to use
-        
-    Returns:
-        bool: True if resizing was successful, False otherwise
-    """
     logger = logger or default_logger
     try:
+        logger.debug(f"📂 Attempting to open image: {image_path}")
         img = IMG2.open(image_path)
-        MAXSIZE = 145  # Maximum size in pixels
+        MAXSIZE = 130  # Maximum size in pixels
+        
+        # Check if image is in CMYK mode and convert to RGB if necessary
+        if img.mode == 'CMYK':
+            logger.info(f"🌈 Converting CMYK image to RGB: {image_path}")
+            img = img.convert('RGB')
+        elif img.mode not in ['RGB', 'RGBA']:
+            logger.info(f"🌈 Converting {img.mode} image to RGB: {image_path}")
+            img = img.convert('RGB')
+
         if img:
             h, w = img.height, img.width  # original size
             logger.debug(f"📐 Original size: height={h}, width={w}")
@@ -75,62 +72,92 @@ def resize_image(image_path, logger=None):
                 else:
                     h = int(h * MAXSIZE / w)
                     w = MAXSIZE
-            logger.debug(f"🔍 Resized to: height={h}, width={w}")
+            logger.debug(f"🔍 Resizing to: height={h}, width={w}")
             newImg = img.resize((w, h))
-            newImg.save(image_path)
+            newImg.save(image_path, 'PNG')
             logger.info(f"✅ Image resized and saved: {image_path}")
+            # Verify the file exists after saving
+            if os.path.exists(image_path):
+                logger.debug(f"📏 File size after save: {os.path.getsize(image_path)} bytes")
+            else:
+                logger.error(f"❌ File not found after save: {image_path}")
+                return False
             return True
     except Exception as e:
         logger.error(f"❌ Error resizing image: {e}, for image: {image_path}", exc_info=True)
         return False
-
-def write_excel_image(local_filename, temp_dir, preferred_image_method, logger=None):
+    
+def write_excel_image(local_filename, temp_dir, column="A", row_offset=0, logger=None):
     """
-    Write images to an Excel file.
+    Write images to an Excel file in a specified column (default 'A') with an optional row offset.
     
     Args:
         local_filename (str): Path to the Excel file
         temp_dir (str): Path to the directory containing images
-        preferred_image_method (str): Preferred method for inserting images ('append', 'overwrite', 'NewColumn')
+        column (str): Column letter to insert images (default 'A')
+        row_offset (int): Number of rows to offset (default 0)
         logger (logging.Logger, optional): Logger instance to use
         
     Returns:
         list: List of row numbers that failed
     """
+    # Handle incorrect argument types (temporary workaround)
+    if isinstance(column, logging.Logger):
+        logger = column
+        column = "A"
+        row_offset = 0
+    elif isinstance(row_offset, logging.Logger):
+        logger = row_offset
+        row_offset = 0
+
     logger = logger or default_logger
+    # Log all arguments for debugging
+    logger.debug(f"write_excel_image called with: local_filename={local_filename}, temp_dir={temp_dir}, column={column}, row_offset={row_offset}, logger={logger}")
+    
     failed_rows = []
     try:
+        if not isinstance(row_offset, int):
+            logger.error(f"❌ row_offset must be an integer, got {type(row_offset)}: {row_offset}")
+            raise TypeError(f"row_offset must be an integer, got {type(row_offset)}: {row_offset}")
+
         logger.debug(f"📂 Loading workbook from {local_filename}")
         wb = load_workbook(local_filename)
         ws = wb.active
-        logger.info(f"🖼️ Processing images in {temp_dir} for Excel file {local_filename}")
+        logger.info(f"🖼️ Processing images in {temp_dir} for Excel file {local_filename} in column {column} with row offset {row_offset}")
         
-        for image_file in os.listdir(temp_dir):
+        if not os.path.exists(temp_dir):
+            logger.error(f"❌ Temp directory does not exist: {temp_dir}")
+            return failed_rows
+        
+        image_files = os.listdir(temp_dir)
+        if not image_files:
+            logger.warning(f"⚠️ No images found in {temp_dir}")
+            return failed_rows
+        
+        for image_file in image_files:
             image_path = os.path.join(temp_dir, image_file)
+            logger.debug(f"📄 Found image file: {image_path}")
             try:
-                row_number = int(image_file.split('.')[0])
-                logger.info(f"🔍 Processing row {row_number}, image path: {image_path}")
+                row_number = int(image_file.split('.')[0]) + row_offset
+                logger.info(f"🔍 Processing row {row_number - row_offset} (adjusted to {row_number}), image path: {image_path}")
             except ValueError:
                 logger.warning(f"⚠️ Skipping file {image_file}: does not match expected naming convention")
                 continue
             
             if verify_png_image_single(image_path, logger=logger):
-                logger.debug(f"🖼️ Inserting image at row {row_number}")
-                img = Image(image_path)
-                if preferred_image_method in ["overwrite", "append"]:
-                    anchor = "A" + str(row_number)
-                elif preferred_image_method == "NewColumn":
-                    anchor = "B" + str(row_number)
-                else:
-                    logger.error(f"❌ Unrecognized preferred image method: {preferred_image_method}")
-                    continue
-                
-                logger.debug(f"📍 Assigned anchor: {anchor}")
-                img.anchor = anchor
-                ws.add_image(img)
-                logger.info(f"✅ Image added at {anchor}")
+                try:
+                    logger.debug(f"🖼️ Inserting image at row {row_number}")
+                    img = Image(image_path)
+                    anchor = f"{column}{row_number}"
+                    logger.debug(f"📍 Assigned anchor: {anchor}")
+                    img.anchor = anchor
+                    ws.add_image(img)
+                    logger.info(f"✅ Image added at {anchor}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to add image at row {row_number}: {e}", exc_info=True)
+                    failed_rows.append(row_number - row_offset)
             else:
-                failed_rows.append(row_number)
+                failed_rows.append(row_number - row_offset)
                 logger.warning(f"⚠️ Inserting image skipped due to verify_png_image_single failure for row {row_number}")
         
         logger.debug(f"💾 Saving workbook to {local_filename}")
@@ -180,7 +207,7 @@ def highlight_cell(excel_file, cell_reference, logger=None):
     except Exception as e:
         logger.error(f"❌ Error highlighting cell {cell_reference} in {excel_file}: {e}", exc_info=True)
         raise
-# excel_utils.py (partial update)
+
 def write_failed_downloads_to_excel(failed_downloads, excel_file, logger=None):
     """Write failed downloads to an Excel file and highlight them."""
     logger = logger or default_logger

@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # Gemini prompt
-prompt = """
+# image_processing.py
+gemini_prompt = """
 Analyze this image and provide the following information in JSON format:
 {
   "description": "A detailed description of the image in one sentence. Extract brand name, category, color, and composition.",
@@ -23,34 +24,39 @@ Analyze this image and provide the following information in JSON format:
     "brand": "Extracted brand name from the image, if any.",
     "category": "Extracted category of the product, if identifiable.",
     "color": "Primary color of the product.",
-    "composition": "Any composition details visible in the image as well as angle and scale/zoom, background color, people,items,text"
-  }
+    "composition": "Any composition details visible in the image (e.g., angle, scale, background color, presence of people/items/text)."
+  },
+  "gemini_confidence_score": "A numeric score from 0 to 100 indicating your confidence in the correctness of the above extracted features.",
+  "reasoning_confidence": "Short explanation of why you chose that gemini_confidence_score."
 }
 Ensure the response is a valid JSON object. Return only the JSON object, no additional text.
 """
 
+
 # Pydantic schema for Grok response
 class GrokScore(BaseModel):
     match_score: Optional[int] = Field(description="A score from 0-100 indicating how well the extracted features match the user-provided details", ge=0, le=100)
-    linesheet_score: Optional[int] = Field(description="A score from 0-100 indicating suitability for a linesheet based on composition", ge=0, le=100)
     reasoning_match: str = Field(description="Explanation for the match score")
-    reasoning_linesheet: str = Field(description="Explanation for the linesheet score")
 
 async def analyze_image_with_gemini(
     image_base64: str,
-    prompt: str = prompt,
     api_key: str = None,
     model_name: str = "gemini-2.0-flash",
     mime_type: str = "image/jpeg",
     max_retries: int = 5,
     initial_delay: float = 0.5
 ) -> Dict[str, Optional[str | int | bool]]:
+    """
+    Modified to use the updated 'gemini_prompt' which returns extra score info.
+    """
+    from config import GOOGLE_API_KEY
+    import google.generativeai as genai
+
     api_key = api_key or GOOGLE_API_KEY
     if not api_key:
         logger.error("No API key provided for Gemini")
-        return {"status_code": None, "success": False, "text": "No API key provided for Gemini"}
-
-    logger.info(f"Analyzing base64 image with prompt: '{prompt}'")
+        return {"status_code": None, "success": False, "text": "No API key provided"}
+    logger.info(f"Analyzing base64 image with prompt: '{gemini_prompt  [:100]}...'")
 
     # Validate base64 input
     if not image_base64 or not isinstance(image_base64, str):
@@ -81,7 +87,7 @@ async def analyze_image_with_gemini(
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name=model_name)
     except Exception as e:
-        logger.error(f"Failed to configure Gemini with {model_name}: {str(e)}")
+        logger.error(f"Failed to configure Gemini: {str(e)}")
         try:
             model = genai.GenerativeModel(model_name="gemini-1.5-pro")
             logger.info("Falling back to gemini-1.5-pro")
@@ -95,10 +101,9 @@ async def analyze_image_with_gemini(
             "mime_type": mime_type,
             "data": image_bytes
         },
-        prompt
+        gemini_prompt  
     ]
 
-    # Retry logic
     loop = asyncio.get_running_loop()
     for attempt in range(max_retries + 1):
         try:
@@ -111,25 +116,29 @@ async def analyze_image_with_gemini(
                     )
                 )
             )
-            response_text = response.text if hasattr(response, "text") else ""
-            logger.info(f"Gemini raw response: '{response_text[:500]}'")
+            response_text = getattr(response, "text", "") or ""
+            logger.info(f"Gemini raw response: {response_text[:500]}")
 
             if response_text:
                 try:
                     features = json.loads(response_text)
-                    if isinstance(features, dict) and "description" in features and "extracted_features" in features:
+                    # We expect the new fields: gemini_confidence_score, reasoning_confidence, etc.
+                    if isinstance(features, dict):
                         logger.info("Image analysis successful")
-                        return {"status_code": 200, "success": True, "features": features}
+                        return {
+                            "status_code": 200,
+                            "success": True,
+                            "features": features
+                        }
                     else:
-                        logger.warning(f"Invalid JSON structure from Gemini: {response_text}")
-                        return {"status_code": 200, "success": False, "text": "Invalid JSON structure"}
+                        logger.warning("Gemini returned an invalid JSON structure")
+                        return {"status_code": 200, "success": False, "text": "Invalid JSON structure (not a dict)"}
                 except json.JSONDecodeError as e:
-                    logger.warning(f"JSON decode error from Gemini: {e}")
-                    return {"status_code": 200, "success": False, "text": f"JSON decode error: {str(e)}"}
+                    logger.warning(f"JSON decode error: {e}")
+                    return {"status_code": 200, "success": False, "text": f"JSON decode error: {e}"}
             else:
                 logger.warning("Gemini returned no text")
                 return {"status_code": 200, "success": False, "text": "No analysis text returned"}
-
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "Resource has been exhausted" in error_str:
@@ -141,6 +150,7 @@ async def analyze_image_with_gemini(
                 return {"status_code": 429, "success": False, "text": f"Rate limit exhausted: {error_str}"}
             logger.error(f"Gemini analysis failed: {error_str}")
             return {"status_code": None, "success": False, "text": f"Gemini analysis error: {error_str}"}
+        
 async def evaluate_with_grok_text(features: dict, product_details: dict) -> dict:
     client = OpenAI(
         api_key=GROK_API_KEY,
@@ -150,7 +160,7 @@ async def evaluate_with_grok_text(features: dict, product_details: dict) -> dict
     "Evaluate the match between the extracted image features and user-provided product details.\n"
     f"Extracted features: {json.dumps(features)}\n"
     f"User-provided details: {json.dumps(product_details)}\n"
-    "First, calculate a match_score from 0 to 110 based on the brand, category, and color fields, using the following rubric:\n"
+    "First, calculate a match_score from 0 to 100 based on the brand, category, and color fields, using the following rubric:\n"
     "- Brand matching (max 50 points):\n"
     "  - Excellent (50 points): Exact match (e.g., 'Nike' vs. 'Nike').\n"
     "  - Poor (0 points): No match (e.g., 'Nike' vs. 'Adidas').\n"
@@ -164,14 +174,11 @@ async def evaluate_with_grok_text(features: dict, product_details: dict) -> dict
     "  - Fair (5 points): Related color family (e.g., 'Red' vs. 'Pink').\n"
     "  - Poor (0 points): No match (e.g., 'Red' vs. 'Blue').\n"
     "Sum the points from brand, category, and color to get the match_score. If no fields align, match_score is 0.\n"
-    "Then, if match_score >= 30, calculate a linesheet_score from 0 to 100 based on the composition field, using the following criteria:\n\n- No models or extra items (40 points): Award if composition clearly indicates no models or extra objects (e.g., 'product only', 'isolated shot'). If 'model wearing' or 'with accessories' is mentioned, award 0 points.\n\n- Straight-on angle shot of front or side (30 points): Award if composition specifies a straight-on front or side view (e.g., 'front view', 'side view'). If 'angled' or 'top view' is mentioned, award 0 points.\n\n- Full visibility of the product (not a detail shot) (20 points): Award if composition indicates the entire product is visible (e.g., 'full shot', 'entire product'). If 'close-up' or 'detail shot' is mentioned, award 0 points.\n\n- Solid white background (10 points): Award if composition specifies a solid white background (e.g., 'white background', 'solid white'). If another background is mentioned or unclear, award 0 points.\n\nAssign points for each criterion only if the composition description explicitly meets it. If a criterion is not mentioned or unclear, award 0 points for that criterion. Sum the points to get the linesheet_score.\n\n"
     "Provide reasoning for both scores, specifying how the points were assigned for each field or criterion.\n"
     "Return a JSON object with the following structure:\n"
     "{\n"
-    "  \"match_score\": <integer from 0 to 100>,\n"
-    "  \"linesheet_score\": <integer from 0 to 100 or null>,\n"
-    "  \"reasoning_match\": \"Explanation for the match score\",\n"
-    "  \"reasoning_linesheet\": \"Explanation for the linesheet score or why it’s not applicable\"\n"
+    "\"reasoning_match\": \"Explanation for the match score\",\n"
+    "\"match_score\": <integer from 0 to 100>,\n"
     "}\n"
     "Ensure the response is a valid JSON object. Return only the JSON object, no additional text."
 )
