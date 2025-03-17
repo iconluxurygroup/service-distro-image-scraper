@@ -38,4 +38,4 @@ RUN odbcinst -j
 EXPOSE 8080
 EXPOSE 8265
 # Run main.py when the container launches
-CMD ray start --head && python main.py
+CMD python main.py
