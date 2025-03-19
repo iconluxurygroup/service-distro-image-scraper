@@ -1,7 +1,7 @@
 import uvicorn
 import ray
 import logging
-from api import app
+from api import app  # Import the app from api.py
 
 # Configure basic logging
 logger = logging.getLogger(__name__)
@@ -29,5 +29,5 @@ if __name__ == "__main__":
     # Manually construct the dashboard URL
     logger.info(f"Ray initialized with dashboard at http://localhost:{dashboard_port}")
 
-    # Run Uvicorn server
-    uvicorn.run("main:app", port=8080, host='0.0.0.0')
+    # Run Uvicorn server with the app from api.py
+    uvicorn.run(app, port=8080, host='0.0.0.0')  # Pass the app object directly

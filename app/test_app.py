@@ -4,7 +4,7 @@ import json
 import pandas as pd
 from fastapi.testclient import TestClient
 from unittest.mock import Mock, patch, AsyncMock
-from app import app, fetch_pending_images, send_email, upload_file_to_space, insert_file_db, load_payload_db, get_records_to_search, process_search_row, generate_download_file, process_image_batch
+from app import app, fetch_pending_images, send_email, upload_file_to_space, insert_file_db, load_payload_db, process_search_row, generate_download_file, process_image_batch
 import asyncio
 import tempfile
 import shutil

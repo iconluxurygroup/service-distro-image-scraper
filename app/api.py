@@ -1,8 +1,8 @@
 # api.py
 from fastapi import FastAPI, BackgroundTasks
 import logging
-from workflow import process_image_batch, generate_download_file, process_restart_batch
-from database import update_ai_sort_order, update_initial_sort_order, check_json_status, fix_json_data, update_log_url_in_db
+from workflow import generate_download_file, process_restart_batch
+from database import update_initial_sort_order,update_log_url_in_db,update_search_sort_order
 from aws_s3 import upload_file_to_space
 from logging_config import setup_job_logger
 import os
@@ -51,32 +51,16 @@ async def run_job_with_logging(job_func, file_id, *args, **kwargs):
             logger.info(f"Log file uploaded to: {upload_url}")
         raise
 
-@app.get("/check_json_status/{file_id}")
-async def api_check_json_status(file_id: str):
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Checking JSON status for FileID: {file_id}")
-    return check_json_status(file_id, logger=logger)
-
 @app.get("/initial_sort/{file_id}")
 async def api_initial_sort(file_id: str):
     logger, _ = setup_job_logger(job_id=file_id)
     logger.info(f"Running initial sort for FileID: {file_id}")
     return update_initial_sort_order(file_id, logger=logger)
-
-@app.post("/update_sort_llama/")
-async def api_update_sort(background_tasks: BackgroundTasks, file_id_db: str):
-    logger, _ = setup_job_logger(job_id=file_id_db)
-    logger.info(f"Queueing AI sort order update for FileID: {file_id_db}")
-    background_tasks.add_task(run_job_with_logging, update_ai_sort_order, file_id_db)
-    return {"message": f"Sort order update for FileID: {file_id_db} initiated", "status": "processing"}
-
-@app.post("/fix_json_data/")
-async def api_fix_json_data(background_tasks: BackgroundTasks, file_id: str = None, limit: int = 1000):
-    job_id = file_id or str(uuid.uuid4())
-    logger, _ = setup_job_logger(job_id=job_id)
-    logger.info(f"Queueing JSON fix" + (f" for FileID: {file_id}" if file_id else " globally"))
-    result = fix_json_data(background_tasks, file_id, limit, logger=logger)
-    return result
+@app.get("/search_sort/{file_id}")
+async def api_initial_sort(file_id: str):
+    logger, _ = setup_job_logger(job_id=file_id)
+    logger.info(f"Running search sort for FileID: {file_id}")
+    return update_search_sort_order(file_id, logger=logger)
 
 @app.post("/restart-failed-batch/")
 async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str):
@@ -93,18 +77,6 @@ async def api_process_restart(background_tasks: BackgroundTasks, file_id_db: str
             await asyncio.get_running_loop().run_in_executor(
                 None, update_log_url_in_db, file_id_db, log_filename, logger
             )
-        return {"error": f"An error occurred: {str(e)}"}
-
-@app.post("/process-image-batch/")
-async def api_process_payload(background_tasks: BackgroundTasks, payload: dict):
-    file_id = payload.get('file_id', str(uuid.uuid4()))
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Received request to process image batch for FileID: {file_id}")
-    try:
-        background_tasks.add_task(run_job_with_logging, process_image_batch, file_id, payload)
-        return {"message": "Processing started successfully"}
-    except Exception as e:
-        logger.error(f"Error processing payload: {e}")
         return {"error": f"An error occurred: {str(e)}"}
 
 @app.post("/generate-download-file/")
