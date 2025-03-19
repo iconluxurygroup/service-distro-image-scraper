@@ -17,13 +17,6 @@ sqlalchemy
 pandas
 chardet
 ray
-transformers
-accelerate
-safetensors
-torch
-openai
-google-generativeai
-google-genai
 aiolimiter
 aiofiles
 ray[default]
