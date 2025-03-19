@@ -35,7 +35,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         </html>
         """
         message = Mail(from_email='nik@iconluxurygroup.com', subject=subject, html_content=html_content)
-        cc_recipient = 'nik@iconluxurygroup.com' if to_emails != 'nik@iconluxurygroup.com' else 'notifications@popovtech.com'
+        cc_recipient = 'nik@iconluxurygroup.com' if to_emails != 'nik@iconluxurygroup.com' else 'nik@luxurymarket.com'
         personalization = Personalization()
         personalization.add_cc(Cc(cc_recipient))
         personalization.add_to(To(to_emails))
