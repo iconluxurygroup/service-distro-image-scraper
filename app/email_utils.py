@@ -21,7 +21,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         <html>
         <body>
         <div class="container">
-            <p>Your file is ready to<a href="{download_url}" class="download-button">download</a></p>
+            <p>Your file is ready to <a href="{download_url}" class="download-button">download</a></p>
 
             <p>Link to search <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">results</a></p>
             
