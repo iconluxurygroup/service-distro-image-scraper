@@ -24,8 +24,8 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
             <p>Your file is ready for download.<br>
             <a href="{download_url}" class="download-button">Download File</a></p>
 
-            <p>Please use the link below to modify the file<br>
-            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">Edit / View</a></p>
+            <p>Link to search results<br>
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">View</a></p>
             
             <p>--</p>
             <p><small>This is an automated notification.<br>
