@@ -21,7 +21,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         <html>
         <body>
         <div class="container">
-            <p>Your file is ready for download.<br>
+            <p>Your file is ready<br>
             <a href="{download_url}" class="download-button">Download File</a></p>
 
             <p>Link to search results<br>
