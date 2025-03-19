@@ -22,7 +22,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         <body>
         <div class="container">
             <p>Your file is ready<br>
-            <a href="{download_url}" class="download-button">Download File</a></p>
+            <a href="{download_url}" class="download-button">Download</a></p>
 
             <p>Link to search results<br>
             <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">View</a></p>
