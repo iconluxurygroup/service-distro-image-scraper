@@ -59,7 +59,7 @@ def send_message_email(to_emails, subject, message, logger=None):
             <p>Message details:<br>{message_with_breaks}</p>
             <p>--</p>
             <p><small>This is an automated system notification.<br>
-            Notified Users: {to_emails} From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v19.3</a></small></p>
+            From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v19.3</a> Notified Users: {to_emails}</small></p>
         </div>
         </body>
         </html>
