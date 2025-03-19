@@ -65,7 +65,7 @@ def send_message_email(to_emails, subject, message, logger=None):
         </html>
         """
         message_obj = Mail(from_email='nik@iconluxurygroup.com', subject=subject, html_content=html_content)
-        cc_recipient = 'nik@luxurymarket.com'
+        cc_recipient = 'nik@iconluxurygroup.com' if to_emails != 'nik@iconluxurygroup.com' else 'nik@luxurymarket.com'
         personalization = Personalization()
         personalization.add_cc(Cc(cc_recipient))
         personalization.add_to(To(to_emails))
