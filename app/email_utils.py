@@ -28,7 +28,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
             <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">Edit / View</a></p>
             
             <p>--</p>
-            <p><small>This is an automated system notification.<br>
+            <p><small>This is an automated notification.<br>
             From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v19.3</a> Notified Users: {to_emails}</small></p>
         </div>
         </body>
@@ -58,7 +58,7 @@ def send_message_email(to_emails, subject, message, logger=None):
         <div class="container">
             <p>Message details:<br>{message_with_breaks}</p>
             <p>--</p>
-            <p><small>This is an automated system notification.<br>
+            <p><small>This is an automated notification.<br>
             From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v19.3</a> Notified Users: {to_emails}</small></p>
         </div>
         </body>
