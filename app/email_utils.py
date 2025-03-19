@@ -27,7 +27,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
             
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            Notified Users: {to_emails}</small> From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v19.3</a></p> 
+            Notified Users: {to_emails} From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v19.3</a></small></p> 
         </div>
         </body>
         </html>
