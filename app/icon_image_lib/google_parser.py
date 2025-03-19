@@ -175,8 +175,3 @@ def clean_image_url(url):
 
     # If no match is found, return the original URL
     return url
-
-# with open("text.html", "r", encoding='utf-8') as f:
-#     html_content = f.read()
-#     results = get_original_images(html_content)
-#     print(results)
