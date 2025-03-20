@@ -48,7 +48,7 @@ def upload_file_to_space(file_src, save_as, is_public=True, logger=None, file_id
     
     try:
         spaces_client = get_spaces_client(logger=logger, file_id=file_id)
-        space_name = 'iconluxurygroup-s3'
+        space_name = 'iconluxurygroup'
         
         logger.info(f"Uploading {file_src} to {space_name}/{save_as}")
         spaces_client.upload_file(
@@ -62,7 +62,7 @@ def upload_file_to_space(file_src, save_as, is_public=True, logger=None, file_id
         double_encoded_filename = double_encode_plus(save_as, logger=logger)
         
         if is_public:
-            upload_url = f"https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/{double_encoded_filename}"
+            upload_url = f"https://iconluxurygroup.s3.us-east-2.amazonaws.com/{double_encoded_filename}"
             logger.info(f"Public URL (double-encoded): {upload_url}")
             return upload_url
         

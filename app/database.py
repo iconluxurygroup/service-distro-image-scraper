@@ -7,6 +7,7 @@ import urllib
 import base64
 from icon_image_lib.google_parser import get_original_images as GP
 from config import conn_str, engine
+from urllib3.util.retry import Retry
 from typing import List, Optional
 import urllib.parse
 from requests.adapters import HTTPAdapter
