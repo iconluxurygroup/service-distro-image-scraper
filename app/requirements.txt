@@ -20,3 +20,4 @@ ray
 aiolimiter
 aiofiles
 ray[default]
+scikit-image

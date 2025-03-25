@@ -7,7 +7,8 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from PIL import Image as IMG2
 from io import BytesIO
-
+import numpy as np
+from collections import Counter
 # Module-level logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -53,36 +54,83 @@ def resize_image(image_path, logger=None):
         logger.debug(f"📂 Attempting to open image: {image_path}")
         img = IMG2.open(image_path)
         MAXSIZE = 130  # Maximum size in pixels
-        
-        # Check if image is in CMYK mode and convert to RGB if necessary
-        if img.mode == 'CMYK':
-            logger.info(f"🌈 Converting CMYK image to RGB: {image_path}")
-            img = img.convert('RGB')
-        elif img.mode not in ['RGB', 'RGBA']:
+
+        # Step 1: Handle transparency
+        if img.mode == 'RGBA':
+            logger.info(f"🌈 Converting RGBA image to RGB with white background: {image_path}")
+            background = IMG2.new('RGB', img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])
+            img = background
+        elif img.mode != 'RGB':
             logger.info(f"🌈 Converting {img.mode} image to RGB: {image_path}")
             img = img.convert('RGB')
 
-        if img:
-            h, w = img.height, img.width  # original size
-            logger.debug(f"📐 Original size: height={h}, width={w}")
-            if h > MAXSIZE or w > MAXSIZE:
-                if h > w:
-                    w = int(w * MAXSIZE / h)
-                    h = MAXSIZE
-                else:
-                    h = int(h * MAXSIZE / w)
-                    w = MAXSIZE
+        # Step 2: Define helper functions for background processing
+        def get_background_color(img):
+            """Detect if the image has a uniform background color based on border pixels."""
+            width, height = img.size
+            pixels = np.array(img)
+            # Extract border pixels
+            top = pixels[0, :]
+            bottom = pixels[height-1, :]
+            left = pixels[1:height-1, 0]
+            right = pixels[1:height-1, width-1]
+            border_pixels = np.concatenate((top, bottom, left, right))
+            # Count colors
+            color_counts = Counter(map(tuple, border_pixels))
+            most_common_color, count = color_counts.most_common(1)[0]
+            total_border_pixels = border_pixels.shape[0]
+            # Consider it uniform if 90% of border pixels match
+            if count / total_border_pixels >= 0.9:
+                return most_common_color
+            return None
+
+        def is_white(color, threshold=240):
+            """Check if a color is white, allowing for slight variations."""
+            r, g, b = color
+            return r >= threshold and g >= threshold and b >= threshold
+
+        def replace_background(img, bg_color):
+            """Replace all pixels matching the background color with white."""
+            pixels = np.array(img)
+            bg_color = np.array(bg_color)
+            white = np.array([255, 255, 255])
+            # Allow a small tolerance for color matching
+            diff = np.abs(pixels - bg_color)
+            mask = np.all(diff <= 5, axis=2)
+            pixels[mask] = white
+            return IMG2.fromarray(pixels)
+
+        # Step 3 & 4: Detect and replace non-white background
+        background_color = get_background_color(img)
+        if background_color and not is_white(background_color):
+            logger.info(f"🖌️ Replacing background color {background_color} with white for {image_path}")
+            img = replace_background(img, background_color)
+
+        # Step 5: Resize if necessary
+        h, w = img.height, img.width
+        logger.debug(f"📐 Original size: height={h}, width={w}")
+        if h > MAXSIZE or w > MAXSIZE:
+            if h > w:
+                w = int(w * MAXSIZE / h)
+                h = MAXSIZE
+            else:
+                h = int(h * MAXSIZE / w)
+                w = MAXSIZE
             logger.debug(f"🔍 Resizing to: height={h}, width={w}")
             newImg = img.resize((w, h))
-            newImg.save(image_path, 'PNG')
-            logger.info(f"✅ Image resized and saved: {image_path}")
-            # Verify the file exists after saving
-            if os.path.exists(image_path):
-                logger.debug(f"📏 File size after save: {os.path.getsize(image_path)} bytes")
-            else:
-                logger.error(f"❌ File not found after save: {image_path}")
-                return False
-            return True
+        else:
+            newImg = img
+
+        newImg.save(image_path, 'PNG')
+        logger.info(f"✅ Image processed and saved: {image_path}")
+        if os.path.exists(image_path):
+            logger.debug(f"📏 File size after save: {os.path.getsize(image_path)} bytes")
+        else:
+            logger.error(f"❌ File not found after save: {image_path}")
+            return False
+        return True
+
     except Exception as e:
         logger.error(f"❌ Error resizing image: {e}, for image: {image_path}", exc_info=True)
         return False

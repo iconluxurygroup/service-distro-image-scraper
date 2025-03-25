@@ -75,3 +75,5 @@ def process_batch(batch, logger=None):
     except Exception as e:
         logger.error(f"🔴 Error processing batch: {e}", exc_info=True)
         return [{"entry_id": "unknown", "search_type": "unknown", "status": "failed", "error": str(e)}]
+    
+

@@ -2,13 +2,13 @@
 from fastapi import FastAPI, BackgroundTasks
 import logging
 from workflow import generate_download_file, process_restart_batch
-from database import update_initial_sort_order,update_log_url_in_db,update_search_sort_order
+from database import update_initial_sort_order,update_log_url_in_db,update_search_sort_order,update_sort_order_based_on_match_score
 from aws_s3 import upload_file_to_space
 from logging_config import setup_job_logger
 import os
 import uuid
 import ray
-
+from image_process import batch_process_images
 app = FastAPI(title='superscaper_dev')
 
 # Initialize Ray once at startup
@@ -50,6 +50,11 @@ async def run_job_with_logging(job_func, file_id, *args, **kwargs):
             upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
             logger.info(f"Log file uploaded to: {upload_url}")
         raise
+@app.get("/match_ai_sort/{file_id}")
+async def api_initial_sort(file_id: str):
+    logger, _ = setup_job_logger(job_id=file_id)
+    logger.info(f"Running initial sort for FileID: {file_id}")
+    return update_sort_order_based_on_match_score(file_id, logger=logger)
 
 @app.get("/initial_sort/{file_id}")
 async def api_initial_sort(file_id: str):
@@ -89,4 +94,30 @@ async def api_generate_download_file(background_tasks: BackgroundTasks, file_id:
         return {"message": "Processing started successfully"}
     except Exception as e:
         logger.error(f"Error generating download file: {e}")
+        return {"error": f"An error occurred: {str(e)}"}
+    
+# New endpoint to trigger the image processing pipeline
+@app.post("/process-ai-analysis/")
+async def api_process_ai_analysis(background_tasks: BackgroundTasks, file_id: str):
+    """
+    Endpoint to initiate AI analysis for images associated with a given file_id.
+    
+    Args:
+        background_tasks (BackgroundTasks): FastAPI background tasks for async execution.
+        file_id (str): The identifier for the batch of images to process.
+    
+    Returns:
+        dict: A message indicating success or an error if something goes wrong.
+    """
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing AI analysis for FileID: {file_id}")
+    try:
+        background_tasks.add_task(run_job_with_logging, batch_process_images, file_id)
+        return {"message": f"AI analysis initiated for FileID: {file_id}"}
+    except Exception as e:
+        logger.error(f"Error queueing AI analysis for FileID {file_id}: {e}", exc_info=True)
+        if os.path.exists(log_filename):
+            upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
+            logger.info(f"Log file uploaded to: {upload_url}")
+            await update_log_url_in_db(file_id, upload_url, logger)
         return {"error": f"An error occurred: {str(e)}"}

@@ -1,177 +1,217 @@
-# icon_image_lib/google_parser.py
 import re
 import chardet
-from icon_image_lib.LR import LR
+from bs4 import BeautifulSoup
+from icon_image_lib.LR import LR  # Assumes LR is a custom class for extracting text between tags
 import logging
+import base64
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def clean_source_url(s):
+    """
+    Clean source URLs by replacing encoded characters with their decoded equivalents.
+    
+    Args:
+        s (str): The raw source URL string.
+    
+    Returns:
+        str: The cleaned URL.
+    """
+    simplified_str = s.replace('\\\\', '')
+    replacements = {
+        'u0026': '&', 'u003d': '=', 'u003f': '?', 'u0020': ' ', 'u0025': '%', 'u002b': '+', 'u003c': '<',
+        'u003e': '>', 'u0023': '#', 'u0024': '$', 'u002f': '/', 'u005c': '\\', 'u007c': '|', 'u002d': '-',
+        'u003a': ':', 'u003b': ';', 'u002c': ',', 'u002e': '.', 'u0021': '!', 'u0040': '@', 'u005e': '^',
+        'u0060': '`', 'u007b': '{', 'u007d': '}', 'u005b': '[', 'u005d': ']', 'u002a': '*', 'u0028': '(',
+        'u0029': ')'
+    }
+    for encoded, decoded in replacements.items():
+        simplified_str = simplified_str.replace(encoded, decoded)
+    return simplified_str
+
+def clean_image_url(url):
+    """
+    Clean image URLs to extract the base image path, removing query parameters.
+    
+    Args:
+        url (str): The raw image URL.
+    
+    Returns:
+        str: The cleaned image URL.
+    """
+    pattern = re.compile(r'(.*\.(?:png|jpg|jpeg|gif))(?:\?.*)?', re.IGNORECASE)
+    match = pattern.match(url)
+    return match.group(1) if match else url
 
 def get_original_images(html_bytes, logger=None):
-    """Parse Google image search HTML and return image data."""
+    """
+    Parse the main Google image search results from HTML bytes, extracting up to 50 images.
+    
+    Args:
+        html_bytes (bytes): The HTML content of the main search page.
+        logger (logging.Logger, optional): Logger instance for debugging.
+    
+    Returns:
+        tuple: (image_urls, descriptions, source_urls, thumbnails) - Lists of extracted data.
+    """
     logger = logger or logging.getLogger(__name__)
+    
+    # Decode HTML with fallback
     try:
-        detected_encoding = chardet.detect(html_bytes)['encoding']
-        if not detected_encoding:
-            logger.warning("No encoding detected, falling back to UTF-8")
-            detected_encoding = 'utf-8'
-        try:
-            soup = html_bytes.decode(detected_encoding)
-        except UnicodeDecodeError:
-            logger.warning(f"Failed to decode with detected encoding '{detected_encoding}', using UTF-8 with replacement")
-            soup = html_bytes.decode('utf-8', errors='replace')  # Replace invalid chars
+        detected_encoding = chardet.detect(html_bytes)['encoding'] or 'utf-8'
+        logger.debug(f"Detected encoding: {detected_encoding}")
+        html_content = html_bytes.decode(detected_encoding, errors='replace')
     except Exception as e:
         logger.error(f"🔴 Decoding error: {e}", exc_info=True)
-        soup = html_bytes.decode('utf-8', errors='replace')  # Fallback with replacement
-    
+        html_content = html_bytes.decode('utf-8', errors='replace')
+
+    # Extract main results section using LR
     start_tag = 'FINANCE",[22,1]]]]]'
     end_tag = ':[null,null,null,"glbl'
-    matched_google_image_data = LR().get(soup, start_tag, end_tag)
-    if 'Error' in matched_google_image_data:
-        logger.warning('Tags not found in HTML')
-        return None
-    if not matched_google_image_data:
-        logger.warning('No matched_google_image_data found')
-        return (['No start_tag or end_tag'], ['No start_tag or end_tag'], ['No start_tag or end_tag'], ['No start_tag or end_tag'])
+    matched_google_image_data = LR().get(html_content, start_tag, end_tag)
+    
+    if 'Error' in matched_google_image_data or not matched_google_image_data:
+        logger.warning('Main results tags not found or no data extracted')
+        return [], [], [], []
     
     matched_google_image_data = str(matched_google_image_data).replace('\u003d', '=').replace('\u0026', '&')
     thumbnails = matched_google_image_data
     
     if '"2003":' not in thumbnails:
-        logger.warning('No 2003 tag found in thumbnails')
-        return (['No google image results found'], ['No google image results found'], ['No google image results found'], ['No google image results found'])
+        logger.warning('No 2003 tag found in main thumbnails')
+        return [], [], [], []
     
-    matched_google_images_thumbnails = ", ".join(
-        re.findall(r'\[\"(https\:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]', str(thumbnails))
-    ).split(", ")
+    # Extract thumbnails
+    main_thumbs = re.findall(r'\[\"(https\:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]', thumbnails)
+    main_thumbs = [clean_source_url(url) for url in main_thumbs]
     
+    # Extract descriptions
     regex_pattern_desc = r'"2003":\[null,"[^"]*","[^"]*","(.*?)"'
-    matched_description = re.findall(regex_pattern_desc, str(thumbnails))
+    main_descriptions = re.findall(regex_pattern_desc, thumbnails)
     
+    # Extract source URLs
     regex_pattern_src = r'"2003":\[null,"[^"]*","(.*?)"'
-    matched_source = re.findall(regex_pattern_src, str(thumbnails))
+    main_source_urls = [clean_source_url(url) for url in re.findall(regex_pattern_src, thumbnails)]
     
-    removed_matched_google_images_thumbnails = re.sub(
-        r'\[\"(https\:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]', "", str(thumbnails)
-    )
+    # Extract full-resolution images
+    removed_thumbs = re.sub(r'\[\"(https\:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]', "", thumbnails)
+    main_image_urls = [clean_image_url(url) for url in re.findall(r"(?:|,),\[\"(https:|http.*?)\",\d+,\d+\]", removed_thumbs)]
     
-    matched_google_full_resolution_images = re.findall(
-        r"(?:|,),\[\"(https:|http.*?)\",\d+,\d+\]", removed_matched_google_images_thumbnails
-    )
+    if not main_image_urls:
+        main_image_urls = main_thumbs
+
+    # Ensure consistent lengths and limit to 50
+    min_length = min(len(main_image_urls), len(main_descriptions), len(main_source_urls), len(main_thumbs))
+    main_image_urls = main_image_urls[:min_length][:50]
+    main_descriptions = main_descriptions[:min_length][:50]
+    main_source_urls = main_source_urls[:min_length][:50]
+    main_thumbs = main_thumbs[:min_length][:50]
+
+    logger.debug(f"Main results: URLs={len(main_image_urls)}, Descriptions={len(main_descriptions)}, "
+                 f"Sources={len(main_source_urls)}, Thumbs={len(main_thumbs)}")
+    return main_image_urls, main_descriptions, main_source_urls, main_thumbs
+
+def get_results_page_results(html_bytes, final_urls, final_descriptions, final_sources, final_thumbs, logger=None):
+    """
+    Parse the additional Google results page HTML and append image data to the provided lists.
     
-    full_res_images = [
-        bytes(bytes(img, "utf-8").decode("unicode-escape"), "utf-8").decode("unicode-escape")
-        for img in matched_google_full_resolution_images
-    ]
-    cleaned_urls = [clean_image_url(url) for url in full_res_images]
-    cleaned_source = [clean_source_url(url) for url in matched_source]
-    cleaned_thumbs = [clean_source_url(url) for url in matched_google_images_thumbnails]
+    Args:
+        html_bytes (bytes): The HTML content of the additional results page.
+        final_urls (list): List to append image URLs.
+        final_descriptions (list): List to append descriptions.
+        final_sources (list): List to append source URLs.
+        final_thumbs (list): List to append thumbnails.
+        logger (logging.Logger, optional): Logger instance for debugging.
     
-    if not cleaned_urls:
-        cleaned_urls = cleaned_thumbs
+    Returns:
+        tuple: Updated (final_urls, final_descriptions, final_sources, final_thumbs).
+    """
+    logger = logger or logging.getLogger(__name__)
     
-    final_thumbnails = []
-    final_full_res_images = []
-    final_descriptions = []
+    # Decode HTML with fallback
+    try:
+        detected_encoding = chardet.detect(html_bytes)['encoding'] or 'utf-8'
+        html_content = html_bytes.decode(detected_encoding, errors='replace')
+    except Exception as e:
+        logger.error(f"🔴 Decoding error: {e}", exc_info=True)
+        html_content = html_bytes.decode('utf-8', errors='replace')
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+    result_divs = soup.find_all('div', class_='H8Rx8c')  # Class assumed for result items
+
+    if not result_divs:
+        logger.warning("No result items found in additional results page")
+        return final_urls, final_descriptions, final_sources, final_thumbs
+
+    for div in result_divs:
+        if len(final_urls) >= 100:
+            break
+
+        # Extract and validate base64 thumbnail
+        img_tag = div.find('img', class_='YQ4gaf')
+        thumb = None
+        if img_tag and 'src' in img_tag.attrs and 'data:image' in img_tag['src']:
+            thumb_base64 = img_tag['src']
+            try:
+                base64.b64decode(thumb_base64.split(',')[1])
+                thumb = thumb_base64
+            except Exception as e:
+                logger.warning(f"Invalid base64 thumbnail: {e}")
+        if not thumb:
+            logger.debug("No valid base64 thumbnail in result item")
+            continue
+        final_thumbs.append(thumb)
+
+        # Extract description
+        desc_div = div.find_next('div', class_='VwiC3b')
+        description = desc_div.get_text(strip=True) if desc_div else 'No description'
+        final_descriptions.append(description)
+
+        # Extract source URL
+        source_tag = div.find_next('cite', class_='qLRx3b')
+        source = clean_source_url(source_tag.get_text(strip=True)) if source_tag else 'No source'
+        final_sources.append(source)
+
+        # Extract full image URL
+        link_tag = div.find_next('a', class_='zReHs')
+        url = clean_image_url(link_tag['href']) if link_tag and 'href' in link_tag.attrs else 'No image URL'
+        final_urls.append(url)
+
+    # Cap at 100 total results
+    if len(final_urls) > 100:
+        final_urls = final_urls[:100]
+        final_descriptions = final_descriptions[:100]
+        final_sources = final_sources[:100]
+        final_thumbs = final_thumbs[:100]
+        logger.debug("Capped total results at 100")
+
+    logger.debug(f"Appended results from additional page. Total now: {len(final_urls)}")
+    return final_urls, final_descriptions, final_sources, final_thumbs
+
+def process_search_result(image_html_bytes, results_html_bytes, logger=None):
+    """
+    Process both main and additional results pages, combining up to 100 results.
     
-    if len(cleaned_urls) >= 8:
-        logger.debug('Found 8 or more image results')
-        if len(matched_description) < 8:
-            matched_description = matched_description + ["No descriptions found"] * (8 - len(matched_description))
-        if len(cleaned_source) < 8:
-            cleaned_source = cleaned_source + ["No sources found"] * (8 - len(cleaned_source))
-        if len(cleaned_thumbs) < 8:
-            cleaned_thumbs = cleaned_thumbs + ["No thumbnails found"] * (8 - len(cleaned_thumbs))
-        
-        final_image_urls = cleaned_urls[:8]
-        final_descriptions = matched_description[:8]
-        final_source_url = cleaned_source[:8]
-        final_thumbs = cleaned_thumbs[:8]
-        
-        logger.debug(f"Returning 8 images: URLs={len(final_image_urls)}, Descriptions={len(final_descriptions)}, Sources={len(final_source_url)}, Thumbs={len(final_thumbs)}")
-        max_length = max(len(final_image_urls), len(final_descriptions), len(final_source_url), len(final_thumbs))
-        min_length = min(len(final_image_urls), len(final_descriptions), len(final_source_url), len(final_thumbs))
-        if max_length != min_length:
-            logger.error(f"Length mismatch: URLs={len(final_image_urls)}, Descriptions={len(final_descriptions)}, Sources={len(final_source_url)}, Thumbs={len(final_thumbs)}")
-            raise ValueError("Mismatch in lengths of image data arrays")
-        
-        return final_image_urls, final_descriptions, final_source_url, final_thumbs
-    else:
-        logger.debug('Found fewer than 8 image results')
-        min_length = len(cleaned_urls)
-        logger.debug(f"Processing {min_length} images: URLs={len(cleaned_urls)}, Descriptions={len(matched_description)}, Sources={len(cleaned_source)}, Thumbs={len(cleaned_thumbs)}")
-        
-        if len(matched_description) < min_length:
-            matched_description = matched_description + ["No descriptions found"] * (min_length - len(matched_description))
-        if len(cleaned_source) < min_length:
-            cleaned_source = cleaned_source + ["No sources found"] * (min_length - len(cleaned_source))
-        if len(cleaned_thumbs) < min_length:
-            cleaned_thumbs = cleaned_thumbs + ["No thumbnails found"] * (min_length - len(cleaned_thumbs))
-        
-        final_image_urls = cleaned_urls[:min_length]
-        final_descriptions = matched_description[:min_length]
-        final_source_url = cleaned_source[:min_length]
-        final_thumbs = cleaned_thumbs[:min_length]
-        
-        logger.debug(f"Returning {min_length} images: URLs={len(final_image_urls)}, Descriptions={len(final_descriptions)}, Sources={len(final_source_url)}, Thumbs={len(final_thumbs)}")
-        max_length = max(len(final_image_urls), len(final_descriptions), len(final_source_url), len(final_thumbs))
-        min_length = min(len(final_image_urls), len(final_descriptions), len(final_source_url), len(final_thumbs))
-        if max_length != min_length:
-            logger.error(f"Length mismatch: URLs={len(final_image_urls)}, Descriptions={len(final_descriptions)}, Sources={len(final_source_url)}, Thumbs={len(final_thumbs)}")
-            raise ValueError("Mismatch in lengths of image data arrays")
-        
-        return final_image_urls, final_descriptions, final_source_url, final_thumbs
+    Args:
+        image_html_bytes (bytes): HTML bytes of the main image search page.
+        results_html_bytes (bytes): HTML bytes of the additional results page.
+        logger (logging.Logger, optional): Logger instance for debugging.
+    
+    Returns:
+        tuple: (image_urls, descriptions, source_urls, thumbnails) - Combined results.
+    """
+    logger = logger or logging.getLogger(__name__)
+    
+    # Parse main results (up to 50)
+    final_urls, final_descriptions, final_sources, final_thumbs = get_original_images(image_html_bytes, logger)
+    
+    # Append additional results (up to 100 total)
+    if results_html_bytes:
+        final_urls, final_descriptions, final_sources, final_thumbs = get_results_page_results(
+            results_html_bytes, final_urls, final_descriptions, final_sources, final_thumbs, logger
+        )
+    
+    logger.info(f"Total combined results: {len(final_urls)}")
+    return final_urls, final_descriptions, final_sources, final_thumbs
 
-# ... clean_image_url and clean_source_url remain unchanged
-def clean_source_url(s):
-    # First, remove '\\\\' to simplify handling
-    simplified_str = s.replace('\\\\', '')
-
-    # Mapping of encoded sequences to their decoded characters
-    replacements = {
-        'u0026': '&',
-        'u003d': '=',
-        'u003f': '?',
-        'u0020': ' ',
-        'u0025': '%',
-        'u002b': '+',
-        'u003c': '<',
-        'u003e': '>',
-        'u0023': '#',
-        'u0024': '$',
-        'u002f': '/',
-        'u005c': '\\',
-        'u007c': '|',
-        'u002d': '-',
-        'u003a': ':',
-        'u003b': ';',
-        'u002c': ',',
-        'u002e': '.',
-        'u0021': '!',
-        'u0040': '@',
-        'u005e': '^',
-        'u0060': '`',
-        'u007b': '{',
-        'u007d': '}',
-        'u005b': '[',
-        'u005d': ']',
-        'u002a': '*',
-        'u0028': '(',
-        'u0029': ')'
-    }
-
-    # Apply the replacements
-    for encoded, decoded in replacements.items():
-        simplified_str = simplified_str.replace(encoded, decoded)
-
-    return simplified_str
-def clean_image_url(url):
-    # Pattern matches common image file extensions followed by a question mark and any characters after it
-    pattern = re.compile(r'(.*\.(?:png|jpg|jpeg|gif))(?:\?.*)?', re.IGNORECASE)
-
-    # Search for matches in the input URL
-    match = pattern.match(url)
-
-    # If a match is found, return the part of the URL before the query parameters (group 1)
-    if match:
-        return match.group(1)
-
-    # If no match is found, return the original URL
-    return url
