@@ -19,10 +19,11 @@ from database import (
     get_records_to_search,
     get_send_to_email,
     update_file_generate_complete,
+    insert_search_results,
     update_file_location_complete,
     update_initial_sort_order,
     update_log_url_in_db,
-    update_search_sort_order,
+   update_search_sort_order,
 )
 from email_utils import send_email, send_message_email
 from excel_utils import (
@@ -51,7 +52,7 @@ async def create_temp_dirs(unique_id: str, logger: Optional[logging.Logger] = No
         logger.info(f"Created temporary directories for ID: {unique_id}")
         return temp_images_dir, temp_excel_dir
     except Exception as e:
-        logger.error(f"🔴 Failed to create temp directories for ID {unique_id}: {e}")
+        logger.error(f"🔴 Failed to create temp directories for ID {unique_id}: {e}", exc_info=True)
         raise
 
 
@@ -66,7 +67,7 @@ async def cleanup_temp_dirs(directories: List[str], logger: Optional[logging.Log
                 await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
                 logger.info(f"Cleaned up directory: {dir_path}")
         except Exception as e:
-            logger.error(f"🔴 Failed to clean up directory {dir_path}: {e}")
+            logger.error(f"🔴 Failed to clean up directory {dir_path}: {e}", exc_info=True)
 
 
 async def download_image_with_sem(
@@ -95,18 +96,24 @@ async def download_image(
     timeout = httpx.Timeout(30, connect=10)
 
     try:
+        if not main_url and not thumb_url:
+            logger.warning(f"No URLs provided for row {row_id}")
+            return (None, row_id)
+        
         # Attempt main URL first
-        try:
-            response = await client.get(main_url, timeout=timeout)
-            response.raise_for_status()
-            async with aiofiles.open(image_path, 'wb') as f:
-                await f.write(response.content)
-            logger.info(f"✅ Downloaded main image for row {row_id}")
-            return None
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            logger.warning(f"⚠️ Failed main image for row {row_id}: {e}")
+        if main_url:
+            try:
+                response = await client.get(main_url, timeout=timeout)
+                response.raise_for_status()
+                async with aiofiles.open(image_path, 'wb') as f:
+                    await f.write(response.content)
+                logger.info(f"✅ Downloaded main image for row {row_id}")
+                return None
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                logger.warning(f"⚠️ Failed main image for row {row_id}: {e}")
 
-            # Fall back to thumbnail URL
+        # Fall back to thumbnail URL
+        if thumb_url:
             try:
                 response = await client.get(thumb_url, timeout=timeout)
                 response.raise_for_status()
@@ -116,10 +123,11 @@ async def download_image(
                 return None
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
                 logger.error(f"❌ Failed thumbnail for row {row_id}: {e}")
-                return (main_url, row_id)
+                return (main_url or thumb_url, row_id)
+        return (main_url or thumb_url, row_id)
     except Exception as e:
-        logger.error(f"🔴 Unexpected error for row {row_id}: {e}")
-        return (main_url, row_id)
+        logger.error(f"🔴 Unexpected error for row {row_id}: {e}", exc_info=True)
+        return (main_url or thumb_url, row_id)
 
 
 async def download_all_images(
@@ -135,7 +143,7 @@ async def download_all_images(
         logger.warning("⚠️ No images to download")
         return failed_img_urls
 
-    logger.info(f"📥 Starting download of {len(image_list)} images for {temp_dir}")
+    logger.info(f"📥 Starting download of {len(image_list)} images to {temp_dir}")
     batch_size = 200
     semaphore = asyncio.Semaphore(50)  # Limit to 50 concurrent downloads per batch
 
@@ -149,7 +157,7 @@ async def download_all_images(
                 if item.get('ExcelRowID') and (item.get('ImageUrl') or item.get('ImageUrlThumbnail'))
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            batch_failures = [result for result in results if result is not None]
+            batch_failures = [result for result in results if result is not None and not isinstance(result, Exception)]
             failed_img_urls.extend(batch_failures)
             logger.info(f"Batch {i // batch_size + 1} completed, failures: {len(batch_failures)}")
 
@@ -170,6 +178,9 @@ async def generate_download_file(
         start_time = time.time()
         loop = asyncio.get_running_loop()
 
+        # Input validation
+        file_id = int(file_id)  # Ensure file_id is an integer
+
         # Fetch images for Excel export
         logger.info(f"🕵️ Fetching images for Excel export for FileID: {file_id}")
         selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id, logger)
@@ -182,8 +193,8 @@ async def generate_download_file(
         selected_image_list = [
             {
                 'ExcelRowID': row['ExcelRowID'],
-                'ImageUrl': row['ImageURL'],
-                'ImageUrlThumbnail': row['ImageURLThumbnail']
+                'ImageUrl': row['ImageUrl'],
+                'ImageUrlThumbnail': row['ImageUrlThumbnail']
             }
             for _, row in selected_images_df.iterrows()
         ]
@@ -222,8 +233,8 @@ async def generate_download_file(
         async with httpx.AsyncClient() as client:
             response = await client.get(provided_file_path, timeout=httpx.Timeout(30, connect=10))
             response.raise_for_status()
-            with open(local_filename, "wb") as file:
-                file.write(response.content)
+            async with aiofiles.open(local_filename, 'wb') as f:
+                await f.write(response.content)
 
         # Process Excel file
         row_offset = header_index
@@ -271,12 +282,15 @@ async def generate_download_file(
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id, logger)
 
         subject_line = f"{file_name} Job Notification"
-        send_to_email = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id, logger)
-        logger.info(f"📧 Sending email to {send_to_email} with download URL: {public_url}")
+        send_to_email_addr = await loop.run_in_executor(ThreadPoolExecutor(), get_send_to_email, file_id, logger)
+        if not send_to_email_addr:
+            logger.error(f"❌ Failed to retrieve email address for FileID {file_id}")
+            return {"error": "Failed to retrieve email address"}
+        logger.info(f"📧 Sending email to {send_to_email_addr} with download URL: {public_url}")
         await loop.run_in_executor(
             ThreadPoolExecutor(),
             lambda: send_email(
-                to_emails=send_to_email,
+                to_emails=send_to_email_addr,
                 subject=subject_line,
                 download_url=public_url,
                 job_id=file_id,
@@ -294,7 +308,6 @@ async def generate_download_file(
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
 
-
 async def process_restart_batch(
     file_id_db: int,
     logger: Optional[logging.Logger] = None,
@@ -311,10 +324,10 @@ async def process_restart_batch(
         # Fetch missing images
         logger.info(f"🖼️ Fetching missing images for FileID: {file_id_db}")
         missing_urls_df = fetch_missing_images(file_id_db, limit=10000, ai_analysis_only=False, logger=logger)
-        logger.debug(f"🟨 🕵️‍♂️Missing URLs DataFrame columns: {missing_urls_df.columns.tolist()}")
-        logger.debug(f"🟨 🕵️‍♂️Missing URLs DataFrame sample: {missing_urls_df.head().to_dict()}")
+        logger.debug(f"🟨 Missing URLs DataFrame columns: {missing_urls_df.columns.tolist()}")
+        logger.debug(f"🟨 Missing URLs DataFrame sample: {missing_urls_df.head().to_dict()}")
 
-        image_url_col = 'ImageURL'
+        image_url_col = 'ImageUrl'
         if image_url_col not in missing_urls_df.columns:
             logger.error(f"🔴 'ImageUrl' not found in DataFrame columns: {missing_urls_df.columns.tolist()}")
             raise KeyError(f"'ImageUrl' column not found in DataFrame")
@@ -337,6 +350,18 @@ async def process_restart_batch(
 
                 success_count = sum(1 for r in all_results if r['status'] == 'success')
                 logger.info(f"🟢 Completed {success_count}/{len(all_results)} searches successfully")
+
+                # Insert search results into the database
+                for result in all_results:
+                    if result['status'] == 'success' and result['result'] is not None:
+                        insert_success = await asyncio.get_running_loop().run_in_executor(
+                            None, insert_search_results, result['result'], logger
+                        )
+                        if not insert_success:
+                            logger.error(f"Failed to insert results for EntryID {result['entry_id']}")
+                        else:
+                            logger.info(f"Successfully inserted results for EntryID {result['entry_id']}")
+
             else:
                 logger.info(f"🟡 No records to search for FileID: {file_id_db}")
 
@@ -347,7 +372,7 @@ async def process_restart_batch(
                 raise Exception("Initial SortOrder update failed")
 
         # Update search sort order
-        logger.info(f"🔍🔀Updating search sort order for FileID: {file_id_db}")
+        logger.info(f"🔍🔀 Updating search sort order for FileID: {file_id_db}")
         sort_result = update_search_sort_order(file_id_db, logger=logger)
         if sort_result is None:
             logger.error(f"🔴 Search sort order update failed for FileID: {file_id_db}")
@@ -361,7 +386,7 @@ async def process_restart_batch(
             raise Exception(result["error"])
 
         logger.info(f"✅ Restart processing completed successfully for FileID: {file_id_db}")
-        return {"message": "Restart processing completed successfully", "file_id": file_id_db}
+        return {"message": "Restart processing completed successfully", "file_id": str(file_id_db)}
 
     except Exception as e:
         logger.error(f"🔴 Error restarting processing for FileID {file_id_db}: {e}", exc_info=True)
@@ -379,7 +404,10 @@ async def process_restart_batch(
             logger.info(f"Log file uploaded to: {upload_url}")
             await update_log_url_in_db(file_id_db, upload_url, logger)
         
-        send_to_email = get_send_to_email(file_id_db, logger=logger)
-        file_name = f"FileID: {file_id_db}"
-        send_message_email(send_to_email, f"Error processing {file_name}", f"An error occurred while reprocessing your file: {str(e)}")
+        send_to_email_addr = get_send_to_email(file_id_db, logger=logger)
+        if not send_to_email_addr:
+            logger.error(f"❌ Failed to retrieve email address for FileID {file_id_db}")
+        else:
+            file_name = f"FileID: {file_id_db}"
+            send_message_email(send_to_email_addr, f"Error processing {file_name}", f"An error occurred while reprocessing your file: {str(e)}")
         return {"error": str(e)}

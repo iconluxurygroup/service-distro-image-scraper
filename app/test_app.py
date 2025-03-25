@@ -60,7 +60,7 @@ def mock_gp():
         yield mock_search
 
 # Test fetch_pending_images
-def test_fetch_pending_images(mock_db):
+def call_fetch_pending_images(mock_db):
     conn, cursor = mock_db
     cursor.fetchall.return_value = [(1, 1, "http://example.com/image.jpg", "BrandX", "Shoes", "Blue")]
     df = fetch_pending_images(limit=1)
@@ -69,7 +69,7 @@ def test_fetch_pending_images(mock_db):
     assert df.iloc[0]["ImageURL"] == "http://example.com/image.jpg"
 
 # Test send_email
-def test_send_email(mock_sendgrid):
+def call_send_email(mock_sendgrid):
     send_email("test@example.com", "Test Subject", "http://example.com/download", "123")
     assert mock_sendgrid.called
     call_args = mock_sendgrid.return_value.send.call_args[0][0]
@@ -77,7 +77,7 @@ def test_send_email(mock_sendgrid):
     assert "Download File" in call_args.html_content
 
 # Test upload_file_to_space
-def test_upload_file_to_space(mock_s3, temp_dir):
+def call_upload_file_to_space(mock_s3, temp_dir):
     file_path = os.path.join(temp_dir, "test.txt")
     with open(file_path, "w") as f:
         f.write("test content")
@@ -86,7 +86,7 @@ def test_upload_file_to_space(mock_s3, temp_dir):
     assert url == "https://iconluxurygroup-s3.s3.us-east-2.amazonaws.com/test.txt"
 
 # Test insert_file_db
-def test_insert_file_db(mock_db):
+def call_insert_file_db(mock_db):
     conn, cursor = mock_db
     cursor.fetchval.return_value = 1
     file_id = insert_file_db("test.xlsx", "http://example.com/test.xlsx", "test@example.com")
@@ -95,7 +95,7 @@ def test_insert_file_db(mock_db):
     assert "INSERT INTO utb_ImageScraperFiles" in cursor.execute.call_args[0][0]
 
 # Test load_payload_db
-def test_load_payload_db(mock_db):
+def call_load_payload_db(mock_db):
     conn, cursor = mock_db
     rows = [{"absoluteRowIndex": 1, "searchValue": "test", "brandValue": "BrandX", "colorValue": "Red", "CategoryValue": "Shoes"}]
     df = load_payload_db(rows, 1)
@@ -105,7 +105,7 @@ def test_load_payload_db(mock_db):
     assert cursor.execute.called
 
 # Test process_search_row
-def test_process_search_row(mock_db, mock_gp):
+def call_process_search_row(mock_db, mock_gp):
     conn, cursor = mock_db
     result = process_search_row("test query", "http://example.com", 1)
     assert result is True

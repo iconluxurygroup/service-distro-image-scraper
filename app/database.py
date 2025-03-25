@@ -1,51 +1,84 @@
-import pyodbc
-import pandas as pd
 import logging
+import pandas as pd
+import pyodbc
 import requests
-import zlib
-import urllib
-import base64
-from icon_image_lib.google_parser import process_search_result
-from config import conn_str, engine
-from urllib3.util.retry import Retry
-from typing import List, Optional
-import urllib.parse
-from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException, Timeout, ConnectionError
 import json
 import re
-import pyodbc
-import pandas as pd
-import logging
-import requests
+import base64
+import zlib
+import urllib.parse
+from typing import List, Optional, Dict, Any
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
+from urllib3.util.retry import Retry
+from config import conn_str, engine
+from icon_image_lib.google_parser import process_search_result
 from skimage import io as skio
 from skimage.metrics import structural_similarity as ssim
 from skimage.transform import resize
+from io import BytesIO
 import numpy as np
-from io import BytesIO
-from typing import Optional
-from io import BytesIO
-import skimage.io as skio
 from PIL import Image
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import logging
-import urllib.parse
-import json
-import pandas as pd
-# Fallback logger for standalone calls
+from config import conn_str
+# Default logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-async def update_log_url_in_db(file_id, log_url, logger=None):
+def insert_search_results(df, logger=None):
+    """
+    Insert search results into the database.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing search results.
+        logger (Optional[logging.Logger]): Logger instance for logging messages. Defaults to default_logger if None.
+
+    Returns:
+        bool: True if insertion succeeds, False otherwise.
+    """
+    # Use default_logger if no logger is provided
+    logger = logger or default_logger
+
+    # Check if DataFrame is empty
+    if df.empty:
+        logger.info("No rows to insert: DataFrame is empty")
+        return False
+
+    # Verify required columns
+    required = ['EntryID', 'ImageURL', 'ImageDesc', 'ImageSource', 'ImageURLThumbnail']
+    if not all(col in df.columns for col in required):
+        missing_cols = [col for col in required if col not in df.columns]
+        logger.error(f"Missing columns: {missing_cols}")
+        return False
+
+    # Log the insertion attempt
+    logger.info(f"Inserting {len(df)} rows: {df.iloc[0].to_dict()}")
+
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            for index, row in df.iterrows():
+                cursor.execute("""
+                    INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+                    VALUES (?, ?, ?, ?, ?, GETDATE())
+                """, (int(row['EntryID']), row['ImageURL'], row['ImageDesc'], row['ImageSource'], row['ImageURLThumbnail']))
+            conn.commit()
+            logger.info(f"Successfully inserted {len(df)} rows")
+            return True
+    except pyodbc.Error as e:
+        logger.error(f"Database error: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return False
+async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logging.Logger] = None) -> bool:
+    """Update the log URL in the database."""
     logger = logger or default_logger
     try:
         file_id = int(file_id)
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
-            # Add LogFileUrl column if it doesn't exist
             cursor.execute("""
                 IF NOT EXISTS (
                     SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
@@ -57,281 +90,78 @@ async def update_log_url_in_db(file_id, log_url, logger=None):
                     ADD LogFileUrl NVARCHAR(MAX)
                 END
             """)
-            # Update the log file URL
-            update_query = """
-                UPDATE utb_ImageScraperFiles 
-                SET LogFileUrl = ? 
-                WHERE ID = ?
-            """
-            cursor.execute(update_query, (log_url, file_id))
+            cursor.execute("UPDATE utb_ImageScraperFiles SET LogFileUrl = ? WHERE ID = ?", (log_url, file_id))
             conn.commit()
-            logger.info(f"✅ Successfully updated log URL '{log_url}' for FileID {file_id}")
+            logger.info(f"✅ Updated log URL '{log_url}' for FileID {file_id}")
             return True
-    except Exception as e:
-        logger.error(f"🔴 Error updating log URL for FileID {file_id}: {e}", exc_info=True)
+    except pyodbc.Error as e:
+        logger.error(f"🔴 Database error updating log URL for FileID {file_id}: {e}", exc_info=True)
         return False
 
-def unpack_content(encoded_content, logger=None):
+def unpack_content(encoded_content: str, logger: Optional[logging.Logger] = None) -> Optional[bytes]:
+    """Unpack base64-encoded and zlib-compressed content."""
     logger = logger or default_logger
     try:
         if encoded_content:
             compressed_content = base64.b64decode(encoded_content)
-            original_content = zlib.decompress(compressed_content)
-            return original_content
+            return zlib.decompress(compressed_content)
         return None
     except Exception as e:
         logger.error(f"Error unpacking content: {e}")
         return None
 
-def get_records_to_search(file_id, logger=None):
+def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    """Fetch records to search from the database."""
     logger = logger or default_logger
     try:
         file_id = int(file_id)
-        sql_query = """
+        query = """
             SELECT EntryID, ProductModel AS SearchString, 'model_only' AS SearchType, FileID
             FROM utb_ImageScraperRecords 
             WHERE FileID = ? AND Step1 IS NULL
             ORDER BY EntryID, SearchType
         """
-        with pyodbc.connect(conn_str) as connection:
-            df = pd.read_sql_query(sql_query, connection, params=[file_id])
-        if not df.empty:
-            invalid_rows = df[df['FileID'] != file_id]
-            if not invalid_rows.empty:
-                logger.error(f"Found {len(invalid_rows)} rows with incorrect FileID for requested FileID {file_id}: {invalid_rows[['EntryID', 'FileID']].to_dict()}")
-                df = df[df['FileID'] == file_id]
-        logger.info(f"Got {len(df)} search records for FileID: {file_id}")
-        return df[['EntryID', 'SearchString', 'SearchType']]
-    except Exception as e:
-        logger.error(f"Error getting records to search for FileID {file_id}: {e}")
+        with pyodbc.connect(conn_str) as conn:
+            df = pd.read_sql_query(query, conn, params=[file_id])
+            if not df.empty and (df["FileID"] != file_id).any():
+                logger.error(f"Found rows with incorrect FileID for {file_id}")
+                df = df[df["FileID"] == file_id]
+            logger.info(f"Got {len(df)} search records for FileID: {file_id}")
+            return df[["EntryID", "SearchString", "SearchType"]]
+    except pyodbc.Error as e:
+        logger.error(f"Database error getting records for FileID {file_id}: {e}")
         return pd.DataFrame()
 
-def check_endpoint_health(endpoint: str, timeout: int = 5) -> bool:
-    """Check if the endpoint can reach Google using /health/google."""
+def check_endpoint_health(endpoint: str, timeout: int = 5, logger: Optional[logging.Logger] = None) -> bool:
+    """Check if an endpoint is healthy by querying its Google health check."""
+    logger = logger or default_logger
     health_url = f"{endpoint}/health/google"
     try:
         response = requests.get(health_url, timeout=timeout)
-        if response.status_code != 200:
-            return False
-        status = response.json().get("status", "")
-        return "Google is reachable" in status
-    except (requests.RequestException, json.JSONDecodeError):
+        response.raise_for_status()
+        return "Google is reachable" in response.json().get("status", "")
+    except RequestException:
+        logger.warning(f"Endpoint {endpoint} health check failed")
         return False
 
-def update_sort_order_based_on_match_score(file_id, logger=None):
-    """
-    Update the SortOrder in utb_ImageScraperResult based on match scores from aijson.
-    For entries with the same top match score per EntryID, use SSIM against an optimal image to break ties.
-    
-    Args:
-        file_id (int): The FileID to filter records.
-        logger (logging.Logger, optional): Logger instance. Defaults to default_logger.
-    """
+def get_healthy_endpoint(endpoints: List[str], logger: Optional[logging.Logger] = None) -> Optional[str]:
+    """Return the first healthy endpoint."""
     logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with pyodbc.connect(conn_str) as connection:
-            connection.timeout = 300
-            cursor = connection.cursor()
-            logger.info(f"🔄 Updating SortOrder based on match_score for FileID: {file_id}")
-
-            # Define category keywords for mapping
-            category_keywords = {
-                "shoe": ["shoe", "shoes", "sneaker", "sneakers", "boot", "boots", "sandal", "sandals"],
-                "pant": ["pant", "pants", "trouser", "trousers", "jean", "jeans", "short", "shorts"],
-                "t-shirt": ["t-shirt", "tshirt", "tee", "shirt","sweatshirt"],
-                "jacket": ["jacket", "jackets", "coat", "coats", "blazer"],
-                "hat": ["hat", "hats", "cap", "beanie"]
-            }
-
-            def map_category(input_str: str) -> str:
-                """Map raw category to standardized category based on keywords."""
-                normalized = input_str.lower().replace(" ", "").replace("-", "").replace("—", "")
-                max_pos = -1
-                selected_category = None
-                for category, keywords in category_keywords.items():
-                    for keyword in keywords:
-                        keyword_normalized = keyword.replace(" ", "").replace("-", "")
-                        pos = normalized.rfind(keyword_normalized)
-                        if pos > max_pos:
-                            max_pos = pos
-                            selected_category = category
-                if selected_category:
-                    return selected_category
-                logger.warning(f"No category keyword found in: {input_str}")
-                return input_str.lower()
-            # Define load_image before using it
-            def load_image(url_or_path: str) -> Optional[np.ndarray]:
-                """Load an image as a grayscale numpy array."""
-                try:
-                    if url_or_path.startswith('http'):
-                        response = requests.get(url_or_path, timeout=10)
-                        response.raise_for_status()
-                        image_data = BytesIO(response.content)
-                        img = Image.open(image_data)
-                        if img.mode == 'P':  # Palette image
-                            img = img.convert('RGBA')
-                        return skio.imread(BytesIO(response.content), as_gray=True)
-                    else:
-                        img = Image.open(url_or_path)
-                        if img.mode == 'P':
-                            img = img.convert('RGBA')
-                        return skio.imread(url_or_path, as_gray=True)
-                except Exception as e:
-                    logger.error(f"Error loading image from {url_or_path}: {e}")
-                    return None
-            # Define optimal reference URLs (update with actual paths/URLs as needed)
-            category_to_ref_url ={
-            "shoe": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ7MGfepTaFjpQhcNFyetjseybIRxLUe58eag&s",
-            "clothing": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTyYe3Vgmztdh089e9IHLqdPPLuE2jUtV8IZg&s",  # Replace with actual path or URL
-            "pant": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcStaRmmSmbuIuozGgVJa6GHuR59RuW3W8_8jA&s",
-            "jeans": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSjiKQ5mZWi6qnWCr6Yca5_AFinCDZXhXhiAg&s",
-            "accessories": "path/to/optimal_accessories.jpg",  # Replace with actual path or URL
-            "t-shirt": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTyYe3Vgmztdh089e9IHLqdPPLuE2jUtV8IZg&s",
-            "jacket": "path/to/optimal_jacket.jpg",  # Replace with actual path or URL
-            "hat": "path/to/optimal_hat.jpg",  # Replace with actual path or URL
-            }
-
-
-
-            # Load optimal reference images
-            optimal_references = {}
-            for category, url in category_to_ref_url.items():
-                image = load_image(url)
-                if image is not None:
-                    optimal_references[category] = image
-                else:
-                    logger.warning(f"Failed to load reference image for category: {category}")
-
-            def download_image(url: str, thumbnail_url: Optional[str] = None, logger=None) -> Optional[bytes]:
-                """Download image data from the main URL, falling back to the thumbnail URL if provided."""
-                logger = logger or default_logger
-                
-                # Validate and try main URL first
-                if url and is_valid_url(url):
-                    try:
-                        logger.info(f"Attempting to download image from main URL: {url}")
-                        response = requests.get(url, timeout=10)
-                        response.raise_for_status()  # Raises exception for 4xx/5xx errors
-                        logger.info(f"Successfully downloaded image from main URL: {url}")
-                        return response.content
-                    except requests.RequestException as e:
-                        logger.warning(f"Failed to download from main URL {url}: {e}")
-                
-                # Fallback to thumbnail URL if provided
-                if thumbnail_url and is_valid_url(thumbnail_url):
-                    try:
-                        logger.info(f"Attempting to download image from thumbnail URL: {thumbnail_url}")
-                        response = requests.get(thumbnail_url, timeout=10)
-                        response.raise_for_status()
-                        logger.info(f"Successfully downloaded image from thumbnail URL: {thumbnail_url}")
-                        return response.content
-                    except requests.RequestException as e:
-                        logger.warning(f"Failed to download from thumbnail URL {thumbnail_url}: {e}")
-                
-                logger.error(f"All attempts failed for main URL {url} and thumbnail URL {thumbnail_url}")
-                return None
-
-            # Helper function to validate URLs
-            def is_valid_url(url: str) -> bool:
-                """Check if the URL is valid."""
-                return bool(url and url.startswith("http") and re.match(r'^https?://[^\s/$.?#].[^\s]*$', url))
-
-            def calculate_ssim(image_data: bytes, reference_image: np.ndarray) -> float:
-                """Calculate SSIM between downloaded image and reference image."""
-                try:
-                    img = skio.imread(BytesIO(image_data), as_gray=True)
-                    img_resized = resize(img, reference_image.shape, anti_aliasing=True)
-                    score = ssim(img_resized, reference_image, data_range=img_resized.max() - img_resized.min())
-                    return score
-                except Exception as e:
-                    logger.error(f"Error calculating SSIM: {e}")
-                    return -1
-
-            query = """
-            SELECT 
-                t.ResultID,
-                t.EntryID,
-                t.ImageURL,
-                t.ImageURLThumbnail,  -- Added thumbnail URL
-                r.ProductCategory,
-                ISNULL(CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT), 0) AS match_score
-            FROM 
-                utb_ImageScraperResult t
-            INNER JOIN 
-                utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-            WHERE 
-                r.FileID = ?
-            """
-            df = pd.read_sql_query(query, connection, params=[file_id])
-            df['match_score'] = pd.to_numeric(df['match_score'], errors='coerce').fillna(0)
-
-            # Process each EntryID group
-            grouped = df.groupby('EntryID')
-            for entry_id, group in grouped:
-                group = group.sort_values('match_score', ascending=False)
-                top_score = group['match_score'].iloc[0]
-                top_group = group[group['match_score'] == top_score]
-
-                if len(top_group) > 1:
-                    raw_category = top_group['ProductCategory'].iloc[0]
-                    category = map_category(raw_category)
-                    reference_image = optimal_references.get(category)
-                    if reference_image is None:
-                        logger.warning(f"No reference image for category: {category}")
-                        top_group = top_group.sort_values('ResultID')
-                    else:
-                        ssim_scores = []
-                        for idx, row in top_group.iterrows():
-                            image_url = row['ImageURL']
-                            thumbnail_url = row['ImageURLThumbnail']  # Pass thumbnail URL
-                            image_data = download_image(image_url, thumbnail_url, logger)  # Updated call
-                            ssim_score = -1 if not image_data else calculate_ssim(image_data, reference_image)
-                            ssim_scores.append(ssim_score)
-                        top_group = top_group.assign(ssim_score=ssim_scores).sort_values('ssim_score', ascending=False)
-                
-                remaining_group = group[group['match_score'] < top_score].sort_values('match_score', ascending=False)
-                sorted_group = pd.concat([top_group, remaining_group])
-                sorted_group['new_sort_order'] = range(1, len(sorted_group) + 1)
-
-                for idx, row in sorted_group.iterrows():
-                    cursor.execute(
-                        "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?",
-                        (row['new_sort_order'], row['ResultID'])
-                    )
-
-            connection.commit()
-            logger.info(f"Successfully updated SortOrder for FileID: {file_id}")
-
-    except Exception as e:
-        logger.error(f"Error updating SortOrder for FileID {file_id}: {e}", exc_info=True)
-        if 'connection' in locals():
-            connection.rollback()
-        raise
-    finally:
-        if 'connection' in locals():
-            connection.close()
-
-def get_healthy_endpoint(endpoints: List[str], logger) -> Optional[str]:
-    """Return the first healthy endpoint where Google is reachable."""
     for endpoint in endpoints:
-        logger.debug(f"Checking health of {endpoint}")
-        if check_endpoint_health(endpoint):
+        if check_endpoint_health(endpoint, logger=logger):
             logger.info(f"Selected healthy endpoint: {endpoint}")
             return endpoint
     logger.error("No healthy endpoints found")
     return None
 
-def process_search_row_gcloud(search_string: str, entry_id: int, logger=None):
+def process_search_row_gcloud(search_string: str, entry_id: int, logger: Optional[logging.Logger] = None) -> Optional[pd.DataFrame]:
+    """Process a search row using Google Cloud endpoints with retries."""
     logger = logger or default_logger
-    logger.debug(f"Entering process_search_row_gcloud with search_string={search_string}, entry_id={entry_id}")
-    logger.info(f"🔎 Search started for {search_string}")
-    logger.info(f"📓 Entry ID: {entry_id}")
-    try:
-        if not search_string or len(search_string.strip()) < 3:
-            logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
-            return False
-        fetch_endpoints = [
+    if not search_string or len(search_string.strip()) < 3:
+        logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
+        return pd.DataFrame()
+
+    endpoints = [
             "https://southamerica-west1-image-scraper-451516.cloudfunctions.net/main",
             "https://us-central1-image-scraper-451516.cloudfunctions.net/main",
             "https://us-east1-image-scraper-451516.cloudfunctions.net/main",
@@ -361,307 +191,142 @@ def process_search_row_gcloud(search_string: str, entry_id: int, logger=None):
             "https://europe-west10-image-proxy4.cloudfunctions.net/main",
             "https://asia-northeast2-image-proxy4.cloudfunctions.net/main"
         ]
-        available_endpoints = fetch_endpoints.copy()
-        attempt_count = 0
-        max_attempts = len(fetch_endpoints)
-        while attempt_count < max_attempts:
-            base_endpoint = get_healthy_endpoint(available_endpoints, logger)
-            if not base_endpoint:
-                logger.error("No healthy endpoints available after exhausting all options")
-                return False
-            fetch_endpoint = f"{base_endpoint}/fetch"
-            search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_string)}&tbm=isch"
-            logger.info(f"Fetching URL via proxy: {search_url} using {fetch_endpoint}")
-            session = requests.Session()
-            retry_strategy = Retry(
-                total=5,
-                status_forcelist=[500, 502, 503, 504],
-                allowed_methods=["POST"],
-                backoff_factor=1,
-                raise_on_status=False
-            )
-            adapter = HTTPAdapter(max_retries=retry_strategy)
-            session.mount("https://", adapter)
-            try:
-                response = session.post(fetch_endpoint, json={"url": search_url}, timeout=30)
-                status_code = response.status_code
-                logger.debug(f"Fetch response status: {status_code} from {fetch_endpoint}")
-                if status_code in [500, 502, 503, 504]:
-                    logger.warning(f"Fetch failed with status {status_code} from {fetch_endpoint}")
-                    attempt_count += 1
-                    available_endpoints.remove(base_endpoint)
-                    continue
-                elif status_code != 200 or not response.json().get("result"):
-                    logger.warning(f"Fetch failed with status {status_code} or no result from {fetch_endpoint}")
-                    return False
-                break
-            except Timeout:
-                logger.error(f"Fetch timed out after 30s from {fetch_endpoint}")
-                attempt_count += 1
-                available_endpoints.remove(base_endpoint)
-                continue
-            except ConnectionError as e:
-                logger.error(f"Connection error: {e} from {fetch_endpoint}")
-                attempt_count += 1
-                available_endpoints.remove(base_endpoint)
-                continue
-            except RequestException as e:
-                logger.error(f"Request error: {e} from {fetch_endpoint}")
-                attempt_count += 1
-                available_endpoints.remove(base_endpoint)
-                continue
+    session = requests.Session()
+    retry_strategy = Retry(total=5, status_forcelist=[500, 502, 503, 504], backoff_factor=1)
+    session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+
+    for attempt, endpoint in enumerate(endpoints, 1):
+        fetch_endpoint = f"{endpoint}/fetch"
+        search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_string)}&tbm=isch"
         try:
-            response_json = response.json()
-            result = response_json.get("result", None)
-        except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON response from {fetch_endpoint}")
-            return False
-        if not result:
-            logger.warning(f"No 'result' in response from {fetch_endpoint}")
-            return False
-        results_html_bytes = result if isinstance(result, bytes) else result.encode('utf-8')
-        df = process_search_result(
-            results_html_bytes,
-            results_html_bytes,
-            entry_id,
-            search_url,
-            engine,
-            conn_str,
-            fetch_endpoint,
-            logger
-        )
-        if df.empty:
-            logger.warning(f"No valid parsed data for {search_url}")
-            return False
-        logger.info(f"Processed EntryID {entry_id} with {len(df)} images using {fetch_endpoint}")
-        return df
-    except Exception as e:
-        logger.error(f"Error processing search row: {e}")
-        return False
+            logger.info(f"Attempt {attempt}: Fetching {search_url} via {fetch_endpoint}")
+            response = session.post(fetch_endpoint, json={"url": search_url}, timeout=30)
+            response.raise_for_status()
+            result = response.json().get("result")
+            if not result:
+                continue
+            results_html_bytes = result if isinstance(result, bytes) else result.encode("utf-8")
+            df = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
+            if not df.empty:
+                logger.info(f"Processed EntryID {entry_id} with {len(df)} images")
+                return df
+        except RequestException as e:
+            logger.warning(f"Attempt {attempt} failed for {fetch_endpoint}: {e}")
+            continue
+    logger.error(f"All attempts failed for EntryID {entry_id}")
+    return pd.DataFrame()
 
+def process_search_row(search_string: str, endpoint: str, entry_id: int, logger: Optional[logging.Logger] = None) -> Optional[pd.DataFrame]:
+    """Process a search row with fallback to Google Cloud."""
+    logger = logger or default_logger
+    if not search_string or not endpoint:
+        logger.warning(f"Invalid input for EntryID {entry_id}: search_string={search_string}, endpoint={endpoint}")
+        return process_search_row_gcloud(search_string, entry_id, logger)
 
-
-def process_search_row(search_string, endpoint, entry_id, logger=None):
-    logger = logger or logging.getLogger(__name__)
-    logger.debug(f"Entering process_search_row with search_string={search_string}, endpoint={endpoint}, entry_id={entry_id}")
-
-    # Input validation
-    if not search_string or len(search_string.strip()) < 1:
-        logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
-        return False
-    if not endpoint:
-        logger.warning(f"Invalid endpoint for EntryID {entry_id}")
-        return False
+    session = requests.Session()
+    retry_strategy = Retry(total=3, status_forcelist=[500, 502, 503, 504], backoff_factor=1)
+    session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
 
     try:
         search_url = f"{endpoint}?query={urllib.parse.quote(search_string)}"
-        logger.info(f"Searching URL: {search_url}")
-
-        # Configure retries and timeouts for HTTP requests
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=3,  # Retry up to 3 times
-            status_forcelist=[500, 502, 503, 504],  # Retry on server-side errors
-            allowed_methods=["GET"],
-            backoff_factor=1  # Wait 1s, 2s, 4s between retries
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-
-        # Make the request with a timeout
+        logger.info(f"Searching {search_url}")
         response = session.get(search_url, timeout=60)
-        
-        if response.status_code != 200:
-            logger.warning(f"Non-200 status {response.status_code} for {search_url}")
-            remove_endpoint(endpoint, logger=logger)
-            return process_search_row_gcloud(search_string, entry_id, logger=logger)
-
-        # Parse JSON response
-        try:
-            response_json = response.json()
-            result = response_json.get('body', None)
-        except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON response for {search_url}")
-            remove_endpoint(endpoint, logger=logger)
-            return process_search_row_gcloud(search_string, entry_id, logger=logger)
-
-        # Check response content
+        response.raise_for_status()
+        result = response.json().get("body")
         if not result:
             logger.warning(f"No body in response for {search_url}")
-            remove_endpoint(endpoint, logger=logger)
-            return process_search_row_gcloud(search_string, entry_id, logger=logger)
+            return process_search_row_gcloud(search_string, entry_id, logger)
 
-        # Unpack content
-        unpacked_html = unpack_content(result, logger=logger)
+        unpacked_html = unpack_content(result, logger)
         if not unpacked_html or len(unpacked_html) < 100:
-            logger.warning(f"Invalid unpacked HTML for {search_url}")
-            remove_endpoint(endpoint, logger=logger)
-            return process_search_row_gcloud(search_string, entry_id, logger=logger)
+            logger.warning(f"Invalid HTML for {search_url}")
+            return process_search_row_gcloud(search_string, entry_id, logger)
 
-        results_html_bytes = unpacked_html
-        df = process_search_result(
-            unpacked_html,
-            results_html_bytes,
-            entry_id,
-            search_url,
-            engine,  # Assume engine is defined elsewhere
-            conn_str,  # Assume conn_str is defined elsewhere
-            endpoint,
-            logger
-        )
-
+        df = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
         if df.empty:
-            logger.warning(f"No valid parsed data for {search_url}")
-            remove_endpoint(endpoint, logger=logger)
-            return process_search_row_gcloud(search_string, entry_id, logger=logger)
+            logger.warning(f"No valid data for {search_url}")
+            return process_search_row_gcloud(search_string, entry_id, logger)
 
         logger.info(f"Processed EntryID {entry_id} with {len(df)} images")
         return df
-
-    except requests.RequestException as e:
+    except RequestException as e:
         logger.error(f"Request error for {search_url}: {e}")
-        remove_endpoint(endpoint, logger=logger)
-        return process_search_row_gcloud(search_string, entry_id, logger=logger)
-    except Exception as e:
-        logger.error(f"Unexpected error processing search row for EntryID {entry_id}: {e}", exc_info=True)
-        remove_endpoint(endpoint, logger=logger)
-        return process_search_row_gcloud(search_string, entry_id, logger=logger)
+        return process_search_row_gcloud(search_string, entry_id, logger)
     
-import pyodbc
-import pandas as pd
-import logging
+def update_sort_order_based_on_match_score(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
 
-def fetch_images_by_file_id(file_id, logger=None):
-    logger = logger or logging.getLogger(__name__)
-    query = """
-        SELECT rr.ResultID, rr.EntryID, rr.ImageURL, 
-               r.ProductBrand, r.ProductCategory, r.ProductColor,
-               rr.aijson
-        FROM utb_ImageScraperRecords r
-        INNER JOIN utb_ImageScraperResult rr ON r.EntryID = rr.EntryID
-        WHERE r.FileID = ?
-    """
-    try:
-        with pyodbc.connect(conn_str) as conn:  # Assume conn_str is defined
-            df = pd.read_sql(query, conn, params=[file_id])
-            logger.info(f"Fetched {len(df)} images for FileID {file_id}")
-            return df
-    except pyodbc.Error as e:
-        logger.error(f"Database error fetching images for FileID {file_id}: {e}")
-        return pd.DataFrame()  # Return empty DataFrame as fallback
-    except Exception as e:
-        logger.error(f"Unexpected error fetching images for FileID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame()
-
-import pyodbc
-import pandas as pd
-import logging
-
-def fetch_missing_images(file_id=None, limit=8, ai_analysis_only=True, exclude_excel_row_ids=[1], logger=None):
-    logger = logger or logging.getLogger(__name__)
-
-    # Input validation
-    if limit is None or not isinstance(limit, int) or limit < 1:
-        limit = 20000
-    if not isinstance(exclude_excel_row_ids, list):
-        logger.warning("exclude_excel_row_ids must be a list; defaulting to [1]")
-        exclude_excel_row_ids = [1]
-
-    logger.info(f"Fetching missing images with file_id={file_id}, limit={limit}, exclude_excel_row_ids={exclude_excel_row_ids}")
-
-    try:
-        connection = pyodbc.connect(conn_str)  # Assume conn_str is defined
-        query_params = []
-        exclude_condition = ""
-        if exclude_excel_row_ids:
-            placeholders = ",".join("?" * len(exclude_excel_row_ids))
-            exclude_condition = f"AND r.ExcelRowID NOT IN ({placeholders})"
-
-        if ai_analysis_only:
-            query = f"""
-                SELECT MIN(t.ResultID) AS ResultID, t.EntryID, t.ImageURL, t.ImageURLThumbnail,
-                    r.ProductBrand, r.ProductCategory, r.ProductColor
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE (
-                    t.ImageURL IS NOT NULL 
-                    AND t.ImageURL <> ''
-                    AND (
-                        ISJSON(t.aijson) = 0 
-                        OR t.aijson IS NULL
-                        OR JSON_VALUE(t.aijson, '$.similarity_score') IS NULL
-                        OR JSON_VALUE(t.aijson, '$.similarity_score') IN ('NaN', 'null', 'undefined')
-                        OR JSON_VALUE(t.aijson, '$.match_score') IS NULL
-                        OR JSON_VALUE(t.aijson, '$.match_score') IN ('NaN', 'null', 'undefined')
-                    )
-                )
-                AND (r.FileID = ? OR ? IS NULL)
-                {exclude_condition}
-                GROUP BY t.EntryID, t.ImageURL, t.ImageURLThumbnail, r.ProductBrand, r.ProductCategory, r.ProductColor
-            """
-            query_params = [file_id, file_id] + exclude_excel_row_ids
-        else:
-            query = f"""
-                SELECT 
-                    NULL as ResultID,
-                    r.EntryID,
-                    NULL as ImageURL,
-                    NULL as ImageURLThumbnail,
-                    r.ProductBrand,
-                    r.ProductCategory,
-                    r.ProductColor
-                FROM utb_ImageScraperRecords r
-                LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
-                WHERE t.EntryID IS NULL
-                AND (r.FileID = ? OR ? IS NULL)
-                {exclude_condition}
-                UNION ALL
-                SELECT 
-                    t.ResultID,
-                    t.EntryID,
-                    t.ImageURL,
-                    t.ImageURLThumbnail,
-                    r.ProductBrand,
-                    r.ProductCategory,
-                    r.ProductColor
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE (t.ImageURL IS NULL OR t.ImageURL = '')
-                AND (r.FileID = ? OR ? IS NULL)
-                {exclude_condition}
-            """
-            query_params = [file_id, file_id, file_id, file_id] + exclude_excel_row_ids * 2
-
-        df = pd.read_sql(query, connection, params=query_params)
-        logger.info(f"Fetched {len(df)} missing images")
-        return df
-
-    except pyodbc.Error as e:
-        logger.error(f"Database error fetching missing images: {e}")
-        return pd.DataFrame()  # Return empty DataFrame as fallback
-    except Exception as e:
-        logger.error(f"Unexpected error fetching missing images: {e}", exc_info=True)
-        return pd.DataFrame()
-    finally:
-        if 'connection' in locals():
-            connection.close()
-
-def update_initial_sort_order(file_id, logger=None):
     logger = logger or default_logger
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str) as connection:
-            connection.timeout = 300
-            cursor = connection.cursor()
-            logger.info(f"🔄 Setting initial SortOrder for FileID: {file_id}")
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            logger.info(f"🔄 Updating SortOrder for FileID: {file_id}")
+
+            # Fetch data from the database, including existing SortOrder
+            query = """
+                SELECT t.ResultID, t.EntryID,
+                       ISNULL(CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT), 0) AS match_score,
+                       ISNULL(CAST(JSON_VALUE(t.aijson, '$.ssim_score') AS FLOAT), -1) AS ssim_score,
+                       ISNULL(t.SortOrder, 0) AS SortOrder
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+            """
+            df = pd.read_sql_query(query, conn, params=[file_id])
+            df["match_score"] = pd.to_numeric(df["match_score"], errors="coerce").fillna(0)
+            df["ssim_score"] = pd.to_numeric(df["ssim_score"], errors="coerce").fillna(-1)
+            df["SortOrder"] = pd.to_numeric(df["SortOrder"], errors="coerce").fillna(0)
+
+            # Process each EntryID group
+            for entry_id, group in df.groupby("EntryID"):
+                # Filter out rows with SortOrder -1 or -2
+                sortable_group = group[~group["SortOrder"].isin([-1, -2])]
+                
+                if not sortable_group.empty:
+                    # Sort by match_score descending, then ssim_score descending
+                    sorted_group = sortable_group.sort_values(by=["match_score", "ssim_score"], ascending=[False, False])
+                    sorted_group["new_sort_order"] = range(1, len(sorted_group) + 1)
+                    
+                    # Update the database with new sort order for sorted rows only
+                    for _, row in sorted_group.iterrows():
+                        cursor.execute(
+                            "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?",
+                            (row["new_sort_order"], row["ResultID"])
+                        )
+                else:
+                    logger.info(f"No sortable images for EntryID: {entry_id}")
+
+            conn.commit()
+            logger.info(f"Successfully updated SortOrder for FileID: {file_id}")
+            
+            # Return only the updated sort order details for sorted images
+            return [{"ResultID": r[0], "EntryID": r[1], "SortOrder": r[2]} for r in cursor.execute(
+                """
+                SELECT ResultID, EntryID, SortOrder 
+                FROM utb_ImageScraperResult 
+                WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) 
+                AND SortOrder NOT IN (-1, -2)
+                """, (file_id,)
+            ).fetchall()]
+    
+    except Exception as e:
+        logger.error(f"Error updating SortOrder for FileID {file_id}: {e}", exc_info=True)
+        return None
+    
+def update_initial_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+    """Set initial sort order for results."""
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
             cursor.execute("BEGIN TRANSACTION")
             cursor.execute("UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE FileID = ?", (file_id,))
-            reset_step1_count = cursor.rowcount
-            logger.info(f"Reset Step1 for {reset_step1_count} rows in utb_ImageScraperRecords")
-            cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)", (file_id,))
-            reset_sort_count = cursor.rowcount
-            logger.info(f"Reset SortOrder for {reset_sort_count} rows in utb_ImageScraperResult")
-            deduplicate_query = """
+            cursor.execute(
+                "UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)",
+                (file_id,)
+            )
+            cursor.execute("""
                 WITH duplicates AS (
                     SELECT ResultID, EntryID,
                            ROW_NUMBER() OVER (PARTITION BY EntryID ORDER BY ResultID) AS row_num
@@ -671,12 +336,9 @@ def update_initial_sort_order(file_id, logger=None):
                 UPDATE utb_ImageScraperResult
                 SET SortOrder = CASE WHEN d.row_num > 1 THEN -1 ELSE NULL END
                 FROM utb_ImageScraperResult r
-                INNER JOIN duplicates d ON r.ResultID = d.ResultID AND r.EntryID = d.EntryID;
-            """
-            cursor.execute(deduplicate_query, (file_id,))
-            dedup_count = cursor.rowcount
-            logger.info(f"Marked {dedup_count} rows as duplicates with SortOrder = -1")
-            initial_sort_query = """
+                INNER JOIN duplicates d ON r.ResultID = d.ResultID AND r.EntryID = d.EntryID
+            """, (file_id,))
+            cursor.execute("""
                 WITH toupdate AS (
                     SELECT t.*, 
                            ROW_NUMBER() OVER (PARTITION BY t.EntryID ORDER BY t.ResultID) AS seqnum
@@ -685,63 +347,40 @@ def update_initial_sort_order(file_id, logger=None):
                     WHERE r.FileID = ? AND t.SortOrder IS NULL
                 ) 
                 UPDATE toupdate 
-                SET SortOrder = seqnum;
-            """
-            cursor.execute(initial_sort_query, (file_id,))
-            update_count = cursor.rowcount
-            logger.info(f"Set initial SortOrder for {update_count} unique rows")
+                SET SortOrder = seqnum
+            """, (file_id,))
             cursor.execute("COMMIT")
-            verify_query = """
-                SELECT t.ResultID, t.EntryID, t.SortOrder
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = ?
-                ORDER BY t.EntryID, t.SortOrder
-            """
-            cursor.execute(verify_query, (file_id,))
-            results = cursor.fetchall()
-            for record in results:
-                logger.info(f"Initial - EntryID: {record[1]}, ResultID: {record[0]}, SortOrder: {record[2]}")
-            count_query = "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)"
-            cursor.execute(count_query, (file_id,))
-            total_results = cursor.fetchone()[0]
-            unique_count_query = """
-                SELECT COUNT(*) 
-                FROM utb_ImageScraperResult 
-                WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) 
-                AND SortOrder > 0
-            """
-            cursor.execute(unique_count_query, (file_id,))
-            unique_results = cursor.fetchone()[0]
-            logger.info(f"Total results: {total_results}, Unique results: {unique_results}")
-            if unique_results < 16:
-                logger.warning(f"Expected at least 16 unique results (8 per search type), got {unique_results}")
-            return [{"ResultID": row[0], "EntryID": row[1], "SortOrder": row[2]} for row in results]
-    except Exception as e:
-        logger.error(f"Error setting initial SortOrder: {e}")
-        if 'cursor' in locals():
+            results = cursor.execute(
+                "SELECT ResultID, EntryID, SortOrder FROM utb_ImageScraperResult WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) ORDER BY EntryID, SortOrder",
+                (file_id,)
+            ).fetchall()
+            logger.info(f"Set initial SortOrder for FileID: {file_id}")
+            return [{"ResultID": r[0], "EntryID": r[1], "SortOrder": r[2]} for r in results]
+    except pyodbc.Error as e:
+        logger.error(f"Database error setting initial SortOrder: {e}", exc_info=True)
+        if "cursor" in locals():
             cursor.execute("ROLLBACK")
         return None
     finally:
-        if 'cursor' in locals():
-            cursor.close()
-        if 'connection' in locals():
-            connection.close()
+        if 'conn' in locals():
+            conn.close()
 
-def update_search_sort_order(file_id, logger=None):
+# ... (other imports and functions remain unchanged)
+
+def update_search_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+    """Set search-based sort order."""
     logger = logger or default_logger
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str) as connection:
-            connection.timeout = 300
-            cursor = connection.cursor()
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
             logger.info(f"🔄 Setting Search SortOrder for FileID: {file_id}")
             fetch_query = """
                 SELECT 
                     t.ResultID, 
                     t.EntryID, 
                     t.ImageDesc, 
-                    t.ImageURL, 
+                    t.ImageUrl, 
                     t.ImageSource, 
                     r.ProductBrand, 
                     r.ProductModel
@@ -749,22 +388,33 @@ def update_search_sort_order(file_id, logger=None):
                 INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                 WHERE r.FileID = ?
             """
-            df = pd.read_sql(fetch_query, connection, params=[file_id])
+            df = pd.read_sql(fetch_query, conn, params=[file_id])
+
             def clean_string(text):
+                """Clean text by removing delimiters including '&' and converting to uppercase."""
                 if pd.isna(text):
                     return ''
-                delimiters = r'[- _.,;:/]'
-                return re.sub(delimiters, '', str(text).upper())
-            df['ImageDesc_clean'] = df['ImageDesc'].apply(clean_string)
-            df['ImageSource_clean'] = df['ImageSource'].apply(clean_string)
-            df['ImageUrl_clean'] = df['ImageURL'].apply(clean_string)
-            df['ProductBrand_clean'] = df['ProductBrand'].apply(clean_string)
-            df['ProductModel_clean'] = df['ProductModel'].apply(clean_string)
+                return re.sub(r'[- _.,;:/&]', '', str(text).upper())
+
+            brand_aliases = {"Scotch & Soda": ["Scotch and Soda", "Scotch Soda"], "Adidas": ["Adidas AG", "Adidas Originals"]}
+            clean_brand_aliases = {
+                clean_string(brand): [clean_string(brand)] + [clean_string(alias) for alias in aliases]
+                for brand, aliases in brand_aliases.items()
+            }
+
+            for col in ["ImageDesc", "ImageSource", "ImageUrl", "ProductBrand", "ProductModel"]:
+                df[f"{col}_clean"] = df[col].apply(clean_string)
+
+            df['brand_aliases_clean'] = df['ProductBrand_clean'].apply(
+                lambda x: clean_brand_aliases.get(x, [x])
+            )
+
             def calculate_priority(row):
-                brand_match = (
-                    (row['ProductBrand_clean'] in row['ImageDesc_clean'] if row['ProductBrand_clean'] else False) or
-                    (row['ProductBrand_clean'] in row['ImageSource_clean'] if row['ProductBrand_clean'] else False) or
-                    (row['ProductBrand_clean'] in row['ImageUrl_clean'] if row['ProductBrand_clean'] else False)
+                brand_match = any(
+                    alias in row['ImageDesc_clean'] or
+                    alias in row['ImageSource_clean'] or
+                    alias in row['ImageUrl_clean']
+                    for alias in row['brand_aliases_clean']
                 )
                 model_match = (
                     (row['ProductModel_clean'] in row['ImageDesc_clean'] if row['ProductModel_clean'] else False) or
@@ -777,18 +427,27 @@ def update_search_sort_order(file_id, logger=None):
                     return 2
                 elif brand_match and pd.notna(row['ProductBrand']):
                     return 3
-                else:
-                    return 4
+                return 4  # Reverted to 4 for no matches
+
             df['priority'] = df.apply(calculate_priority, axis=1)
-            df['new_sort_order'] = df.apply(lambda row: -2 if row['priority'] == 4 else None, axis=1)
-            df.loc[df['priority'] != 4, 'new_sort_order'] = df[df['priority'] != 4].groupby('EntryID').cumcount() + 1
+
+            # Sort by priority ascending, but assign SortOrder so lower priority gets higher numbers
+            df = df.sort_values(by=['EntryID', 'priority', 'ResultID'], ascending=[True, True, True])
+            df['new_sort_order'] = df.groupby('EntryID').cumcount() + 1
+
+            # Directly set SortOrder = -2 for non-matching rows (priority 4)
+            df['new_sort_order'] = df.apply(lambda row: -2 if row['priority'] == 4 else row['new_sort_order'], axis=1)
+
             cursor.execute("BEGIN TRANSACTION")
             update_query = "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?"
-            updates = df[['ResultID', 'new_sort_order']].dropna()
+            updates = df[['ResultID', 'new_sort_order']]
+
             for _, row in updates.iterrows():
-                cursor.execute(update_query, (int(row['new_sort_order']), row['ResultID']))
+                cursor.execute(update_query, (int(row['new_sort_order']), int(row['ResultID'])))
+
             update_count = len(updates)
             logger.info(f"Set Search SortOrder for {update_count} rows")
+
             verify_query = """
                 SELECT TOP 20 t.ResultID, t.EntryID, t.ImageDesc, t.SortOrder, r.ProductBrand, r.ProductModel
                 FROM utb_ImageScraperResult t
@@ -801,34 +460,155 @@ def update_search_sort_order(file_id, logger=None):
             for record in results:
                 logger.info(f"Search - EntryID: {record[1]}, ResultID: {record[0]}, ImageDesc: {record[2]}, SortOrder: {record[3]}")
             cursor.execute("COMMIT")
+
             return [{"ResultID": row[0], "EntryID": row[1], "ImageDesc": row[2], "SortOrder": row[3], "ProductBrand": row[4], "ProductModel": row[5]} for row in results]
     except Exception as e:
-        logger.error(f"Error setting Search SortOrder: {e}")
+        logger.error(f"Error setting Search SortOrder for FileID {file_id}: {e}", exc_info=True)
         if 'cursor' in locals():
             cursor.execute("ROLLBACK")
         return None
     finally:
-        if 'cursor' in locals():
-            cursor.close()
-        if 'connection' in locals():
-            connection.close()
+        if 'conn' in locals():
+            conn.close()
 
-def update_file_location_complete(file_id, file_location, logger=None):
+def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger=None) -> pd.DataFrame:
+    """
+    Fetch images needing AI analysis for a given file_id, excluding negative SortOrder values.
+
+    Args:
+        file_id (str): Identifier for the file.
+        limit (int): Maximum number of images to fetch (default: 1000).
+        ai_analysis_only (bool): If True, fetch images needing AI analysis; if False, fetch records missing ImageUrl.
+        logger (Optional[logging.Logger]): Logger instance for logging messages.
+
+    Returns:
+        pd.DataFrame: DataFrame with image data to process.
+    """
     logger = logger or default_logger
-    file_id = int(file_id)
     try:
-        with pyodbc.connect(conn_str) as connection:
-            cursor = connection.cursor()
-            cursor.execute("BEGIN TRANSACTION")
-            cursor.execute("UPDATE utb_ImageScraperFiles SET FileLocationURLComplete = ? WHERE ID = ?", (file_location, file_id))
-            cursor.execute("COMMIT")
-            logger.info(f"Updated file location URL for FileID: {file_id}")
-    except Exception as e:
-        logger.error(f"Error updating file location URL: {e}")
-        if 'cursor' in locals():
-            cursor.execute("ROLLBACK")
-        raise
+        with pyodbc.connect(conn_str) as conn:
+            if ai_analysis_only:
+                # Fetch images needing AI analysis with positive SortOrder only
+                query = """
+                    SELECT t.ResultID, t.EntryID, t.ImageUrl, t.ImageUrlThumbnail,
+                           r.ProductBrand, r.ProductCategory, r.ProductColor
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                    WHERE r.FileID = ?
+                    AND (t.AiJson IS NULL OR t.AiJson = '' OR ISJSON(t.AiJson) = 0)
+                    AND t.ImageUrl IS NOT NULL AND t.ImageUrl <> ''
+                    AND t.SortOrder > 0  -- Only fetch positive SortOrder values
+                    ORDER BY t.ResultID
+                    OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
+                """
+                params = (file_id, limit)
+            else:
+                # Fetch records missing ImageUrl (unchanged for non-AI case)
+                query = """
+                    SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
+                           t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
+                    FROM utb_ImageScraperRecords r
+                    LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+                    WHERE r.FileID = ?
+                    AND (t.ImageUrl IS NULL OR t.ImageUrl = '')
+                    ORDER BY r.EntryID
+                    OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
+                """
+                params = (file_id, limit)
 
+            df = pd.read_sql(query, conn, params=params)
+            logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
+            return df
+    except pyodbc.Error as e:
+        logger.error(f"Database error fetching missing images for FileID {file_id}: {e}", exc_info=True)
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Unexpected error fetching missing images for FileID {file_id}: {e}", exc_info=True)
+        return pd.DataFrame()
+
+def get_endpoint(logger: Optional[logging.Logger] = None) -> str:
+    """Get a random unblocked endpoint from the database."""
+    logger = logger or default_logger
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT TOP 1 EndpointURL FROM utb_Endpoints WHERE EndpointIsBlocked = 0 ORDER BY NEWID()")
+            result = cursor.fetchone()
+            endpoint = result[0] if result else "No EndpointURL"
+            logger.info(f"Retrieved endpoint: {endpoint}")
+            return endpoint
+    except pyodbc.Error as e:
+        logger.error(f"Database error getting endpoint: {e}")
+        return "No EndpointURL"
+
+def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None) -> None:
+    """Mark an endpoint as blocked in the database."""
+    logger = logger or default_logger
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE utb_Endpoints SET EndpointIsBlocked = 1 WHERE EndpointURL = ?", (endpoint,))
+            conn.commit()
+            logger.info(f"Marked endpoint as blocked: {endpoint}")
+    except pyodbc.Error as e:
+        logger.error(f"Error marking endpoint as blocked: {e}")
+
+
+def unpack_content(encoded_content, logger=None):
+    logger = logger or default_logger
+    try:
+        if encoded_content:
+            compressed_content = base64.b64decode(encoded_content)
+            original_content = zlib.decompress(compressed_content)
+            return original_content
+        return None
+    except Exception as e:
+        logger.error(f"Error unpacking content: {e}")
+        return None
+import pyodbc
+import pandas as pd
+from config import conn_str
+import logging
+
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+
+def get_images_excel_db(file_id, logger=None):
+    logger = logger or default_logger
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            query = """
+                SELECT s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail
+                FROM utb_ImageScraperFiles f
+                INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
+                INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID
+                WHERE f.ID = ?
+                ORDER BY s.ExcelRowID
+            """
+            df = pd.read_sql(query, conn, params=(file_id,))
+            logger.info(f"Fetched {len(df)} images for Excel export for FileID {file_id}")
+            return df
+    except pyodbc.Error as e:
+        logger.error(f"Error in get_images_excel_db: {e}")
+        return pd.DataFrame()
+# In database.py
+def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
+    """Retrieve the email address associated with a file ID."""
+    logger = logger or logging.getLogger(__name__)
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            query = "SELECT UserEmail FROM utb_ImageScraperFiles WHERE ID = ?"
+            cursor.execute(query, (file_id,))
+            result = cursor.fetchone()
+            if result and result[0]:
+                return result[0]
+            logger.warning(f"No email found for FileID {file_id}")
+            return "nik@accessx.com"
+    except Exception as e:
+        logger.error(f"Error fetching email for FileID {file_id}: {e}")
+        return "nik@accessx.com"
 def update_file_generate_complete(file_id, logger=None):
     logger = logger or default_logger
     try:
@@ -837,92 +617,78 @@ def update_file_generate_complete(file_id, logger=None):
             query = "UPDATE utb_ImageScraperFiles SET CreateFileCompleteTime = GETDATE() WHERE ID = ?"
             cursor.execute(query, (file_id,))
             conn.commit()
-            logger.info(f"Marked file generation as complete for FileID: {file_id}")
-    except Exception as e:
-        logger.error(f"Error updating file generation completion time: {e}")
-        raise
-
-def get_send_to_email(file_id, logger=None):
-    logger = logger or default_logger
-    try:
-        with pyodbc.connect(conn_str, timeout=60) as conn:
-            cursor = conn.cursor()
-            query = "SELECT UserEmail FROM utb_ImageScraperFiles WHERE ID = ?"
-            cursor.execute(query, (file_id,))
-            send_to_email = cursor.fetchone()
-            if send_to_email:
-                logger.info(f"Got email address for FileID: {file_id}: {send_to_email[0]}")
-                return send_to_email[0]
-            logger.warning(f"No email address found for FileID: {file_id}")
-            return "No Email Found"
-    except Exception as e:
-        logger.error(f"Error getting email address: {e}")
-        return "nik@iconluxurygroup.com"
-
-def get_images_excel_db(file_id, logger=None):
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with pyodbc.connect(conn_str) as connection:
-            cursor = connection.cursor()
-            cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?", (file_id,))
-            connection.commit()
-            query = """
-                SELECT s.ExcelRowID AS ExcelRowID, 
-                        r.ImageURL AS ImageURL, 
-                        r.ImageURLThumbnail AS ImageURLThumbnail 
-                    FROM utb_ImageScraperFiles f
-                    INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
-                    INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
-                    WHERE f.ID = ? AND r.SortOrder = 1
-                    ORDER BY s.ExcelRowID
-            """
-            df = pd.read_sql_query(query, connection, params=[file_id])
-            logger.info(f"Queried FileID: {file_id}, retrieved {len(df)} images for Excel export")
-        return df
-    except Exception as e:
-        logger.error(f"Error getting images for Excel export: {e}")
-        return pd.DataFrame()
-
-def get_lm_products(file_id, logger=None):
+            logger.info(f"Marked file generation complete for FileID: {file_id}")
+    except pyodbc.Error as e:
+        logger.error(f"Error in update_file_generate_complete: {e}")
+def update_file_location_complete(file_id, file_location, logger=None):
     logger = logger or default_logger
     try:
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
-            query = f"EXEC usp_ImageScrapergetMatchFromRetail {file_id}"
-            cursor.execute(query)
+            query = "UPDATE utb_ImageScraperFiles SET FileLocationURLComplete = ? WHERE ID = ?"
+            cursor.execute(query, (file_location, file_id))
             conn.commit()
-            logger.info(f"Executed stored procedure to match products for FileID: {file_id}")
-    except Exception as e:
-        logger.error(f"Error executing stored procedure to match products: {e}")
-
-def get_endpoint(logger=None):
+            logger.info(f"Updated file location for FileID: {file_id}")
+    except pyodbc.Error as e:
+        logger.error(f"Error in update_file_location_complete: {e}")
+# Test Wrapper Functions
+def call_fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger=None) -> Dict[str, Any]:
+    """Test wrapper for fetch_missing_images."""
     logger = logger or default_logger
     try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            sql_query = "SELECT TOP 1 EndpointURL FROM utb_Endpoints WHERE EndpointIsBlocked = 0 ORDER BY NEWID()"
-            cursor.execute(sql_query)
-            endpoint_url = cursor.fetchone()
-            if endpoint_url:
-                endpoint = endpoint_url[0]
-                logger.info(f"Got endpoint URL: {endpoint}")
-                return endpoint
-            else:
-                logger.warning("No endpoint URL found")
-                return "No EndpointURL"
+        logger.info(f"Testing fetch_missing_images with FileID: {file_id}, limit: {limit}, ai_analysis_only: {ai_analysis_only}")
+        result = fetch_missing_images(file_id, limit, ai_analysis_only, logger)
+        if result.empty:
+            logger.info("No missing images found")
+            return {"success": True, "output": [], "message": "No missing images found"}
+        return {"success": True, "output": result.to_dict(orient='records'), "message": "Fetched missing images successfully"}
     except Exception as e:
-        logger.error(f"Error getting endpoint URL: {e}")
-        return "No EndpointURL"
+        logger.error(f"Test failed for fetch_missing_images: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "message": "Failed to fetch missing images"}
 
-def remove_endpoint(endpoint, logger=None):
+def call_get_images_excel_db(file_id: str, logger=None) -> Dict[str, Any]:
+    """Test wrapper for get_images_excel_db."""
     logger = logger or default_logger
     try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            sql_query = f"UPDATE utb_Endpoints SET EndpointIsBlocked = 1 WHERE EndpointURL = ?"
-            cursor.execute(sql_query, (endpoint,))
-            conn.commit()
-            logger.info(f"Marked endpoint as blocked: {endpoint}")
+        logger.info(f"Testing get_images_excel_db with FileID: {file_id}")
+        result = get_images_excel_db(file_id, logger)
+        if result.empty:
+            logger.info("No images found for Excel export")
+            return {"success": True, "output": [], "message": "No images found for Excel export"}
+        return {"success": True, "output": result.to_dict(orient='records'), "message": "Fetched Excel images successfully"}
     except Exception as e:
-        logger.error(f"Error marking endpoint as blocked: {e}")
+        logger.error(f"Test failed for get_images_excel_db: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "message": "Failed to fetch Excel images"}
+
+def call_get_send_to_email(file_id: int, logger=None) -> Dict[str, Any]:
+    """Test wrapper for get_send_to_email."""
+    logger = logger or default_logger
+    try:
+        logger.info(f"Testing get_send_to_email with FileID: {file_id}")
+        result = get_send_to_email(file_id, logger)
+        return {"success": True, "output": result, "message": "Retrieved email successfully"}
+    except Exception as e:
+        logger.error(f"Test failed for get_send_to_email: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "message": "Failed to retrieve email"}
+
+def call_update_file_generate_complete(file_id: str, logger=None) -> Dict[str, Any]:
+    """Test wrapper for update_file_generate_complete."""
+    logger = logger or default_logger
+    try:
+        logger.info(f"Testing update_file_generate_complete with FileID: {file_id}")
+        update_file_generate_complete(file_id, logger)
+        return {"success": True, "output": None, "message": "Updated file generate complete successfully"}
+    except Exception as e:
+        logger.error(f"Test failed for update_file_generate_complete: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "message": "Failed to update file generate complete"}
+
+async def call_update_file_location_complete(file_id: str, file_location: str, logger=None) -> Dict[str, Any]:
+    """Test wrapper for update_file_location_complete."""
+    logger = logger or default_logger
+    try:
+        logger.info(f"Testing update_file_location_complete with FileID: {file_id}, file_location: {file_location}")
+        update_file_location_complete(file_id, file_location, logger)
+        return {"success": True, "output": None, "message": "Updated file location successfully"}
+    except Exception as e:
+        logger.error(f"Test failed for update_file_location_complete: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "message": "Failed to update file location"}

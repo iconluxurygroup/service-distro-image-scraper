@@ -21,3 +21,4 @@ aiolimiter
 aiofiles
 ray[default]
 scikit-image
+olefile 
