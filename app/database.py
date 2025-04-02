@@ -215,54 +215,85 @@ def process_search_row_gcloud(search_string: str, entry_id: int, logger: Optiona
             continue
     logger.error(f"All attempts failed for EntryID {entry_id}")
     return pd.DataFrame()
-
-def process_search_row(search_string: str, endpoint: str, entry_id: int, logger: Optional[logging.Logger] = None) -> Optional[pd.DataFrame]:
-    """Process a search row with fallback to Google Cloud."""
-    logger = logger or default_logger
+import re
+import urllib.parse
+import logging
+import pandas as pd
+from requests import Session
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
+from urllib3.util.retry import Retry
+def process_search_row(search_string: str, endpoint: str, entry_id: int, logger: logging.Logger = None, search_type: str = "default") -> pd.DataFrame:
+    """Process a search row with the specified search_type, adjusting queries accordingly."""
+    logger = logger or logging.getLogger(__name__)
     if not search_string or not endpoint:
         logger.warning(f"Invalid input for EntryID {entry_id}: search_string={search_string}, endpoint={endpoint}")
-        return process_search_row_gcloud(search_string, entry_id, logger)
+        return pd.DataFrame()
 
-    session = requests.Session()
+    session = Session()
     retry_strategy = Retry(total=3, status_forcelist=[500, 502, 503, 504], backoff_factor=1)
     session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
 
     try:
-        search_url = f"{endpoint}?query={urllib.parse.quote(search_string)}"
-        logger.info(f"Searching {search_url}")
-        response = session.get(search_url, timeout=60)
-        response.raise_for_status()
-        result = response.json().get("body")
-        if not result:
-            logger.warning(f"No body in response for {search_url}")
-            return process_search_row_gcloud(search_string, entry_id, logger)
+        if search_type == "retry_with_alternative":
+            # Define delimiters for splitting: space, hyphen, underscore, comma
+            delimiters = r'[\s\-_,]+'
+            words = re.split(delimiters, search_string.strip())
 
-        unpacked_html = unpack_content(result, logger)
-        if not unpacked_html or len(unpacked_html) < 100:
-            logger.warning(f"Invalid HTML for {search_url}")
-            return process_search_row_gcloud(search_string, entry_id, logger)
+            # Search progressively from full string to single word
+            for i in range(len(words), 0, -1):
+                partial_search = ' '.join(words[:i])
+                # Construct query without "org login", excluding only "signup"
+                query = f'"{partial_search}"'
+                search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=isch"
+                fetch_endpoint = f"{endpoint}/fetch"
+                logger.info(f"Fetching URLs via {fetch_endpoint} for EntryID {entry_id} with query: {query}")
+                
+                response = session.post(fetch_endpoint, json={"url": search_url}, timeout=60)
+                response.raise_for_status()
+                result = response.json().get("result")
+                
+                if result:
+                    results_html_bytes = result if isinstance(result, bytes) else result.encode("utf-8")
+                    df = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
+                    if not df.empty:
+                        logger.info(f"Processed EntryID {entry_id} with {len(df)} images using query: {query}")
+                        return df
+                logger.warning(f"No results for query: {query}, trying next split")
+            
+            # If all attempts fail, return empty DataFrame
+            logger.warning(f"No valid data for EntryID {entry_id} after all splits")
+            return pd.DataFrame()
 
-        df = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
-        if df.empty:
-            logger.warning(f"No valid data for {search_url}")
-            return process_search_row_gcloud(search_string, entry_id, logger)
+        else:
+            # Default search type (unchanged)
+            search_url = f"{endpoint}?query={urllib.parse.quote(search_string + ' images')}"
+            logger.info(f"Searching {search_url} for EntryID {entry_id}")
+            response = session.get(search_url, timeout=60)
+            response.raise_for_status()
+            result = response.json().get("body")
+            if not result:
+                logger.warning(f"No body in response for {search_url}")
+                return pd.DataFrame()
+            unpacked_html = unpack_content(result, logger)
+            if not unpacked_html or len(unpacked_html) < 100:
+                logger.warning(f"Invalid HTML for {search_url}")
+                return pd.DataFrame()
+            df = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
+            if df.empty:
+                logger.warning(f"No valid data for EntryID {entry_id}")
+            return df
 
-        logger.info(f"Processed EntryID {entry_id} with {len(df)} images")
-        return df
     except RequestException as e:
-        logger.error(f"Request error for {search_url}: {e}")
-        return process_search_row_gcloud(search_string, entry_id, logger)
+        logger.error(f"Request error for EntryID {entry_id}: {e}")
+        return pd.DataFrame()
     
 def update_sort_order_based_on_match_score(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
-
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
+        with engine.connect() as conn:
             logger.info(f"🔄 Updating SortOrder for FileID: {file_id}")
-
-            # Fetch data from the database, including existing SortOrder
             query = """
                 SELECT t.ResultID, t.EntryID,
                        ISNULL(CAST(JSON_VALUE(t.aijson, '$.match_score') AS FLOAT), 0) AS match_score,
@@ -271,48 +302,168 @@ def update_sort_order_based_on_match_score(file_id: str, logger: Optional[loggin
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                 WHERE r.FileID = ?
+                AND (t.SortOrder >= 0 OR t.SortOrder IS NULL)
             """
-            df = pd.read_sql_query(query, conn, params=[file_id])
+            df = pd.read_sql_query(query, conn, params=(file_id,))
+            logger.debug(f"Fetched {len(df)} rows for FileID {file_id}:\n{df.to_string()}")
+            if df.empty:
+                logger.warning(f"No eligible data (SortOrder >= 0) found for FileID: {file_id}")
+                return []
+
             df["match_score"] = pd.to_numeric(df["match_score"], errors="coerce").fillna(0)
             df["ssim_score"] = pd.to_numeric(df["ssim_score"], errors="coerce").fillna(-1)
             df["SortOrder"] = pd.to_numeric(df["SortOrder"], errors="coerce").fillna(0)
 
-            # Process each EntryID group
+            updates = []
             for entry_id, group in df.groupby("EntryID"):
-                # Filter out rows with SortOrder -1 or -2
-                sortable_group = group[~group["SortOrder"].isin([-1, -2])]
-                
-                if not sortable_group.empty:
-                    # Sort by match_score descending, then ssim_score descending
-                    sorted_group = sortable_group.sort_values(by=["match_score", "ssim_score"], ascending=[False, False])
-                    sorted_group["new_sort_order"] = range(1, len(sorted_group) + 1)
-                    
-                    # Update the database with new sort order for sorted rows only
-                    for _, row in sorted_group.iterrows():
-                        cursor.execute(
-                            "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?",
-                            (row["new_sort_order"], row["ResultID"])
-                        )
-                else:
-                    logger.info(f"No sortable images for EntryID: {entry_id}")
+                sorted_group = group.sort_values(by=["match_score", "ssim_score"], ascending=[False, False])
+                sorted_group["new_sort_order"] = range(1, len(sorted_group) + 1)
+                for _, row in sorted_group.iterrows():
+                    if row["SortOrder"] != row["new_sort_order"]:
+                        updates.append((row["new_sort_order"], row["ResultID"]))
 
-            conn.commit()
-            logger.info(f"Successfully updated SortOrder for FileID: {file_id}")
-            
-            # Return only the updated sort order details for sorted images
-            return [{"ResultID": r[0], "EntryID": r[1], "SortOrder": r[2]} for r in cursor.execute(
+            # Define cursor here, always available
+            cursor = conn.connection.cursor()
+            if updates:
+                cursor.executemany(
+                    "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?",
+                    updates
+                )
+                conn.connection.commit()
+                logger.info(f"Updated SortOrder for {len(updates)} rows for FileID: {file_id}")
+            else:
+                logger.info(f"No SortOrder updates needed for FileID: {file_id}")
+
+            cursor.execute(
                 """
                 SELECT ResultID, EntryID, SortOrder 
                 FROM utb_ImageScraperResult 
                 WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) 
-                AND SortOrder NOT IN (-1, -2)
+                AND (SortOrder >= 0 OR SortOrder IS NULL)
                 """, (file_id,)
-            ).fetchall()]
-    
+            )
+            results = [{"ResultID": r[0], "EntryID": r[1], "SortOrder": r[2]} for r in cursor.fetchall()]
+            return results if results else []
+
     except Exception as e:
         logger.error(f"Error updating SortOrder for FileID {file_id}: {e}", exc_info=True)
         return None
-    
+async def update_sort_order_by_match(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+    """Update sort order based solely on match_score."""
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            logger.info(f"🔄 Updating SortOrder by match_score for FileID: {file_id}")
+            
+            query = """
+                SELECT t.ResultID, t.EntryID,
+                       ISNULL(CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0) AS match_score,
+                       ISNULL(t.SortOrder, 0) AS SortOrder
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+                AND (t.SortOrder >= 0 OR t.SortOrder IS NULL)
+            """
+            df = pd.read_sql_query(query, conn, params=(file_id,))
+            if df.empty:
+                logger.warning(f"No eligible data found for FileID: {file_id}")
+                return []
+
+            df["match_score"] = pd.to_numeric(df["match_score"], errors="coerce").fillna(0)
+            df["SortOrder"] = pd.to_numeric(df["SortOrder"], errors="coerce").fillna(0)
+
+            updates = []
+            for entry_id, group in df.groupby("EntryID"):
+                sorted_group = group.sort_values(by="match_score", ascending=False)
+                sorted_group["new_sort_order"] = range(1, len(sorted_group) + 1)
+                for _, row in sorted_group.iterrows():
+                    if row["SortOrder"] != row["new_sort_order"]:
+                        updates.append((row["new_sort_order"], row["ResultID"]))
+
+            if updates:
+                cursor.executemany(
+                    "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?",
+                    updates
+                )
+                conn.commit()
+                logger.info(f"Updated SortOrder for {len(updates)} rows for FileID: {file_id}")
+            else:
+                logger.info(f"No SortOrder updates needed for FileID: {file_id}")
+
+            cursor.execute(
+                """
+                SELECT ResultID, EntryID, SortOrder 
+                FROM utb_ImageScraperResult 
+                WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) 
+                AND (SortOrder >= 0 OR SortOrder IS NULL)
+                """, (file_id,)
+            )
+            results = [{"ResultID": r[0], "EntryID": r[1], "SortOrder": r[2]} for r in cursor.fetchall()]
+            return results if results else []
+
+    except Exception as e:
+        logger.error(f"Error updating SortOrder by match for FileID {file_id}: {e}", exc_info=True)
+        return None
+async def update_sort_order_by_ssim(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+    """Update sort order based solely on ssim_score."""
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            logger.info(f"🔄 Updating SortOrder by ssim_score for FileID: {file_id}")
+            
+            query = """
+                SELECT t.ResultID, t.EntryID,
+                       ISNULL(CAST(JSON_VALUE(t.AiJson, '$.ssim_score') AS FLOAT), -1) AS ssim_score,
+                       ISNULL(t.SortOrder, 0) AS SortOrder
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+                AND (t.SortOrder >= 0 OR t.SortOrder IS NULL)
+            """
+            df = pd.read_sql_query(query, conn, params=(file_id,))
+            if df.empty:
+                logger.warning(f"No eligible data found for FileID: {file_id}")
+                return []
+
+            df["ssim_score"] = pd.to_numeric(df["ssim_score"], errors="coerce").fillna(-1)
+            df["SortOrder"] = pd.to_numeric(df["SortOrder"], errors="coerce").fillna(0)
+
+            updates = []
+            for entry_id, group in df.groupby("EntryID"):
+                sorted_group = group.sort_values(by="ssim_score", ascending=False)
+                sorted_group["new_sort_order"] = range(1, len(sorted_group) + 1)
+                for _, row in sorted_group.iterrows():
+                    if row["SortOrder"] != row["new_sort_order"]:
+                        updates.append((row["new_sort_order"], row["ResultID"]))
+
+            if updates:
+                cursor.executemany(
+                    "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?",
+                    updates
+                )
+                conn.commit()
+                logger.info(f"Updated SortOrder for {len(updates)} rows for FileID: {file_id}")
+            else:
+                logger.info(f"No SortOrder updates needed for FileID: {file_id}")
+
+            cursor.execute(
+                """
+                SELECT ResultID, EntryID, SortOrder 
+                FROM utb_ImageScraperResult 
+                WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) 
+                AND (SortOrder >= 0 OR SortOrder IS NULL)
+                """, (file_id,)
+            )
+            results = [{"ResultID": r[0], "EntryID": r[1], "SortOrder": r[2]} for r in cursor.fetchall()]
+            return results if results else []
+
+    except Exception as e:
+        logger.error(f"Error updating SortOrder by ssim for FileID {file_id}: {e}", exc_info=True)
+        return None
 def update_initial_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
     """Set initial sort order for results."""
     logger = logger or default_logger
@@ -396,7 +547,7 @@ def update_search_sort_order(file_id: str, logger: Optional[logging.Logger] = No
                     return ''
                 return re.sub(r'[- _.,;:/&]', '', str(text).upper())
 
-            brand_aliases = {"Scotch & Soda": ["Scotch and Soda", "Scotch Soda"], "Adidas": ["Adidas AG", "Adidas Originals"]}
+            brand_aliases = {"Scotch & Soda": ["Scotch and Soda", "Scotch Soda"], "Adidas": ["Adidas AG", "Adidas Originals"], "BAPE": ["A Bathing Ape", "BATHING APE"]}
             clean_brand_aliases = {
                 clean_string(brand): [clean_string(brand)] + [clean_string(alias) for alias in aliases]
                 for brand, aliases in brand_aliases.items()
@@ -470,6 +621,95 @@ def update_search_sort_order(file_id: str, logger: Optional[logging.Logger] = No
     finally:
         if 'conn' in locals():
             conn.close()
+def set_sort_order_negative_four_for_zero_match(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+    """
+    Set SortOrder to -4 for records with match_score = 0 for a given file_id.
+    Handles malformed JSON gracefully.
+    
+    Args:
+        file_id (str): Identifier for the file
+        logger (Optional[logging.Logger]): Logger instance for logging messages
+    
+    Returns:
+        Optional[List[Dict]]: List of updated records with ResultID, EntryID, and new SortOrder,
+                            or None if a critical error occurs
+    """
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            logger.info(f"🔄 Setting SortOrder to -4 for match_score = 0 for FileID: {file_id}")
+            
+            # Modified query to handle JSON parsing errors using TRY_CAST
+            query = """
+                SELECT 
+                    t.ResultID, 
+                    t.EntryID,
+                    CASE 
+                        WHEN ISJSON(t.AiJson) = 1 
+                        THEN ISNULL(TRY_CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0)
+                        ELSE 0 
+                    END AS match_score,
+                    t.SortOrder,
+                    t.AiJson
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+            """
+            df = pd.read_sql_query(query, conn, params=(file_id,))
+            
+            if df.empty:
+                logger.info(f"No records found for FileID: {file_id}")
+                return []
+
+            # Filter for match_score = 0 and log any problematic JSON
+            zero_match_df = df[df['match_score'] == 0].copy()
+            
+            # Log records with invalid JSON
+            invalid_json_df = df[df['AiJson'].notnull() & (df['AiJson'].str.strip() != '') & (df['match_score'] == 0)]
+            for _, row in invalid_json_df.iterrows():
+                if row['AiJson'] and not pd.isna(row['AiJson']):
+                    logger.warning(f"Record with potentially malformed JSON - ResultID: {row['ResultID']}, AiJson: {row['AiJson'][:100]}...")
+
+            if zero_match_df.empty:
+                logger.info(f"No records found with match_score = 0 for FileID: {file_id}")
+                return []
+
+            # Prepare updates for records where SortOrder needs to change
+            updates = []
+            for _, row in zero_match_df.iterrows():
+                if row["SortOrder"] != -4:  # Only update if SortOrder isn't already -4
+                    updates.append((-4, int(row["ResultID"])))
+
+            if updates:
+                cursor.executemany(
+                    "UPDATE utb_ImageScraperResult SET SortOrder = ? WHERE ResultID = ?",
+                    updates
+                )
+                conn.commit()
+                logger.info(f"Updated SortOrder to -4 for {len(updates)} records with match_score = 0 for FileID: {file_id}")
+            else:
+                logger.info(f"No SortOrder updates needed for FileID: {file_id} (all already -4)")
+
+            # Fetch and return the updated records
+            cursor.execute(
+                """
+                SELECT ResultID, EntryID, SortOrder
+                FROM utb_ImageScraperResult
+                WHERE EntryID IN (SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)
+                AND (
+                    (ISJSON(AiJson) = 1 AND ISNULL(TRY_CAST(JSON_VALUE(AiJson, '$.match_score') AS FLOAT), 0) = 0)
+                    OR (ISJSON(AiJson) = 0 AND AiJson IS NOT NULL)
+                )
+                """, (file_id,)
+            )
+            results = [{"ResultID": r[0], "EntryID": r[1], "SortOrder": r[2]} for r in cursor.fetchall()]
+            return results if results else []
+
+    except Exception as e:
+        logger.error(f"Critical error setting SortOrder to -4 for match_score = 0 for FileID {file_id}: {e}", exc_info=True)
+        return None
 
 def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger=None) -> pd.DataFrame:
     """
@@ -505,14 +745,13 @@ def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool
             else:
                 # Fetch records missing ImageUrl (unchanged for non-AI case)
                 query = """
-                    SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
-                           t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
-                    FROM utb_ImageScraperRecords r
-                    LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
-                    WHERE r.FileID = ?
-                    AND (t.ImageUrl IS NULL OR t.ImageUrl = '')
-                    ORDER BY r.EntryID
-                    OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
+                  SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
+                    t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
+                FROM utb_ImageScraperRecords r
+                LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID AND t.SortOrder >= 0
+                WHERE r.FileID = ? AND t.ResultID IS NULL
+                ORDER BY r.EntryID
+                OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
                 """
                 params = (file_id, limit)
 

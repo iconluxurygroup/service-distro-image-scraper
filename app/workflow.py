@@ -6,7 +6,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple
-
+import pandas as pd
 import aiofiles
 import httpx
 import pyodbc
@@ -332,12 +332,29 @@ async def process_restart_batch(
             logger.error(f"🔴 'ImageUrl' not found in DataFrame columns: {missing_urls_df.columns.tolist()}")
             raise KeyError(f"'ImageUrl' column not found in DataFrame")
 
-        # Process records needing URL generation
         needs_url_generation = missing_urls_df[missing_urls_df[image_url_col].isnull() | (missing_urls_df[image_url_col] == '')]
         if not needs_url_generation.empty:
             logger.info(f"🔗 Found {len(needs_url_generation)} records needing URL generation for FileID: {file_id_db}")
             search_df = get_records_to_search(file_id_db, logger=logger)
             if not search_df.empty:
+                # Check for multiple negative SortOrder results
+                entry_ids = search_df['EntryID'].tolist()
+                if entry_ids:
+                    with pyodbc.connect(conn_str) as conn:
+                        query = f"""
+                            SELECT EntryID, COUNT(*) AS negative_count
+                            FROM utb_ImageScraperResult
+                            WHERE EntryID IN ({','.join(map(str, entry_ids))}) AND SortOrder < 0
+                            GROUP BY EntryID
+                        """
+                        count_df = pd.read_sql(query, conn)
+                    search_df = search_df.merge(count_df, on='EntryID', how='left')
+                    search_df['negative_count'] = search_df['negative_count'].fillna(0).astype(int)
+                    search_df['SearchType'] = search_df.apply(
+                        lambda row: 'retry_with_alternative' if row['negative_count'] > 1 else row['SearchType'],
+                        axis=1
+                    )
+                
                 search_list = search_df.to_dict('records')
                 logger.info(f"🔬🔍 Preparing {len(search_list)} searches for FileID: {file_id_db}")
 
@@ -377,10 +394,9 @@ async def process_restart_batch(
         if sort_result is None:
             logger.error(f"🔴 Search sort order update failed for FileID: {file_id_db}")
             raise Exception("Search sort order update failed")
-
         # Generate download file
         logger.info(f"💾 Generating download file for FileID: {file_id_db}")
-        result = await generate_download_file(file_id_db, logger=logger)
+        # result = await generate_download_file(file_id_db, logger=logger)
         if "error" in result and result["error"] != f"No images found for FileID {file_id_db}":
             logger.error(f"🔴 Failed to generate download file: {result['error']}")
             raise Exception(result["error"])

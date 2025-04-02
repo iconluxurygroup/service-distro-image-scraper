@@ -96,7 +96,7 @@ def get_results_page_results(html_bytes, final_urls, final_descriptions, final_s
         if len(final_urls) >= 100:
             break
 
-        img_tag = div.find('img', class_='YQ4gaf')
+        img_tag = div.find('img', class_='gdOPf uhHOwf ez24Df')
         thumb = None
         if img_tag and 'src' in img_tag.attrs and 'data:image' in img_tag['src']:
             thumb_base64 = img_tag['src']

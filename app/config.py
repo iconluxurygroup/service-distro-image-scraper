@@ -3,14 +3,14 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 # Load environment variables from a .env file
 #load_dotenv()
-GOOGLE_API_KEY='AIzaSyBE3VOxl4bG6aLlPbbHphIbh8eoBdA2jwE'
+GOOGLE_API_KEY='AIzaSyDXfc_kdxa5UX2h9D3WwktefCqdyjHasn8'
 # AWS credentials and region
 AWS_ACCESS_KEY_ID ='AKIA2CUNLEV6V627SWI7'
 AWS_SECRET_ACCESS_KEY = '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'
 REGION = "us-east-2"
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 if not SENDGRID_API_KEY:
-    SENDGRID_API_KEY = 'SG.'
+    SENDGRID_API_KEY = 'SG.3HYJCeA5SLKkEySfp_DPJA.'
 # Database credentials
 MSSQLS_PWD =  'Ftu5675FDG54hjhiuu$'
 
