@@ -41,7 +41,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
             <p>Link to search <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">results</a></p>
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            Notified Users: {to_emails}<br>From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v23.9.3</a></small></p> 
+            Notified Users: {to_emails}<br>Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">23.9.3</a></small></p> 
         </div>
         </body>
         </html>
@@ -83,7 +83,7 @@ def send_message_email(to_emails, subject, message, logger=None):
             <p>Message details:<br>{message_with_breaks}</p>
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            From: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">ImageDistro: v23.9.3</a> <br>Notified Users: {to_emails}</small></p>
+            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">23.9.3</a> <br>Notified Users: {to_emails}</small></p>
         </div>
         </body>
         </html>
