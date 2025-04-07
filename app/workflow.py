@@ -17,6 +17,7 @@ from aws_s3 import upload_file_to_space
 from config import conn_str
 from database import (
     fetch_missing_images,
+    process_search_row_gcloud,
     get_images_excel_db,
     get_records_to_search,
     get_send_to_email,
@@ -321,6 +322,32 @@ async def process_restart_batch(
                 success_count = sum(1 for r in all_results if r['status'] == 'success')
                 logger.info(f"🟢 Completed {success_count}/{len(all_results)} searches successfully")
 
+                # Fallback to process_search_row_gcloud if no successful results
+                if success_count == 0:
+                    logger.warning(f"⚠️ No successful results from Ray processing for FileID: {file_id_db}. Falling back to process_search_row_gcloud.")
+                    fallback_results = []
+                    for record in search_list:
+                        search_string = record.get('SearchString')
+                        entry_id = record.get('EntryID')
+                        if search_string and entry_id:
+                            df = process_search_row_gcloud(search_string, entry_id, logger=logger)
+                            if not df.empty:
+                                fallback_results.append({
+                                    'status': 'success',
+                                    'entry_id': entry_id,
+                                    'result': df
+                                })
+                            else:
+                                fallback_results.append({
+                                    'status': 'failed',
+                                    'entry_id': entry_id,
+                                    'result': None
+                                })
+                    all_results = fallback_results
+                    success_count = sum(1 for r in all_results if r['status'] == 'success')
+                    logger.info(f"🟢 Fallback completed {success_count}/{len(all_results)} searches successfully")
+
+                # Insert results (from Ray or fallback)
                 for result in all_results:
                     if result['status'] == 'success' and result['result'] is not None:
                         insert_success = await asyncio.get_running_loop().run_in_executor(
