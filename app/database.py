@@ -19,6 +19,10 @@ from skimage.transform import resize
 from io import BytesIO
 import numpy as np
 from PIL import Image
+import pyodbc
+import pandas as pd
+from config import conn_str
+import logging
 from config import conn_str
 # Default logger
 default_logger = logging.getLogger(__name__)
@@ -804,25 +808,38 @@ def unpack_content(encoded_content, logger=None):
     except Exception as e:
         logger.error(f"Error unpacking content: {e}")
         return None
-import pyodbc
-import pandas as pd
-from config import conn_str
-import logging
+
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
+
 
 def get_images_excel_db(file_id, logger=None):
     logger = logger or default_logger
     try:
         with pyodbc.connect(conn_str) as conn:
             query = """
-                SELECT s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail
+                SELECT 
+                    s.ExcelRowID, 
+                    r.ImageUrl, 
+                    r.ImageUrlThumbnail, 
+                    s.ProductBrand AS Brand, 
+                    s.ProductModel AS Style, 
+                    s.ProductColor AS Color, 
+                    s.ProductCategory AS Category
                 FROM utb_ImageScraperFiles f
                 INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
                 INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID
-                WHERE f.ID = ?
+                WHERE f.ID = ? AND r.SortOrder = 1
+                GROUP BY 
+                    s.ExcelRowID, 
+                    r.ImageUrl, 
+                    r.ImageUrlThumbnail, 
+                    s.ProductBrand, 
+                    s.ProductModel, 
+                    s.ProductColor, 
+                    s.ProductCategory
                 ORDER BY s.ExcelRowID
             """
             df = pd.read_sql(query, conn, params=(file_id,))

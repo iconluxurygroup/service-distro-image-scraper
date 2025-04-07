@@ -5,6 +5,7 @@ from openpyxl import load_workbook
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
+from typing import List, Dict
 from PIL import Image as IMG2
 from io import BytesIO
 import numpy as np
@@ -135,85 +136,84 @@ def resize_image(image_path, logger=None):
         logger.error(f"❌ Error resizing image: {e}, for image: {image_path}", exc_info=True)
         return False
     
-def write_excel_image(local_filename, temp_dir, column="A", row_offset=0, logger=None):
-    """
-    Write images to an Excel file in a specified column (default 'A') with an optional row offset.
-    
-    Args:
-        local_filename (str): Path to the Excel file
-        temp_dir (str): Path to the directory containing images
-        column (str): Column letter to insert images (default 'A')
-        row_offset (int): Number of rows to offset (default 0)
-        logger (logging.Logger, optional): Logger instance to use
-        
-    Returns:
-        list: List of row numbers that failed
-    """
-    # Handle incorrect argument types (temporary workaround)
-    if isinstance(column, logging.Logger):
-        logger = column
-        column = "A"
-        row_offset = 0
-    elif isinstance(row_offset, logging.Logger):
-        logger = row_offset
-        row_offset = 0
-
+def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="A", row_offset=5, logger=None):
+    """Write one image per entry to an Excel file starting at row 6, removing unneeded rows."""
     logger = logger or default_logger
-    # Log all arguments for debugging
-    logger.debug(f"write_excel_image called with: local_filename={local_filename}, temp_dir={temp_dir}, column={column}, row_offset={row_offset}, logger={logger}")
-    
     failed_rows = []
-    try:
-        if not isinstance(row_offset, int):
-            logger.error(f"❌ row_offset must be an integer, got {type(row_offset)}: {row_offset}")
-            raise TypeError(f"row_offset must be an integer, got {type(row_offset)}: {row_offset}")
 
+    try:
         logger.debug(f"📂 Loading workbook from {local_filename}")
         wb = load_workbook(local_filename)
         ws = wb.active
-        logger.info(f"🖼️ Processing images in {temp_dir} for Excel file {local_filename} in column {column} with row offset {row_offset}")
-        
+
+        if ws.max_row < 5:
+            logger.error(f"❌ Excel file must have at least 5 rows for header")
+            return failed_rows
+
+        logger.info(f"🖼️ Processing images for {local_filename}")
         if not os.path.exists(temp_dir):
             logger.error(f"❌ Temp directory does not exist: {temp_dir}")
             return failed_rows
-        
+
         image_files = os.listdir(temp_dir)
         if not image_files:
             logger.warning(f"⚠️ No images found in {temp_dir}")
             return failed_rows
-        
-        for image_file in image_files:
-            image_path = os.path.join(temp_dir, image_file)
-            logger.debug(f"📄 Found image file: {image_path}")
-            try:
-                row_number = int(image_file.split('.')[0]) + row_offset
-                logger.info(f"🔍 Processing row {row_number - row_offset} (adjusted to {row_number}), image path: {image_path}")
-            except ValueError:
-                logger.warning(f"⚠️ Skipping file {image_file}: does not match expected naming convention")
-                continue
-            
-            if verify_png_image_single(image_path, logger=logger):
-                try:
-                    logger.debug(f"🖼️ Inserting image at row {row_number}")
+
+        # Create a map of ExcelRowID to filename
+        image_map = {}
+        for f in image_files:
+            if '_' in f and f.split('_')[0].isdigit():
+                row_id = int(f.split('_')[0])
+                image_map[row_id] = f
+
+        # Process each entry
+        for item in image_data:
+            row_id = item['ExcelRowID']
+            row_number = row_id + row_offset  # e.g., ExcelRowID=1 -> row 6
+
+            if row_id in image_map:
+                image_file = image_map[row_id]
+                image_path = os.path.join(temp_dir, image_file)
+                if verify_png_image_single(image_path, logger=logger):
                     img = Image(image_path)
                     anchor = f"{column}{row_number}"
-                    logger.debug(f"📍 Assigned anchor: {anchor}")
                     img.anchor = anchor
                     ws.add_image(img)
                     logger.info(f"✅ Image added at {anchor}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to add image at row {row_number}: {e}", exc_info=True)
-                    failed_rows.append(row_number - row_offset)
+                else:
+                    failed_rows.append(row_id)
+                    logger.warning(f"⚠️ Image verification failed for {image_file}")
             else:
-                failed_rows.append(row_number - row_offset)
-                logger.warning(f"⚠️ Inserting image skipped due to verify_png_image_single failure for row {row_number}")
-        
-        logger.debug(f"💾 Saving workbook to {local_filename}")
+                logger.warning(f"⚠️ No image found for row {row_id}")
+                failed_rows.append(row_id)
+
+            # Populate data
+            ws[f"B{row_number}"] = item.get('Brand', '')
+            ws[f"D{row_number}"] = item.get('Style', '')
+            if item.get('Color'):
+                ws[f"E{row_number}"] = item['Color']
+            if item.get('Category'):
+                ws[f"H{row_number}"] = item['Category']
+
+            # Validate
+            if not ws[f"B{row_number}"].value:
+                logger.warning(f"⚠️ Missing Brand in B{row_number}")
+            if not ws[f"D{row_number}"].value:
+                logger.warning(f"⚠️ Missing Style in D{row_number}")
+
+        # Remove unneeded rows
+        max_data_row = max(item['ExcelRowID'] for item in image_data) + row_offset
+        if ws.max_row > max_data_row:
+            logger.info(f"🗑️ Removing rows {max_data_row + 1} to {ws.max_row}")
+            ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
+
         wb.save(local_filename)
-        logger.info("🏁 Finished processing all images.")
+        logger.info("🏁 Finished processing images")
         return failed_rows
+
     except Exception as e:
-        logger.error(f"❌ Error writing images to Excel: {e}", exc_info=True)
+        logger.error(f"❌ Error writing images: {e}")
         return failed_rows
 
 def highlight_cell(excel_file, cell_reference, logger=None):
