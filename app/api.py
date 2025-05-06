@@ -1,44 +1,29 @@
-from fastapi import FastAPI, BackgroundTasks, Query, APIRouter
 import logging
 import asyncio
-from typing import Dict
 import os
-import uuid
 import ray
-from fastapi.middleware.cors import CORSMiddleware
-
-from ray_workers import process_file_with_retries
-from workflow import generate_download_file, process_restart_batch
+from typing import Dict
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from workflow import run_process_restart_batch, generate_download_file, process_file_with_retries
 from database import (
     update_initial_sort_order,
+    update_sort_order,
     set_sort_order_negative_four_for_zero_match,
     update_log_url_in_db,
-    update_search_sort_order,
-    update_sort_order,
-    call_fetch_missing_images,
-    call_get_images_excel_db,
-    call_get_send_to_email,
-    call_update_file_generate_complete,
-    call_update_file_location_complete
+    fetch_missing_images,
+    get_images_excel_db,
+    get_send_to_email,
+    update_file_generate_complete,
+    update_file_location_complete,
+    update_sort_order_per_entry,
 )
-from aws_s3 import upload_file_to_space
+from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from logging_config import setup_job_logger
-from image_process import batch_process_images
+import traceback
+from typing import Callable, Any, Union
 
 # Initialize FastAPI app
-app = FastAPI(title="superscaper_dev")
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-# Initialize Ray
-ray.init(ignore_reinit_error=True)
+app = FastAPI(title="super_scraper", version="3.0.0")
 
 # Default logger
 default_logger = logging.getLogger(__name__)
@@ -49,155 +34,249 @@ if not default_logger.handlers:
 # Create APIRouter instance
 router = APIRouter()
 
-async def run_job_with_logging(job_func, file_id: str, *args, **kwargs) -> Dict:
-    """Run a job with logging and upload logs to S3."""
-    file_id = str(file_id)
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Starting job {job_func.__name__} for FileID: {file_id}")
-
+async def run_job_with_logging(job_func: Callable[..., Any], file_id: int, **kwargs) -> Any:
+    """
+    Run a job function with logging and upload logs to storage.
+    Handles both synchronous and asynchronous job functions and upload functions.
+    """
+    logger, _ = setup_job_logger(job_id=file_id, console_output=True)
+    result = None
     try:
-        result = job_func(*args, logger=logger, file_id=file_id, **kwargs) if args else job_func(file_id, logger=logger, **kwargs)
-        if asyncio.iscoroutine(result):
-            result = await result
-        else:
-            logger.info("Result is not awaitable, proceeding directly")
-
-        if os.path.exists(log_filename):
-            upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
-            logger.info(f"Log file uploaded to: {upload_url}")
-            await update_log_url_in_db(file_id, upload_url, logger)
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.info(f"Starting job {func_name} for FileID: {file_id}")
         
-        logger.info(f"✅ Job {job_func.__name__} completed successfully")
-        return result or {"message": "Job completed"}
-
+        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+            result = await job_func(file_id, **kwargs)
+        else:
+            result = job_func(file_id, **kwargs)
+            
+        logger.info(f"Completed job {func_name} for FileID: {file_id}")
     except Exception as e:
-        logger.error(f"🔴 Error in job {job_func.__name__} for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
-            await update_log_url_in_db(file_id, upload_url, logger)
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {str(e)}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
         raise
+    finally:
+        log_file = f"job_logs/job_{file_id}.log"
+        if os.path.exists(log_file):
+            try:
+                upload_result = upload_file_to_space(
+                    file_src=log_file,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+                # Check if upload_result is awaitable
+                if asyncio.iscoroutine(upload_result):
+                    upload_url = await upload_result
+                else:
+                    upload_url = upload_result
+            except Exception as upload_error:
+                logger.warning(f"Async upload failed for FileID {file_id}: {upload_error}")
+                upload_url = upload_file_to_space_sync(
+                    file_src=log_file,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+            logger.info(f"Log uploaded to: {upload_url}")
+        else:
+            logger.warning(f"Log file {log_file} does not exist, skipping upload")
+    
+    return result
 
 # Sorting-related endpoints
-@router.get("/sort-by-match-and-search/{file_id}", tags=["Sorting"])
+@router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
-    """Run sort order update based on match_score and search-based priority for a given file ID."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running match and search sort for FileID: {file_id}")
+    """Run sort order update based on match_score and search-based priority."""
     return await run_job_with_logging(update_sort_order, file_id)
 
-@router.get("/initial_sort/{file_id}", tags=["Sorting"])
-async def api_initial_sort(file_id: str):
-    """Run initial sort order update for a given file ID."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running initial sort for FileID: {file_id}")
-    return await run_job_with_logging(update_initial_sort_order, file_id)
+@router.get("/update-sort-order-per-entry/{file_id}", tags=["Sorting"])
+async def api_update_sort_order_per_entry(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
+    
+    try:
+        result = await update_sort_order_per_entry(file_id, logger)
+        if result is None:
+            logger.error(f"Failed to update SortOrder for FileID {file_id}: update_sort_order_per_entry returned None")
+            raise HTTPException(status_code=500, detail=f"Failed to update SortOrder for FileID {file_id}")
+        
+        # Upload logs
+        if os.path.exists(log_filename):
+            try:
+                upload_result = upload_file_to_space(
+                    file_src=log_filename,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+                if asyncio.iscoroutine(upload_result):
+                    upload_url = await upload_result
+                else:
+                    upload_url = upload_result
+                await update_log_url_in_db(file_id, upload_url, logger)
+                logger.info(f"Log uploaded to: {upload_url}")
+            except Exception as upload_error:
+                logger.warning(f"Async upload failed for FileID {file_id}: {upload_error}")
+                upload_url = upload_file_to_space_sync(
+                    file_src=log_filename,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+                await update_log_url_in_db(file_id, upload_url, logger)
+                logger.info(f"Log uploaded to: {upload_url}")
+        
+        return result
+    
+    except Exception as e:
+        logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        if os.path.exists(log_filename):
+            try:
+                upload_result = upload_file_to_space(
+                    file_src=log_filename,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+                if asyncio.iscoroutine(upload_result):
+                    upload_url = await upload_result
+                else:
+                    upload_url = upload_result
+                await update_log_url_in_db(file_id, upload_url, logger)
+            except Exception as upload_error:
+                logger.warning(f"Async upload failed for FileID {file_id}: {upload_error}")
+                upload_url = upload_file_to_space_sync(
+                    file_src=log_filename,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+                await update_log_url_in_db(file_id, upload_url, logger)
+        raise HTTPException(status_code=500, detail=f"Error processing FileID {file_id}: {str(e)}")
 
+@router.get("/initial-sort/{file_id}", tags=["Sorting"])
+async def api_initial_sort(file_id: str):
+    """Run initial sort order update."""
+    return await run_job_with_logging(update_initial_sort_order, file_id, file_id=file_id)
 
 @router.get("/set-negative-four-for-zero-match/{file_id}", tags=["Sorting"])
 async def api_set_negative_four_for_zero_match(file_id: str):
     """Set SortOrder to -4 for records with match_score = 0."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running set negative four for zero match for FileID: {file_id}")
-    return await run_job_with_logging(set_sort_order_negative_four_for_zero_match, file_id)
+    return await run_job_with_logging(set_sort_order_negative_four_for_zero_match, file_id, file_id=file_id)
 
-# Processing-related endpoints
-@router.post("/restart-job/", tags=["Processing"])
-async def api_process_restart(background_tasks: BackgroundTasks, file_id: str):
-    """Queue a restart of a failed batch processing task."""
+@router.post("/restart-job/{file_id}", tags=["Processing"])
+async def api_process_restart(file_id: str, entry_id: int = None):
     logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing restart of failed batch for FileID: {file_id}")
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else ""))
     try:
-        background_tasks.add_task(run_job_with_logging, process_restart_batch, file_id)
-        return {"message": f"Processing restart initiated for FileID: {file_id}"}
+        result = await run_process_restart_batch(
+            file_id_db=int(file_id),
+            max_retries=7,
+            logger=logger,
+            entry_id=entry_id
+        )
+        if "error" in result:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
+            raise HTTPException(status_code=500, detail=result["error"])
+        logger.info(f"Completed restart batch for FileID {file_id}. Result: {result}")
+        return {"message": f"Processing restart completed for FileID: {file_id}", **result}
     except Exception as e:
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
-            await update_log_url_in_db(file_id, upload_url, logger)
-        return {"error": f"An error occurred: {str(e)}"}
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@router.post("/generate-download-file/", tags=["Export"])
-async def api_generate_download_file(background_tasks: BackgroundTasks, file_id: int):
-    """Queue generation of a download file for a given file ID."""
-    file_id_str = str(file_id)
-    logger, _ = setup_job_logger(job_id=file_id_str)
-    logger.info(f"Received request to generate download file for FileID: {file_id}")
-    try:
-        background_tasks.add_task(run_job_with_logging, generate_download_file, file_id_str)
-        return {"message": "Processing started successfully"}
-    except Exception as e:
-        logger.error(f"Error generating download file: {e}", exc_info=True)
-        return {"error": f"An error occurred: {str(e)}"}
-
-@router.post("/process-ai-analysis/", tags=["Processing"])
-async def api_process_ai_analysis(background_tasks: BackgroundTasks, file_id: str):
-    """Queue AI analysis for images associated with a given file ID."""
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing AI analysis for FileID: {file_id}")
-    try:
-        background_tasks.add_task(run_job_with_logging, batch_process_images, file_id)
-        return {"message": f"AI analysis initiated for FileID: {file_id}"}
-    except Exception as e:
-        logger.error(f"Error queuing AI analysis for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
-            await update_log_url_in_db(file_id, upload_url, logger)
-        return {"error": f"An error occurred: {str(e)}"}
-
-@router.post("/retry-process-batch/{file_id}", tags=["Processing"])
+@router.post("/process-file/{file_id}", tags=["Processing"])
 async def api_process_file(
     background_tasks: BackgroundTasks,
     file_id: str,
-    max_retries: int = Query(2, description="Maximum number of retry attempts")
+    max_retries: int = Query(3, description="Maximum number of retry attempts")
 ):
-    """Queue the processing of entries for a given file ID with retry logic."""
+    """Queue the processing of entries with retry logic."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing process_file_with_retries for FileID: {file_id} with max_retries: {max_retries}")
     try:
-        background_tasks.add_task(run_job_with_logging, process_file_with_retries, file_id, max_retries=max_retries)
+        background_tasks.add_task(run_job_with_logging, process_file_with_retries, file_id, file_id=int(file_id), max_retries=max_retries)
         return {"message": f"Processing initiated for FileID: {file_id}"}
     except Exception as e:
         logger.error(f"Error queuing process_file_with_retries for FileID {file_id}: {e}", exc_info=True)
         if os.path.exists(log_filename):
-            upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+        return {"error": f"An error occurred: {str(e)}"}
+
+# Export-related endpoints
+@router.post("/generate-download-file/{file_id}", tags=["Export"])
+async def api_generate_download_file(background_tasks: BackgroundTasks, file_id: str):
+    """Queue generation of a download file."""
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Received request to generate download file for FileID: {file_id}")
+    try:
+        background_tasks.add_task(run_job_with_logging, generate_download_file, file_id, file_id=int(file_id))
+        return {"message": f"Processing started successfully for FileID: {file_id}"}
+    except Exception as e:
+        logger.error(f"Error generating download file for FileID {file_id}: {e}", exc_info=True)
+        if os.path.exists(log_filename):
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
             await update_log_url_in_db(file_id, upload_url, logger)
         return {"error": f"An error occurred: {str(e)}"}
 
 # Database-related endpoints
-@router.get("/call-fetch-missing-images/{file_id}", tags=["Database"])
-async def call_fetch_missing_images_endpoint(file_id: str):
-    """Fetch missing images for a given file ID."""
+@router.get("/fetch-missing-images/{file_id}", tags=["Database"])
+async def fetch_missing_images_endpoint(file_id: str, limit: int = Query(1000), ai_analysis_only: bool = Query(True)):
+    """Fetch missing images."""
     logger, _ = setup_job_logger(job_id=file_id)
-    result = call_fetch_missing_images(file_id, limit=10, ai_analysis_only=False, logger=logger)
-    return result
+    logger.info(f"Fetching missing images for FileID: {file_id}, limit: {limit}, ai_analysis_only: {ai_analysis_only}")
+    result = await fetch_missing_images(file_id, limit, ai_analysis_only, logger)
+    if result.empty:
+        logger.info("No missing images found")
+        return {"success": True, "output": [], "message": "No missing images found"}
+    return {"success": True, "output": result.to_dict(orient='records'), "message": "Fetched missing images successfully"}
 
-@router.get("/call-get-images-excel-db/{file_id}", tags=["Database"])
-async def call_get_images_excel_db_endpoint(file_id: str):
-    """Get images from Excel DB for a given file ID."""
+@router.get("/get-images-excel-db/{file_id}", tags=["Database"])
+async def get_images_excel_db_endpoint(file_id: str):
+    """Get images from Excel DB."""
     logger, _ = setup_job_logger(job_id=file_id)
-    result = call_get_images_excel_db(file_id, logger=logger)
-    return result
+    logger.info(f"Fetching Excel images for FileID: {file_id}")
+    result = await get_images_excel_db(file_id, logger)
+    if result.empty:
+        logger.info("No images found for Excel export")
+        return {"success": True, "output": [], "message": "No images found for Excel export"}
+    return {"success": True, "output": result.to_dict(orient='records'), "message": "Fetched Excel images successfully"}
 
-@router.get("/call-get-send-to-email/{file_id}", tags=["Database"])
-async def call_get_send_to_email_endpoint(file_id: str):
-    """Get email-related data for a given file ID."""
+@router.get("/get-send-to-email/{file_id}", tags=["Database"])
+async def get_send_to_email_endpoint(file_id: str):
+    """Get email address for a file."""
     logger, _ = setup_job_logger(job_id=file_id)
-    result = call_get_send_to_email(int(file_id), logger=logger)
-    return result
+    logger.info(f"Retrieving email for FileID: {file_id}")
+    result = await get_send_to_email(int(file_id), logger)
+    return {"success": True, "output": result, "message": "Retrieved email successfully"}
 
-@router.get("/call-update-file-generate-complete/{file_id}", tags=["Database"])
-async def call_update_file_generate_complete_endpoint(file_id: str):
+@router.post("/update-file-generate-complete/{file_id}", tags=["Database"])
+async def update_file_generate_complete_endpoint(file_id: str):
     """Update file generation completion status."""
     logger, _ = setup_job_logger(job_id=file_id)
-    result = call_update_file_generate_complete(file_id, logger=logger)
-    return result
+    logger.info(f"Updating file generate complete for FileID: {file_id}")
+    await update_file_generate_complete(file_id, logger)
+    return {"success": True, "output": None, "message": "Updated file generate complete successfully"}
 
-@router.get("/call-update-file-location-complete/{file_id}", tags=["Database"])
-async def call_update_file_location_complete_endpoint(file_id: str, file_location: str = "call_location_url"):
+@router.post("/update-file-location-complete/{file_id}", tags=["Database"])
+async def update_file_location_complete_endpoint(file_id: str, file_location: str):
     """Update file location completion status."""
     logger, _ = setup_job_logger(job_id=file_id)
-    result = await call_update_file_location_complete(file_id, file_location, logger=logger)
-    return result
+    logger.info(f"Updating file location complete for FileID: {file_id}, file_location: {file_location}")
+    await update_file_location_complete(file_id, file_location, logger)
+    return {"success": True, "output": None, "message": "Updated file location successfully"}
 
 # Include the router in the FastAPI app
-app.include_router(router, prefix="/api/v2")
+app.include_router(router, prefix="/api/v3")

@@ -8,6 +8,7 @@ SENDER_PASSWORD="wvug kynd dfhd xrjh"
 SENDER_NAME='imagesearch'
 GOOGLE_API_KEY='AIzaSyDXfc_kdxa5UX2h9D3WwktefCqdyjHasn8'
 # AWS credentials and region
+BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
 AWS_ACCESS_KEY_ID ='AKIA2CUNLEV6V627SWI7'
 AWS_SECRET_ACCESS_KEY = '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'
 REGION = "us-east-2"
