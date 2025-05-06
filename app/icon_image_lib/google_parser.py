@@ -142,10 +142,10 @@ def process_search_result(image_html_bytes, results_html_bytes, entry_id: int, l
 
     df = pd.DataFrame({
         'EntryID': [entry_id] * min_length,
-        'ImageURL': final_urls,
+        'ImageUrl': final_urls,
         'ImageDesc': final_descriptions,
         'ImageSource': final_sources,
-        'ImageURLThumbnail': final_thumbs
+        'ImageUrlThumbnail': final_thumbs
     })
     
     logger.info(f"Processed EntryID {entry_id} with {len(df)} images")

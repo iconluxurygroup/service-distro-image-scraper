@@ -29,7 +29,7 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         msg['Subject'] = subject
         
         # Set CC recipient
-        cc_recipient = 'nik@iconluxurygroup.com' if to_emails != 'nik@iconluxurygroup.com' else 'nik@accessx.com'
+        cc_recipient = 'nik@iconluxurygroup.com' if to_emails != 'nik@iconluxurygroup.com' else 'nik@luxurymarket.com'
         msg['Cc'] = cc_recipient
 
         # HTML content
@@ -38,10 +38,14 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         <body>
         <div class="container">
             <p>Your file is ready to <a href="{download_url}" class="download-button">download</a></p>
-            <p>Link to search <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">results</a></p>
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            Notified Users: {to_emails}<br>Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">23.9.5</a></small></p> 
+            Notify: {to_emails}<br>
+            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">All results</a><br>
+            Job ID: {str(job_id)}<br>
+            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">23.9.5</a>
+            </small>
+            </p> 
         </div>
         </body>
         </html>
@@ -83,7 +87,7 @@ def send_message_email(to_emails, subject, message, logger=None):
             <p>Message details:<br>{message_with_breaks}</p>
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">23.9.5</a> <br>Notified Users: {to_emails}</small></p>
+            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">23.9.5</a> <br>Notify: {to_emails}</small></p>
         </div>
         </body>
         </html>

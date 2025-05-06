@@ -1,57 +1,67 @@
-from fastapi import FastAPI, BackgroundTasks, Query
+from fastapi import FastAPI, BackgroundTasks, Query, APIRouter
 import logging
 import asyncio
-
-from ray_workers import process_file_with_retries  # Assuming this is where the function is defined
+from typing import Dict
 import os
 import uuid
 import ray
-from typing import Dict
+from fastapi.middleware.cors import CORSMiddleware
+
+from ray_workers import process_file_with_retries
 from workflow import generate_download_file, process_restart_batch
-from database import update_initial_sort_order, set_sort_order_negative_four_for_zero_match,update_sort_order_by_match,update_sort_order_by_ssim,update_log_url_in_db, update_search_sort_order, update_sort_order_based_on_match_score, call_fetch_missing_images,call_get_images_excel_db,call_get_send_to_email,call_update_file_generate_complete,call_update_file_location_complete
+from database import (
+    update_initial_sort_order,
+    set_sort_order_negative_four_for_zero_match,
+    update_log_url_in_db,
+    update_search_sort_order,
+    update_sort_order,
+    call_fetch_missing_images,
+    call_get_images_excel_db,
+    call_get_send_to_email,
+    call_update_file_generate_complete,
+    call_update_file_location_complete
+)
 from aws_s3 import upload_file_to_space
 from logging_config import setup_job_logger
 from image_process import batch_process_images
-from fastapi.middleware.cors import CORSMiddleware
+
 # Initialize FastAPI app
 app = FastAPI(title="superscaper_dev")
+
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this to specific origins in production (e.g., ["http://localhost:3000"])
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],  # Include allowed methods
-    allow_headers=["*"],  # Adjust to specific headers if needed
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
-# Initialize Ray once at startup
+
+# Initialize Ray
 ray.init(ignore_reinit_error=True)
 
-# Default logger for non-job contexts
+# Default logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+# Create APIRouter instance
+router = APIRouter()
+
 async def run_job_with_logging(job_func, file_id: str, *args, **kwargs) -> Dict:
-    """Run a job with logging and upload logs to S3, handling both sync and async functions."""
+    """Run a job with logging and upload logs to S3."""
     file_id = str(file_id)
-    logger, log_filename = setup_job_logger(job_id=file_id or str(uuid.uuid4()))
+    logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Starting job {job_func.__name__} for FileID: {file_id}")
 
     try:
-        # Execute the job function
-        if args:
-            result = job_func(args[0], logger=logger, file_id=file_id, **kwargs)
-        else:
-            result = job_func(file_id, logger=logger, **kwargs)
-
-        # Handle async results
+        result = job_func(*args, logger=logger, file_id=file_id, **kwargs) if args else job_func(file_id, logger=logger, **kwargs)
         if asyncio.iscoroutine(result):
             result = await result
         else:
             logger.info("Result is not awaitable, proceeding directly")
 
-        # Upload logs to S3 if log file exists
         if os.path.exists(log_filename):
             upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
             logger.info(f"Log file uploaded to: {upload_url}")
@@ -64,32 +74,34 @@ async def run_job_with_logging(job_func, file_id: str, *args, **kwargs) -> Dict:
         logger.error(f"🔴 Error in job {job_func.__name__} for FileID {file_id}: {e}", exc_info=True)
         if os.path.exists(log_filename):
             upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
-            logger.info(f"Log file uploaded to: {upload_url}")
             await update_log_url_in_db(file_id, upload_url, logger)
         raise
 
-@app.get("/sort-by-match-then-ssim/{file_id}")
-async def api_match_ai_sort(file_id: str):
-    """Run AI-based sort order update for a given file ID."""
+# Sorting-related endpoints
+@router.get("/sort-by-match-and-search/{file_id}", tags=["Sorting"])
+async def api_match_and_search_sort(file_id: str):
+    """Run sort order update based on match_score and search-based priority for a given file ID."""
     logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running match AI sort for FileID: {file_id}")
-    return await run_job_with_logging(update_sort_order_based_on_match_score, file_id)
+    logger.info(f"Running match and search sort for FileID: {file_id}")
+    return await run_job_with_logging(update_sort_order, file_id)
 
-@app.get("/initial_sort/{file_id}")
+@router.get("/initial_sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
     """Run initial sort order update for a given file ID."""
     logger, _ = setup_job_logger(job_id=file_id)
     logger.info(f"Running initial sort for FileID: {file_id}")
     return await run_job_with_logging(update_initial_sort_order, file_id)
 
-@app.get("/search_sort/{file_id}")
-async def api_search_sort(file_id: str):
-    """Run search-based sort order update for a given file ID."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running search sort for FileID: {file_id}")
-    return await run_job_with_logging(update_search_sort_order, file_id)
 
-@app.post("/restart-job/")
+@router.get("/set-negative-four-for-zero-match/{file_id}", tags=["Sorting"])
+async def api_set_negative_four_for_zero_match(file_id: str):
+    """Set SortOrder to -4 for records with match_score = 0."""
+    logger, _ = setup_job_logger(job_id=file_id)
+    logger.info(f"Running set negative four for zero match for FileID: {file_id}")
+    return await run_job_with_logging(set_sort_order_negative_four_for_zero_match, file_id)
+
+# Processing-related endpoints
+@router.post("/restart-job/", tags=["Processing"])
 async def api_process_restart(background_tasks: BackgroundTasks, file_id: str):
     """Queue a restart of a failed batch processing task."""
     logger, log_filename = setup_job_logger(job_id=file_id)
@@ -104,7 +116,7 @@ async def api_process_restart(background_tasks: BackgroundTasks, file_id: str):
             await update_log_url_in_db(file_id, upload_url, logger)
         return {"error": f"An error occurred: {str(e)}"}
 
-@app.post("/generate-download-file/")
+@router.post("/generate-download-file/", tags=["Export"])
 async def api_generate_download_file(background_tasks: BackgroundTasks, file_id: int):
     """Queue generation of a download file for a given file ID."""
     file_id_str = str(file_id)
@@ -117,20 +129,7 @@ async def api_generate_download_file(background_tasks: BackgroundTasks, file_id:
         logger.error(f"Error generating download file: {e}", exc_info=True)
         return {"error": f"An error occurred: {str(e)}"}
 
-@app.get("/sort-by-match/{file_id}")
-async def api_sort_by_match(file_id: str):
-    """Run sort order update by match_score only for a given file ID."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running sort by match for FileID: {file_id}")
-    return await run_job_with_logging(update_sort_order_by_match, file_id)
-
-@app.get("/sort-by-ssim/{file_id}")
-async def api_sort_by_ssim(file_id: str):
-    """Run sort order update by ssim_score only for a given file ID."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running sort by ssim for FileID: {file_id}")
-    return await run_job_with_logging(update_sort_order_by_ssim, file_id)
-@app.post("/process-ai-analysis/")
+@router.post("/process-ai-analysis/", tags=["Processing"])
 async def api_process_ai_analysis(background_tasks: BackgroundTasks, file_id: str):
     """Queue AI analysis for images associated with a given file ID."""
     logger, log_filename = setup_job_logger(job_id=file_id)
@@ -144,45 +143,17 @@ async def api_process_ai_analysis(background_tasks: BackgroundTasks, file_id: st
             upload_url = upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", logger=logger, file_id=file_id)
             await update_log_url_in_db(file_id, upload_url, logger)
         return {"error": f"An error occurred: {str(e)}"}
-    
-# Add this new endpoint to your existing app
-@app.get("/set-negative-four-for-zero-match/{file_id}")
-async def api_set_negative_four_for_zero_match(file_id: str):
-    """
-    Set SortOrder to -4 for records with match_score = 0 for a given file ID.
-    
-    Args:
-        file_id (str): The ID of the file to process
-    
-    Returns:
-        Dict: Results of the operation or error message
-    """
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Running set negative four for zero match for FileID: {file_id}")
-    return await run_job_with_logging(set_sort_order_negative_four_for_zero_match, file_id)
-# Add this endpoint to your existing app
-@app.post("/retry-process-batch/{file_id}")
+
+@router.post("/retry-process-batch/{file_id}", tags=["Processing"])
 async def api_process_file(
     background_tasks: BackgroundTasks,
     file_id: str,
     max_retries: int = Query(2, description="Maximum number of retry attempts")
 ):
-    """
-    Queue the processing of entries for a given file ID with retry logic.
-
-    Args:
-        - **file_id**: The ID of the file to process (path parameter).
-        - **max_retries**: Optional, default is 2. The maximum number of retry attempts for entries with invalid results (query parameter).
-
-    Returns:
-        - A JSON response indicating that processing has been initiated or an error message if something goes wrong.
-
-    This endpoint triggers the processing in the background and returns immediately.
-    """
+    """Queue the processing of entries for a given file ID with retry logic."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing process_file_with_retries for FileID: {file_id} with max_retries: {max_retries}")
     try:
-        # Queue the task to run in the background
         background_tasks.add_task(run_job_with_logging, process_file_with_retries, file_id, max_retries=max_retries)
         return {"message": f"Processing initiated for FileID: {file_id}"}
     except Exception as e:
@@ -192,33 +163,41 @@ async def api_process_file(
             await update_log_url_in_db(file_id, upload_url, logger)
         return {"error": f"An error occurred: {str(e)}"}
 
-# In api.py
-@app.get("/call-fetch-missing-images/{file_id}")
+# Database-related endpoints
+@router.get("/call-fetch-missing-images/{file_id}", tags=["Database"])
 async def call_fetch_missing_images_endpoint(file_id: str):
+    """Fetch missing images for a given file ID."""
     logger, _ = setup_job_logger(job_id=file_id)
     result = call_fetch_missing_images(file_id, limit=10, ai_analysis_only=False, logger=logger)
     return result
 
-@app.get("/call-get-images-excel-db/{file_id}")
+@router.get("/call-get-images-excel-db/{file_id}", tags=["Database"])
 async def call_get_images_excel_db_endpoint(file_id: str):
+    """Get images from Excel DB for a given file ID."""
     logger, _ = setup_job_logger(job_id=file_id)
     result = call_get_images_excel_db(file_id, logger=logger)
     return result
 
-@app.get("/call-get-send-to-email/{file_id}")
+@router.get("/call-get-send-to-email/{file_id}", tags=["Database"])
 async def call_get_send_to_email_endpoint(file_id: str):
+    """Get email-related data for a given file ID."""
     logger, _ = setup_job_logger(job_id=file_id)
     result = call_get_send_to_email(int(file_id), logger=logger)
     return result
 
-@app.get("/call-update-file-generate-complete/{file_id}")
+@router.get("/call-update-file-generate-complete/{file_id}", tags=["Database"])
 async def call_update_file_generate_complete_endpoint(file_id: str):
+    """Update file generation completion status."""
     logger, _ = setup_job_logger(job_id=file_id)
     result = call_update_file_generate_complete(file_id, logger=logger)
     return result
 
-@app.get("/call-update-file-location-complete/{file_id}")
+@router.get("/call-update-file-location-complete/{file_id}", tags=["Database"])
 async def call_update_file_location_complete_endpoint(file_id: str, file_location: str = "call_location_url"):
+    """Update file location completion status."""
     logger, _ = setup_job_logger(job_id=file_id)
     result = await call_update_file_location_complete(file_id, file_location, logger=logger)
     return result
+
+# Include the router in the FastAPI app
+app.include_router(router, prefix="/api/v2")

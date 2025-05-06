@@ -277,128 +277,333 @@ async def generate_download_file(
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
 
+
+import asyncio
+import logging
+import pyodbc
+import pandas as pd
+from typing import Optional, Dict
+from ray_workers import fetch_brand_rules, process_batch, BRAND_RULES_URL
+from config import conn_str
+from database import insert_search_results, update_search_sort_order, process_search_row_gcloud
+import asyncio
+import logging
+import pyodbc
+import pandas as pd
+from typing import Optional, Dict
+from ray_workers import fetch_brand_rules, process_batch, BRAND_RULES_URL
+from config import conn_str
+from database import insert_search_results, update_search_sort_order, process_search_row_gcloud
+
+import asyncio
+import logging
+import pyodbc
+import pandas as pd
+from typing import Optional, Dict
+from ray_workers import fetch_brand_rules, process_batch, BRAND_RULES_URL
+from config import conn_str
+from database import insert_search_results, update_search_sort_order, process_search_row_gcloud
+
+import asyncio
+import logging
+from typing import Optional
+import pyodbc
+import pandas as pd
+import ray
+from config import conn_str  # Assumes database connection string is defined here
+from database import insert_search_results, update_search_sort_order  # Database helper functions
+from ray_workers import process_batch  # Ray-based batch processing function
+import asyncio
+import logging
+import pyodbc
+import pandas as pd
+import ray
+from typing import Optional, Dict
+from config import conn_str
+from database import insert_search_results, update_search_sort_order, process_search_row_gcloud
+from ray_workers import process_batch
+import asyncio
+import logging
+import pyodbc
+import pandas as pd
+from typing import Optional
+from sqlalchemy import create_engine
+from config import conn_str
+from database import insert_search_results, update_search_sort_order
+async def process_single_row(
+    entry_id: int,
+    search_string: str,
+    max_row_retries: int,
+    file_id_db: int,
+    brand_rules: dict,
+    brand: Optional[str] = None,
+    model: Optional[str] = None,
+    logger: Optional[logging.Logger] = None
+) -> bool:
+    logger = logger or default_logger
+    
+    try:
+        entry_id = int(entry_id)
+        file_id_db = int(file_id_db)
+        if not search_string or not isinstance(search_string, str):
+            logger.error(f"Invalid search string for EntryID {entry_id}")
+            return False
+        model = model or search_string
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid input parameters for EntryID {entry_id}: {e}", exc_info=True)
+        return False
+
+    search_types = ["default", "brand_name", "retry_with_alternative"]
+    loop = asyncio.get_running_loop()
+    all_results = []
+    result_brand = brand
+    result_model = model
+    result_category = None
+
+    api_to_db_mapping = {
+        'image_url': 'ImageUrl', 'thumbnail_url': 'ImageUrlThumbnail', 'url': 'ImageUrl',
+        'thumb': 'ImageUrlThumbnail', 'image': 'ImageUrl', 'thumbnail': 'ImageUrlThumbnail',
+        'img_url': 'ImageUrl', 'thumb_url': 'ImageUrlThumbnail', 'imageURL': 'ImageUrl',
+        'imageUrl': 'ImageUrl', 'thumbnailURL': 'ImageUrlThumbnail', 'thumbnailUrl': 'ImageUrlThumbnail',
+        'brand': 'Brand', 'model': 'Model', 'brand_name': 'Brand', 'product_model': 'Model'
+    }
+    required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+
+    if not brand or not model or not result_category:
+        try:
+            with pyodbc.connect(conn_str, autocommit=False) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT ProductBrand, ProductModel, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID = ?",
+                    (file_id_db, entry_id)
+                )
+                result = cursor.fetchone()
+                if result:
+                    result_brand = result_brand or result[0]
+                    result_model = result_model or result[1]
+                    result_category = result[2]
+                    logger.info(f"Fetched attributes for EntryID {entry_id}: Brand={result_brand}, Model={result_model}, Category={result_category}")
+                else:
+                    logger.warning(f"No attributes found for FileID {file_id_db}, EntryID {entry_id}")
+        except pyodbc.Error as e:
+            logger.error(f"Failed to fetch attributes for EntryID {entry_id}: {e}", exc_info=True)
+
+    for search_type in search_types:
+        logger.info(f"Processing search type '{search_type}' for EntryID {entry_id}")
+        batch = [{"EntryID": entry_id, "SearchString": search_string, "SearchTypes": [search_type]}]
+        try:
+            from ray_workers import process_batch
+            results_ref = process_batch.remote(batch, brand_rules, logger=logger)
+            results = ray.get(results_ref)
+
+            for res in results:
+                if res.get("status") != "success" or res.get("result") is None:
+                    logger.warning(f"Search type '{search_type}' failed for EntryID {entry_id}")
+                    continue
+
+                result_df = res["result"]
+                logger.debug(f"Raw result_df columns for EntryID {entry_id}: {list(result_df.columns)}")
+
+                for api_col, db_col in api_to_db_mapping.items():
+                    if api_col in result_df.columns and db_col not in result_df.columns:
+                        result_df.rename(columns={api_col: db_col}, inplace=True)
+
+                missing = [col for col in required_columns if col not in result_df.columns]
+                if missing:
+                    logger.error(f"Missing columns {missing} in result_df for EntryID {entry_id}")
+                    continue
+
+                result_df["EntryID"] = entry_id
+                result_brand = result_df.get('Brand', [result_brand])[0] if 'Brand' in result_df else result_brand
+                result_model = result_df.get('Model', [result_model])[0] if 'Model' in result_df else result_model
+                type_results = result_df.head(50)  # Cap at 50 results
+                logger.info(f"Stored {len(type_results)} results for EntryID {entry_id} from '{search_type}'")
+                all_results.append(type_results)
+                break  # Use first successful result
+        except Exception as e:
+            logger.error(f"Error processing search type '{search_type}' for EntryID {entry_id}: {e}", exc_info=True)
+
+    if all_results:
+        try:
+            combined_df = pd.concat(all_results, ignore_index=True)
+            logger.info(f"Combined {len(combined_df)} results for EntryID {entry_id} for batch insertion")
+            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
+            logger.info(f"Deduplicated to {len(deduplicated_df)} rows")
+            insert_success = await loop.run_in_executor(None, insert_search_results, deduplicated_df, logger)
+            if not insert_success:
+                logger.error(f"Failed to insert deduplicated results for EntryID {entry_id}")
+                return False
+            logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
+            update_result = await loop.run_in_executor(
+                None, update_search_sort_order, str(file_id_db), str(entry_id), result_brand, result_model, None, result_category, logger
+            )
+            if update_result is None:
+                logger.error(f"SortOrder update failed for EntryID {entry_id}")
+                return False
+            logger.info(f"Updated sort order for EntryID {entry_id} with Brand: {result_brand}, Model: {result_model}, Category: {result_category}")
+
+            try:
+                with pyodbc.connect(conn_str, autocommit=False) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder > 0",
+                        (entry_id,)
+                    )
+                    count = cursor.fetchone()[0]
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder IS NULL",
+                        (entry_id,)
+                    )
+                    null_count = cursor.fetchone()[0]
+                    logger.info(f"Verification: Found {count} rows with positive SortOrder, {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                    if null_count > 0:
+                        logger.error(f"Found {null_count} rows with NULL SortOrder after update for EntryID {entry_id}")
+            except pyodbc.Error as e:
+                logger.error(f"Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
+
+            return True
+        except Exception as e:
+            logger.error(f"Error during batch database update for EntryID {entry_id}: {e}", exc_info=True)
+            return False
+
+    logger.info(f"No results to insert for EntryID {entry_id}")
+    return False
+import asyncio
+import logging
+import os
+import pyodbc
+from typing import Optional, Dict
+from concurrent.futures import ThreadPoolExecutor
+from ray_workers import fetch_brand_rules, process_batch, BRAND_RULES_URL
+from config import conn_str
+from database import (
+    insert_search_results,
+    process_search_row_gcloud,
+    update_search_sort_order,
+    get_send_to_email,
+    update_log_url_in_db
+)
+from aws_s3 import upload_file_to_space
+from email_utils import send_message_email
 async def process_restart_batch(
     file_id_db: int,
-    logger: Optional[logging.Logger] = None,
-    file_id: Optional[int] = None
+    max_retries: int = 15,
+    logger: Optional[logging.Logger] = None
 ) -> Dict[str, str]:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(f"job_{file_id_db}")
     log_filename = logger.handlers[0].baseFilename if logger.handlers else os.path.join(os.getcwd(), 'logs', f"file_{file_id_db}.log")
 
     try:
-        logger.info(f"🔁 Restarting processing for FileID: {file_id_db}")
+        logger.info(f"🔁 Starting concurrent search processing for FileID: {file_id_db}")
         file_id_db = int(file_id_db)
 
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, logger=logger)
         if not brand_rules:
-            logger.error("Failed to load brand rules; proceeding without brand-specific logic")
+            logger.warning("⚠️ Failed to load brand rules; using default logic")
             brand_rules = {"brand_rules": []}
 
-        logger.info(f"🖼️ Fetching missing images for FileID: {file_id_db}")
-        missing_urls_df = fetch_missing_images(file_id_db, limit=10000, ai_analysis_only=False, logger=logger)
-        logger.debug(f"🟨 Missing URLs DataFrame columns: {missing_urls_df.columns.tolist()}")
-        logger.debug(f"🟨 Missing URLs DataFrame sample: {missing_urls_df.head().to_dict()}")
+        with pyodbc.connect(conn_str, autocommit=False) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT EntryID, ProductModel, ProductBrand FROM utb_ImageScraperRecords WHERE FileID = ?",
+                (file_id_db,)
+            )
+            entries = [(row[0], row[1], row[2]) for row in cursor.fetchall() if row[1] is not None]
+            logger.info(f"📋 Found {len(entries)} valid entries for FileID: {file_id_db}")
 
-        image_url_col = 'ImageUrl'
-        if image_url_col not in missing_urls_df.columns:
-            logger.error(f"🔴 'ImageUrl' not found in DataFrame columns: {missing_urls_df.columns.tolist()}")
-            raise KeyError(f"'ImageUrl' column not found in DataFrame")
+        if not entries:
+            logger.warning(f"⚠️ No entries found for FileID: {file_id_db}")
+            return {"error": f"No entries found for FileID: {file_id_db}"}
 
-        needs_url_generation = missing_urls_df[missing_urls_df[image_url_col].isnull() | (missing_urls_df[image_url_col] == '')]
-        if not needs_url_generation.empty:
-            logger.info(f"🔗 Found {len(needs_url_generation)} records needing URL generation for FileID: {file_id_db}")
-            search_df = get_records_to_search(file_id_db, logger=logger)
-            if not search_df.empty:
-                search_list = search_df.to_dict('records')
-                logger.info(f"🔬🔍 Preparing {len(search_list)} searches for FileID: {file_id_db}")
+        tasks = [
+            process_single_row(
+                entry_id, search_string, max_retries, file_id_db, brand_rules,
+                brand=brand, model=search_string, logger=logger
+            )
+            for entry_id, search_string, brand in entries
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                BATCH_SIZE = 10
-                batches = [search_list[i:i + BATCH_SIZE] for i in range(0, len(search_list), BATCH_SIZE)]
-                logger.info(f"📋 Processing {len(batches)} batches with Ray")
-                futures = [process_batch.remote(batch, brand_rules, logger=logger) for batch in batches]
-                batch_results = ray.get(futures)
-                all_results = [result for batch_result in batch_results for result in batch_result]
+        total_processed = len(tasks)
+        successful_entries = sum(1 for result in results if result is True)
+        failed_entries = sum(1 for result in results if isinstance(result, Exception))
 
-                success_count = sum(1 for r in all_results if r['status'] == 'success')
-                logger.info(f"🟢 Completed {success_count}/{len(all_results)} searches successfully")
+        with pyodbc.connect(conn_str, autocommit=False) as conn:
+            cursor = conn.cursor()
+            time.sleep(5)  # Ensure transaction visibility
+            cursor.execute(
+                """
+                SELECT COUNT(DISTINCT t.EntryID)
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE r.FileID = ? AND t.SortOrder > 0
+                """,
+                (file_id_db,)
+            )
+            positive_entries = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                SELECT COUNT(DISTINCT t.EntryID)
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE r.FileID = ? AND t.SortOrder IS NULL
+                """,
+                (file_id_db,)
+            )
+            null_entries = cursor.fetchone()[0]
+            logger.info(f"Final verification: Found {positive_entries} entries with positive SortOrder, {null_entries} entries with NULL SortOrder")
 
-                # Fallback to process_search_row_gcloud if no successful results
-                if success_count == 0:
-                    logger.warning(f"⚠️ No successful results from Ray processing for FileID: {file_id_db}. Falling back to process_search_row_gcloud.")
-                    fallback_results = []
-                    for record in search_list:
-                        search_string = record.get('SearchString')
-                        entry_id = record.get('EntryID')
-                        if search_string and entry_id:
-                            df = process_search_row_gcloud(search_string, entry_id, logger=logger)
-                            if not df.empty:
-                                fallback_results.append({
-                                    'status': 'success',
-                                    'entry_id': entry_id,
-                                    'result': df
-                                })
-                            else:
-                                fallback_results.append({
-                                    'status': 'failed',
-                                    'entry_id': entry_id,
-                                    'result': None
-                                })
-                    all_results = fallback_results
-                    success_count = sum(1 for r in all_results if r['status'] == 'success')
-                    logger.info(f"🟢 Fallback completed {success_count}/{len(all_results)} searches successfully")
+            cursor.execute(
+                """
+                SELECT TOP 5 t.ResultID, t.EntryID, t.SortOrder, t.ImageDesc
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE r.FileID = ? AND t.SortOrder > 0
+                ORDER BY t.SortOrder
+                """, (file_id_db,)
+            )
+            sample_results = cursor.fetchall()
+            for result in sample_results:
+                logger.info(f"Sample - ResultID: {result[0]}, EntryID: {result[1]}, SortOrder: {result[2]}, ImageDesc: {result[3]}")
 
-                # Insert results (from Ray or fallback)
-                for result in all_results:
-                    if result['status'] == 'success' and result['result'] is not None:
-                        insert_success = await asyncio.get_running_loop().run_in_executor(
-                            None, insert_search_results, result['result'], logger
-                        )
-                        if not insert_success:
-                            logger.error(f"Failed to insert results for EntryID {result['entry_id']}")
-                        else:
-                            logger.info(f"Successfully inserted results for EntryID {result['entry_id']}")
-            else:
-                logger.info(f"🟡 No records to search for FileID: {file_id_db}")
+        if os.path.exists(log_filename):
+            loop = asyncio.get_running_loop()
+            upload_url = await loop.run_in_executor(
+                None,
+                lambda: upload_file_to_space(
+                    log_filename, f"job_logs/job_{file_id_db}.log", True, logger, file_id_db
+                )
+            )
+            logger.info(f"📤 Log file uploaded to: {upload_url}")
+            await update_log_url_in_db(str(file_id_db), upload_url, logger)
 
-            logger.debug(f"Updating initial sort order for FileID: {file_id_db}")
-            initial_sort_result = update_initial_sort_order(file_id_db, logger=logger)
-            if initial_sort_result is None:
-                logger.error(f"🔴 Initial SortOrder update failed for FileID: {file_id_db}")
-                raise Exception("Initial SortOrder update failed")
-
-        logger.info(f"🔍🔀 Updating search sort order for FileID: {file_id_db}")
-        sort_result = update_search_sort_order(file_id_db, logger=logger)
-        if sort_result is None:
-            logger.error(f"🔴 Search sort order update failed for FileID: {file_id_db}")
-            raise Exception("Search sort order update failed")
-
-        logger.info(f"💾 Generating download file for FileID: {file_id_db}")
-        result = await generate_download_file(file_id_db, logger=logger)
-        if "error" in result and result["error"] != f"No images found for FileID {file_id_db}":
-            logger.error(f"🔴 Failed to generate download file: {result['error']}")
-            raise Exception(result["error"])
-
-        logger.info(f"✅ Restart processing completed successfully for FileID: {file_id_db}")
-        return {"message": "Restart processing completed successfully", "file_id": str(file_id_db)}
+        logger.info(f"✅ Completed processing for FileID: {file_id_db}. {positive_entries}/{total_processed} entries with positive SortOrder. Failed entries: {failed_entries}")
+        return {
+            "message": "Search processing completed",
+            "file_id": str(file_id_db),
+            "successful_entries": str(successful_entries),
+            "total_entries": str(total_processed),
+            "failed_entries": str(failed_entries)
+        }
 
     except Exception as e:
-        logger.error(f"🔴 Error restarting processing for FileID {file_id_db}: {e}", exc_info=True)
-        loop = asyncio.get_running_loop()
+        logger.error(f"🔴 Error processing FileID {file_id_db}: {e}", exc_info=True)
         if os.path.exists(log_filename):
+            loop = asyncio.get_running_loop()
             upload_url = await loop.run_in_executor(
-                ThreadPoolExecutor(),
-                upload_file_to_space,
-                log_filename,
-                f"job_logs/job_{file_id_db}.log",
-                True,
-                logger,
-                file_id_db
+                None,
+                lambda: upload_file_to_space(
+                    log_filename, f"job_logs/job_{file_id_db}.log", True, logger, file_id_db
+                )
             )
-            logger.info(f"Log file uploaded to: {upload_url}")
-            await update_log_url_in_db(file_id_db, upload_url, logger)
-        
-        send_to_email_addr = get_send_to_email(file_id_db, logger=logger)
+            logger.info(f"📤 Log file uploaded to: {upload_url}")
+            await update_log_url_in_db(str(file_id_db), upload_url, logger)
+
+        send_to_email_addr = get_send_to_email(file_id_db, logger)  # Synchronous call
         if send_to_email_addr:
-            file_name = f"FileID: {file_id_db}"
-            send_message_email(send_to_email_addr, f"Error processing {file_name}", f"An error occurred while reprocessing your file: {str(e)}")
+            await send_message_email(
+                send_to_email_addr,
+                f"Error processing FileID: {file_id_db}",
+                f"An error occurred while processing your file: {str(e)}"
+            )
         return {"error": str(e)}

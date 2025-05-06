@@ -11,7 +11,7 @@ from typing import Optional, List, Dict
 from config import conn_str
 from database import (
     insert_search_results,
-    update_sort_order_based_on_match_score,
+    update_sort_order,
     default_logger,
     process_search_row,
     get_endpoint,
@@ -46,7 +46,7 @@ async def fetch_brand_rules(url: str, max_attempts: int = 3, timeout: int = 10, 
 def search_variation(variation: str, endpoint: str, entry_id: int, search_type: str, logger: Optional[logging.Logger] = None) -> Dict:
     logger = logger or logging.getLogger(__name__)
     try:
-        result = process_search_row(variation, endpoint, entry_id, logger=logger, search_type=search_type)
+        result = process_search_row(variation, endpoint, entry_id, logger=logger, search_type=search_type,max_retries=15)
         if isinstance(result, pd.DataFrame) and not result.empty:
             return {"variation": variation, "result": result, "status": "success", "result_count": len(result)}
         return {"variation": variation, "result": None, "status": "failed", "result_count": 0}
@@ -116,7 +116,7 @@ def process_db_row(entry_id: int, search_string: str, search_types: List[str], e
                 variations = [' '.join(parts[:i]) for i in range(len(parts), 0, -1)]
                 if product_brand:
                     brand_name = brand_rule["full_name"] if brand_rule else product_brand
-                    variations.append(f"{search_string} {brand_name}".strip())
+                    variations.append(f"{search_string}".strip())
             
             if variations:
                 all_variations[search_type] = variations
@@ -132,18 +132,18 @@ def process_db_row(entry_id: int, search_string: str, search_types: List[str], e
                 futures.append(search_variation.remote(variation, endpoint, entry_id, search_type, logger=logger))
         
         results = ray.get(futures)
+        for res in results:
+            logger.info(f"Variation '{res['variation']}' for EntryID {entry_id} returned {res['result_count']} results")
         successful_results = [res for res in results if res["status"] == "success"]
         
         if successful_results:
-            best_result = max(successful_results, key=lambda x: x["result_count"])
-            logger.info(f"Successfully processed EntryID {entry_id} with {best_result['result_count']} images using variation: {best_result['variation']}")
+            combined_df = pd.concat([res["result"] for res in successful_results]).drop_duplicates()
             return {
                 "entry_id": entry_id,
-                "search_type": next(st for st, vars in all_variations.items() if best_result["variation"] in vars),
                 "status": "success",
-                "result_count": best_result["result_count"],
-                "result": best_result["result"],
-                "used_variation": best_result["variation"]
+                "result_count": len(combined_df),
+                "result": combined_df,
+                "used_variation": "combined"
             }
         
         logger.warning(f"All variations failed for EntryID {entry_id}")
@@ -167,7 +167,7 @@ def process_batch(batch: List[Dict], brand_rules: Dict, logger: Optional[logging
             return [{"entry_id": row['EntryID'], "status": "failed", "error": "No endpoint", "result": None} for row in batch]
 
         logger.info(f"⚙️ Processing batch of {len(batch)} search tasks with endpoint {endpoint}")
-        search_types = ["default", "brand_name", "retry_with_alternative", "brand_format"]
+        search_types = ["default", "brand_name", "brand_format","retry_with_alternative"]
         futures = [process_db_row.remote(row['EntryID'], row['SearchString'], search_types, endpoint, brand_rules, logger=logger) 
                   for row in batch if row.get('SearchString')]
         results = ray.get(futures)
@@ -217,7 +217,7 @@ async def process_file_with_retries(file_id, max_retries: int = None, logger: Op
                     insert_search_results(res["result"], logger=logger)
 
             await batch_process_images(file_id, logger=logger)
-            update_sort_order_based_on_match_score(file_id, logger=logger)
+            update_sort_order(file_id, logger=logger)
             set_sort_order_negative_four_for_zero_match(file_id, logger=logger)
 
             cursor.execute("""
