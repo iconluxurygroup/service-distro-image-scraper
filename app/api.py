@@ -23,7 +23,7 @@ import traceback
 from typing import Callable, Any, Union
 
 # Initialize FastAPI app
-app = FastAPI(title="super_scraper", version="3.0.0")
+app = FastAPI(title="super_scraper", version="3.0.4")
 
 # Default logger
 default_logger = logging.getLogger(__name__)
