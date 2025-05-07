@@ -192,26 +192,30 @@ async def api_process_restart(file_id: str, entry_id: int = None):
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@router.post("/process-file/{file_id}", tags=["Processing"])
-async def api_process_file(
-    background_tasks: BackgroundTasks,
+@router.post("/restart-search-all/{file_id}", tags=["Processing"])
+async def api_restart_search_all(
     file_id: str,
-    max_retries: int = Query(3, description="Maximum number of retry attempts")
+    entry_id: int = None
 ):
-    """Queue the processing of entries with retry logic."""
+    """Restart batch processing for a file, searching all variations for each entry."""
     logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing process_file_with_retries for FileID: {file_id} with max_retries: {max_retries}")
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
     try:
-        background_tasks.add_task(run_job_with_logging, process_file_with_retries, file_id, file_id=int(file_id), max_retries=max_retries)
-        return {"message": f"Processing initiated for FileID: {file_id}"}
+        result = await run_process_restart_batch(
+            file_id_db=int(file_id),
+            max_retries=7,
+            logger=logger,
+            entry_id=entry_id,
+            use_all_variations=True
+        )
+        if "error" in result:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
+            raise HTTPException(status_code=500, detail=result["error"])
+        logger.info(f"Completed restart batch for FileID {file_id}. Result: {result}")
+        return {"message": f"Processing restart completed for FileID: {file_id} with all variations", **result}
     except Exception as e:
-        logger.error(f"Error queuing process_file_with_retries for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-        return {"error": f"An error occurred: {str(e)}"}
+        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 # Export-related endpoints
 @router.post("/generate-download-file/{file_id}", tags=["Export"])
