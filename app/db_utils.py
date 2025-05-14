@@ -801,6 +801,42 @@ def sync_update_search_sort_order(
     except Exception as e:
         logger.error(f"Unexpected error updating SortOrder for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
+
+
+async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
+        
+        async with engine.begin() as conn:  
+            result = await conn.execute(
+                     text(
+                    """
+                    DELETE FROM utb_ImageScraperResult
+                    WHERE EntryID IN (
+                        SELECT r.EntryID
+                        FROM utb_ImageScraperRecords r
+                        WHERE r.FileID = :file_id
+                        AND utb_ImageScraperResult.ImageUrl = 'placeholder://no-results'
+                    )
+                    """
+                ),
+                {"file_id": file_id}
+            )
+            rows_affected = result.rowcount
+            logger.info(f"Deleted {rows_affected} entries for FileID: {file_id}")
+            
+            return {"file_id": file_id, "rows_affected": rows_affected}
+    
+    except ValueError as ve:
+        logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
+        return None
+    except Exception as e:
+        logger.error(f"Error updating entries for FileID: {file_id}, error: {str(e)}")
+        return None
+
+
 async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
     logger = logger or default_logger
     try:

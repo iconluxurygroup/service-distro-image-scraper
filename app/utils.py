@@ -218,8 +218,8 @@ def process_search_row_gcloud(search_string: str, entry_id: int, logger: Optiona
 
     total_attempts = total_attempts or [0]
     base_url = "https://api.thedataproxy.com/v2/proxy/fetch"
-    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ2NDcyMDQzLjc0Njk3NiwiZXhwIjoxNzc4MDA4MDQzLjc0Njk4MX0.MduHUL3BeVw9k6Tk3mbOVHuZyT7k49d01ddeFqnmU8k"
-    regions = ['northamerica-northeast', 'southamerica', 'us-central', 'us-east', 'us-west', 'europe', 'australia']
+    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
+    regions = ['northamerica-northeast', 'southamerica', 'us-central', 'us-east', 'us-west', 'europe', 'australia','asia','middle-east']
     headers = {
         "accept": "application/json",
         "x-api-key": api_key,

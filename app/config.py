@@ -1,7 +1,8 @@
 import os
-from dotenv import load_dotenv 
+#from dotenv import load_dotenv 
 from sqlalchemy import create_engine
-# Load environment variables from a .env file
+# Load environment variables from a .env file dev environment
+# Uncomment the following lines if you have a .env file to load
 #load_dotenv()
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"

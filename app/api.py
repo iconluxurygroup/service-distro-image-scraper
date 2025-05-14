@@ -4,17 +4,17 @@ import os
 import ray
 from typing import Dict
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
-from workflow import run_process_restart_batch, generate_download_file, process_file_with_retries
+from workflow import run_process_restart_batch, generate_download_file
 from database import (
     update_initial_sort_order,
     update_sort_order,
-    set_sort_order_negative_four_for_zero_match,
     update_log_url_in_db,
     fetch_missing_images,
     get_images_excel_db,
     get_send_to_email,
     update_file_generate_complete,
     update_file_location_complete,
+    update_sort_no_image_entry,
     update_sort_order_per_entry,
 )
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
@@ -23,7 +23,7 @@ import traceback
 from typing import Callable, Any, Union
 
 # Initialize FastAPI app
-app = FastAPI(title="super_scraper", version="3.0.0")
+app = FastAPI(title="super_scraper", version="3.2.0")
 
 # Default logger
 default_logger = logging.getLogger(__name__)
@@ -166,12 +166,10 @@ async def api_update_sort_order_per_entry(file_id: str):
 async def api_initial_sort(file_id: str):
     """Run initial sort order update."""
     return await run_job_with_logging(update_initial_sort_order, file_id, file_id=file_id)
-
-@router.get("/set-negative-four-for-zero-match/{file_id}", tags=["Sorting"])
-async def api_set_negative_four_for_zero_match(file_id: str):
-    """Set SortOrder to -4 for records with match_score = 0."""
-    return await run_job_with_logging(set_sort_order_negative_four_for_zero_match, file_id, file_id=file_id)
-
+@router.get("/no-image-sort/{file_id}", tags=["Sorting"])
+async def api_no_image_sort(file_id: str):
+    """Remove entries with no image results for a given file ID."""
+    return await run_job_with_logging(update_sort_no_image_entry, file_id, file_id=file_id)
 @router.post("/restart-job/{file_id}", tags=["Processing"])
 async def api_process_restart(file_id: str, entry_id: int = None):
     logger, log_filename = setup_job_logger(job_id=file_id)
