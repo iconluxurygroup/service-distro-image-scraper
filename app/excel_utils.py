@@ -1,15 +1,17 @@
-# excel_utils.py
 import os
 import logging
+import aiofiles.os as aio_os
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-from typing import List, Dict
+from typing import List, Dict, Optional
 from PIL import Image as IMG2
 from io import BytesIO
 import numpy as np
 from collections import Counter
+import asyncio
+
 # Module-level logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -135,10 +137,17 @@ def resize_image(image_path, logger=None):
     except Exception as e:
         logger.error(f"❌ Error resizing image: {e}, for image: {image_path}", exc_info=True)
         return False
-    
-def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="A", row_offset=5, logger=None):
-    """Write one image per entry to an Excel file starting at row 6, removing unneeded rows."""
-    logger = logger or default_logger
+
+async def write_excel_image(
+    local_filename: str,
+    temp_dir: str,
+    image_data: List[Dict],
+    column: str = "A",
+    row_offset: int = 5,
+    logger: Optional[logging.Logger] = None
+) -> List[int]:
+    """Write one image per entry to an Excel file starting at row 6, including text data for all rows."""
+    logger = logger or logging.getLogger(__name__)
     failed_rows = []
 
     try:
@@ -150,28 +159,46 @@ def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="
             logger.error(f"❌ Excel file must have at least 5 rows for header")
             return failed_rows
 
-        logger.info(f"🖼️ Processing images for {local_filename}")
-        if not os.path.exists(temp_dir):
+        # Step 1: Clear all rows beyond header (row 5) to prevent stale data
+        if ws.max_row > 5:
+            logger.info(f"🗑️ Clearing rows 6 to {ws.max_row} to remove stale data")
+            ws.delete_rows(6, ws.max_row - 5)
+
+        logger.info(f"🖼️ Processing {len(image_data)} entries for {local_filename}")
+        if not await aio_os.path.exists(temp_dir):
             logger.error(f"❌ Temp directory does not exist: {temp_dir}")
             return failed_rows
 
-        image_files = os.listdir(temp_dir)
-        if not image_files:
-            logger.warning(f"⚠️ No images found in {temp_dir}")
-            return failed_rows
-
-        # Create a map of ExcelRowID to filename
+        # Create a map of ExcelRowID to filename for images
+        image_files = await aio_os.listdir(temp_dir)
         image_map = {}
         for f in image_files:
             if '_' in f and f.split('_')[0].isdigit():
                 row_id = int(f.split('_')[0])
                 image_map[row_id] = f
+        logger.debug(f"📸 Found {len(image_map)} images in {temp_dir}")
 
-        # Process each entry
+        # Process each entry in image_data
         for item in image_data:
             row_id = item['ExcelRowID']
             row_number = row_id + row_offset  # e.g., ExcelRowID=1 -> row 6
+            logger.debug(f"Processing row_id={row_id}, row_number={row_number}")
 
+            # Write text data for all entries
+            ws[f"B{row_number}"] = item.get('Brand', '')
+            ws[f"D{row_number}"] = item.get('Style', '')
+            if item.get('Color'):
+                ws[f"E{row_number}"] = item['Color']
+            if item.get('Category'):
+                ws[f"H{row_number}"] = item['Category']
+
+            # Validate text data
+            if not ws[f"B{row_number}"].value:
+                logger.warning(f"⚠️ Missing Brand in B{row_number}")
+            if not ws[f"D{row_number}"].value:
+                logger.warning(f"⚠️ Missing Style in D{row_number}")
+
+            # Write image if available
             if row_id in image_map:
                 image_file = image_map[row_id]
                 image_path = os.path.join(temp_dir, image_file)
@@ -185,35 +212,24 @@ def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="
                     failed_rows.append(row_id)
                     logger.warning(f"⚠️ Image verification failed for {image_file}")
             else:
-                logger.warning(f"⚠️ No image found for row {row_id}")
                 failed_rows.append(row_id)
+                logger.warning(f"⚠️ No image found for row_id={row_id}")
 
-            # Populate data
-            ws[f"B{row_number}"] = item.get('Brand', '')
-            ws[f"D{row_number}"] = item.get('Style', '')
-            if item.get('Color'):
-                ws[f"E{row_number}"] = item['Color']
-            if item.get('Category'):
-                ws[f"H{row_number}"] = item['Category']
-
-            # Validate
-            if not ws[f"B{row_number}"].value:
-                logger.warning(f"⚠️ Missing Brand in B{row_number}")
-            if not ws[f"D{row_number}"].value:
-                logger.warning(f"⚠️ Missing Style in D{row_number}")
-
-        # Remove unneeded rows
+        # Step 2: Ensure all rows up to max ExcelRowID are initialized
         max_data_row = max(item['ExcelRowID'] for item in image_data) + row_offset
-        if ws.max_row > max_data_row:
-            logger.info(f"🗑️ Removing rows {max_data_row + 1} to {ws.max_row}")
-            ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
+        for row in range(6, max_data_row + 1):
+            if not ws[f"B{row}"].value and not ws[f"D{row}"].value:  # Check if row is empty
+                ws[f"B{row}"] = ""  # Initialize with empty values to avoid gaps
+                ws[f"D{row}"] = ""
+                logger.debug(f"Initialized empty row {row} to prevent gaps")
 
+        # Save the workbook
         wb.save(local_filename)
-        logger.info("🏁 Finished processing images")
+        logger.info(f"🏁 Finished processing {len(image_data)} entries, {len(failed_rows)} rows without valid images")
         return failed_rows
 
     except Exception as e:
-        logger.error(f"❌ Error writing images: {e}")
+        logger.error(f"❌ Error writing images and data: {e}", exc_info=True)
         return failed_rows
 
 def highlight_cell(excel_file, cell_reference, logger=None):

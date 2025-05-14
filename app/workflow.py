@@ -18,6 +18,7 @@ from database import (
     update_initial_sort_order,
     update_log_url_in_db,
     get_endpoint,
+    sync_update_search_sort_order,
     get_images_excel_db,
     get_send_to_email,
     update_file_generate_complete,
@@ -40,7 +41,7 @@ from file_utils import create_temp_dirs, cleanup_temp_dirs
 from aws_s3 import upload_file_to_space
 import httpx
 import aiofiles
-
+import datetime
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -358,8 +359,9 @@ async def generate_download_file(
         template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
         header_index = 5
         base_name, extension = os.path.splitext(original_filename)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         unique_id = base_name[-8:] if len(base_name) >= 8 else base_name
-        processed_file_name = f"{base_name}_processed_{unique_id}{extension}"
+        processed_file_name = f"super_scraper/jobs/{file_id}/{base_name}_scraper_{timestamp}_{unique_id}{extension}"
         logger.info(f"🆔 Generated filename: {processed_file_name}")
 
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
