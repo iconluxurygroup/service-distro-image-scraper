@@ -1,10 +1,9 @@
-# email_utils.py
 import os
 import logging
-import smtplib
+import aiosmtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from config import SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME
+from config import SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, VERSION
 
 # Module-level logger
 default_logger = logging.getLogger(__name__)
@@ -18,8 +17,11 @@ if not default_logger.handlers:
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
-def send_email(to_emails, subject, download_url, job_id, logger=None):
-    """Send an email notification with the download URL using Gmail SMTP."""
+async def send_email(to_emails, subject, download_url, job_id, logger=None):
+    """Send an email notification with the download URL using Gmail SMTP.
+
+    Version: 3.0.4
+    """
     logger = logger or default_logger
     try:
         # Create MIME message
@@ -37,13 +39,12 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         <html>
         <body>
         <div class="container">
-            <p>Your file is ready to <a href="{download_url}" class="download-button">download</a></p>
+            <p>Your file is ready to <a href="{download_url}" class="download-button">download</a></p>            
             <p>--</p>
             <p><small>This is an automated notification.<br>
             User: {to_emails}<br>
-            <a href="https://cms.rtsplusdev.com/webadmin/ImageScraperForm.asp?Action=Edit&ID={str(job_id)}">All results</a><br>
             Job ID: {str(job_id)}<br>
-            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">3.0.4</a>
+            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">{VERSION}</a>
             </small>
             </p> 
         </div>
@@ -53,19 +54,29 @@ def send_email(to_emails, subject, download_url, job_id, logger=None):
         msg.attach(MIMEText(html_content, 'html'))
 
         # Connect and send email
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()  # Enable TLS
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)  # Login with Gmail credentials
-            recipients = [to_emails, cc_recipient]
-            server.sendmail(SENDER_EMAIL, recipients, msg.as_string())
+        smtp_client = aiosmtplib.SMTP(
+            hostname=SMTP_SERVER,
+            port=SMTP_PORT,
+            use_tls=False,  # Start in non-TLS mode
+            start_tls=True  # Automatically handle STARTTLS
+        )
+        await smtp_client.connect()
+        await smtp_client.login(SENDER_EMAIL, SENDER_PASSWORD)
+        recipients = [to_emails, cc_recipient]
+        await smtp_client.send_message(msg, sender=SENDER_EMAIL, recipients=recipients)
+        await smtp_client.quit()
 
         logger.info(f"📧 Email sent successfully to {to_emails}")
+        return True
     except Exception as e:
         logger.error(f"🔴 Error sending email to {to_emails}: {e}", exc_info=True)
         raise
 
-def send_message_email(to_emails, subject, message, logger=None):
-    """Send a plain message email (e.g., for errors) using Gmail SMTP."""
+async def send_message_email(to_emails, subject, message, logger=None):
+    """Send a plain message email (e.g., for errors) using Gmail SMTP.
+
+    Version: 3.0.4
+    """
     logger = logger or default_logger
     try:
         # Create MIME message
@@ -87,7 +98,9 @@ def send_message_email(to_emails, subject, message, logger=None):
             <p>Message details:<br>{message_with_breaks}</p>
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">3.0.4</a> <br>User: {to_emails}</small></p>
+            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">{VERSION}</a>
+            <br>
+            User: {to_emails}</small></p>
         </div>
         </body>
         </html>
@@ -95,13 +108,20 @@ def send_message_email(to_emails, subject, message, logger=None):
         msg.attach(MIMEText(html_content, 'html'))
 
         # Connect and send email
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()  # Enable TLS
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)  # Login with Gmail credentials
-            recipients = [to_emails, cc_recipient]
-            server.sendmail(SENDER_EMAIL, recipients, msg.as_string())
+        smtp_client = aiosmtplib.SMTP(
+            hostname=SMTP_SERVER,
+            port=SMTP_PORT,
+            use_tls=False,  # Start in non-TLS mode
+            start_tls=True  # Automatically handle STARTTLS
+        )
+        await smtp_client.connect()
+        await smtp_client.login(SENDER_EMAIL, SENDER_PASSWORD)
+        recipients = [to_emails, cc_recipient]
+        await smtp_client.send_message(msg, sender=SENDER_EMAIL, recipients=recipients)
+        await smtp_client.quit()
 
         logger.info(f"📧 Message email sent successfully to {to_emails}")
+        return True
     except Exception as e:
         logger.error(f"🔴 Error sending message email to {to_emails}: {e}", exc_info=True)
         raise

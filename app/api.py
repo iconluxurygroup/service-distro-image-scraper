@@ -21,9 +21,9 @@ from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from logging_config import setup_job_logger
 import traceback
 from typing import Optional
-
+from config import VERSION
 # Initialize FastAPI app
-app = FastAPI(title="super_scraper", version="3.3.1")
+app = FastAPI(title="super_scraper", version=VERSION)
 
 # Default logger
 default_logger = logging.getLogger(__name__)

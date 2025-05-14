@@ -1291,8 +1291,8 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                     s.ProductCategory AS Category
                 FROM utb_ImageScraperFiles f
                 INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
-                INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID
-                WHERE f.ID = ? AND r.SortOrder = 1
+                LEFT JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID AND r.SortOrder = 1
+                WHERE f.ID = ?
                 GROUP BY 
                     s.ExcelRowID, 
                     r.ImageUrl, 
@@ -1304,7 +1304,7 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                 ORDER BY s.ExcelRowID
             """
             df = pd.read_sql_query(query, conn, params=(file_id,))
-            logger.info(f"Fetched {len(df)} images for Excel export for FileID {file_id}")
+            logger.info(f"Fetched {len(df)} rows for Excel export for FileID {file_id}")
             return df
     except pyodbc.Error as e:
         logger.error(f"Database error in get_images_excel_db: {e}")
