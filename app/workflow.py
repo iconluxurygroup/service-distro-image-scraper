@@ -33,9 +33,22 @@ from utils import (
     process_and_tag_results,
     process_search_row_gcloud,
 )
+import asyncio
+import os
+import logging
+import datetime
+import aiofiles
+import httpx
+import pyodbc
+import pandas as pd
+from typing import Dict, Optional
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+
 from image_reason import process_entry_remote
 from image_utils import download_all_images
-from excel_utils import write_excel_image
+
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+
 from email_utils import send_email, send_message_email
 from file_utils import create_temp_dirs, cleanup_temp_dirs
 from aws_s3 import upload_file_to_space
@@ -315,12 +328,13 @@ def process_restart_batch(
             "log_filename": log_filename
         }
 
+
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
     file_id_param: Optional[int] = None
 ) -> Dict[str, str]:
-    """Generate and upload a processed Excel file with images."""
+    """Generate and upload a processed Excel file with images asynchronously."""
     logger = logger or default_logger
     temp_images_dir, temp_excel_dir = None, None
 
@@ -367,7 +381,10 @@ async def generate_download_file(
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
         local_filename = os.path.join(temp_excel_dir, original_filename)
 
+        # Download images with thumbnail fallback
         failed_img_urls = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
+        logger.info(f"📥 Downloaded images, {len(failed_img_urls)} failed")
+
         logger.info(f"📥 Downloading template file from {template_file_path}")
         async with httpx.AsyncClient() as client:
             response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
@@ -380,6 +397,14 @@ async def generate_download_file(
         failed_rows = await write_excel_image(
             local_filename, temp_images_dir, selected_image_list, "A", row_offset, logger
         )
+
+        # Write failed downloads to Excel if any
+        if failed_img_urls:
+            logger.info(f"📝 Writing {len(failed_img_urls)} failed downloads to Excel")
+            # failed_img_urls is already a list of (url, row_id) tuples
+            success = await write_failed_downloads_to_excel(failed_img_urls, local_filename, logger=logger)
+            if not success:
+                logger.warning(f"⚠️ Failed to write some failed downloads to Excel")
 
         public_url = await upload_file_to_space(
             local_filename, processed_file_name, True, logger, file_id
