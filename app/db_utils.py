@@ -11,11 +11,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql import text
 from requests.exceptions import RequestException
 
+
+
+
 # Import shared utilities from common.py
 from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
 # Import check_endpoint_health from utils.py
 # Import database configuration
-from config import conn_str, engine
+from config import conn_str, engine,async_engine
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -804,14 +807,14 @@ def sync_update_search_sort_order(
 
 
 async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
-        
-        async with engine.begin() as conn:  
+        # Use async engine with async context manager
+        async with async_engine.begin() as conn:  
             result = await conn.execute(
-                     text(
+                text(
                     """
                     DELETE FROM utb_ImageScraperResult
                     WHERE EntryID IN (

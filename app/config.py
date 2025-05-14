@@ -1,9 +1,11 @@
 import os
 #from dotenv import load_dotenv 
 from sqlalchemy import create_engine
-# Load environment variables from a .env file dev environment
-# Uncomment the following lines if you have a .env file to load
-#load_dotenv()
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+import logging
+from typing import Optional, Dict
+from sqlalchemy.sql import text
+from urllib.parse import quote_plus
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"
 SENDER_NAME='imagesearch'
@@ -37,4 +39,9 @@ GROK_ENDPOINT = os.getenv('GROK_ENDPOINT', 'https://api.x.ai/v1/chat/completions
 pwd_str = f"Pwd={MSSQLS_PWD};"
 conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;{pwd_str}"
 # Database connection strings
+
+encoded_conn_str = quote_plus(conn_str)
+ASYNC_DATABASE_URL = f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}"
+# Create async engine
+async_engine = create_async_engine(ASYNC_DATABASE_URL, echo=True)
 engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn_str)
