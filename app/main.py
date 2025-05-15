@@ -72,7 +72,7 @@ if __name__ == "__main__":
             app,
             host="0.0.0.0",
             port=8080,
-            threads=os.cpu_count() * 2 + 1,
+            threads=os.cpu_count() / 2 + 1,
             connection_limit=1000,
             asyncore_loop_timeout=120
         )
@@ -98,11 +98,11 @@ if __name__ == "__main__":
                 return self.application
 
         options = {
-            "bind": "0.0.0.0:8080",
-            "workers": os.cpu_count() + 1,
-            "worker_class": "uvicorn.workers.UvicornWorker",
-            "loglevel": "info",
-            "timeout": 120,
-            "graceful_timeout": 30,
-        }
-        StandaloneApplication(app, options).run()
+    "bind": "0.0.0.0:8080",
+    "workers": os.cpu_count() + 1,
+    "worker_class": "uvicorn.workers.UvicornWorker",
+    "loglevel": "info",
+    "timeout": 7200,  # 2 hours (7200 seconds), a practical maximum
+    "graceful_timeout": 7140,  # Slightly less than timeout (119 minutes)
+}
+StandaloneApplication(app, options).run()
