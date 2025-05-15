@@ -6,6 +6,7 @@ import ray
 import aiofiles
 import httpx
 import datetime
+import psutil  # Added for memory logging
 from typing import Dict, List, Optional, Tuple
 from config import conn_str
 from database import (
@@ -46,7 +47,7 @@ def run_process_restart_batch(*args, **kwargs):
     """Wrapper for process_restart_batch to match expected API."""
     return process_restart_batch.remote(*args, **kwargs)
 
-@ray.remote
+@ray.remote(num_cpus=1, memory=2 * 1024 * 1024 * 1024)  # 2GB memory limit
 def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -56,14 +57,21 @@ def process_restart_batch(
     # Initialize logger inside the remote function to avoid serialization issues
     logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
 
+    # Function to log memory usage
+    def log_memory_usage():
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        logger.info(f"Memory usage: RSS={mem_info.rss / 1024 / 1024:.2f} MB, VMS={mem_info.vms / 1024 / 1024:.2f} MB")
+
     # Define the async logic in a separate function
     async def _process_restart_batch_async() -> Dict[str, str]:
         try:
             logger.info(f"🔁 Starting concurrent search processing for FileID: {file_id_db}" + 
                        (f", EntryID: {entry_id}" if entry_id else "") + 
                        f", use_all_variations: {use_all_variations}")
+            log_memory_usage()  # Log memory at start
             file_id_db_int = int(file_id_db)
-            BATCH_SIZE = 10
+            BATCH_SIZE = 5  # Reduced from 10 to lower memory usage
 
             # Fetch brand rules asynchronously
             brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
@@ -97,7 +105,7 @@ def process_restart_batch(
                 logger.error(f"No healthy endpoint available for FileID: {file_id_db} after {max_endpoint_retries} attempts")
                 return {"error": f"No healthy endpoint available for FileID: {file_id_db}", "log_filename": log_filename}
 
-            # Fetch entries
+            # Fetch entries using a single connection
             with pyodbc.connect(conn_str, autocommit=False) as conn:
                 cursor = conn.cursor()
                 if entry_id:
@@ -136,13 +144,14 @@ def process_restart_batch(
 
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Processing batch {batch_idx}/{len(entry_batches)} with {len(batch_entries)} entries")
+                start_time = datetime.datetime.now()  # Track batch processing time
                 batch_results = []
 
                 # Create a list of Ray tasks for concurrent execution with semaphore
-                semaphore = asyncio.Semaphore(10)  # Limit to 20 concurrent tasks
+                semaphore = asyncio.Semaphore(10)  # Reduced from 20 to 10
                 async def submit_task(entry_id, search_string, brand, color, category):
                     async with semaphore:
-                        # Call sync_process_and_tag_results.remote without await, as it's a Ray remote task
+                        logger.debug(f"Submitting Ray task for EntryID: {entry_id}")
                         return sync_process_and_tag_results.remote(
                             search_string=search_string,
                             brand=brand,
@@ -155,8 +164,12 @@ def process_restart_batch(
                         )
 
                 tasks = [submit_task(*entry) for entry in batch_entries]
-                # Use ray.get to resolve Ray ObjectRefs, since tasks are not awaitable
+                logger.debug(f"Submitting {len(tasks)} Ray tasks for batch {batch_idx}")
                 results = ray.get(await asyncio.gather(*tasks, return_exceptions=True))
+                logger.debug(f"Received results for {len(results)} tasks in batch {batch_idx}")
+                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
+                log_memory_usage()  # Log memory after each batch
 
                 # Process results
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
@@ -213,26 +226,25 @@ def process_restart_batch(
                             successful_entries += 1
                             batch_results.append(True)
 
-                            # Verify database insertion
-                            with pyodbc.connect(conn_str, autocommit=False) as conn:
-                                cursor = conn.cursor()
-                                cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ?", (entry_id,))
-                                total_count = cursor.fetchone()[0]
-                                cursor.execute(
-                                    "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder > 0",
-                                    (entry_id,)
-                                )
-                                count = cursor.fetchone()[0]
-                                cursor.execute(
-                                    "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder IS NULL",
-                                    (entry_id,)
-                                )
-                                null_count = cursor.fetchone()[0]
-                                logger.info(f"Verification: Found {total_count} total rows, {count} with positive SortOrder, {null_count} with NULL SortOrder for EntryID {entry_id}")
-                                if null_count > 0:
-                                    logger.error(f"Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                                if total_count == 0:
-                                    logger.error(f"No rows found for EntryID {entry_id} after insertion")
+                            # Verify database insertion using the same connection
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ?", (entry_id,))
+                            total_count = cursor.fetchone()[0]
+                            cursor.execute(
+                                "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder > 0",
+                                (entry_id,)
+                            )
+                            count = cursor.fetchone()[0]
+                            cursor.execute(
+                                "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder IS NULL",
+                                (entry_id,)
+                            )
+                            null_count = cursor.fetchone()[0]
+                            logger.info(f"Verification: Found {total_count} total rows, {count} with positive SortOrder, {null_count} with NULL SortOrder for EntryID {entry_id}")
+                            if null_count > 0:
+                                logger.error(f"Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                            if total_count == 0:
+                                logger.error(f"No rows found for EntryID {entry_id} after insertion")
 
                         else:
                             logger.error(f"No results returned for EntryID {entry_id}")
@@ -244,7 +256,7 @@ def process_restart_batch(
                         failed_entries += 1
                         batch_results.append(False)
 
-            # Final verification
+            # Final verification using the same connection
             with pyodbc.connect(conn_str, autocommit=False) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -283,6 +295,7 @@ def process_restart_batch(
                     logger.info(f"Sample - ResultID: {result[0]}, EntryID: {result[1]}, SortOrder: {result[2]}, ImageDesc: {result[3]}")
                 
             logger.info(f"✅ Completed processing for FileID: {file_id_db}. {positive_entries}/{len(entries)} entries with positive SortOrder. Failed entries: {failed_entries}")
+            log_memory_usage()  # Log memory at completion
                 
             # Send success email notification
             to_emails = await get_send_to_email(file_id_db_int, logger=logger)
@@ -312,6 +325,7 @@ def process_restart_batch(
 
         except Exception as e:
             logger.error(f"🔴 Error processing FileID {file_id_db}: {e}", exc_info=True)
+            log_memory_usage()  # Log memory on error
             to_emails = await get_send_to_email(file_id_db, logger=logger)
             if to_emails:
                 await send_message_email(
