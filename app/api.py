@@ -18,6 +18,8 @@ from database import (
     update_sort_order_per_entry,
 )
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
+from email_utils import send_message_email
+
 from logging_config import setup_job_logger
 import traceback
 from typing import Optional
@@ -214,16 +216,17 @@ async def api_restart_search_all(file_id: str, entry_id: int = None):
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
     try:
-        result = await process_restart_batch(
-    file_id_db=int(file_id),
-    entry_id=entry_id,
-    use_all_variations=True
-    )     
-        if "error" in result:
-            logger.error(f"Failed to process restart batch for FileID: {file_id}: {result['error']}")
-            raise HTTPException(status_code=500, detail=result["error"])
+        result = await run_job_with_logging(
+            process_restart_batch,
+            file_id,
+            entry_id=entry_id,
+            use_all_variations=True
+        )
+        if result["status_code"] != 200:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
+            raise HTTPException(status_code=result["status_code"], detail=result["message"])
         logger.info(f"Completed restart batch for FileID: {file_id}. Result: {result}")
-        return {"status_code": 200, "message": f"Processing restart with all variations completed for FileID: {file_id}", "data": result}
+        return {"status_code": 200, "message": f"Processing restart with all variations completed for FileID: {file_id}", "data": result["data"]}
     except Exception as e:
         logger.error(f"Error queuing restart batch for FileID: {file_id}: {e}", exc_info=True)
         if os.path.exists(log_filename):
@@ -231,6 +234,15 @@ async def api_restart_search_all(file_id: str, entry_id: int = None):
                 log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
+            # Send email on failure
+            subject = f"Failure: Batch Restart for FileID {file_id}"
+            message = f"Batch restart for FileID {file_id} failed.\nError: {str(e)}\nLog file: {upload_url}"
+            await send_message_email(
+                to_emails=["nik@iconluxurygroup.com"],
+                subject=subject,
+                message=message,
+                logger=logger
+            )
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
 
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
