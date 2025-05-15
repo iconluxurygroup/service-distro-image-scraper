@@ -1,0 +1,47 @@
+[project]
+name = "distro-image"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ray[default]>=2.46.0",
+    "fastapi==0.115.11",
+    "uvicorn==0.34.0",
+    "torch==2.6.0",
+    "opencv-python==4.11.0.86",
+    "pyodbc==5.2.0",
+    "pandas==2.2.3",
+    "boto3==1.36",
+    "SQLAlchemy==2.0.39",
+    "rapidfuzz==3.13.0",
+    "numpy==2.1.1",
+    "torchvision==0.21.0", 
+    "requests==2.32.3",    
+    "aioodbc==0.5.0",
+    "httpx==0.28.1",
+    "Unidecode==1.4.0",
+    "fuzzywuzzy==0.18.0",
+    "python-Levenshtein==0.27.1",
+    "aiofiles==24.1.0",
+    "openpyxl==3.1.5",
+    "aiosmtplib==4.0.1",
+    "aiobotocore==2.18.0",
+    "chardet==5.2.0",
+    "beautifulsoup4==4.13.4",
+    "google-generativeai==0.8.5",
+    "ultralytics==8.3.135",
+    "setuptools>=69.0.0"
+
+
+    
+]
+
+[project.optional-dependencies]
+ml = [
+    "transformers==4.49.0",
+]
+dev = [
+    "pytest==8.3.2",
+    "black==24.8.0",
+]

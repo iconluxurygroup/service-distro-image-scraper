@@ -3,39 +3,48 @@ FROM python:3.10-slim
 
 # Set the working directory in the container
 WORKDIR /app
-# Upgrade pip in its own layer
-RUN pip install --upgrade pip
-# Copy and install requirements
-COPY app/requirements.txt /app/requirements.txt
-RUN pip install -r requirements.txt
 
-# Clean the apt cache and update with --fix-missing
-RUN apt-get clean && \
-    apt-get update --fix-missing
+# Install system dependencies for opencv-python, torch, pyodbc, and other packages
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
+        apt-transport-https \
+        curl \
+        gnupg \
+        lsb-release \
+        unixodbc \
+        unixodbc-dev \
+        libpq-dev \
+        build-essential \
+        libopencv-dev \
+        && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install necessary packages
-RUN apt-get install -y apt-transport-https curl gnupg lsb-release unixodbc unixodbc-dev
 # Add Microsoft package repository and install msodbcsql17
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
-    curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
+    curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update --fix-missing && \
-    ACCEPT_EULA=Y apt-get install -y msodbcsql17 && \
-    ACCEPT_EULA=Y apt-get install -y mssql-tools
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 mssql-tools && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Set PATH to include mssql-tools
 ENV PATH="/opt/mssql-tools/bin:${PATH}"
 
 # Verify installation of unixODBC
-RUN which odbcinst
+RUN which odbcinst && odbcinst -j
+
+# Install uv for dependency management
+RUN pip install --no-cache-dir uv
+
+# Copy pyproject.toml and generate requirements.txt using uv
+COPY app/pyproject.toml /app/
+RUN uv pip compile pyproject.toml -o requirements.txt && \
+    uv pip install --system -r requirements.txt
 
 # Copy the rest of the application into the container
 COPY app/ /app/
 
-# Verify ODBC installation
-RUN odbcinst -j
-
-# Make port 8080 available to the world outside this container
+# Make ports available (8080 for Uvicorn, 8265 for Ray dashboard)
 EXPOSE 8080
 EXPOSE 8265
+
 # Run main.py when the container launches
-CMD python main.py
+CMD ["python", "main.py"]
