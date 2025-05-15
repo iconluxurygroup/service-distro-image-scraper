@@ -1,6 +1,6 @@
 [project]
-name = "distro-image"
-version = "0.1.0"
+name = "super-scraper"
+version = "3.4.9"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,8 +32,6 @@ dependencies = [
     "google-generativeai==0.8.5",
     "ultralytics==8.3.135",
     "setuptools>=69.0.0"
-
-
     
 ]
 

@@ -36,12 +36,10 @@ RUN pip install --no-cache-dir uv
 
 # Copy pyproject.toml and generate requirements.txt using uv
 COPY app/pyproject.toml /app/
+COPY app/uv.lock /app/
 RUN uv pip compile pyproject.toml -o requirements.txt && \
     uv pip install --system -r requirements.txt
-
-# Copy the rest of the application into the container
 COPY app/ /app/
-
 # Make ports available (8080 for Uvicorn, 8265 for Ray dashboard)
 EXPOSE 8080
 EXPOSE 8265
