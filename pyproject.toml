@@ -5,7 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "ray[default]>=2.46.0",
     "fastapi==0.115.11",
     "uvicorn==0.34.0",
     "torch==2.6.0",
