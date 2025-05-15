@@ -38,7 +38,7 @@ ENV PATH="/opt/mssql-tools/bin:${PATH}"
 RUN which odbcinst && odbcinst -j
 
 # Install uv
-RUN pip install --no-cache-dir uv==0.4.18
+RUN pip install --no-cache-dir uv>=0.4.18
 
 COPY pyproject.toml /app/ 
 # Copy dependency files
