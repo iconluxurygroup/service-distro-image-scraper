@@ -3,7 +3,8 @@ import asyncio
 import os
 from typing import Dict, Any, Callable, Union, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
-from workflow import process_restart_batch, generate_download_file, batch_vision_reason
+from workflow import process_restart_batch, generate_download_file
+#, batch_vision_reason
 from database import (
     update_initial_sort_order,
     update_sort_order,
@@ -243,40 +244,40 @@ async def api_restart_search_all(file_id: str, entry_id: int = None):
                 logger=logger
             )
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
-@router.post("/process-images-ai/{file_id}", tags=["Processing"])
-async def api_process_ai_images(
-    file_id: str,
-    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to process"),
-    step: int = Query(0, description="Retry step for logging"),
-    limit: int = Query(5000, description="Maximum number of images to process"),
-    concurrency: int = Query(10, description="Maximum concurrent Ray tasks")
-):
-    """Trigger AI image processing for a file, analyzing images with YOLOv11 and Gemini."""
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing AI image processing for FileID: {file_id}, EntryIDs: {entry_ids}, Step: {step}")
-    try:
-        result = await run_job_with_logging(
-            batch_vision_reason,
-            file_id,
-            entry_ids=entry_ids,
-            step=step,
-            limit=limit,
-            concurrency=concurrency,
-            logger=logger
-        )
-        if result["status_code"] != 200:
-            logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
-            raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        logger.info(f"Completed AI image processing for FileID {file_id}")
-        return {"status_code": 200, "message": f"AI image processing completed for FileID: {file_id}", "data": result["data"]}
-    except Exception as e:
-        logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
+# @router.post("/process-images-ai/{file_id}", tags=["Processing"])
+# async def api_process_ai_images(
+#     file_id: str,
+#     entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to process"),
+#     step: int = Query(0, description="Retry step for logging"),
+#     limit: int = Query(5000, description="Maximum number of images to process"),
+#     concurrency: int = Query(10, description="Maximum concurrent Ray tasks")
+# ):
+#     """Trigger AI image processing for a file, analyzing images with YOLOv11 and Gemini."""
+#     logger, log_filename = setup_job_logger(job_id=file_id)
+#     logger.info(f"Queueing AI image processing for FileID: {file_id}, EntryIDs: {entry_ids}, Step: {step}")
+#     try:
+#         result = await run_job_with_logging(
+#             batch_vision_reason,
+#             file_id,
+#             entry_ids=entry_ids,
+#             step=step,
+#             limit=limit,
+#             concurrency=concurrency,
+#             logger=logger
+#         )
+#         if result["status_code"] != 200:
+#             logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
+#             raise HTTPException(status_code=result["status_code"], detail=result["message"])
+#         logger.info(f"Completed AI image processing for FileID {file_id}")
+#         return {"status_code": 200, "message": f"AI image processing completed for FileID: {file_id}", "data": result["data"]}
+#     except Exception as e:
+#         logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
+#         if os.path.exists(log_filename):
+#             upload_url = await upload_file_to_space(
+#                 log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+#             )
+#             await update_log_url_in_db(file_id, upload_url, logger)
+#         raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
 
 # Export-related endpoints
 @router.post("/generate-download-file/{file_id}", tags=["Export"])
