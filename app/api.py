@@ -210,7 +210,7 @@ async def api_process_restart(file_id: str, entry_id: int = None):
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
 
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
-async def api_restart_search_all(background_tasks: BackgroundTasks,file_id: str, entry_id: int = None):
+async def api_restart_search_all(background_tasks: BackgroundTasks, file_id: str, entry_id: int = None):
     """Restart batch processing for a file, searching all variations for each entry."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
@@ -218,7 +218,7 @@ async def api_restart_search_all(background_tasks: BackgroundTasks,file_id: str,
         background_tasks.add_task(
             run_job_with_logging,
             run_process_restart_batch,
-            file_id_db=int(file_id),
+            file_id,  # Pass file_id positionally
             entry_id=entry_id,
             use_all_variations=True,
             logger=logger
