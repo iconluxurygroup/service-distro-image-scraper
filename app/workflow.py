@@ -33,6 +33,7 @@ def process_entry(args):
             model=search_string,
             endpoint=endpoint,
             entry_id=entry_id,
+            logger=logger,  # Add logger argument
             use_all_variations=use_all_variations,
             file_id_db=file_id_db
         )
