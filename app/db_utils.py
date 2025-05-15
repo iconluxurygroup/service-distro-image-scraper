@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql import text
 from requests.exceptions import RequestException
-
+import aioodbc
 
 
 
@@ -29,14 +29,14 @@ async def get_endpoint(logger: Optional[logging.Logger] = None) -> str:
     """Retrieve a random non-blocked endpoint from the database."""
     logger = logger or default_logger
     try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT TOP 1 EndpointURL FROM utb_Endpoints WHERE EndpointIsBlocked = 0 ORDER BY NEWID()")
-            result = cursor.fetchone()
-            endpoint = result[0] if result else "No EndpointURL"
-            logger.info(f"Retrieved endpoint: {endpoint}")
-            return endpoint
-    except pyodbc.Error as e:
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT TOP 1 EndpointURL FROM utb_Endpoints WHERE EndpointIsBlocked = 0 ORDER BY NEWID()")
+                result = await cursor.fetchone()
+                endpoint = result[0] if result else "No EndpointURL"
+                logger.info(f"Retrieved endpoint: {endpoint}")
+                return endpoint
+    except Exception as e:
         logger.error(f"Database error getting endpoint: {e}")
         return "No EndpointURL"
 def sync_get_endpoint(logger: Optional[logging.Logger] = None) -> Optional[str]:
