@@ -51,46 +51,57 @@ def generate_aliases(model: Any) -> List[str]:
     aliases.add(base)
     return [a for a in aliases if a and len(a) >= len(model) - 3]
 
-async def fetch_brand_rules(url: str = BRAND_RULES_URL, max_attempts: int = 3, timeout: int = 10, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
+import httpx
+import logging
+import asyncio
+from typing import Optional, Dict
+
+async def fetch_brand_rules(
+    url: str = BRAND_RULES_URL,
+    max_attempts: int = 3,
+    timeout: int = 10,
+    logger: Optional[logging.Logger] = None
+) -> Optional[Dict]:
     """Fetch brand rules from a remote URL with retry logic."""
     logger = logger or default_logger
-    for attempt in range(max_attempts):
-        try:
-            response = requests.get(url, timeout=timeout)
-            response.raise_for_status()
-            brand_rules = response.json()
-            if "brand_rules" not in brand_rules:
-                logger.error(f"Invalid brand rules format from {url}")
-                return {"brand_rules": []}
-            brand_rules["brand_rules"].append({
-                "names": ["Scotch & Soda", "Scotch and Soda", "Scotch Soda", "ScotchSoda"],
-                "full_name": "Scotch & Soda",
-                "version": "1.0",
-                "last_updated": "2025-05-06",
-                "is_active": True,
-                "sku_format": {
-                    "base": {"article": ["6"], "model": ["0"]},
-                    "base_separator": "",
-                    "color_extension": ["3"],
-                    "color_separator": "_"
-                },
-                "expected_length": {"base": [6], "with_color": [10]},
-                "fallback_format": "base",
-                "render": False,
-                "delay": False,
-                "domain_hierarchy": ["scotch-soda.com", "scotchandsoda.com"],
-                "comments": "SKU format: 6-digit base + 3-digit color",
-                "example_sku": "179177_260"
-            })
-            logger.info(f"Successfully fetched brand rules from {url} with Scotch & Soda fallback")
-            return brand_rules
-        except (RequestException, ValueError) as e:
-            logger.warning(f"Attempt {attempt + 1} failed to fetch brand rules from {url}: {e}")
-            if attempt < max_attempts - 1:
-                await asyncio.sleep(2)
-            else:
-                logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
-                return {"brand_rules": []}
+    async with httpx.AsyncClient() as client:
+        for attempt in range(max_attempts):
+            try:
+                response = await client.get(url, timeout=timeout)
+                response.raise_for_status()
+                brand_rules = response.json()
+                if "brand_rules" not in brand_rules:
+                    logger.error(f"Invalid brand rules format from {url}")
+                    return {"brand_rules": []}
+                brand_rules["brand_rules"].append({
+                    "names": ["Scotch & Soda", "Scotch and Soda", "Scotch Soda", "ScotchSoda"],
+                    "full_name": "Scotch & Soda",
+                    "version": "1.0",
+                    "last_updated": "2025-05-06",
+                    "is_active": True,
+                    "sku_format": {
+                        "base": {"article": ["6"], "model": ["0"]},
+                        "base_separator": "",
+                        "color_extension": ["3"],
+                        "color_separator": "_"
+                    },
+                    "expected_length": {"base": [6], "with_color": [10]},
+                    "fallback_format": "base",
+                    "render": False,
+                    "delay": False,
+                    "domain_hierarchy": ["scotch-soda.com", "scotchandsoda.com"],
+                    "comments": "SKU format: 6-digit base + 3-digit color",
+                    "example_sku": "179177_260"
+                })
+                logger.info(f"Successfully fetched brand rules from {url} with Scotch & Soda fallback")
+                return brand_rules
+            except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
+                logger.warning(f"Attempt {attempt + 1} failed to fetch brand rules from {url}: {e}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
+                    return {"brand_rules": []}
 
 def normalize_model(model: Any) -> str:
     """Normalize a model string to lowercase."""
