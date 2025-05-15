@@ -46,21 +46,46 @@ BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.co
 def run_process_restart_batch(*args, **kwargs):
     """Wrapper for process_restart_batch to match expected API."""
     return process_restart_batch.remote(*args, **kwargs)
+python
 
-@ray.remote(num_cpus=1, memory=8 * 1024 * 1024 * 1024)  # Increased to 8GB
+Copy
+import os
+import pandas as pd
+import pyodbc
+import ray
+import requests
+import time
+import datetime
+import psutil
+import logging
+from typing import Dict, Optional, List
+from config import conn_str
+from database import (
+    insert_search_results,
+    update_search_sort_order,
+    get_endpoint,
+    get_send_to_email,
+)
+from utils import fetch_brand_rules, sync_process_and_tag_results
+from logging_config import setup_job_logger
+
+BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
+
+def run_process_restart_batch(*args, **kwargs):
+    return process_restart_batch.remote(*args, **kwargs)
+
+@ray.remote(num_cpus=1, memory=8 * 1024 * 1024 * 1024)  # 8GB
 def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False
 ) -> Dict[str, str]:
-    """Process a batch of entries for a file using Ray, handling retries and logging synchronously."""
     try:
-        # Initialize logger
+        # Initialize logger inside Ray task
         logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
         logger.setLevel(logging.DEBUG)
         logger.debug("Logger initialized successfully")
 
-        # Log memory usage
         def log_memory_usage():
             try:
                 process = psutil.Process()
@@ -75,14 +100,13 @@ def process_restart_batch(
                    f", use_all_variations: {use_all_variations}")
         log_memory_usage()
 
-        file_id_db_int = int(file_id_db)  # Should be safe since file_id_db is typed as int
+        file_id_db_int = file_id_db
         BATCH_SIZE = 2
 
-        # Fetch brand rules
         logger.debug("Fetching brand rules...")
         brand_rules = fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
-            logger.warning(f"No brand rules fetched for FileID: {file_id_db}")
+            logger.warning(f"No brand rules fetched")
             return {
                 "message": "Failed to fetch brand rules",
                 "file_id": str(file_id_db),
@@ -91,9 +115,7 @@ def process_restart_batch(
                 "failed_entries": "0",
                 "log_filename": log_filename
             }
-        logger.debug("Brand rules fetched successfully")
 
-        # Fetch endpoint
         logger.debug("Fetching endpoint...")
         max_endpoint_retries = 5
         endpoint = None
@@ -103,16 +125,15 @@ def process_restart_batch(
                 if endpoint:
                     logger.info(f"Selected healthy endpoint: {endpoint}")
                     break
-                logger.warning(f"Attempt {attempt + 1} failed to find healthy endpoint")
+                logger.warning(f"Attempt {attempt + 1} failed")
                 time.sleep(2)
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed to get endpoint: {e}")
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
                 time.sleep(2)
         if not endpoint:
-            logger.error(f"No healthy endpoint available after {max_endpoint_retries} attempts")
-            return {"error": f"No healthy endpoint available", "log_filename": log_filename}
+            logger.error(f"No healthy endpoint after {max_endpoint_retries} attempts")
+            return {"error": "No healthy endpoint", "log_filename": log_filename}
 
-        # Fetch entries
         logger.debug("Fetching entries from database...")
         with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
             cursor = conn.cursor()
@@ -128,16 +149,15 @@ def process_restart_batch(
                         (file_id_db_int,)
                     )
                 entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
-                logger.info(f"📋 Found {len(entries)} valid entries")
+                logger.info(f"Found {len(entries)} valid entries")
             except pyodbc.Error as e:
                 logger.error(f"Database query failed: {e}", exc_info=True)
                 return {"error": f"Database query failed: {e}", "log_filename": log_filename}
 
         if not entries:
-            logger.warning(f"⚠️ No entries found")
-            return {"error": f"No entries found", "log_filename": log_filename}
+            logger.warning(f"No entries found")
+            return {"error": "No entries found", "log_filename": log_filename}
 
-        # Process entries in batches
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
         logger.info(f"Created {len(entry_batches)} batches")
 
@@ -251,7 +271,6 @@ def process_restart_batch(
             logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
             log_memory_usage()
 
-        # Final verification
         with pyodbc.connect(conn_str, autocommit=False) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -301,12 +320,7 @@ def process_restart_batch(
                 f"Failed entries: {failed_entries}\n"
                 f"Log file: {log_filename}"
             )
-            send_message_email(
-                to_emails=to_emails,
-                subject=subject,
-                message=message,
-                logger=logger
-            )
+            send_message_email(to_emails=to_emails, subject=subject, message=message, logger=logger)
 
         return {
             "message": "Search processing completed",
@@ -328,10 +342,7 @@ def process_restart_batch(
                 message=f"An error occurred while processing your file: {str(e)}",
                 logger=logger
             )
-        return {
-            "error": str(e),
-            "log_filename": log_filename
-        }
+        return {"error": str(e), "log_filename": log_filename}
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
