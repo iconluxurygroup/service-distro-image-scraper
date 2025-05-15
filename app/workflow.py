@@ -47,7 +47,7 @@ def run_process_restart_batch(*args, **kwargs):
     """Wrapper for process_restart_batch to match expected API."""
     return process_restart_batch.remote(*args, **kwargs)
 
-@ray.remote(num_cpus=1, memory=4 * 1024 * 1024 * 1024)  # 4GB memory limit
+@ray.remote(num_cpus=1, memory=8 * 1024 * 1024 * 1024)  # Increased to 8GB
 def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -57,13 +57,17 @@ def process_restart_batch(
     try:
         # Initialize logger
         logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
-        logger.setLevel(logging.DEBUG)  # Enable debug logging
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Logger initialized successfully")
 
         # Log memory usage
         def log_memory_usage():
-            process = psutil.Process()  # Fixed typo
-            mem_info = process.memory_info()
-            logger.info(f"Memory usage: RSS={mem_info.rss / 1024 / 1024:.2f} MB, VMS={mem_info.vms / 1024 / 1024:.2f} MB")
+            try:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                logger.info(f"Memory usage: RSS={mem_info.rss / 1024 / 1024:.2f} MB, VMS={mem_info.vms / 1024 / 1024:.2f} MB")
+            except Exception as e:
+                logger.error(f"Memory logging failed: {e}")
 
         logger.debug(f"Input file_id_db: {file_id_db}, entry_id: {entry_id}, use_all_variations: {use_all_variations}")
         logger.info(f"🔁 Starting processing for FileID: {file_id_db}" + 
@@ -71,10 +75,10 @@ def process_restart_batch(
                    f", use_all_variations: {use_all_variations}")
         log_memory_usage()
 
-        file_id_db_int = int(file_id_db)
-        BATCH_SIZE = 2  # Reduced to lower memory usage
+        file_id_db_int = int(file_id_db)  # Should be safe since file_id_db is typed as int
+        BATCH_SIZE = 2
 
-        # Fetch brand rules synchronously
+        # Fetch brand rules
         logger.debug("Fetching brand rules...")
         brand_rules = fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
@@ -87,9 +91,9 @@ def process_restart_batch(
                 "failed_entries": "0",
                 "log_filename": log_filename
             }
-        logger.debug(f"Brand rules fetched successfully")
+        logger.debug("Brand rules fetched successfully")
 
-        # Fetch endpoint with retries
+        # Fetch endpoint
         logger.debug("Fetching endpoint...")
         max_endpoint_retries = 5
         endpoint = None
@@ -175,27 +179,22 @@ def process_restart_batch(
                 try:
                     dfs = result
                     if dfs:
-                        # Combine and deduplicate results
                         combined_df = pd.concat(dfs, ignore_index=True)
                         logger.info(f"Combined {len(combined_df)} results for EntryID {entry_id}")
 
-                        # Rename columns
                         for api_col, db_col in api_to_db_mapping.items():
                             if api_col in combined_df.columns and db_col not in combined_df.columns:
                                 combined_df.rename(columns={api_col: db_col}, inplace=True)
 
-                        # Verify required columns
                         if not all(col in combined_df.columns for col in required_columns):
                             logger.error(f"Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
                             failed_entries += 1
                             batch_results.append(False)
                             continue
 
-                        # Deduplicate
                         deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
                         logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
 
-                        # Insert into database
                         insert_success = insert_search_results(deduplicated_df, logger=logger)
                         if not insert_success:
                             logger.error(f"Failed to insert results for EntryID {entry_id}")
@@ -205,7 +204,6 @@ def process_restart_batch(
 
                         logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
 
-                        # Update sort order
                         update_result = update_search_sort_order(
                             str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                         )
@@ -219,7 +217,6 @@ def process_restart_batch(
                         successful_entries += 1
                         batch_results.append(True)
 
-                        # Verify database insertion
                         with pyodbc.connect(conn_str) as conn:
                             cursor = conn.cursor()
                             cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ?", (entry_id,))
@@ -291,11 +288,10 @@ def process_restart_batch(
             sample_results = cursor.fetchall()
             for result in sample_results:
                 logger.info(f"Sample - ResultID: {result[0]}, EntryID: {result[1]}, SortOrder: {result[2]}, ImageDesc: {result[3]}")
-        
+
         logger.info(f"✅ Completed processing for FileID: {file_id_db}. {positive_entries}/{len(entries)} entries with positive SortOrder. Failed entries: {failed_entries}")
         log_memory_usage()
 
-        # Send success email
         to_emails = get_send_to_email(file_id_db_int, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
