@@ -36,10 +36,6 @@ if not default_logger.handlers:
 router = APIRouter()
 
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str, int], **kwargs) -> Dict:
-    """
-    Run a job function with logging and upload logs to storage.
-    Returns standardized response with status_code, message, and data.
-    """
     file_id_str = str(file_id)
     logger, _ = setup_job_logger(job_id=file_id_str, console_output=True)
     result = None
@@ -47,7 +43,11 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str,
         func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
         logger.info(f"Starting job {func_name} for FileID: {file_id}")
         
-        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+        if hasattr(job_func, '_remote'):
+            # Ray remote task
+            result_ref = await job_func(file_id, **kwargs)
+            result = ray.get(result_ref)  # Resolve Ray ObjectRef
+        elif asyncio.iscoroutinefunction(job_func):
             result = await job_func(file_id, **kwargs)
         else:
             result = job_func(file_id, **kwargs)
@@ -55,8 +55,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str,
         logger.info(f"Completed job {func_name} for FileID: {file_id}")
         return {"status_code": 200, "message": f"Job {func_name} completed successfully for FileID: {file_id}", "data": result}
     except Exception as e:
-        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
-        logger.error(f"Error in job {func_name} for FileID: {file_id}: {str(e)}")
+        logger.error(f"Error in job {func_name} for FileID {file_id}: {str(e)}")
         logger.debug(f"Traceback: {traceback.format_exc()}")
         return {"status_code": 500, "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}"}
     finally:
