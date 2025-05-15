@@ -9,7 +9,7 @@ from urllib.parse import quote_plus
 VERSION="3.4.19"
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"
-SENDER_NAME='imagesearch'
+SENDER_NAME='superscraper'
 GOOGLE_API_KEY='AIzaSyDXfc_kdxa5UX2h9D3WwktefCqdyjHasn8'
 # AWS credentials and region
 BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
