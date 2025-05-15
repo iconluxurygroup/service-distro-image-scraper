@@ -768,8 +768,9 @@ def process_single_row(
         logger.error(f"Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
 async def process_and_tag_results(search_string, brand, model, endpoint, entry_id, logger, use_all_variations: bool = False, file_id_db: int = None):
-    logger = logger or default_logger
+    logger = logger or logging.getLogger("default")
     try:
+        logger.debug(f"Starting process_and_tag_results for EntryID {entry_id}")
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched for EntryID {entry_id}")
@@ -789,7 +790,8 @@ async def process_and_tag_results(search_string, brand, model, endpoint, entry_i
 
         max_row_retries = 3
         process_func = process_single_all if use_all_variations else process_single_row
-        success = ray.get(process_func.remote(
+        logger.debug(f"Calling process_func for EntryID {entry_id}")
+        success = process_func(
             entry_id=entry_id,
             search_string=search_string,
             max_row_retries=max_row_retries,
@@ -799,7 +801,8 @@ async def process_and_tag_results(search_string, brand, model, endpoint, entry_i
             brand=brand,
             model=model,
             logger=logger
-        ))
+        )
+        logger.debug(f"Process func result for EntryID {entry_id}: {success}")
 
         if not success:
             logger.error(f"Processing failed for EntryID {entry_id}")
@@ -812,8 +815,9 @@ async def process_and_tag_results(search_string, brand, model, endpoint, entry_i
                 "search_type": "default",
                 "priority": 4
             }])]
+
         try:
-            with pyodbc.connect(conn_str, autocommit=False) as conn:
+            with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
                 query = """
                     SELECT 
                         r.EntryID, 
@@ -829,12 +833,11 @@ async def process_and_tag_results(search_string, brand, model, endpoint, entry_i
                         ON r.EntryID = rec.EntryID
                     WHERE r.EntryID = ?
                 """
-                df = pd.read_sql(query, conn, params=(entry_id,))
-                logger.info(f"Retrieved {len(df)} rows from database for EntryID {entry_id}")
+                logger.debug(f"Executing database query for EntryID {entry_id}")
+                df = pd.read_sql(query, conn, params=(entry_id,), timeout=60)
+                logger.debug(f"Retrieved {len(df)} rows for EntryID {entry_id}")
         except pyodbc.Error as e:
             logger.error(f"Failed to retrieve results for EntryID {entry_id}: {e}", exc_info=True)
-
-
             return [pd.DataFrame([{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://error",
@@ -910,8 +913,7 @@ async def process_and_tag_results(search_string, brand, model, endpoint, entry_i
             "search_type": "default",
             "priority": 4
         }])]
+
 def sync_process_and_tag_results(*args, **kwargs):
-    """
-    Synchronous wrapper for process_and_tag_results to use with Ray remote tasks.
-    """
+    """Synchronous wrapper for process_and_tag_results."""
     return asyncio.run(process_and_tag_results(*args, **kwargs))
