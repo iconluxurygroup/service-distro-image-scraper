@@ -69,6 +69,25 @@ def process_entry(args):
     except Exception as e:
         logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
         return None
+import logging
+import asyncio
+import os
+import pandas as pd
+import time
+import pyodbc
+import multiprocessing
+from typing import Optional, Dict, List, Tuple
+from queue import Queue
+from logging.handlers import QueueHandler
+from config import conn_str
+from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
+from common import fetch_brand_rules
+from utils import sync_process_and_tag_results
+from logging_config import setup_job_logger
+import psutil
+
+BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -125,7 +144,7 @@ async def process_restart_batch(
         endpoint = None
         for attempt in range(5):
             try:
-                endpoint = get_endpoint(logger=logger)
+                endpoint = sync_get_endpoint(logger=logger)
                 if endpoint:
                     logger.info(f"Selected endpoint: {endpoint}")
                     break
