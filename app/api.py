@@ -244,7 +244,6 @@ async def api_restart_search_all(file_id: str, entry_id: int = None):
                 logger=logger
             )
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
-
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
     file_id: str,
