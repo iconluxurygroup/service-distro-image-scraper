@@ -504,84 +504,6 @@ wheels = [
 ]
 
 [[package]]
-name = "distro-image"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "aiobotocore" },
-    { name = "aiofiles" },
-    { name = "aioodbc" },
-    { name = "aiosmtplib" },
-    { name = "beautifulsoup4" },
-    { name = "boto3" },
-    { name = "chardet" },
-    { name = "fastapi" },
-    { name = "fuzzywuzzy" },
-    { name = "google-generativeai" },
-    { name = "httpx" },
-    { name = "numpy" },
-    { name = "opencv-python" },
-    { name = "openpyxl" },
-    { name = "pandas" },
-    { name = "pyodbc" },
-    { name = "python-levenshtein" },
-    { name = "rapidfuzz" },
-    { name = "ray", extra = ["default"] },
-    { name = "requests" },
-    { name = "setuptools" },
-    { name = "sqlalchemy" },
-    { name = "torch" },
-    { name = "torchvision" },
-    { name = "ultralytics" },
-    { name = "unidecode" },
-    { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "black" },
-    { name = "pytest" },
-]
-ml = [
-    { name = "transformers" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiobotocore", specifier = "==2.18.0" },
-    { name = "aiofiles", specifier = "==24.1.0" },
-    { name = "aioodbc", specifier = "==0.5.0" },
-    { name = "aiosmtplib", specifier = "==4.0.1" },
-    { name = "beautifulsoup4", specifier = "==4.13.4" },
-    { name = "black", marker = "extra == 'dev'", specifier = "==24.8.0" },
-    { name = "boto3", specifier = "==1.36" },
-    { name = "chardet", specifier = "==5.2.0" },
-    { name = "fastapi", specifier = "==0.115.11" },
-    { name = "fuzzywuzzy", specifier = "==0.18.0" },
-    { name = "google-generativeai", specifier = "==0.8.5" },
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "numpy", specifier = "==2.1.1" },
-    { name = "opencv-python", specifier = "==4.11.0.86" },
-    { name = "openpyxl", specifier = "==3.1.5" },
-    { name = "pandas", specifier = "==2.2.3" },
-    { name = "pyodbc", specifier = "==5.2.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = "==8.3.2" },
-    { name = "python-levenshtein", specifier = "==0.27.1" },
-    { name = "rapidfuzz", specifier = "==3.13.0" },
-    { name = "ray", extras = ["default"], specifier = ">=2.46.0" },
-    { name = "requests", specifier = "==2.32.3" },
-    { name = "setuptools", specifier = ">=69.0.0" },
-    { name = "sqlalchemy", specifier = "==2.0.39" },
-    { name = "torch", specifier = "==2.6.0" },
-    { name = "torchvision", specifier = "==0.21.0" },
-    { name = "transformers", marker = "extra == 'ml'", specifier = "==4.49.0" },
-    { name = "ultralytics", specifier = "==8.3.135" },
-    { name = "unidecode", specifier = "==1.4.0" },
-    { name = "uvicorn", specifier = "==0.34.0" },
-]
-provides-extras = ["ml", "dev"]
-
-[[package]]
 name = "et-xmlfile"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1000,6 +922,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/d7/53/a911467bece076020456401f55a27415d2d70d3bc2c37af06b44ea41fc5c/grpcio_status-1.71.0.tar.gz", hash = "sha256:11405fed67b68f406b3f3c7c5ae5104a79d2d309666d10d61b152e91d28fb968", size = 13669, upload-time = "2025-03-10T19:29:00.901Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ad/d6/31fbc43ff097d8c4c9fc3df741431b8018f67bf8dfbe6553a555f6e5f675/grpcio_status-1.71.0-py3-none-any.whl", hash = "sha256:843934ef8c09e3e858952887467f8256aac3910c55f077a359a65b2b3cde3e68", size = 14424, upload-time = "2025-03-10T19:27:04.967Z" },
+]
+
+[[package]]
+name = "gunicorn"
+version = "21.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/89/acd9879fa6a5309b4bf16a5a8855f1e58f26d38e0c18ede9b3a70996b021/gunicorn-21.2.0.tar.gz", hash = "sha256:88ec8bff1d634f98e61b9f65bc4bf3cd918a90806c6f5c48bc5603849ec81033", size = 3632557, upload-time = "2023-07-19T11:46:46.917Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0e/2a/c3a878eccb100ccddf45c50b6b8db8cf3301a6adede6e31d48e8531cab13/gunicorn-21.2.0-py3-none-any.whl", hash = "sha256:3213aa5e8c24949e792bcacfc176fef362e7aac80b76c56f6b5122bf350722f0", size = 80176, upload-time = "2023-07-19T11:46:44.51Z" },
 ]
 
 [[package]]
@@ -2888,6 +2822,88 @@ wheels = [
 ]
 
 [[package]]
+name = "super-scraper"
+version = "3.4.21"
+source = { virtual = "." }
+dependencies = [
+    { name = "aiobotocore" },
+    { name = "aiofiles" },
+    { name = "aioodbc" },
+    { name = "aiosmtplib" },
+    { name = "beautifulsoup4" },
+    { name = "boto3" },
+    { name = "chardet" },
+    { name = "fastapi" },
+    { name = "fuzzywuzzy" },
+    { name = "google-generativeai" },
+    { name = "gunicorn" },
+    { name = "httpx" },
+    { name = "numpy" },
+    { name = "opencv-python" },
+    { name = "openpyxl" },
+    { name = "pandas" },
+    { name = "pyodbc" },
+    { name = "python-levenshtein" },
+    { name = "rapidfuzz" },
+    { name = "ray", extra = ["default"] },
+    { name = "requests" },
+    { name = "setuptools" },
+    { name = "sqlalchemy" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "ultralytics" },
+    { name = "unidecode" },
+    { name = "uvicorn" },
+    { name = "waitress" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "black" },
+    { name = "pytest" },
+]
+ml = [
+    { name = "transformers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiobotocore", specifier = "==2.18.0" },
+    { name = "aiofiles", specifier = "==24.1.0" },
+    { name = "aioodbc", specifier = "==0.5.0" },
+    { name = "aiosmtplib", specifier = "==4.0.1" },
+    { name = "beautifulsoup4", specifier = "==4.13.4" },
+    { name = "black", marker = "extra == 'dev'", specifier = "==24.8.0" },
+    { name = "boto3", specifier = "==1.36" },
+    { name = "chardet", specifier = "==5.2.0" },
+    { name = "fastapi", specifier = "==0.115.11" },
+    { name = "fuzzywuzzy", specifier = "==0.18.0" },
+    { name = "google-generativeai", specifier = "==0.8.5" },
+    { name = "gunicorn", specifier = "==21.2.0" },
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "numpy", specifier = "==2.1.1" },
+    { name = "opencv-python", specifier = "==4.11.0.86" },
+    { name = "openpyxl", specifier = "==3.1.5" },
+    { name = "pandas", specifier = "==2.2.3" },
+    { name = "pyodbc", specifier = "==5.2.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = "==8.3.2" },
+    { name = "python-levenshtein", specifier = "==0.27.1" },
+    { name = "rapidfuzz", specifier = "==3.13.0" },
+    { name = "ray", extras = ["default"], specifier = ">=2.46.0" },
+    { name = "requests", specifier = "==2.32.3" },
+    { name = "setuptools", specifier = ">=69.0.0" },
+    { name = "sqlalchemy", specifier = "==2.0.39" },
+    { name = "torch", specifier = "==2.6.0" },
+    { name = "torchvision", specifier = "==0.21.0" },
+    { name = "transformers", marker = "extra == 'ml'", specifier = "==4.49.0" },
+    { name = "ultralytics", specifier = "==8.3.135" },
+    { name = "unidecode", specifier = "==1.4.0" },
+    { name = "uvicorn", specifier = "==0.34.0" },
+    { name = "waitress", specifier = "==3.0.2" },
+]
+provides-extras = ["ml", "dev"]
+
+[[package]]
 name = "sympy"
 version = "1.13.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3195,6 +3211,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/87/14/ca9890d58cd33d9122eb87ffec2f3c6be0714785f992a0fd3b56a3b6c993/virtualenv-20.21.0.tar.gz", hash = "sha256:f50e3e60f990a0757c9b68333c9fdaa72d7188caa417f96af9e52407831a3b68", size = 12070063, upload-time = "2023-03-12T18:30:13.739Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/86/2f/35a79942c38d4ca89b444085d67900f713f1967446fdcefc8351619d7c65/virtualenv-20.21.0-py3-none-any.whl", hash = "sha256:31712f8f2a17bd06234fa97fdf19609e789dd4e3e4bf108c3da71d710651adbc", size = 8707576, upload-time = "2023-03-12T18:30:10.374Z" },
+]
+
+[[package]]
+name = "waitress"
+version = "3.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bf/cb/04ddb054f45faa306a230769e868c28b8065ea196891f09004ebace5b184/waitress-3.0.2.tar.gz", hash = "sha256:682aaaf2af0c44ada4abfb70ded36393f0e307f4ab9456a215ce0020baefc31f", size = 179901, upload-time = "2024-11-16T20:02:35.195Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/57/a27182528c90ef38d82b636a11f606b0cbb0e17588ed205435f8affe3368/waitress-3.0.2-py3-none-any.whl", hash = "sha256:c56d67fd6e87c2ee598b76abdd4e96cfad1f24cacdea5078d382b1f9d7b5ed2e", size = 56232, upload-time = "2024-11-16T20:02:33.858Z" },
 ]
 
 [[package]]

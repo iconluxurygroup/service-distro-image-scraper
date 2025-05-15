@@ -1,40 +1,109 @@
-import uvicorn
 import logging
 import ray
 from fastapi.middleware.cors import CORSMiddleware
 from api import app
+import os
+import platform
+import uvicorn
+import signal
+import sys
+from waitress import serve
+import shutil
+import tempfile
 
-
-# Configure basic logging
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-if __name__ == "__main__":
-    logger.info("Starting Uvicorn server")
+def shutdown(signalnum, frame):
+    logger.info("Received shutdown signal, stopping gracefully")
+    if ray.is_initialized():
+        ray.shutdown()
+    sys.exit(0)
 
-    # Add CORS middleware to the FastAPI app
+if __name__ == "__main__":
+    logger.info("Starting application")
+
+    # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=["http://trusted-domain.com"],  # Replace with your domains
         allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 
-    # Shutdown any existing Ray instance to avoid conflicts
+    # Clean up previous Ray sessions to avoid conflicts
+    ray_temp_dir = os.path.join(tempfile.gettempdir(), "ray")
+    if os.path.exists(ray_temp_dir):
+        try:
+            shutil.rmtree(ray_temp_dir)
+            logger.info("Cleaned up previous Ray session directory")
+        except Exception as e:
+            logger.warning(f"Failed to clean up Ray session directory: {e}")
+
+    # Initialize Ray
     if ray.is_initialized():
         ray.shutdown()
+    if platform.system() == "Windows":
+        # Disable dashboard and related logging on Windows
+        ray.init(
+            include_dashboard=False,
+            logging_level=logging.ERROR,  # Suppress dashboard logs
+            configure_logging=True,
+            log_to_driver=True
+        )
+        logger.info("Ray initialized without dashboard on Windows")
+    else:
+        ray.init(
+            dashboard_host="127.0.0.1",
+            dashboard_port=8265,
+            include_dashboard=True
+        )
+        logger.info("Ray initialized with dashboard on Unix")
 
-    # Initialize Ray with dashboard enabled
-    dashboard_host = "0.0.0.0"
-    dashboard_port = 8265
-    ray.init(
-        dashboard_host=dashboard_host,
-        dashboard_port=dashboard_port,
-        include_dashboard=True
-    )
-    logger.info(f"Ray initialized with dashboard at http://localhost:{dashboard_port}")
+    # Register shutdown handlers
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
 
-    # Run Uvicorn server
-    uvicorn.run(app, port=8080, host='0.0.0.0')
+    # Run server based on platform
+    if platform.system() == "Windows":
+        logger.info("Running Waitress on Windows")
+        serve(
+            app,
+            host="0.0.0.0",
+            port=8080,
+            threads=os.cpu_count() * 2 + 1,
+            connection_limit=1000,
+            asyncore_loop_timeout=120
+        )
+    else:
+        logger.info("Running Gunicorn with Uvicorn workers on Unix")
+        from gunicorn.app.base import BaseApplication
+        from gunicorn import Config
+        from uvicorn.workers import UvicornWorker
+
+        class StandaloneApplication(BaseApplication):
+            def __init__(self, app, options=None):
+                self.options = options or {}
+                self.application = app
+                super().__init__()
+
+            def load_config(self):
+                config = Config()
+                for key, value in self.options.items():
+                    config.set(key, value)
+                self.cfg = config
+
+            def load(self):
+                return self.application
+
+        options = {
+            "bind": "0.0.0.0:8080",
+            "workers": os.cpu_count() * 2 + 1,
+            "worker_class": "uvicorn.workers.UvicornWorker",
+            "loglevel": "info",
+            "timeout": 120,
+            "graceful_timeout": 30,
+        }
+        StandaloneApplication(app, options).run()

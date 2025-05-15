@@ -86,7 +86,9 @@ def process_restart_batch(
         file_id_db = int(file_id_db)
 
         # Fetch brand rules synchronously
-        brand_rules = asyncio.run(fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger))
+        loop = asyncio.get_event_loop()
+        brand_rules = loop.run_in_executor(None, lambda: asyncio.run(fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)))
+        brand_rules = brand_rules.result()  # Block until complete
         if not brand_rules:
             logger.warning(f"No brand rules fetched for FileID: {file_id_db}")
             brand_rules = {"brand_rules": []}
@@ -104,7 +106,8 @@ def process_restart_batch(
         endpoint = None
         for attempt in range(max_endpoint_retries):
             try:
-                endpoint = asyncio.run(get_endpoint(logger=logger))
+                endpoint_future = loop.run_in_executor(None, lambda: asyncio.run(get_endpoint(logger=logger)))
+                endpoint = endpoint_future.result()
                 if endpoint:
                     logger.info(f"Selected healthy endpoint: {endpoint}")
                     break
@@ -156,28 +159,23 @@ def process_restart_batch(
             logger.info(f"Processing batch {batch_idx}/{len(entry_batches)} with {len(batch_entries)} entries")
             batch_results = []
 
-            # Create a list of Ray tasks for concurrent execution
-            tasks = [
-                ray.remote(sync_process_and_tag_results).remote(
-                    search_string=search_string,
-                    brand=brand,
-                    model=search_string,
-                    endpoint=endpoint,
-                    entry_id=entry_id,
-                    logger=logger,
-                    use_all_variations=use_all_variations,
-                    file_id_db=file_id_db
-                )
-                for entry_id, search_string, brand, color, category in batch_entries
-            ]
+            # Create a list of Ray tasks for concurrent execution with semaphore
+            semaphore = asyncio.Semaphore(20)  # Limit to 20 concurrent tasks
+            async def submit_task(entry_id, search_string, brand, color, category):
+                async with semaphore:
+                    return await ray.remote(sync_process_and_tag_results).remote(
+                        search_string=search_string,
+                        brand=brand,
+                        model=search_string,
+                        endpoint=endpoint,
+                        entry_id=entry_id,
+                        logger=logger,
+                        use_all_variations=use_all_variations,
+                        file_id_db=file_id_db
+                    )
 
-            # Wait for up to 10 tasks to complete
-            try:
-                results = ray.get(tasks)
-            except Exception as e:
-                logger.error(f"Error in batch {batch_idx}: {e}", exc_info=True)
-                failed_entries += len(batch_entries)
-                continue
+            tasks = [loop.run_in_executor(None, lambda: asyncio.run(submit_task(*entry))) for entry in batch_entries]
+            results = [task.result() for task in tasks]  # Block until complete
 
             # Process results
             for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
@@ -221,9 +219,9 @@ def process_restart_batch(
                         logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
 
                         # Update sort order
-                        update_result = asyncio.run(update_search_sort_order(
+                        update_result = loop.run_in_executor(None, lambda: asyncio.run(update_search_sort_order(
                             str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                        ))
+                        ))).result()
                         if update_result is None:
                             logger.error(f"SortOrder update failed for EntryID {entry_id}")
                             failed_entries += 1
@@ -315,12 +313,12 @@ def process_restart_batch(
                 f"Failed entries: {failed_entries}\n"
                 f"Log file: {log_filename}"
             )
-            asyncio.run(send_message_email(
+            loop.run_in_executor(None, lambda: asyncio.run(send_message_email(
                 to_emails=to_emails,
                 subject=subject,
                 message=message,
                 logger=logger
-            ))
+            ))).result()
 
         return {
             "message": "Search processing completed",
@@ -333,14 +331,14 @@ def process_restart_batch(
 
     except Exception as e:
         logger.error(f"🔴 Error processing FileID {file_id_db}: {e}", exc_info=True)
-        to_emails = asyncio.run(get_send_to_email(file_id_db, logger))
+        to_emails = loop.run_in_executor(None, lambda: asyncio.run(get_send_to_email(file_id_db, logger))).result()
         if to_emails:
-            send_message_email(
+            loop.run_in_executor(None, lambda: asyncio.run(send_message_email(
                 to_emails=to_emails,
                 subject=f"Error processing FileID: {file_id_db}",
                 message=f"An error occurred while processing your file: {str(e)}",
                 logger=logger
-            )
+            ))).result()
         return {
             "error": str(e),
             "log_filename": log_filename
@@ -456,7 +454,7 @@ async def generate_download_file(
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
-        
+
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
@@ -486,7 +484,7 @@ async def batch_vision_reason(
         logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
-        semaphore = asyncio.Semaphore(concurrency)
+        semaphore = asyncio.Semaphore(concurrency)  # Limit to `concurrency` tasks
         futures = []
 
         async def submit_task(entry_id, entry_df):
@@ -539,5 +537,5 @@ async def batch_vision_reason(
             logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
 
     except Exception as e:
-        logger.error(f"🔴 Error in batch_process_images for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
         raise

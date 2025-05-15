@@ -149,10 +149,10 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         if pd.notna(row.get("ImageUrlThumbnail")):
             image_urls.append(row["ImageUrlThumbnail"])
         product_details = {
-            "brand": row.get("ProductBrand"),
-            "category": row.get("ProductCategory"),
-            "color": row.get("ProductColor")
-        }
+    "brand": str(row.get("ProductBrand") or ""),
+    "category": str(row.get("ProductCategory") or ""),
+    "color": str(row.get("ProductColor") or "")
+}
 
         image_data, downloaded_url = await get_image_data_async(image_urls, session, logger)
         if not image_data:
@@ -225,6 +225,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
             return result_id, ai_json, cv_description, 0
 
         expected_category = product_details.get("category", "").lower()
+        if not expected_category:
+            logger.warning(f"ResultID {result_id}: ProductCategory is empty or None")
         if cls_label and not is_related_to_category(cls_label, expected_category):
             logger.warning(f"Detected label '{cls_label}' not related to category '{expected_category}'")
             cv_description += f"\nWarning: Detected classification may be irrelevant to category '{expected_category}'."
@@ -337,7 +339,7 @@ async def process_entry(
         logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
         return [(row.get("ResultID"), json.dumps({"error": f"Entry processing error: {str(e)}"}), None, 1) for _, row in entry_df.iterrows()]
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, num_gpus=0.5)  # Adjust based on hardware
 def process_entry_remote(
     file_id: int,
     entry_id: int,

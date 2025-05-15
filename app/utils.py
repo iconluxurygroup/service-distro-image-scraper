@@ -344,7 +344,7 @@ def generate_search_variations(
         logger.debug(f"No color suffix detected, no_color variation same as original: '{search_string}'")
     
     return variations
-@ray.remote(max_retries=3)
+@ray.remote(num_cpus=1, max_retries=3)
 def search_variation(
     variation: str,
     endpoint: str,
@@ -416,7 +416,7 @@ def search_variation(
             "error": str(e)
         }
 
-@ray.remote(max_retries=3)
+@ray.remote(num_cpus=1, max_retries=3)
 def process_single_all(
     entry_id: int,
     search_string: str,
@@ -593,7 +593,7 @@ def process_single_all(
         logger.error(f"Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
 
-@ray.remote(max_retries=3)
+@ray.remote(num_cpus=1, max_retries=3)
 def process_single_row(
     entry_id: int,
     search_string: str,
