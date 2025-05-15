@@ -191,7 +191,6 @@ async def api_process_restart(file_id: str, entry_id: int = None):
     try:
         result = await process_restart_batch(
     file_id_db=int(file_id),
-    max_retries=7,
     logger=logger,
     entry_id=entry_id
 )
