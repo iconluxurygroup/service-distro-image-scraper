@@ -104,8 +104,8 @@ if __name__ == "__main__":
             "workers": int(os.cpu_count() / 2 + 1),
             "worker_class": "uvicorn.workers.UvicornWorker",
             "loglevel": "info",
-            "timeout": 120,  # Adjusted for typical use cases
-            "graceful_timeout": 100,
+            "timeout": 300,  # Increase to 300 seconds
+            "graceful_timeout": 280,
             "proc_name": "gunicorn_large_batch",
             "accesslog": "-",
             "errorlog": "-",

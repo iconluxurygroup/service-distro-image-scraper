@@ -139,7 +139,7 @@ def process_restart_batch(
                 batch_results = []
 
                 # Create a list of Ray tasks for concurrent execution with semaphore
-                semaphore = asyncio.Semaphore(20)  # Limit to 20 concurrent tasks
+                semaphore = asyncio.Semaphore(10)  # Limit to 20 concurrent tasks
                 async def submit_task(entry_id, search_string, brand, color, category):
                     async with semaphore:
                         # Call sync_process_and_tag_results.remote without await, as it's a Ray remote task
