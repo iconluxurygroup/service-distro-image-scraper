@@ -1,5 +1,3 @@
-# workflow.py
-# Contains workflow functions for batch processing, file generation, and retries
 
 import logging
 import asyncio
@@ -7,90 +5,26 @@ import os
 import pandas as pd
 import time
 import pyodbc
-import ray
-from typing import List, Dict, Optional, Tuple
-from config import conn_str
-from database import (
-    insert_search_results,
-    update_search_sort_order,
-    get_records_to_search,
-    fetch_missing_images,
-    update_initial_sort_order,
-    update_log_url_in_db,
-    get_endpoint,
-    sync_update_search_sort_order,
-    get_images_excel_db,
-    get_send_to_email,
-    update_file_generate_complete,
-    update_file_location_complete,
-    set_sort_order_negative_four_for_zero_match,
-)
-from utils import (
-    fetch_brand_rules,
-    sync_process_and_tag_results,
-    generate_search_variations,
-    process_search_row,
-    process_and_tag_results,
-    process_search_row_gcloud,
-)
-import asyncio
-import os
-import logging
-import datetime
-import aiofiles
-import httpx
-import pyodbc
-import pandas as pd
-from typing import Dict, Optional
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-
-from image_reason import process_entry_remote
-from image_utils import download_all_images
-
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-
-from email_utils import send_email, send_message_email
-from file_utils import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-import httpx
-import aiofiles
-import datetime
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
-
-import os
-import pandas as pd
-import pyodbc
-import requests
-import time
-import datetime
-import psutil
-import logging
 import multiprocessing
-from typing import Dict, Optional, List
-from config import conn_str
-from database import insert_search_results, update_search_sort_order, get_endpoint, get_send_to_email
-from utils import fetch_brand_rules, sync_process_and_tag_results
-from logging_config import setup_job_logger
-from logging.handlers import QueueHandler
+from typing import Optional, Dict
 from queue import Queue
+from logging.handlers import QueueHandler
+from config import conn_str
+from common import fetch_brand_rules
+from database import get_endpoint, insert_search_results, update_search_sort_order
+from utils import sync_process_and_tag_results
+from logging_config import setup_job_logger
+import psutil
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
-
 def process_entry(args):
     """Wrapper for sync_process_and_tag_results to run in a multiprocessing worker."""
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db, log_queue = args
-    # Set up logging in the worker process
     logger = logging.getLogger(f"worker_{entry_id}")
     logger.setLevel(logging.DEBUG)
-    logger.handlers = []  # Clear any existing handlers
+    logger.handlers = []
     queue_handler = QueueHandler(log_queue)
     logger.addHandler(queue_handler)
-    
     try:
         result = sync_process_and_tag_results(
             search_string=search_string,
@@ -106,13 +40,12 @@ def process_entry(args):
     except Exception as e:
         logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
         return None
-
-def process_restart_batch(
+async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False
 ) -> Dict[str, str]:
-    """Process a batch of entries for a file synchronously using multiprocessing."""
+    """Process a batch of entries for a file using multiprocessing."""
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
         # Initialize logger
@@ -123,7 +56,7 @@ def process_restart_batch(
         # Set up logging queue for multiprocessing
         log_queue = Queue()
         queue_handler = QueueHandler(log_queue)
-        logger.handlers = [queue_handler]  # Replace with queue handler
+        logger.handlers = [queue_handler]
         log_listener = logging.handlers.QueueListener(log_queue, *logger.handlers)
         log_listener.start()
 
@@ -140,7 +73,7 @@ def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        BATCH_SIZE = 1  # Minimize memory usage
+        BATCH_SIZE = 1
 
         # Validate FileID
         logger.debug("Validating FileID...")
@@ -153,7 +86,7 @@ def process_restart_batch(
 
         # Fetch brand rules
         logger.debug("Fetching brand rules...")
-        brand_rules = fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
+        brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning("No brand rules fetched")
             return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename}
@@ -213,18 +146,16 @@ def process_restart_batch(
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        with multiprocessing.Pool(processes=4) as pool:  # Adjust processes based on CPU cores
+        with multiprocessing.Pool(processes=4) as pool:
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
                 start_time = datetime.datetime.now()
 
-                # Prepare tasks for multiprocessing
                 tasks = [
                     (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db_int, log_queue)
                     for entry_id, search_string, brand, color, category in batch_entries
                 ]
 
-                # Execute tasks
                 results = pool.map(process_entry, tasks)
 
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
