@@ -62,206 +62,220 @@ if not default_logger.handlers:
 
 BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
 
-def run_process_restart_batch(*args, **kwargs):
-    """Wrapper for process_restart_batch to match expected API."""
-    return process_restart_batch.remote(*args, **kwargs)
+import os
+import pandas as pd
+import pyodbc
+import requests
+import time
+import datetime
+import psutil
+import logging
+import multiprocessing
+from typing import Dict, Optional, List
+from config import conn_str
+from database import insert_search_results, update_search_sort_order, get_endpoint, get_send_to_email
+from utils import fetch_brand_rules, sync_process_and_tag_results
+from logging_config import setup_job_logger
+from logging.handlers import QueueHandler
+from queue import Queue
 
-@ray.remote(max_retries=3)
+BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
+
+def process_entry(args):
+    """Wrapper for sync_process_and_tag_results to run in a multiprocessing worker."""
+    search_string, brand, endpoint, entry_id, use_all_variations, file_id_db, log_queue = args
+    # Set up logging in the worker process
+    logger = logging.getLogger(f"worker_{entry_id}")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []  # Clear any existing handlers
+    queue_handler = QueueHandler(log_queue)
+    logger.addHandler(queue_handler)
+    
+    try:
+        result = sync_process_and_tag_results(
+            search_string=search_string,
+            brand=brand,
+            model=search_string,
+            endpoint=endpoint,
+            entry_id=entry_id,
+            use_all_variations=use_all_variations,
+            file_id_db=file_id_db
+        )
+        logger.debug(f"Task completed for EntryID: {entry_id}")
+        return result
+    except Exception as e:
+        logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
+        return None
+
 def process_restart_batch(
     file_id_db: int,
-    max_retries: int = 7,
-    logger: Optional[logging.Logger] = None,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False
 ) -> Dict[str, str]:
-    """Process a batch of entries for a file using Ray, handling retries and logging."""
-    logger = logger or logging.getLogger(f"job_{file_id_db}")
-    log_dir = os.path.join(os.getcwd(), 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_filename = logger.handlers[0].baseFilename if logger.handlers else os.path.join(log_dir, f"file_{file_id_db}.log")
-    BATCH_SIZE = 10
-
+    """Process a batch of entries for a file synchronously using multiprocessing."""
+    log_filename = f"job_logs/job_{file_id_db}.log"
     try:
-        logger.info(f"🔁 Starting concurrent search processing for FileID: {file_id_db}" + (f", EntryID: {entry_id}" if entry_id else "") + f", use_all_variations: {use_all_variations}")
-        file_id_db = int(file_id_db)
+        # Initialize logger
+        logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Logger initialized")
 
-        # Fetch brand rules synchronously
-        loop = asyncio.get_event_loop()
-        brand_rules = loop.run_in_executor(None, lambda: asyncio.run(fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)))
-        brand_rules = brand_rules.result()  # Block until complete
-        if not brand_rules:
-            logger.warning(f"No brand rules fetched for FileID: {file_id_db}")
-            brand_rules = {"brand_rules": []}
-            return {
-                "message": "Failed to fetch brand rules",
-                "file_id": str(file_id_db),
-                "successful_entries": "0",
-                "total_entries": "0",
-                "failed_entries": "0",
-                "log_filename": log_filename
-            }
+        # Set up logging queue for multiprocessing
+        log_queue = Queue()
+        queue_handler = QueueHandler(log_queue)
+        logger.handlers = [queue_handler]  # Replace with queue handler
+        log_listener = logging.handlers.QueueListener(log_queue, *logger.handlers)
+        log_listener.start()
 
-        # Fetch endpoint with retries
-        max_endpoint_retries = 3
-        endpoint = None
-        for attempt in range(max_endpoint_retries):
+        def log_memory_usage():
             try:
-                endpoint_future = loop.run_in_executor(None, lambda: asyncio.run(get_endpoint(logger=logger)))
-                endpoint = endpoint_future.result()
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                logger.info(f"Memory usage: RSS={mem_info.rss / 1024 / 1024:.2f} MB")
+            except Exception as e:
+                logger.error(f"Memory logging failed: {e}")
+
+        logger.debug(f"Input file_id_db: {file_id_db}, entry_id: {entry_id}, use_all_variations: {use_all_variations}")
+        logger.info(f"🔁 Starting processing for FileID: {file_id_db}")
+        log_memory_usage()
+
+        file_id_db_int = file_id_db
+        BATCH_SIZE = 1  # Minimize memory usage
+
+        # Validate FileID
+        logger.debug("Validating FileID...")
+        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id_db_int,))
+            if cursor.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id_db} does not exist")
+                return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename}
+
+        # Fetch brand rules
+        logger.debug("Fetching brand rules...")
+        brand_rules = fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
+        if not brand_rules:
+            logger.warning("No brand rules fetched")
+            return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename}
+
+        # Fetch endpoint
+        logger.debug("Fetching endpoint...")
+        endpoint = None
+        for attempt in range(5):
+            try:
+                endpoint = get_endpoint(logger=logger)
                 if endpoint:
-                    logger.info(f"Selected healthy endpoint: {endpoint}")
+                    logger.info(f"Selected endpoint: {endpoint}")
                     break
-                logger.warning(f"Attempt {attempt + 1} failed to find healthy endpoint")
+                logger.warning(f"Attempt {attempt + 1} failed")
                 time.sleep(2)
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed to get endpoint: {e}")
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
                 time.sleep(2)
         if not endpoint:
-            logger.error(f"No healthy endpoint available for FileID: {file_id_db} after {max_endpoint_retries} attempts")
-            return {"error": f"No healthy endpoint available for FileID: {file_id_db}", "log_filename": log_filename}
+            logger.error("No healthy endpoint")
+            return {"error": "No healthy endpoint", "log_filename": log_filename}
 
         # Fetch entries
-        with pyodbc.connect(conn_str, autocommit=False) as conn:
+        logger.debug("Fetching entries...")
+        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
             cursor = conn.cursor()
-            if entry_id:
-                cursor.execute(
-                    "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID = ?",
-                    (file_id_db, entry_id)
-                )
-            else:
-                cursor.execute(
-                    "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ?",
-                    (file_id_db,)
-                )
-            entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
-            logger.info(f"📋 Found {len(entries)} valid entries for FileID: {file_id_db}" + (f", EntryID: {entry_id}" if entry_id else ""))
+            try:
+                if entry_id:
+                    cursor.execute(
+                        "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID = ?",
+                        (file_id_db_int, entry_id)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ?",
+                        (file_id_db_int,)
+                    )
+                entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
+                logger.info(f"Found {len(entries)} entries")
+            except pyodbc.Error as e:
+                logger.error(f"Database query failed: {e}", exc_info=True)
+                return {"error": f"Database query failed: {e}", "log_filename": log_filename}
 
         if not entries:
-            logger.warning(f"⚠️ No entries found for FileID {file_id_db}" + (f", EntryID: {entry_id}" if entry_id else ""))
-            return {"error": f"No entries found for FileID: {file_id_db}", "log_filename": log_filename}
+            logger.warning("No entries found")
+            return {"error": "No entries found", "log_filename": log_filename}
 
-        # Process entries in batches
+        # Create batches
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
-        logger.info(f"Created {len(entry_batches)} batches for processing")
+        logger.info(f"Created {len(entry_batches)} batches")
 
         successful_entries = 0
         failed_entries = 0
         api_to_db_mapping = {
             'image_url': 'ImageUrl', 'thumbnail_url': 'ImageUrlThumbnail', 'url': 'ImageUrl',
-            'thumb': 'ImageUrlThumbnail', 'image': 'ImageUrl', 'thumbnail': 'ImageUrlThumbnail',
-            'img_url': 'ImageUrl', 'thumb_url': 'ImageUrlThumbnail', 'imageURL': 'ImageUrl',
-            'imageUrl': 'ImageUrl', 'thumbnailURL': 'ImageUrlThumbnail', 'thumbnailUrl': 'ImageUrlThumbnail',
-            'brand': 'Brand', 'model': 'Model', 'brand_name': 'Brand', 'product_model': 'Model'
+            'thumb': 'ImageUrlThumbnail', 'image': 'ImageUrl', 'thumbnail': 'ImageUrlThumbnail'
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        for batch_idx, batch_entries in enumerate(entry_batches, 1):
-            logger.info(f"Processing batch {batch_idx}/{len(entry_batches)} with {len(batch_entries)} entries")
-            batch_results = []
+        with multiprocessing.Pool(processes=4) as pool:  # Adjust processes based on CPU cores
+            for batch_idx, batch_entries in enumerate(entry_batches, 1):
+                logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
+                start_time = datetime.datetime.now()
 
-            # Create a list of Ray tasks for concurrent execution with semaphore
-            semaphore = asyncio.Semaphore(20)  # Limit to 20 concurrent tasks
-            async def submit_task(entry_id, search_string, brand, color, category):
-                async with semaphore:
-                    return await ray.remote(sync_process_and_tag_results).remote(
-                        search_string=search_string,
-                        brand=brand,
-                        model=search_string,
-                        endpoint=endpoint,
-                        entry_id=entry_id,
-                        logger=logger,
-                        use_all_variations=use_all_variations,
-                        file_id_db=file_id_db
-                    )
+                # Prepare tasks for multiprocessing
+                tasks = [
+                    (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db_int, log_queue)
+                    for entry_id, search_string, brand, color, category in batch_entries
+                ]
 
-            tasks = [loop.run_in_executor(None, lambda: asyncio.run(submit_task(*entry))) for entry in batch_entries]
-            results = [task.result() for task in tasks]  # Block until complete
+                # Execute tasks
+                results = pool.map(process_entry, tasks)
 
-            # Process results
-            for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
-                try:
-                    if isinstance(result, Exception):
-                        logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
-                        failed_entries += 1
-                        batch_results.append(False)
-                        continue
+                for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
+                    try:
+                        dfs = result
+                        if dfs:
+                            combined_df = pd.concat(dfs, ignore_index=True)
+                            logger.info(f"Combined {len(combined_df)} results for EntryID {entry_id}")
 
-                    dfs = result
-                    if dfs:
-                        # Combine and deduplicate results
-                        combined_df = pd.concat(dfs, ignore_index=True)
-                        logger.info(f"Combined {len(combined_df)} results for EntryID {entry_id}")
+                            for api_col, db_col in api_to_db_mapping.items():
+                                if api_col in combined_df.columns and db_col not in combined_df.columns:
+                                    combined_df.rename(columns={api_col: db_col}, inplace=True)
 
-                        # Rename columns
-                        for api_col, db_col in api_to_db_mapping.items():
-                            if api_col in combined_df.columns and db_col not in combined_df.columns:
-                                combined_df.rename(columns={api_col: db_col}, inplace=True)
+                            if not all(col in combined_df.columns for col in required_columns):
+                                logger.error(f"Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
 
-                        # Verify required columns
-                        if not all(col in combined_df.columns for col in required_columns):
-                            logger.error(f"Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
-                            failed_entries += 1
-                            batch_results.append(False)
-                            continue
+                            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
+                            logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
 
-                        # Deduplicate
-                        deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-                        logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
+                            insert_success = insert_search_results(deduplicated_df, logger=logger)
+                            if not insert_success:
+                                logger.error(f"Failed to insert results for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
 
-                        # Insert into database
-                        insert_success = insert_search_results(deduplicated_df, logger=logger)
-                        if not insert_success:
-                            logger.error(f"Failed to insert results for EntryID {entry_id}")
-                            failed_entries += 1
-                            batch_results.append(False)
-                            continue
+                            logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
 
-                        logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
-
-                        # Update sort order
-                        update_result = loop.run_in_executor(None, lambda: asyncio.run(update_search_sort_order(
-                            str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                        ))).result()
-                        if update_result is None:
-                            logger.error(f"SortOrder update failed for EntryID {entry_id}")
-                            failed_entries += 1
-                            batch_results.append(False)
-                            continue
-
-                        logger.info(f"Updated sort order for EntryID {entry_id}")
-                        successful_entries += 1
-                        batch_results.append(True)
-
-                        # Verify database insertion
-                        with pyodbc.connect(conn_str, autocommit=False) as conn:
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ?", (entry_id,))
-                            total_count = cursor.fetchone()[0]
-                            cursor.execute(
-                                "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder > 0",
-                                (entry_id,)
+                            update_result = update_search_sort_order(
+                                str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                             )
-                            count = cursor.fetchone()[0]
-                            cursor.execute(
-                                "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder IS NULL",
-                                (entry_id,)
-                            )
-                            null_count = cursor.fetchone()[0]
-                            logger.info(f"Verification: Found {total_count} total rows, {count} with positive SortOrder, {null_count} with NULL SortOrder for EntryID {entry_id}")
-                            if null_count > 0:
-                                logger.error(f"Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                            if total_count == 0:
-                                logger.error(f"No rows found for EntryID {entry_id} after insertion")
+                            if update_result is None:
+                                logger.error(f"SortOrder update failed for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
 
-                    else:
-                        logger.error(f"No results returned for EntryID {entry_id}")
+                            logger.info(f"Updated sort order for EntryID {entry_id}")
+                            successful_entries += 1
+
+                        else:
+                            logger.error(f"No results returned for EntryID {entry_id}")
+                            failed_entries += 1
+
+                    except Exception as e:
+                        logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
                         failed_entries += 1
-                        batch_results.append(False)
 
-                except Exception as e:
-                    logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-                    failed_entries += 1
-                    batch_results.append(False)
+                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
+                log_memory_usage()
 
         # Final verification
         with pyodbc.connect(conn_str, autocommit=False) as conn:
@@ -273,7 +287,7 @@ def process_restart_batch(
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                 WHERE r.FileID = ? AND t.SortOrder > 0
                 """,
-                (file_id_db,)
+                (file_id_db_int,)
             )
             positive_entries = cursor.fetchone()[0]
             cursor.execute(
@@ -283,28 +297,15 @@ def process_restart_batch(
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                 WHERE r.FileID = ? AND t.SortOrder IS NULL
                 """,
-                (file_id_db,)
+                (file_id_db_int,)
             )
             null_entries = cursor.fetchone()[0]
             logger.info(f"Final verification: Found {positive_entries} entries with positive SortOrder, {null_entries} entries with NULL SortOrder")
 
-            cursor.execute(
-                """
-                SELECT TOP 5 t.ResultID, t.EntryID, t.SortOrder, t.ImageDesc
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ? AND t.SortOrder > 0
-                ORDER BY t.SortOrder
-                """, (file_id_db,)
-            )
-            sample_results = cursor.fetchall()
-            for result in sample_results:
-                logger.info(f"Sample - ResultID: {result[0]}, EntryID: {result[1]}, SortOrder: {result[2]}, ImageDesc: {result[3]}")
-        
-        logger.info(f"✅ Completed processing for FileID: {file_id_db}. {positive_entries}/{len(entries)} entries with positive SortOrder. Failed entries: {failed_entries}")
-        
-        # Send success email notification
-        to_emails = 'nik@iconluxurygroup.com'
+        logger.info(f"Completed processing. Successful: {successful_entries}, Failed: {failed_entries}")
+        log_memory_usage()
+
+        to_emails = get_send_to_email(file_id_db_int, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
             message = (
@@ -313,12 +314,7 @@ def process_restart_batch(
                 f"Failed entries: {failed_entries}\n"
                 f"Log file: {log_filename}"
             )
-            loop.run_in_executor(None, lambda: asyncio.run(send_message_email(
-                to_emails=to_emails,
-                subject=subject,
-                message=message,
-                logger=logger
-            ))).result()
+            send_message_email(to_emails=to_emails, subject=subject, message=message, logger=logger)
 
         return {
             "message": "Search processing completed",
@@ -330,20 +326,11 @@ def process_restart_batch(
         }
 
     except Exception as e:
-        logger.error(f"🔴 Error processing FileID {file_id_db}: {e}", exc_info=True)
-        to_emails = loop.run_in_executor(None, lambda: asyncio.run(get_send_to_email(file_id_db, logger))).result()
-        if to_emails:
-            loop.run_in_executor(None, lambda: asyncio.run(send_message_email(
-                to_emails=to_emails,
-                subject=f"Error processing FileID: {file_id_db}",
-                message=f"An error occurred while processing your file: {str(e)}",
-                logger=logger
-            ))).result()
-        return {
-            "error": str(e),
-            "log_filename": log_filename
-        }
-
+        logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
+        print(f"Fallback error in process_restart_batch for FileID {file_id_db}: {e}")
+        return {"error": str(e), "log_filename": log_filename}
+    finally:
+        log_listener.stop()
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
