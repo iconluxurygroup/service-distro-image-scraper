@@ -99,7 +99,7 @@ if __name__ == "__main__":
 
         options = {
     "bind": "0.0.0.0:8080",
-    "workers": os.cpu_count() + 1,
+    "workers": os.cpu_count() / 2 + 1,
     "worker_class": "uvicorn.workers.UvicornWorker",
     "loglevel": "info",
     "timeout": 7200,  # 2 hours (7200 seconds), a practical maximum
