@@ -283,21 +283,6 @@ async def process_restart_batch(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
@@ -316,14 +301,14 @@ async def generate_download_file(
             result = cursor.fetchone()
             if not result:
                 logger.error(f"❌ No file found for FileID {file_id}")
-                return {"error": f"No file found for FileID {file_id}"}
+                return {"error": f"No file found for FileID {file_id}", "log_filename": log_filename}
             original_filename = result[0]
 
         logger.info(f"🕵️ Fetching images for FileID: {file_id}")
         selected_images_df = await get_images_excel_db(str(file_id), logger=logger)
         if selected_images_df.empty:
             logger.warning(f"⚠️ No images found for FileID {file_id}")
-            return {"error": f"No images found for FileID {file_id}"}
+            return {"error": f"No images found for FileID {file_id}", "log_filename": log_filename}
 
         selected_image_list = [
             {
@@ -336,6 +321,7 @@ async def generate_download_file(
                 'Category': row.get('Category', '')
             }
             for _, row in selected_images_df.iterrows()
+            if row['ImageUrl'] or row['ImageUrlThumbnail']
         ]
         logger.debug(f"📋 Selected {len(selected_image_list)} images: {selected_image_list[:2]}")
 
@@ -350,37 +336,52 @@ async def generate_download_file(
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
         local_filename = os.path.join(temp_excel_dir, original_filename)
 
-        # Download images with thumbnail fallback
-        failed_img_urls = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
-        logger.info(f"📥 Downloaded images, {len(failed_img_urls)} failed")
-
+        # Download template file
         logger.info(f"📥 Downloading template file from {template_file_path}")
         async with httpx.AsyncClient() as client:
             response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
             response.raise_for_status()
             async with aiofiles.open(local_filename, 'wb') as f:
                 await f.write(response.content)
+        
+        # Verify template file
+        if not os.path.exists(local_filename):
+            logger.error(f"Template file not found at {local_filename}")
+            return {"error": f"Failed to download template file", "log_filename": log_filename}
+        logger.debug(f"Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
 
-        row_offset = header_index
-        logger.info(f"🖼️ Writing images with row_offset={row_offset}")
+        # Download images
+        logger.debug(f"Using temp_images_dir: {temp_images_dir}")
+        failed_img_urls = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
+        logger.info(f"📥 Downloaded images, {len(failed_img_urls)} failed")
+
+        # Write images to Excel
+        logger.info(f"🖼️ Writing images with row_offset={header_index}")
         failed_rows = await write_excel_image(
-            local_filename, temp_images_dir, selected_image_list, "A", row_offset, logger
+            local_filename, temp_images_dir, selected_image_list, "A", header_index, logger
         )
 
-        # Write failed downloads to Excel if any
+        # Write failed downloads
         if failed_img_urls:
             logger.info(f"📝 Writing {len(failed_img_urls)} failed downloads to Excel")
-            # failed_img_urls is already a list of (url, row_id) tuples
             success = await write_failed_downloads_to_excel(failed_img_urls, local_filename, logger=logger)
             if not success:
                 logger.warning(f"⚠️ Failed to write some failed downloads to Excel")
 
+        # Verify Excel file
+        if not os.path.exists(local_filename):
+            logger.error(f"Excel file not found at {local_filename}")
+            return {"error": f"Excel file not found", "log_filename": log_filename}
+        logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
+        logger.debug(f"Temp excel dir contents: {os.listdir(temp_excel_dir)}")
+
+        # Upload to S3
         public_url = await upload_file_to_space(
             local_filename, processed_file_name, True, logger, file_id
         )
         if not public_url:
             logger.error(f"❌ Upload failed for FileID {file_id}")
-            return {"error": "Failed to upload processed file"}
+            return {"error": "Failed to upload processed file", "log_filename": log_filename}
 
         await update_file_location_complete(str(file_id), public_url, logger=logger)
         await update_file_generate_complete(str(file_id), logger=logger)
@@ -388,7 +389,7 @@ async def generate_download_file(
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
             logger.error(f"❌ No email address for FileID {file_id}")
-            return {"error": "Failed to retrieve email address"}
+            return {"error": "Failed to retrieve email address", "log_filename": log_filename}
         subject_line = f"{original_filename} Job Notification"
         await send_email(
             to_emails=send_to_email_addr,
@@ -399,11 +400,11 @@ async def generate_download_file(
         )
 
         logger.info(f"🏁 Completed FileID {file_id}")
-        return {"message": "Processing completed successfully", "public_url": public_url}
+        return {"message": "Processing completed successfully", "public_url": public_url, "log_filename": log_filename}
 
     except Exception as e:
         logger.error(f"🔴 Error for FileID {file_id}: {e}", exc_info=True)
-        return {"error": f"An error occurred: {str(e)}"}
+        return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename}
     finally:
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)

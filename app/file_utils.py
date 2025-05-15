@@ -13,14 +13,22 @@ async def create_temp_dirs(unique_id: str | int, logger: Optional[logging.Logger
     """Create temporary directories for images and Excel files."""
     logger = logger or default_logger
     loop = asyncio.get_running_loop()
-    base_dir = os.path.join(os.getcwd(), 'temp_files')
+    # Use logged path for consistency, configurable via env
+    base_dir = os.getenv("TEMP_FILES_DIR", "/root/service-distro-image/temp_files")
     temp_images_dir = os.path.join(base_dir, 'images', str(unique_id))
     temp_excel_dir = os.path.join(base_dir, 'excel', str(unique_id))
 
     try:
         await loop.run_in_executor(None, lambda: os.makedirs(temp_images_dir, exist_ok=True))
         await loop.run_in_executor(None, lambda: os.makedirs(temp_excel_dir, exist_ok=True))
-        logger.info(f"Created temporary directories for ID: {unique_id}")
+        
+        # Verify directories are writable
+        for dir_path in [temp_images_dir, temp_excel_dir]:
+            if not os.access(dir_path, os.W_OK):
+                logger.error(f"Directory not writable: {dir_path}")
+                raise OSError(f"Directory not writable: {dir_path}")
+        
+        logger.info(f"Created temporary directories for ID {unique_id}: {temp_images_dir}, {temp_excel_dir}")
         return temp_images_dir, temp_excel_dir
     except Exception as e:
         logger.error(f"🔴 Failed to create temp directories for ID {unique_id}: {e}", exc_info=True)
