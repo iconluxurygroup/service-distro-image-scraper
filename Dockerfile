@@ -53,4 +53,5 @@ EXPOSE 8265
 
 # Run main.py
 RUN [ "uv" ,"lock" ]
+RUN [ "uv" ,"sync" ]
 CMD ["python", "main.py"]
