@@ -10,6 +10,9 @@ import sys
 from waitress import serve
 import shutil
 import tempfile
+from gunicorn.app.base import BaseApplication
+from gunicorn.config import GConfig  
+from uvicorn.workers import UvicornWorker
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -80,7 +83,7 @@ if __name__ == "__main__":
     else:
         logger.info("Running Gunicorn with Uvicorn workers on Unix")
         from gunicorn.app.base import BaseApplication
-        from gunicorn import Config
+        from gunicorn.config import Config  # Correct import
         from uvicorn.workers import UvicornWorker
 
         class StandaloneApplication(BaseApplication):
@@ -90,7 +93,7 @@ if __name__ == "__main__":
                 super().__init__()
 
             def load_config(self):
-                config = Config()
+                config = Config()  # Correct class name
                 for key, value in self.options.items():
                     config.set(key, value)
                 self.cfg = config
