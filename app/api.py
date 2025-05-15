@@ -218,7 +218,7 @@ async def api_restart_search_all(background_tasks: BackgroundTasks,file_id: str,
         background_tasks.add_task(
             run_job_with_logging,
             run_process_restart_batch,
-            file_id_db=int(file_id),
+            file_id=int(file_id),
             entry_id=entry_id,
             use_all_variations=True,
             logger=logger
