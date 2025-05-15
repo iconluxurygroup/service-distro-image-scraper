@@ -210,24 +210,23 @@ async def api_process_restart(file_id: str, entry_id: int = None):
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
 
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
-async def api_restart_search_all(background_tasks: BackgroundTasks,file_id: str, entry_id: int = None):
+async def api_restart_search_all(file_id: str, entry_id: int = None):
     """Restart batch processing for a file, searching all variations for each entry."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
     try:
-        background_tasks.add_task(
-            run_job_with_logging,
-            run_process_restart_batch,
-            file_id=int(file_id),
+        result = await run_process_restart_batch(
+            file_id_db=int(file_id),
+            max_retries=7,
+            logger=logger,
             entry_id=entry_id,
-            use_all_variations=True,
-            logger=logger
+            use_all_variations=True
         )
-        return {
-            "status_code": 202,
-            "message": f"Processing restart with all variations queued for FileID: {file_id}",
-            "data": None
-        }
+        if "error" in result:
+            logger.error(f"Failed to process restart batch for FileID: {file_id}: {result['error']}")
+            raise HTTPException(status_code=500, detail=result["error"])
+        logger.info(f"Completed restart batch for FileID: {file_id}. Result: {result}")
+        return {"status_code": 200, "message": f"Processing restart with all variations completed for FileID: {file_id}", "data": result}
     except Exception as e:
         logger.error(f"Error queuing restart batch for FileID: {file_id}: {e}", exc_info=True)
         if os.path.exists(log_filename):
@@ -235,7 +234,7 @@ async def api_restart_search_all(background_tasks: BackgroundTasks,file_id: str,
                 log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error queuing restart batch for FileID {file_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
 
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
