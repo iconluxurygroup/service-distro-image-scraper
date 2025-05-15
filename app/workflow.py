@@ -46,7 +46,7 @@ BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.co
 def run_process_restart_batch(*args, **kwargs):
     """Wrapper for process_restart_batch to match expected API."""
     return process_restart_batch.remote(*args, **kwargs)
-@ray.remote(num_cpus=1, memory=8 * 1024 * 1024 * 1024)  # 8GB
+@ray.remote(num_cpus=1)
 def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
