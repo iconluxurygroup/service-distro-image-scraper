@@ -249,7 +249,7 @@ async def process_restart_batch(
         logger.info(f"Completed processing. Successful: {successful_entries}, Failed: {failed_entries}")
         log_memory_usage()
 
-        to_emails = get_send_to_email(file_id_db_int, logger=logger)
+        to_emails = await get_send_to_email(file_id, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
             message = (
