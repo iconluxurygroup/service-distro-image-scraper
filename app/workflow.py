@@ -258,7 +258,7 @@ async def process_restart_batch(
                 f"Failed entries: {failed_entries}\n"
                 f"Log file: {log_filename}"
             )
-            send_message_email(to_emails=to_emails, subject=subject, message=message, logger=logger)
+            await send_message_email(to_emails=to_emails, subject=subject, message=message, logger=logger)
 
         return {
             "message": "Search processing completed",
