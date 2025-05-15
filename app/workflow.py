@@ -104,6 +104,23 @@ import psutil
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
+import logging
+import asyncio
+import os
+import pandas as pd
+import time
+import pyodbc
+import multiprocessing
+from typing import Optional, Dict, List, Tuple
+from config import conn_str
+from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
+from common import fetch_brand_rules
+from utils import sync_process_and_tag_results
+from logging_config import setup_job_logger
+import psutil
+
+BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -116,13 +133,6 @@ async def process_restart_batch(
         logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
         logger.setLevel(logging.DEBUG)
         logger.debug("Logger initialized")
-
-        # Set up logging queue for multiprocessing
-        log_queue = multiprocessing.Queue()
-        queue_handler = QueueHandler(log_queue)
-        logger.handlers = [queue_handler]
-        log_listener = logging.handlers.QueueListener(log_queue, *logger.handlers)
-        log_listener.start()
 
         def log_memory_usage():
             try:
@@ -216,7 +226,7 @@ async def process_restart_batch(
                 start_time = datetime.datetime.now()
 
                 tasks = [
-                    (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db_int, log_queue)
+                    (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db_int)
                     for entry_id, search_string, brand, color, category in batch_entries
                 ]
 
@@ -324,8 +334,6 @@ async def process_restart_batch(
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
         print(f"Fallback error in process_restart_batch for FileID {file_id_db}: {e}")
         return {"error": str(e), "log_filename": log_filename}
-    finally:
-        log_listener.stop()
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
