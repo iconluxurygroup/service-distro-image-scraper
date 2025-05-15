@@ -1,7 +1,7 @@
 import logging
 import ray
 from fastapi.middleware.cors import CORSMiddleware
-from api import app  # Replace with your FastAPI app
+from api import app
 import os
 import platform
 import signal
@@ -20,10 +20,26 @@ def shutdown(signalnum, frame):
         ray.shutdown()
     sys.exit(0)
 
+# Batch processing function (example)
+@ray.remote
+def process_batch(file_id, variations, chunk_size=10):
+    from ultralytics import YOLO
+    import time
+    logger.info(f"Starting batch for FileID: {file_id} with {len(variations)} variations")
+    start_time = time.time()
+    model = YOLO("yolov11n.pt")
+    for i in range(0, len(variations), chunk_size):
+        chunk = variations[i:i + chunk_size]
+        chunk_start = time.time()
+        results = model.predict(chunk)
+        logger.info(f"Processed chunk {i//chunk_size + 1}/{len(variations)//chunk_size + 1} for FileID: {file_id} in {time.time() - chunk_start:.2f} seconds")
+    logger.info(f"Completed batch for FileID: {file_id} in {time.time() - start_time:.2f} seconds")
+    return results
+
 if __name__ == "__main__":
     logger.info("Starting application")
 
-    # Fix Ultralytics config directory
+    # Fix Ultralytics config
     os.environ["YOLO_CONFIG_DIR"] = "/tmp/ultralytics_config"
 
     # Add CORS middleware
@@ -57,7 +73,7 @@ if __name__ == "__main__":
         logger.info("Ray initialized without dashboard on Windows")
     else:
         ray.init(
-            dashboard_host="127.0.0.1",
+            dashboard_host="127.0.0.0.0:8080",
             dashboard_port=8265,
             include_dashboard=True
         )
@@ -67,7 +83,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # Run server based on platform
+    # Run server
     if platform.system() == "Windows":
         logger.info("Running Waitress on Windows")
         serve(
@@ -101,7 +117,7 @@ if __name__ == "__main__":
 
         options = {
             "bind": "0.0.0.0:8080",
-            "workers": int(os.cpu_count() / 2 + 1),  # Ensure integer
+            "workers": int(os.cpu_count() / 2 + 1),
             "worker_class": "uvicorn.workers.UvicornWorker",
             "loglevel": "info",
             "timeout": 7200,
