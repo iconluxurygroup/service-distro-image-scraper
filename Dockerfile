@@ -34,8 +34,8 @@ RUN which odbcinst && odbcinst -j
 # Install uv
 RUN pip install --no-cache-dir uv==0.4.18
 
+COPY pyproject.toml /app/ 
 # Copy dependency files
-COPY app/pyproject.toml /app/
 COPY app/uv.lock /app/
 RUN uv pip install --system -r uv.lock
 
