@@ -1,14 +1,13 @@
 # workflow.py
-# Contains workflow functions for batch processing, file generation, and retries
-
-import logging
 import asyncio
 import os
 import pandas as pd
-import time
 import pyodbc
 import ray
-from typing import List, Dict, Optional, Tuple
+import aiofiles
+import httpx
+import datetime
+from typing import Dict, List, Optional, Tuple
 from config import conn_str
 from database import (
     insert_search_results,
@@ -33,65 +32,42 @@ from utils import (
     process_and_tag_results,
     process_search_row_gcloud,
 )
-import asyncio
-import os
-import logging
-import datetime
-import aiofiles
-import httpx
-import pyodbc
-import pandas as pd
-from typing import Dict, Optional
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
-
 from image_reason import process_entry_remote
 from image_utils import download_all_images
-
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-
 from email_utils import send_email, send_message_email
 from file_utils import create_temp_dirs, cleanup_temp_dirs
 from aws_s3 import upload_file_to_space
-import httpx
-import aiofiles
-import datetime
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
+from logging_config import setup_job_logger
+import logging
+BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
 def run_process_restart_batch(*args, **kwargs):
     """Wrapper for process_restart_batch to match expected API."""
     return process_restart_batch.remote(*args, **kwargs)
 
 @ray.remote(max_retries=3)
-def process_restart_batch(
+async def process_restart_batch(
     file_id_db: int,
-    max_retries: int = 7,
     logger: Optional[logging.Logger] = None,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False
 ) -> Dict[str, str]:
     """Process a batch of entries for a file using Ray, handling retries and logging."""
-    logger = logger or logging.getLogger(f"job_{file_id_db}")
-    log_dir = os.path.join(os.getcwd(), 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_filename = logger.handlers[0].baseFilename if logger.handlers else os.path.join(log_dir, f"file_{file_id_db}.log")
-    BATCH_SIZE = 10
+    # Initialize logger for this Ray task
+    logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
 
     try:
-        logger.info(f"🔁 Starting concurrent search processing for FileID: {file_id_db}" + (f", EntryID: {entry_id}" if entry_id else "") + f", use_all_variations: {use_all_variations}")
+        logger.info(f"🔁 Starting concurrent search processing for FileID: {file_id_db}" + 
+                   (f", EntryID: {entry_id}" if entry_id else "") + 
+                   f", use_all_variations: {use_all_variations}")
         file_id_db = int(file_id_db)
+        BATCH_SIZE = 10
 
-        # Fetch brand rules synchronously
-        loop = asyncio.get_event_loop()
-        brand_rules = loop.run_in_executor(None, lambda: asyncio.run(fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)))
-        brand_rules = brand_rules.result()  # Block until complete
+        # Fetch brand rules asynchronously
+        brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched for FileID: {file_id_db}")
-            brand_rules = {"brand_rules": []}
             return {
                 "message": "Failed to fetch brand rules",
                 "file_id": str(file_id_db),
@@ -106,16 +82,15 @@ def process_restart_batch(
         endpoint = None
         for attempt in range(max_endpoint_retries):
             try:
-                endpoint_future = loop.run_in_executor(None, lambda: asyncio.run(get_endpoint(logger=logger)))
-                endpoint = endpoint_future.result()
+                endpoint = await get_endpoint(logger=logger)
                 if endpoint:
                     logger.info(f"Selected healthy endpoint: {endpoint}")
                     break
                 logger.warning(f"Attempt {attempt + 1} failed to find healthy endpoint")
-                time.sleep(2)
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} failed to get endpoint: {e}")
-                time.sleep(2)
+                await asyncio.sleep(2)
         if not endpoint:
             logger.error(f"No healthy endpoint available for FileID: {file_id_db} after {max_endpoint_retries} attempts")
             return {"error": f"No healthy endpoint available for FileID: {file_id_db}", "log_filename": log_filename}
@@ -134,10 +109,12 @@ def process_restart_batch(
                     (file_id_db,)
                 )
             entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
-            logger.info(f"📋 Found {len(entries)} valid entries for FileID: {file_id_db}" + (f", EntryID: {entry_id}" if entry_id else ""))
+            logger.info(f"📋 Found {len(entries)} valid entries for FileID: {file_id_db}" + 
+                       (f", EntryID: {entry_id}" if entry_id else ""))
 
         if not entries:
-            logger.warning(f"⚠️ No entries found for FileID {file_id_db}" + (f", EntryID: {entry_id}" if entry_id else ""))
+            logger.warning(f"⚠️ No entries found for FileID {file_id_db}" + 
+                          (f", EntryID: {entry_id}" if entry_id else ""))
             return {"error": f"No entries found for FileID: {file_id_db}", "log_filename": log_filename}
 
         # Process entries in batches
@@ -163,7 +140,7 @@ def process_restart_batch(
             semaphore = asyncio.Semaphore(20)  # Limit to 20 concurrent tasks
             async def submit_task(entry_id, search_string, brand, color, category):
                 async with semaphore:
-                    return await ray.remote(sync_process_and_tag_results).remote(
+                    return await sync_process_and_tag_results.remote(
                         search_string=search_string,
                         brand=brand,
                         model=search_string,
@@ -174,8 +151,8 @@ def process_restart_batch(
                         file_id_db=file_id_db
                     )
 
-            tasks = [loop.run_in_executor(None, lambda: asyncio.run(submit_task(*entry))) for entry in batch_entries]
-            results = [task.result() for task in tasks]  # Block until complete
+            tasks = [submit_task(*entry) for entry in batch_entries]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Process results
             for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
@@ -219,9 +196,9 @@ def process_restart_batch(
                         logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
 
                         # Update sort order
-                        update_result = loop.run_in_executor(None, lambda: asyncio.run(update_search_sort_order(
+                        update_result = await update_search_sort_order(
                             str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                        ))).result()
+                        )
                         if update_result is None:
                             logger.error(f"SortOrder update failed for EntryID {entry_id}")
                             failed_entries += 1
@@ -304,7 +281,7 @@ def process_restart_batch(
         logger.info(f"✅ Completed processing for FileID: {file_id_db}. {positive_entries}/{len(entries)} entries with positive SortOrder. Failed entries: {failed_entries}")
         
         # Send success email notification
-        to_emails = 'nik@iconluxurygroup.com'
+        to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
             message = (
@@ -313,12 +290,12 @@ def process_restart_batch(
                 f"Failed entries: {failed_entries}\n"
                 f"Log file: {log_filename}"
             )
-            loop.run_in_executor(None, lambda: asyncio.run(send_message_email(
+            await send_message_email(
                 to_emails=to_emails,
                 subject=subject,
                 message=message,
                 logger=logger
-            ))).result()
+            )
 
         return {
             "message": "Search processing completed",
@@ -331,14 +308,14 @@ def process_restart_batch(
 
     except Exception as e:
         logger.error(f"🔴 Error processing FileID {file_id_db}: {e}", exc_info=True)
-        to_emails = loop.run_in_executor(None, lambda: asyncio.run(get_send_to_email(file_id_db, logger))).result()
+        to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
-            loop.run_in_executor(None, lambda: asyncio.run(send_message_email(
+            await send_message_email(
                 to_emails=to_emails,
                 subject=f"Error processing FileID: {file_id_db}",
                 message=f"An error occurred while processing your file: {str(e)}",
                 logger=logger
-            ))).result()
+            )
         return {
             "error": str(e),
             "log_filename": log_filename
@@ -350,7 +327,7 @@ async def generate_download_file(
     file_id_param: Optional[int] = None
 ) -> Dict[str, str]:
     """Generate and upload a processed Excel file with images asynchronously."""
-    logger = logger or default_logger
+    logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     temp_images_dir, temp_excel_dir = None, None
 
     try:
@@ -385,7 +362,7 @@ async def generate_download_file(
         ]
         logger.debug(f"📋 Selected {len(selected_image_list)} images: {selected_image_list[:2]}")
 
-        template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
+        template_file_path = os.getenv("TEMPLATE_FILE_URL", "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx")
         header_index = 5
         base_name, extension = os.path.splitext(original_filename)
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -416,7 +393,6 @@ async def generate_download_file(
         # Write failed downloads to Excel if any
         if failed_img_urls:
             logger.info(f"📝 Writing {len(failed_img_urls)} failed downloads to Excel")
-            # failed_img_urls is already a list of (url, row_id) tuples
             success = await write_failed_downloads_to_excel(failed_img_urls, local_filename, logger=logger)
             if not success:
                 logger.warning(f"⚠️ Failed to write some failed downloads to Excel")
@@ -463,7 +439,7 @@ async def batch_vision_reason(
     concurrency: int = 10,
     logger: Optional[logging.Logger] = None
 ) -> None:
-    logger = logger or default_logger
+    logger, _ = setup_job_logger(job_id=file_id, log_dir="job_logs", console_output=True)
     try:
         file_id = int(file_id)
         logger.info(f"📷 Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
@@ -484,7 +460,7 @@ async def batch_vision_reason(
         logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
-        semaphore = asyncio.Semaphore(concurrency)  # Limit to `concurrency` tasks
+        semaphore = asyncio.Semaphore(concurrency)
         futures = []
 
         async def submit_task(entry_id, entry_df):
@@ -523,16 +499,14 @@ async def batch_vision_reason(
                 else:
                     product_brand = product_model = product_color = product_category = ''
             
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: sync_update_search_sort_order(
-                    file_id=str(file_id),
-                    entry_id=str(entry_id),
-                    brand=product_brand,
-                    model=product_model,
-                    color=product_color,
-                    category=product_category,
-                    logger=logger
-                )
+            await sync_update_search_sort_order(
+                file_id=str(file_id),
+                entry_id=str(entry_id),
+                brand=product_brand,
+                model=product_model,
+                color=product_color,
+                category=product_category,
+                logger=logger
             )
             logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
 
