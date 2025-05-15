@@ -1,12 +1,12 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import asyncio
 import os
 import pandas as pd
 import time
 import pyodbc
-import multiprocessing
 import httpx
-import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
 from config import conn_str
@@ -16,28 +16,32 @@ from utils import sync_process_and_tag_results
 from logging_config import setup_job_logger
 import psutil
 from email_utils import send_message_email
+
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
 def process_entry(args):
-    """Wrapper for sync_process_and_tag_results to run in a multiprocessing worker."""
+    """Wrapper for sync_process_and_tag_results to run in a thread."""
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
     logger = logging.getLogger(f"worker_{entry_id}")
     logger.setLevel(logging.DEBUG)
+    # Ensure thread-safe logging
     handler = logging.FileHandler(f"job_logs/worker_{entry_id}.log")
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
     try:
+        mem_info = psutil.Process().memory_info()
+        logger.debug(f"Worker {entry_id} memory: RSS={mem_info.rss / 1024 / 1024:.2f} MB")
         result = sync_process_and_tag_results(
             search_string=search_string,
             brand=brand,
             model=search_string,
             endpoint=endpoint,
             entry_id=entry_id,
-            logger=logger,  # Add logger argument
+            logger=logger,
             use_all_variations=use_all_variations,
             file_id_db=file_id_db
         )
-        logger.debug(f"Task completed for EntryID: {entry_id}")
+        logger.debug(f"Result for EntryID {entry_id}: {result}")
         return result
     except Exception as e:
         logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
@@ -51,7 +55,7 @@ async def process_restart_batch(
     entry_id: Optional[int] = None,
     use_all_variations: bool = False
 ) -> Dict[str, str]:
-    """Process a batch of entries for a file using multiprocessing."""
+    """Process a batch of entries for a file using threading."""
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
         # Initialize logger
@@ -145,7 +149,8 @@ async def process_restart_batch(
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        with multiprocessing.Pool(processes=4) as pool:
+        # Use ThreadPoolExecutor instead of multiprocessing.Pool
+        with ThreadPoolExecutor(max_workers=4) as executor:
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
                 start_time = datetime.datetime.now()
@@ -156,7 +161,8 @@ async def process_restart_batch(
                 ]
                 logger.debug(f"Tasks: {tasks}")
 
-                results = pool.map(process_entry, tasks)
+                # Submit tasks to ThreadPoolExecutor
+                results = list(executor.map(process_entry, tasks))
                 logger.debug(f"Batch {batch_idx} results: {results}")
 
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
@@ -187,6 +193,7 @@ async def process_restart_batch(
                         deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
                         logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
 
+                        # Ensure thread-safe database operations
                         insert_success = insert_search_results(deduplicated_df, logger=logger)
                         if not insert_success:
                             logger.error(f"Failed to insert results for EntryID {entry_id}")
@@ -210,9 +217,9 @@ async def process_restart_batch(
                         logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
                         failed_entries += 1
 
-                        elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                        logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
-                        log_memory_usage()
+                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
+                log_memory_usage()
 
         # Final verification
         with pyodbc.connect(conn_str, autocommit=False) as conn:
@@ -264,8 +271,25 @@ async def process_restart_batch(
 
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
-        print(f"Fallback error in process_restart_batch for FileID {file_id_db}: {e}")
         return {"error": str(e), "log_filename": log_filename}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
