@@ -1,10 +1,10 @@
 # Use an official Python runtime as a parent image
 FROM python:3.10-slim
 
-# Set the working directory in the container
+# Set the working directory
 WORKDIR /app
 
-# Install system dependencies for opencv-python, torch, pyodbc, and other packages
+# Install system dependencies
 RUN apt-get update --fix-missing && \
     apt-get install -y --no-install-recommends \
         apt-transport-https \
@@ -18,31 +18,33 @@ RUN apt-get update --fix-missing && \
         libopencv-dev \
         && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Add Microsoft package repository and install msodbcsql17
+# Add Microsoft package repository
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
     curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update --fix-missing && \
     ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 mssql-tools && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Set PATH to include mssql-tools
+# Set PATH for mssql-tools
 ENV PATH="/opt/mssql-tools/bin:${PATH}"
 
-# Verify installation of unixODBC
+# Verify unixODBC
 RUN which odbcinst && odbcinst -j
 
-# Install uv for dependency management
-RUN pip install --no-cache-dir uv
+# Install uv
+RUN pip install --no-cache-dir uv==0.4.18
 
-# Copy pyproject.toml and generate requirements.txt using uv
+# Copy dependency files
 COPY app/pyproject.toml /app/
 COPY app/uv.lock /app/
-RUN uv pip compile pyproject.toml -o requirements.txt && \
-    uv pip install --system -r requirements.txt
+RUN uv pip install --system -r uv.lock
+
+# Copy the rest of the application
 COPY app/ /app/
-# Make ports available (8080 for Uvicorn, 8265 for Ray dashboard)
+
+# Expose ports
 EXPOSE 8080
 EXPOSE 8265
 
-# Run main.py when the container launches
+# Run main.py
 CMD ["python", "main.py"]
