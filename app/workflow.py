@@ -64,12 +64,12 @@ import psutil
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 def process_entry(args):
     """Wrapper for sync_process_and_tag_results to run in a multiprocessing worker."""
-    search_string, brand, endpoint, entry_id, use_all_variations, file_id_db, log_queue = args
+    search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
     logger = logging.getLogger(f"worker_{entry_id}")
     logger.setLevel(logging.DEBUG)
-    logger.handlers = []
-    queue_handler = QueueHandler(log_queue)
-    logger.addHandler(queue_handler)
+    handler = logging.FileHandler(f"job_logs/worker_{entry_id}.log")
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
     try:
         result = sync_process_and_tag_results(
             search_string=search_string,
@@ -85,6 +85,9 @@ def process_entry(args):
     except Exception as e:
         logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
         return None
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
 import logging
 import asyncio
 import os
