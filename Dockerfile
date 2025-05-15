@@ -51,7 +51,14 @@ COPY app/ /app/
 EXPOSE 8080
 EXPOSE 8265
 
-# Run main.py
-RUN [ "uv" ,"lock" ]
-RUN [ "uv" ,"sync" ]
+# Generate or update uv.lock based on pyproject.toml
+RUN ["uv", "lock"]
+
+# Synchronize the virtual environment with uv.lock
+RUN ["uv", "sync"]
+
+# Set the entrypoint to use uv run for all commands
+ENTRYPOINT ["uv", "run"]
+
+# Default command to run main.py
 CMD ["python", "main.py"]
