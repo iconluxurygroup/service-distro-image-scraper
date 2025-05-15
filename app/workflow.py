@@ -306,7 +306,7 @@ def process_restart_batch(
         logger.info(f"✅ Completed processing for FileID: {file_id_db}. {positive_entries}/{len(entries)} entries with positive SortOrder. Failed entries: {failed_entries}")
         
         # Send success email notification
-        to_emails = asyncio.run(get_send_to_email(file_id_db, logger))
+        to_emails = 'nik@iconluxurygroup.com'
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
             message = (
