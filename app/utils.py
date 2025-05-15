@@ -306,6 +306,7 @@ def generate_search_variations(
         variations["brand_alias"] = [f"{alias} {search_string}" for alias in brand_aliases]
     
     no_color_string = search_string
+    # In utils.py, replace the relevant block in generate_search_variations (around lines 319–334)
     if brand and brand_rules and "brand_rules" in brand_rules:
         for rule in brand_rules["brand_rules"]:
             if any(brand in name.lower() for name in rule.get("names", [])):
@@ -315,7 +316,16 @@ def generate_search_variations(
                 base_length = expected_length.get("base", [6])[0]
                 with_color_length = expected_length.get("with_color", [10])[0]
                 
+                # Validate color_separator
+                if not color_separator:
+                    logger.warning(f"Empty color_separator for brand {brand}, skipping color split")
+                    no_color_string = search_string  # Fallback to full search_string
+                    logger.debug(f"Brand rule applied for {brand}: No color split, no_color='{no_color_string}'")
+                    break
+                
+                # Perform split if color_separator is valid
                 if color_separator in search_string:
+                    logger.debug(f"Applying color_separator '{color_separator}' to search_string '{search_string}'")
                     parts = search_string.split(color_separator)
                     base_part = parts[0]
                     if len(base_part) == base_length and len(search_string) <= with_color_length:

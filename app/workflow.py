@@ -410,87 +410,87 @@ async def generate_download_file(
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
 
-async def batch_vision_reason(
-    file_id: str,
-    entry_ids: Optional[List[int]] = None,
-    step: int = 0,
-    limit: int = 5000,
-    concurrency: int = 10,
-    logger: Optional[logging.Logger] = None
-) -> None:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        logger.info(f"📷 Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
+# async def batch_vision_reason(
+#     file_id: str,
+#     entry_ids: Optional[List[int]] = None,
+#     step: int = 0,
+#     limit: int = 5000,
+#     concurrency: int = 10,
+#     logger: Optional[logging.Logger] = None
+# ) -> None:
+#     logger = logger or default_logger
+#     try:
+#         file_id = int(file_id)
+#         logger.info(f"📷 Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
 
-        df = await fetch_missing_images(file_id, limit, True, logger)
-        if df.empty:
-            logger.warning(f"⚠️ No missing images found for FileID: {file_id}")
-            return
+#         df = await fetch_missing_images(file_id, limit, True, logger)
+#         if df.empty:
+#             logger.warning(f"⚠️ No missing images found for FileID: {file_id}")
+#             return
 
-        if entry_ids is not None:
-            df = df[df['EntryID'].isin(entry_ids)]
-            if df.empty:
-                logger.warning(f"⚠️ No missing images found for specified EntryIDs: {entry_ids}")
-                return
+#         if entry_ids is not None:
+#             df = df[df['EntryID'].isin(entry_ids)]
+#             if df.empty:
+#                 logger.warning(f"⚠️ No missing images found for specified EntryIDs: {entry_ids}")
+#                 return
 
-        columns_to_drop = ['Step1', 'Step2', 'Step3', 'Step4', 'CreateTime_1', 'CreateTime_2']
-        df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
-        logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
-        entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
+#         columns_to_drop = ['Step1', 'Step2', 'Step3', 'Step4', 'CreateTime_1', 'CreateTime_2']
+#         df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
+#         logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
+#         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
-        semaphore = asyncio.Semaphore(concurrency)  # Limit to `concurrency` tasks
-        futures = []
+#         semaphore = asyncio.Semaphore(concurrency)  # Limit to `concurrency` tasks
+#         futures = []
 
-        async def submit_task(entry_id, entry_df):
-            async with semaphore:
-                logger.info(f"Submitting Ray task for EntryID: {entry_id}")
-                future = process_entry_remote.remote(file_id, entry_id, entry_df, logger)
-                futures.append(future)
+#         async def submit_task(entry_id, entry_df):
+#             async with semaphore:
+#                 logger.info(f"Submitting Ray task for EntryID: {entry_id}")
+#                 future = process_entry_remote.remote(file_id, entry_id, entry_df, logger)
+#                 futures.append(future)
 
-        tasks = [submit_task(entry_id, df[df['EntryID'] == entry_id]) for entry_id in entry_ids_to_process]
-        await asyncio.gather(*tasks)
+#         tasks = [submit_task(entry_id, df[df['EntryID'] == entry_id]) for entry_id in entry_ids_to_process]
+#         await asyncio.gather(*tasks)
 
-        results = ray.get(futures)
-        valid_updates = []
-        for updates in results:
-            valid_updates.extend(updates)
+#         results = ray.get(futures)
+#         valid_updates = []
+#         for updates in results:
+#             valid_updates.extend(updates)
 
-        if valid_updates:
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                query = "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?"
-                cursor.executemany(query, valid_updates)
-                conn.commit()
-                logger.info(f"Updated {len(valid_updates)} records")
+#         if valid_updates:
+#             with pyodbc.connect(conn_str) as conn:
+#                 cursor = conn.cursor()
+#                 query = "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?"
+#                 cursor.executemany(query, valid_updates)
+#                 conn.commit()
+#                 logger.info(f"Updated {len(valid_updates)} records")
 
-        for entry_id in entry_ids_to_process:
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = ? AND EntryID = ?
-                """, (file_id, entry_id))
-                result = cursor.fetchone()
-                if result:
-                    product_brand, product_model, product_color, product_category = result
-                else:
-                    product_brand = product_model = product_color = product_category = ''
+#         for entry_id in entry_ids_to_process:
+#             with pyodbc.connect(conn_str) as conn:
+#                 cursor = conn.cursor()
+#                 cursor.execute("""
+#                     SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
+#                     FROM utb_ImageScraperRecords
+#                     WHERE FileID = ? AND EntryID = ?
+#                 """, (file_id, entry_id))
+#                 result = cursor.fetchone()
+#                 if result:
+#                     product_brand, product_model, product_color, product_category = result
+#                 else:
+#                     product_brand = product_model = product_color = product_category = ''
             
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: sync_update_search_sort_order(
-                    file_id=str(file_id),
-                    entry_id=str(entry_id),
-                    brand=product_brand,
-                    model=product_model,
-                    color=product_color,
-                    category=product_category,
-                    logger=logger
-                )
-            )
-            logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
+#             await asyncio.get_event_loop().run_in_executor(
+#                 None, lambda: sync_update_search_sort_order(
+#                     file_id=str(file_id),
+#                     entry_id=str(entry_id),
+#                     brand=product_brand,
+#                     model=product_model,
+#                     color=product_color,
+#                     category=product_category,
+#                     logger=logger
+#                 )
+#             )
+#             logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
 
-    except Exception as e:
-        logger.error(f"🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
-        raise
+#     except Exception as e:
+#         logger.error(f"🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
+#         raise
