@@ -46,7 +46,7 @@ def run_process_restart_batch(*args, **kwargs):
     """Wrapper for process_restart_batch to match expected API."""
     return process_restart_batch.remote(*args, **kwargs)
 
-@ray.remote(max_retries=3)
+
 async def process_restart_batch(
     file_id_db: int,
     logger: Optional[logging.Logger] = None,
