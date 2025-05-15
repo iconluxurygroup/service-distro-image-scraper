@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml /app/ 
 # Copy dependency files
 COPY uv.lock /app/
-RUN uv pip install --system -r uv.lock
+RUN uv.lock
 
 # Copy the rest of the application
 COPY app/ /app/
