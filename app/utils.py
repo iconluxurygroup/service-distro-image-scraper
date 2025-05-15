@@ -821,7 +821,7 @@ async def process_and_tag_results(
             }])]
 
         try:
-            with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
+            with pyodbc.connect(conn_str, autocommit=False) as conn:
                 query = """
                     SELECT 
                         r.EntryID, 
@@ -838,7 +838,7 @@ async def process_and_tag_results(
                     WHERE r.EntryID = ?
                 """
                 logger.debug(f"Executing database query for EntryID {entry_id}")
-                df = pd.read_sql(query, conn, params=(entry_id,), timeout=60)
+                df = pd.read_sql(query, conn, params=(entry_id,))  # Removed timeout=60
                 logger.debug(f"Retrieved {len(df)} rows for EntryID {entry_id}")
         except pyodbc.Error as e:
             logger.error(f"Failed to retrieve results for EntryID {entry_id}: {e}", exc_info=True)
@@ -917,7 +917,6 @@ async def process_and_tag_results(
             "search_type": "default",
             "priority": 4
         }])]
-
 def sync_process_and_tag_results(*args, **kwargs):
     """Synchronous wrapper for process_and_tag_results."""
     return asyncio.run(process_and_tag_results(*args, **kwargs))
