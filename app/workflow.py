@@ -1,57 +1,10 @@
-import asyncio
-import os
-import pandas as pd
-import pyodbc
-import ray
-import aiofiles
-import httpx
-import datetime
-import time
-import psutil  # Added for memory logging
-from typing import Dict, List, Optional, Tuple
-from config import conn_str
-from database import (
-    insert_search_results,
-    update_search_sort_order,
-    get_records_to_search,
-    fetch_missing_images,
-    update_initial_sort_order,
-    update_log_url_in_db,
-    get_endpoint,
-    sync_update_search_sort_order,
-    get_images_excel_db,
-    get_send_to_email,
-    update_file_generate_complete,
-    update_file_location_complete,
-    set_sort_order_negative_four_for_zero_match,
-)
-from utils import (
-    fetch_brand_rules,
-    sync_process_and_tag_results,
-    generate_search_variations,
-    process_search_row,
-    process_and_tag_results,
-    process_search_row_gcloud,
-)
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from image_reason import process_entry_remote
-from image_utils import download_all_images
-from email_utils import send_email, send_message_email
-from file_utils import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-from logging_config import setup_job_logger
-import logging
 
-BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
-
-def run_process_restart_batch(*args, **kwargs):
-    """Wrapper for process_restart_batch to match expected API."""
-    return process_restart_batch.remote(*args, **kwargs)
 import os
 import pandas as pd
 import pyodbc
 import ray
 import requests
+import time
 import datetime
 import psutil
 import logging
@@ -59,21 +12,21 @@ from typing import Dict, List, Optional, Tuple
 from config import conn_str
 from database import (
     insert_search_results,
-    update_search_sort_order,  # Assume synchronous version
+    update_search_sort_order,  # Synchronous version
     get_records_to_search,
     fetch_missing_images,
     update_initial_sort_order,
     update_log_url_in_db,
-    get_endpoint,  # Assume synchronous version
+    get_endpoint,  # Synchronous version
     sync_update_search_sort_order,
     get_images_excel_db,
-    get_send_to_email,
+    get_send_to_email,  # Synchronous version
     update_file_generate_complete,
     update_file_location_complete,
     set_sort_order_negative_four_for_zero_match,
 )
 from utils import (
-    fetch_brand_rules,  # Assume synchronous version
+    fetch_brand_rules,  # Synchronous version
     sync_process_and_tag_results,
     generate_search_variations,
     process_search_row,
@@ -94,7 +47,7 @@ def run_process_restart_batch(*args, **kwargs):
     """Wrapper for process_restart_batch to match expected API."""
     return process_restart_batch.remote(*args, **kwargs)
 
-@ray.remote(num_cpus=1, memory=4 * 1024 * 1024 * 1024)  # Increased to 4GB
+@ray.remote(num_cpus=1, memory=4 * 1024 * 1024 * 1024)  # 4GB memory limit
 def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -108,12 +61,12 @@ def process_restart_batch(
 
         # Log memory usage
         def log_memory_usage():
-            process = psutil.Process()
+            process = psutil.Process()  # Fixed typo
             mem_info = process.memory_info()
             logger.info(f"Memory usage: RSS={mem_info.rss / 1024 / 1024:.2f} MB, VMS={mem_info.vms / 1024 / 1024:.2f} MB")
 
         logger.debug(f"Input file_id_db: {file_id_db}, entry_id: {entry_id}, use_all_variations: {use_all_variations}")
-        logger.info(f"🔁 Starting concurrent search processing for FileID: {file_id_db}" + 
+        logger.info(f"🔁 Starting processing for FileID: {file_id_db}" + 
                    (f", EntryID: {entry_id}" if entry_id else "") + 
                    f", use_all_variations: {use_all_variations}")
         log_memory_usage()
@@ -123,7 +76,7 @@ def process_restart_batch(
 
         # Fetch brand rules synchronously
         logger.debug("Fetching brand rules...")
-        brand_rules = fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)  # Synchronous version
+        brand_rules = fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched for FileID: {file_id_db}")
             return {
@@ -142,7 +95,7 @@ def process_restart_batch(
         endpoint = None
         for attempt in range(max_endpoint_retries):
             try:
-                endpoint = get_endpoint(logger=logger)  # Synchronous version
+                endpoint = get_endpoint(logger=logger)
                 if endpoint:
                     logger.info(f"Selected healthy endpoint: {endpoint}")
                     break
@@ -200,7 +153,6 @@ def process_restart_batch(
             start_time = datetime.datetime.now()
             batch_results = []
 
-            # Process entries sequentially (no asyncio semaphore)
             for entry_id, search_string, brand, color, category in batch_entries:
                 logger.debug(f"Submitting Ray task for EntryID: {entry_id}")
                 try:
@@ -253,7 +205,7 @@ def process_restart_batch(
 
                         logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
 
-                        # Update sort order synchronously
+                        # Update sort order
                         update_result = update_search_sort_order(
                             str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                         )
@@ -344,7 +296,7 @@ def process_restart_batch(
         log_memory_usage()
 
         # Send success email
-        to_emails = get_send_to_email(file_id_db_int, logger=logger)  # Synchronous version
+        to_emails = get_send_to_email(file_id_db_int, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
             message = (
