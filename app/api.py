@@ -4,7 +4,7 @@ import os
 import ray
 from typing import Dict, Any, Callable, Union, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
-from workflow import run_process_restart_batch, generate_download_file, batch_vision_reason
+from workflow import process_restart_batch, generate_download_file, batch_vision_reason
 from database import (
     update_initial_sort_order,
     update_sort_order,
@@ -189,12 +189,12 @@ async def api_process_restart(file_id: str, entry_id: int = None):
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else ""))
     try:
-        result = await run_process_restart_batch(
-            file_id_db=int(file_id),
-            max_retries=7,
-            logger=logger,
-            entry_id=entry_id
-        )
+        result = await process_restart_batch(
+    file_id_db=int(file_id),
+    max_retries=7,
+    logger=logger,
+    entry_id=entry_id
+)
         if "error" in result:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
             raise HTTPException(status_code=500, detail=result["error"])
@@ -215,13 +215,13 @@ async def api_restart_search_all(file_id: str, entry_id: int = None):
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
     try:
-        result = await run_process_restart_batch(
-            file_id_db=int(file_id),
-            max_retries=7,
-            logger=logger,
-            entry_id=entry_id,
-            use_all_variations=True
-        )
+        result = await process_restart_batch(
+    file_id_db=int(file_id),
+    max_retries=7,
+    logger=logger,
+    entry_id=entry_id,
+    use_all_variations=True
+)
         if "error" in result:
             logger.error(f"Failed to process restart batch for FileID: {file_id}: {result['error']}")
             raise HTTPException(status_code=500, detail=result["error"])
