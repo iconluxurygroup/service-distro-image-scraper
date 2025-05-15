@@ -44,7 +44,7 @@ async def send_email(to_emails, subject, download_url, job_id, logger=None):
             <p><small>This is an automated notification.<br>
             User: {to_emails}<br>
             Job ID: {str(job_id)}<br>
-            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">{VERSION}</a>
+            Version: <a href="https://dashboard.iconluxury.group">{VERSION}</a>
             </small>
             </p> 
         </div>
@@ -98,7 +98,7 @@ async def send_message_email(to_emails, subject, message, logger=None):
             <p>Message details:<br>{message_with_breaks}</p>
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            Version: <a href="https://cms.rtsplusdev.com/webadmin/ImageScraper.asp">{VERSION}</a>
+            Version: <a href="https://dashboard.iconluxury.group">{VERSION}</a>
             <br>
             User: {to_emails}</small></p>
         </div>
