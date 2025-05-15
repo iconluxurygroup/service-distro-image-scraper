@@ -10,7 +10,6 @@ import pandas as pd
 import aiohttp
 from PIL import Image
 from io import BytesIO
-import ray
 import os
 from typing import Optional, List, Tuple, Dict, Set
 from image_vision import detect_objects_with_computer_vision_async, analyze_image_with_gemini_async

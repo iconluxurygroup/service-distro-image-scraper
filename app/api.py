@@ -1,7 +1,6 @@
 import logging
 import asyncio
 import os
-import ray
 from typing import Dict, Any, Callable, Union, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 from workflow import process_restart_batch, generate_download_file, batch_vision_reason
