@@ -20,22 +20,6 @@ def shutdown(signalnum, frame):
         ray.shutdown()
     sys.exit(0)
 
-# Batch processing function (example)
-@ray.remote
-def process_batch(file_id, variations, chunk_size=10):
-    from ultralytics import YOLO
-    import time
-    logger.info(f"Starting batch for FileID: {file_id} with {len(variations)} variations")
-    start_time = time.time()
-    model = YOLO("yolov11n.pt")
-    for i in range(0, len(variations), chunk_size):
-        chunk = variations[i:i + chunk_size]
-        chunk_start = time.time()
-        results = model.predict(chunk)
-        logger.info(f"Processed chunk {i//chunk_size + 1}/{len(variations)//chunk_size + 1} for FileID: {file_id} in {time.time() - chunk_start:.2f} seconds")
-    logger.info(f"Completed batch for FileID: {file_id} in {time.time() - start_time:.2f} seconds")
-    return results
-
 if __name__ == "__main__":
     logger.info("Starting application")
 
@@ -73,11 +57,11 @@ if __name__ == "__main__":
         logger.info("Ray initialized without dashboard on Windows")
     else:
         ray.init(
-            dashboard_host="127.0.0.0.0:8080",
-            dashboard_port=8265,
+            dashboard_host="127.0.0.1",
+            dashboard_port=8266,  # Changed to avoid conflict
             include_dashboard=True
         )
-        logger.info("Ray initialized with dashboard on Unix")
+        logger.info("Ray initialized with dashboard on Unix at http://127.0.0.1:8266")
 
     # Register shutdown handlers
     signal.signal(signal.SIGTERM, shutdown)
@@ -117,7 +101,7 @@ if __name__ == "__main__":
 
         options = {
             "bind": "0.0.0.0:8080",
-            "workers": int(os.cpu_count() / 2 + 1),
+            "workers": 2,  # Reduced for memory stability
             "worker_class": "uvicorn.workers.UvicornWorker",
             "loglevel": "info",
             "timeout": 7200,
