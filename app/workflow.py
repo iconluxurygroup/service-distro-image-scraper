@@ -43,7 +43,8 @@ import multiprocessing
 from logging_config import setup_job_logger
 from logging.handlers import QueueHandler
 from queue import Queue
-
+from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
+from common import fetch_brand_rules
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 def process_entry(args):
     """Wrapper for sync_process_and_tag_results to run in a multiprocessing worker."""
