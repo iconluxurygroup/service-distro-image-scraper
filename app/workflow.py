@@ -15,7 +15,7 @@ from common import fetch_brand_rules
 from utils import sync_process_and_tag_results
 from logging_config import setup_job_logger
 import psutil
-
+from email_utils import send_message_email
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
 def process_entry(args):
