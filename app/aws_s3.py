@@ -26,14 +26,16 @@ def get_s3_client(service='s3', logger=None, file_id=None):
     try:
         logger.info(f"Creating {service.upper()} client")
         session = aiobotocore.session.get_session()
+        config = AioConfig(signature_version='s3v4')  # Explicitly use Signature Version 4
         if service == 'r2':
+            logger.debug(f"R2 config: endpoint={S3_CONFIG['r2_endpoint']}, access_key={S3_CONFIG['r2_access_key'][:4]}...")
             return session.create_client(
                 "s3",
                 region_name='auto',
                 endpoint_url=S3_CONFIG['r2_endpoint'],
                 aws_access_key_id=S3_CONFIG['r2_access_key'],
                 aws_secret_access_key=S3_CONFIG['r2_secret_key'],
-                config=AioConfig()
+                config=config
             )
         else:
             return session.create_client(
@@ -42,7 +44,7 @@ def get_s3_client(service='s3', logger=None, file_id=None):
                 endpoint_url=S3_CONFIG['endpoint'],
                 aws_access_key_id=S3_CONFIG['access_key'],
                 aws_secret_access_key=S3_CONFIG['secret_key'],
-                config=AioConfig()
+                config=config
             )
     except Exception as e:
         logger.error(f"Error creating {service.upper()} client: {e}", exc_info=True)
@@ -168,7 +170,11 @@ async def upload_file_to_space(file_src, save_as, is_public=True, logger=None, f
         content_type = 'text/plain' if file_src.endswith('.log') else 'application/octet-stream'
         logger.warning(f"Could not determine Content-Type for {file_src}, using {content_type}")
 
-    # Upload to S3 with retry logic
+    # Log file details
+    file_size = os.path.getsize(file_src)
+    logger.info(f"Uploading file: {file_src}, size: {file_size / 1024:.2f} KB, save_as: {save_as}")
+
+    # Upload to S3
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
@@ -190,30 +196,37 @@ async def upload_file_to_space(file_src, save_as, is_public=True, logger=None, f
         except Exception as e:
             if attempt < max_attempts - 1 and 'InternalError' in str(e):
                 logger.warning(f"InternalError on attempt {attempt + 1}, retrying after delay...")
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                await asyncio.sleep(2 ** attempt)
                 continue
             logger.error(f"Failed to upload {file_src} to S3: {e}", exc_info=True)
             raise
 
-    # Upload to R2
-    try:
-        async with get_s3_client(service='r2', logger=logger, file_id=file_id) as r2_client:
-            logger.info(f"Uploading {file_src} to R2: {S3_CONFIG['r2_bucket_name']}/{save_as}")
-            with open(file_src, 'rb') as file:
-                await r2_client.put_object(
-                    Bucket=S3_CONFIG['r2_bucket_name'],
-                    Key=save_as,
-                    Body=file,
-                    ACL='public-read' if is_public else 'private',
-                    ContentType=content_type
-                )
-            double_encoded_key = double_encode_plus(save_as, logger=logger)
-            r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
-            logger.info(f"Uploaded {file_src} to R2: {r2_url} with Content-Type: {content_type}")
-            result_urls['r2'] = r2_url
-    except Exception as e:
-        logger.error(f"Failed to upload {file_src} to R2: {e}", exc_info=True)
-        pass
+    # Upload to R2 with retries
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            async with get_s3_client(service='r2', logger=logger, file_id=file_id) as r2_client:
+                logger.info(f"Uploading {file_src} to R2: {S3_CONFIG['r2_bucket_name']}/{save_as}")
+                with open(file_src, 'rb') as file:
+                    await r2_client.put_object(
+                        Bucket=S3_CONFIG['r2_bucket_name'],
+                        Key=save_as,
+                        Body=file,
+                        ACL='public-read' if is_public else 'private',
+                        ContentType=content_type
+                    )
+                double_encoded_key = double_encode_plus(save_as, logger=logger)
+                r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
+                logger.info(f"Uploaded {file_src} to R2: {r2_url} with Content-Type: {content_type}")
+                result_urls['r2'] = r2_url
+                break
+        except Exception as e:
+            if attempt < max_attempts - 1 and 'SignatureDoesNotMatch' in str(e):
+                logger.warning(f"SignatureDoesNotMatch on attempt {attempt + 1}, retrying after delay...")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            logger.error(f"Failed to upload {file_src} to R2: {e}", exc_info=True)
+            break  # Don't raise, allow process to continue
 
     if is_public and result_urls.get('s3'):
         return result_urls['s3']
