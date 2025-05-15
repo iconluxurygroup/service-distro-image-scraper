@@ -45,6 +45,22 @@ from logging.handlers import QueueHandler
 from queue import Queue
 from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
 from common import fetch_brand_rules
+import logging
+import asyncio
+import os
+import pandas as pd
+import time
+import pyodbc
+import multiprocessing
+from multiprocessing import Queue
+from typing import Optional, Dict, List, Tuple
+from logging.handlers import QueueHandler
+from config import conn_str
+from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
+from common import fetch_brand_rules
+from utils import sync_process_and_tag_results
+from logging_config import setup_job_logger
+import psutil
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 def process_entry(args):
     """Wrapper for sync_process_and_tag_results to run in a multiprocessing worker."""
@@ -102,7 +118,7 @@ async def process_restart_batch(
         logger.debug("Logger initialized")
 
         # Set up logging queue for multiprocessing
-        log_queue = Queue()
+        log_queue = multiprocessing.Queue()
         queue_handler = QueueHandler(log_queue)
         logger.handlers = [queue_handler]
         log_listener = logging.handlers.QueueListener(log_queue, *logger.handlers)
