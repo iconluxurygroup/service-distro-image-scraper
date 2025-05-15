@@ -1,14 +1,11 @@
 import logging
-import ray
-from fastapi.middleware.cors import CORSMiddleware
-from api import app
-import os
 import platform
 import signal
 import sys
+from fastapi.middleware.cors import CORSMiddleware
+from api import app
+import os
 from waitress import serve
-import shutil
-import tempfile
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -16,8 +13,6 @@ if not logger.handlers:
 
 def shutdown(signalnum, frame):
     logger.info("Received shutdown signal, stopping gracefully")
-    if ray.is_initialized():
-        ray.shutdown()
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -34,34 +29,6 @@ if __name__ == "__main__":
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
-
-    # Clean up previous Ray sessions
-    ray_temp_dir = os.path.join(tempfile.gettempdir(), "ray")
-    if os.path.exists(ray_temp_dir):
-        try:
-            shutil.rmtree(ray_temp_dir)
-            logger.info("Cleaned up previous Ray session directory")
-        except Exception as e:
-            logger.warning(f"Failed to clean up Ray session directory: {e}")
-
-    # Initialize Ray
-    if ray.is_initialized():
-        ray.shutdown()
-    if platform.system() == "Windows":
-        ray.init(
-            include_dashboard=False,
-            logging_level=logging.ERROR,
-            configure_logging=True,
-            log_to_driver=True
-        )
-        logger.info("Ray initialized without dashboard on Windows")
-    else:
-        ray.init(
-            dashboard_host="127.0.0.1",
-            dashboard_port=8265,  # Changed to avoid conflict
-            include_dashboard=True
-        )
-        logger.info("Ray initialized with dashboard on Unix at http://127.0.0.1:8266")
 
     # Register shutdown handlers
     signal.signal(signal.SIGTERM, shutdown)
