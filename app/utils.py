@@ -7,7 +7,6 @@ import os
 import pandas as pd
 import time
 import pyodbc
-import ray
 from typing import List, Dict, Optional, Tuple, Any
 from config import conn_str
 from common import (
@@ -21,7 +20,7 @@ from common import (
     filter_model_results,
     calculate_priority
 )
-from db_utils import get_endpoint
+from db_utils import get_endpoint, sync_get_endpoint, insert_search_results, sync_update_search_sort_order
 from image_utils import download_all_images
 from excel_utils import write_excel_image
 from email_utils import send_email, send_message_email
@@ -264,8 +263,6 @@ def process_search_row_gcloud(search_string: str, entry_id: int, logger: Optiona
             continue
     logger.error(f"All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     return pd.DataFrame()
-from typing import Dict, List, Optional
-import logging
 
 def generate_search_variations(
     search_string: str,
@@ -274,7 +271,7 @@ def generate_search_variations(
     brand_rules: Optional[Dict] = None,
     logger: Optional[logging.Logger] = None
 ) -> Dict[str, List[str]]:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     variations = {
         "default": [],
         "delimiter_variations": [],
@@ -345,7 +342,7 @@ def generate_search_variations(
     
     return variations
 
-def search_variation(
+async def search_variation(
     variation: str,
     endpoint: str,
     entry_id: int,
@@ -416,7 +413,7 @@ def search_variation(
             "error": str(e)
         }
 
-def process_single_all(
+async def process_single_all(
     entry_id: int,
     search_string: str,
     max_row_retries: int,
@@ -429,7 +426,6 @@ def process_single_all(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    from db_utils import insert_search_results, sync_get_endpoint, sync_update_search_sort_order
     logger = logger or default_logger
     
     try:
@@ -495,9 +491,10 @@ def process_single_all(
             logger.warning(f"Search type '{search_type}' not found in variations for EntryID {entry_id}")
             continue
         logger.info(f"Processing search type '{search_type}' for EntryID {entry_id} with variations: {variations[search_type]}")
-        futures = [search_variation.remote(variation, endpoint, entry_id, search_type, result_brand, result_category, logger)
-                   for variation in variations[search_type]]
-        results = ray.get(futures)
+        results = []
+        for variation in variations[search_type]:
+            result = await search_variation(variation, endpoint, entry_id, search_type, result_brand, result_category, logger)
+            results.append(result)
         successful_results = [res for res in results if res["status"] == "success" and not res["result"].empty]
         if successful_results:
             result_count = sum(len(res["result"]) for res in successful_results)
@@ -592,7 +589,7 @@ def process_single_all(
         logger.error(f"Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
 
-def process_single_row(
+async def process_single_row(
     entry_id: int,
     search_string: str,
     max_row_retries: int,
@@ -605,8 +602,6 @@ def process_single_row(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    from db_utils import insert_search_results, sync_get_endpoint, sync_update_search_sort_order
-    import pandas as pd
     logger = logger or default_logger
     
     try:
@@ -672,9 +667,10 @@ def process_single_row(
             logger.warning(f"Search type '{search_type}' not found in variations for EntryID {entry_id}")
             continue
         logger.info(f"Processing search type '{search_type}' for EntryID {entry_id} with variations: {variations[search_type]}")
-        futures = [search_variation.remote(variation, endpoint, entry_id, search_type, result_brand, result_category, logger)
-                   for variation in variations[search_type]]
-        results = ray.get(futures)
+        results = []
+        for variation in variations[search_type]:
+            result = await search_variation(variation, endpoint, entry_id, search_type, result_brand, result_category, logger)
+            results.append(result)
         successful_results = [res for res in results if res["status"] == "success" and not res["result"].empty]
         if successful_results:
             all_results.extend([res["result"] for res in successful_results])
@@ -765,8 +761,18 @@ def process_single_row(
     except pyodbc.Error as e:
         logger.error(f"Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
-async def process_and_tag_results(search_string, brand, model, endpoint, entry_id, logger, use_all_variations: bool = False, file_id_db: int = None):
-    logger = logger or logging.getLogger("default")
+
+async def process_and_tag_results(
+    search_string,
+    brand,
+    model,
+    endpoint,
+    entry_id,
+    logger,
+    use_all_variations: bool = False,
+    file_id_db: int = None
+) -> List[pd.DataFrame]:
+    logger = logger or default_logger
     try:
         logger.debug(f"Starting process_and_tag_results for EntryID {entry_id}")
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
@@ -789,7 +795,7 @@ async def process_and_tag_results(search_string, brand, model, endpoint, entry_i
         max_row_retries = 3
         process_func = process_single_all if use_all_variations else process_single_row
         logger.debug(f"Calling process_func for EntryID {entry_id}")
-        success = process_func(
+        success = await process_func(
             entry_id=entry_id,
             search_string=search_string,
             max_row_retries=max_row_retries,
