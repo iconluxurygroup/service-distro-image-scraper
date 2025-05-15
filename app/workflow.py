@@ -6,6 +6,7 @@ import ray
 import aiofiles
 import httpx
 import datetime
+import time
 import psutil  # Added for memory logging
 from typing import Dict, List, Optional, Tuple
 from config import conn_str
@@ -107,7 +108,7 @@ def process_restart_batch(
 
         # Log memory usage
         def log_memory_usage():
-            process komoly = psutil.Process()
+            process = psutil.Process()
             mem_info = process.memory_info()
             logger.info(f"Memory usage: RSS={mem_info.rss / 1024 / 1024:.2f} MB, VMS={mem_info.vms / 1024 / 1024:.2f} MB")
 
