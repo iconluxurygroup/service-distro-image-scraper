@@ -154,58 +154,65 @@ async def process_restart_batch(
                     (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db_int)
                     for entry_id, search_string, brand, color, category in batch_entries
                 ]
+                logger.debug(f"Tasks: {tasks}")
 
                 results = pool.map(process_entry, tasks)
+                logger.debug(f"Batch {batch_idx} results: {results}")
 
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
                     try:
-                        dfs = result
-                        if dfs:
-                            combined_df = pd.concat(dfs, ignore_index=True)
-                            logger.info(f"Combined {len(combined_df)} results for EntryID {entry_id}")
-
-                            for api_col, db_col in api_to_db_mapping.items():
-                                if api_col in combined_df.columns and db_col not in combined_df.columns:
-                                    combined_df.rename(columns={api_col: db_col}, inplace=True)
-
-                            if not all(col in combined_df.columns for col in required_columns):
-                                logger.error(f"Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
-                                failed_entries += 1
-                                continue
-
-                            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-                            logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
-
-                            insert_success = insert_search_results(deduplicated_df, logger=logger)
-                            if not insert_success:
-                                logger.error(f"Failed to insert results for EntryID {entry_id}")
-                                failed_entries += 1
-                                continue
-
-                            logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
-
-                            update_result = update_search_sort_order(
-                                str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                            )
-                            if update_result is None:
-                                logger.error(f"SortOrder update failed for EntryID {entry_id}")
-                                failed_entries += 1
-                                continue
-
-                            logger.info(f"Updated sort order for EntryID {entry_id}")
-                            successful_entries += 1
-
-                        else:
-                            logger.error(f"No results returned for EntryID {entry_id}")
+                        if result is None:
+                            logger.error(f"No results for EntryID {entry_id}")
                             failed_entries += 1
+                            continue
+
+                        dfs = result
+                        if not dfs:
+                            logger.error(f"Empty results for EntryID {entry_id}")
+                            failed_entries += 1
+                            continue
+
+                        combined_df = pd.concat(dfs, ignore_index=True)
+                        logger.debug(f"Combined DataFrame for EntryID {entry_id}: {combined_df.to_dict()}")
+
+                        for api_col, db_col in api_to_db_mapping.items():
+                            if api_col in combined_df.columns and db_col not in combined_df.columns:
+                                combined_df.rename(columns={api_col: db_col}, inplace=True)
+
+                        if not all(col in combined_df.columns for col in required_columns):
+                            logger.error(f"Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
+                            failed_entries += 1
+                            continue
+
+                        deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
+                        logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
+
+                        insert_success = insert_search_results(deduplicated_df, logger=logger)
+                        if not insert_success:
+                            logger.error(f"Failed to insert results for EntryID {entry_id}")
+                            failed_entries += 1
+                            continue
+
+                        logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
+
+                        update_result = update_search_sort_order(
+                            str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                        )
+                        if update_result is None:
+                            logger.error(f"SortOrder update failed for EntryID {entry_id}")
+                            failed_entries += 1
+                            continue
+
+                        logger.info(f"Updated sort order for EntryID {entry_id}")
+                        successful_entries += 1
 
                     except Exception as e:
                         logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
                         failed_entries += 1
 
-                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
-                log_memory_usage()
+                        elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                        logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
+                        log_memory_usage()
 
         # Final verification
         with pyodbc.connect(conn_str, autocommit=False) as conn:
