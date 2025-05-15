@@ -302,8 +302,26 @@ def process_restart_batch(
             sample_results = cursor.fetchall()
             for result in sample_results:
                 logger.info(f"Sample - ResultID: {result[0]}, EntryID: {result[1]}, SortOrder: {result[2]}, ImageDesc: {result[3]}")
-
+        
         logger.info(f"✅ Completed processing for FileID: {file_id_db}. {positive_entries}/{len(entries)} entries with positive SortOrder. Failed entries: {failed_entries}")
+        
+        # Send success email notification
+        to_emails = asyncio.run(get_send_to_email(file_id_db, logger))
+        if to_emails:
+            subject = f"Processing Completed for FileID: {file_id_db}"
+            message = (
+                f"Processing for FileID {file_id_db} has completed successfully.\n"
+                f"Successful entries: {successful_entries}/{len(entries)}\n"
+                f"Failed entries: {failed_entries}\n"
+                f"Log file: {log_filename}"
+            )
+            asyncio.run(send_message_email(
+                to_emails=to_emails,
+                subject=subject,
+                message=message,
+                logger=logger
+            ))
+
         return {
             "message": "Search processing completed",
             "file_id": str(file_id_db),
@@ -321,13 +339,12 @@ def process_restart_batch(
                 to_emails=to_emails,
                 subject=f"Error processing FileID: {file_id_db}",
                 message=f"An error occurred while processing your file: {str(e)}",
-                logger=to_emails
+                logger=logger
             )
         return {
             "error": str(e),
             "log_filename": log_filename
         }
-
 
 async def generate_download_file(
     file_id: int,
