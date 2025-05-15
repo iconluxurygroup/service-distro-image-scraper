@@ -101,7 +101,7 @@ if __name__ == "__main__":
 
         options = {
             "bind": "0.0.0.0:8080",
-            "workers": 2,  # Reduced for memory stability
+            "workers": 5,  # Reduced for memory stability
             "worker_class": "uvicorn.workers.UvicornWorker",
             "loglevel": "info",
             "timeout": 7200,
