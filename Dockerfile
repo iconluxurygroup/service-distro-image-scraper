@@ -43,7 +43,6 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml /app/ 
 # Copy dependency files
 COPY uv.lock /app/
-RUN uv.lock
 
 # Copy the rest of the application
 COPY app/ /app/
@@ -53,4 +52,5 @@ EXPOSE 8080
 EXPOSE 8265
 
 # Run main.py
+RUN [ "uv" ,"lock" ]
 CMD ["python", "main.py"]
