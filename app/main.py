@@ -58,7 +58,7 @@ if __name__ == "__main__":
     else:
         ray.init(
             dashboard_host="127.0.0.1",
-            dashboard_port=8266,  # Changed to avoid conflict
+            dashboard_port=8265,  # Changed to avoid conflict
             include_dashboard=True
         )
         logger.info("Ray initialized with dashboard on Unix at http://127.0.0.1:8266")
