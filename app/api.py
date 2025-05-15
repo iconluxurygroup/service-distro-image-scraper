@@ -36,6 +36,10 @@ if not default_logger.handlers:
 router = APIRouter()
 
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str, int], **kwargs) -> Dict:
+    """
+    Run a job function with logging and upload logs to storage.
+    Returns standardized response with status_code, message, and data.
+    """
     file_id_str = str(file_id)
     logger, _ = setup_job_logger(job_id=file_id_str, console_output=True)
     result = None
@@ -43,11 +47,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str,
         func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
         logger.info(f"Starting job {func_name} for FileID: {file_id}")
         
-        if hasattr(job_func, '_remote'):
-            # Ray remote task
-            result_ref = await job_func(file_id, **kwargs)
-            result = ray.get(result_ref)  # Resolve Ray ObjectRef
-        elif asyncio.iscoroutinefunction(job_func):
+        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
             result = await job_func(file_id, **kwargs)
         else:
             result = job_func(file_id, **kwargs)
@@ -55,7 +55,8 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str,
         logger.info(f"Completed job {func_name} for FileID: {file_id}")
         return {"status_code": 200, "message": f"Job {func_name} completed successfully for FileID: {file_id}", "data": result}
     except Exception as e:
-        logger.error(f"Error in job {func_name} for FileID {file_id}: {str(e)}")
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {str(e)}")
         logger.debug(f"Traceback: {traceback.format_exc()}")
         return {"status_code": 500, "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}"}
     finally:
@@ -209,7 +210,7 @@ async def api_process_restart(file_id: str, entry_id: int = None):
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
 
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
-async def api_restart_search_all(background_tasks: BackgroundTasks, file_id: str, entry_id: int = None):
+async def api_restart_search_all(background_tasks: BackgroundTasks,file_id: str, entry_id: int = None):
     """Restart batch processing for a file, searching all variations for each entry."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
@@ -217,7 +218,7 @@ async def api_restart_search_all(background_tasks: BackgroundTasks, file_id: str
         background_tasks.add_task(
             run_job_with_logging,
             run_process_restart_batch,
-            file_id,  # Pass file_id positionally
+            file_id_db=int(file_id),
             entry_id=entry_id,
             use_all_variations=True,
             logger=logger
