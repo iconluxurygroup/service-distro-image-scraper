@@ -100,38 +100,33 @@ if __name__ == "__main__":
                 return self.application
 
         options = {
-            "bind": "0.0.0.0:8080",
-            "workers": 5,  # Reduced for memory stability
+            "bind": f"0.0.0.0:8080",
+            "workers": int(os.cpu_count() / 2 + 1),
             "worker_class": "uvicorn.workers.UvicornWorker",
             "loglevel": "info",
-            "timeout": 7200,
-            "graceful_timeout": 7140,
+            "timeout": 120,  # Adjusted for typical use cases
+            "graceful_timeout": 100,
             "proc_name": "gunicorn_large_batch",
             "accesslog": "-",
             "errorlog": "-",
             "logconfig_dict": {
                 "loggers": {
-                    "gunicorn": {
-                        "level": "INFO",
-                        "handlers": ["console"],
-                        "propagate": False,
-                        "qualname": "gunicorn"
-                    }
+                    "gunicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                    "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
                 },
                 "handlers": {
                     "console": {
                         "class": "logging.StreamHandler",
                         "formatter": "generic",
-                        "stream": "ext://sys.stdout"
-                    }
+                        "stream": "ext://sys.stdout",
+                    },
                 },
                 "formatters": {
                     "generic": {
                         "format": "%(asctime)s [%(process)d] [%(levelname)s] %(message)s",
                         "datefmt": "[%Y-%m-%d %H:%M:%S %z]",
-                        "class": "logging.Formatter"
-                    }
-                }
-            }
+                    },
+                },
+            },
         }
         StandaloneApplication(app, options).run()
