@@ -4,64 +4,17 @@ import os
 import pandas as pd
 import time
 import pyodbc
-import ray
-from typing import List, Dict, Optional, Tuple
-from config import conn_str
-from database import (
-    insert_search_results,
-    update_search_sort_order,
-    get_records_to_search,
-    fetch_missing_images,
-    update_initial_sort_order,
-    update_log_url_in_db,
-    get_endpoint,
-    sync_update_search_sort_order,
-    get_images_excel_db,
-    get_send_to_email,
-    update_file_generate_complete,
-    update_file_location_complete,
-    set_sort_order_negative_four_for_zero_match,
-)
-from utils import (
-    fetch_brand_rules,
-    sync_process_and_tag_results,
-    generate_search_variations,
-    process_search_row,
-    process_and_tag_results,
-    process_search_row_gcloud,
-)
-from image_reason import process_entry_remote
-from image_utils import download_all_images
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from email_utils import send_email, send_message_email
-from file_utils import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-import httpx
-import aiofiles
-import datetime
 import multiprocessing
-from logging_config import setup_job_logger
-from logging.handlers import QueueHandler
-from queue import Queue
-from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
-from common import fetch_brand_rules
-import logging
-import asyncio
-import os
-import pandas as pd
-import time
-import pyodbc
-import multiprocessing
-from multiprocessing import Queue
 from typing import Optional, Dict, List, Tuple
-from logging.handlers import QueueHandler
 from config import conn_str
 from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
 from common import fetch_brand_rules
 from utils import sync_process_and_tag_results
 from logging_config import setup_job_logger
 import psutil
+
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
+
 def process_entry(args):
     """Wrapper for sync_process_and_tag_results to run in a multiprocessing worker."""
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
@@ -88,41 +41,6 @@ def process_entry(args):
     finally:
         logger.removeHandler(handler)
         handler.close()
-import logging
-import asyncio
-import os
-import pandas as pd
-import time
-import pyodbc
-import multiprocessing
-from typing import Optional, Dict, List, Tuple
-from queue import Queue
-from logging.handlers import QueueHandler
-from config import conn_str
-from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
-from common import fetch_brand_rules
-from utils import sync_process_and_tag_results
-from logging_config import setup_job_logger
-import psutil
-
-BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
-
-import logging
-import asyncio
-import os
-import pandas as pd
-import time
-import pyodbc
-import multiprocessing
-from typing import Optional, Dict, List, Tuple
-from config import conn_str
-from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
-from common import fetch_brand_rules
-from utils import sync_process_and_tag_results
-from logging_config import setup_job_logger
-import psutil
-
-BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
 async def process_restart_batch(
     file_id_db: int,
