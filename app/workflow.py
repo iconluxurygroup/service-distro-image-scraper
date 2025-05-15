@@ -7,15 +7,23 @@ import pandas as pd
 import time
 import pyodbc
 import httpx
+import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
 from config import conn_str
-from db_utils import sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email
+from db_utils import (sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email,get_images_excel_db, fetch_missing_images,  
+update_file_location_complete, update_file_generate_complete)
+from image_utils import download_all_images
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
+from utils import create_temp_dirs, cleanup_temp_dirs
 from utils import sync_process_and_tag_results
+
 from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space
 import psutil
-from email_utils import send_message_email
+from email_utils import send_message_email, send_email
+from typing import Optional
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
@@ -296,7 +304,7 @@ async def generate_download_file(
     file_id_param: Optional[int] = None
 ) -> Dict[str, str]:
     """Generate and upload a processed Excel file with images asynchronously."""
-    logger = logger or default_logger
+    logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     temp_images_dir, temp_excel_dir = None, None
 
     try:
