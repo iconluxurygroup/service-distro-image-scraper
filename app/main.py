@@ -1,15 +1,15 @@
 import logging
 import ray
 from fastapi.middleware.cors import CORSMiddleware
-from api import app
+from api import app  # Replace with your FastAPI app
 import os
 import platform
-import uvicorn
 import signal
 import sys
 from waitress import serve
 import shutil
 import tempfile
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -23,16 +23,19 @@ def shutdown(signalnum, frame):
 if __name__ == "__main__":
     logger.info("Starting application")
 
+    # Fix Ultralytics config directory
+    os.environ["YOLO_CONFIG_DIR"] = "/tmp/ultralytics_config"
+
     # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Replace with your domains
+        allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 
-    # Clean up previous Ray sessions to avoid conflicts
+    # Clean up previous Ray sessions
     ray_temp_dir = os.path.join(tempfile.gettempdir(), "ray")
     if os.path.exists(ray_temp_dir):
         try:
@@ -45,10 +48,9 @@ if __name__ == "__main__":
     if ray.is_initialized():
         ray.shutdown()
     if platform.system() == "Windows":
-        # Disable dashboard and related logging on Windows
         ray.init(
             include_dashboard=False,
-            logging_level=logging.ERROR,  # Suppress dashboard logs
+            logging_level=logging.ERROR,
             configure_logging=True,
             log_to_driver=True
         )
@@ -72,14 +74,14 @@ if __name__ == "__main__":
             app,
             host="0.0.0.0",
             port=8080,
-            threads=os.cpu_count() / 2 + 1,
+            threads=int(os.cpu_count() / 2 + 1),
             connection_limit=1000,
             asyncore_loop_timeout=120
         )
     else:
         logger.info("Running Gunicorn with Uvicorn workers on Unix")
         from gunicorn.app.base import BaseApplication
-        from gunicorn.config import Config  # Correct import
+        from gunicorn.config import Config
         from uvicorn.workers import UvicornWorker
 
         class StandaloneApplication(BaseApplication):
@@ -89,7 +91,7 @@ if __name__ == "__main__":
                 super().__init__()
 
             def load_config(self):
-                config = Config()  # Correct class name
+                config = Config()
                 for key, value in self.options.items():
                     config.set(key, value)
                 self.cfg = config
@@ -98,11 +100,38 @@ if __name__ == "__main__":
                 return self.application
 
         options = {
-    "bind": "0.0.0.0:8080",
-    "workers": 8,
-    "worker_class": "uvicorn.workers.UvicornWorker",
-    "loglevel": "info",
-    "timeout": 7200,  # 2 hours (7200 seconds), a practical maximum
-    "graceful_timeout": 7140,  # Slightly less than timeout (119 minutes)
-}
-StandaloneApplication(app, options).run()
+            "bind": "0.0.0.0:8080",
+            "workers": int(os.cpu_count() / 2 + 1),  # Ensure integer
+            "worker_class": "uvicorn.workers.UvicornWorker",
+            "loglevel": "info",
+            "timeout": 7200,
+            "graceful_timeout": 7140,
+            "proc_name": "gunicorn_large_batch",
+            "accesslog": "-",
+            "errorlog": "-",
+            "logconfig_dict": {
+                "loggers": {
+                    "gunicorn": {
+                        "level": "INFO",
+                        "handlers": ["console"],
+                        "propagate": False,
+                        "qualname": "gunicorn"
+                    }
+                },
+                "handlers": {
+                    "console": {
+                        "class": "logging.StreamHandler",
+                        "formatter": "generic",
+                        "stream": "ext://sys.stdout"
+                    }
+                },
+                "formatters": {
+                    "generic": {
+                        "format": "%(asctime)s [%(process)d] [%(levelname)s] %(message)s",
+                        "datefmt": "[%Y-%m-%d %H:%M:%S %z]",
+                        "class": "logging.Formatter"
+                    }
+                }
+            }
+        }
+        StandaloneApplication(app, options).run()
