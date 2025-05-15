@@ -217,11 +217,10 @@ async def api_restart_search_all(file_id: str, entry_id: int = None):
     try:
         result = await process_restart_batch(
     file_id_db=int(file_id),
-    max_retries=7,
     logger=logger,
     entry_id=entry_id,
     use_all_variations=True
-)
+    )     
         if "error" in result:
             logger.error(f"Failed to process restart batch for FileID: {file_id}: {result['error']}")
             raise HTTPException(status_code=500, detail=result["error"])
