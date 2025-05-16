@@ -30,40 +30,39 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # Category hierarchy URL and fallback
-category_hierarchy_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/category_hierarchy.json"
+category_hierarchy_url = "https://iconluxury.group/static_settings/category_hierarchy.json"
 category_hierarchy = None
 
 # Category mapping URL and fallback
-category_mapping_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/category_mapping.json"
+category_mapping_url = "https://iconluxury.group/static_settings/category_mapping.json"
 CATEGORY_MAPPING = None
 
 # Fashion labels URL and fallback
-fashion_labels_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/fashion_labels.json"
+fashion_labels_url = "https://iconluxury.group/static_settings/fashion_labels.json"
 FASHION_LABELS = None
+
+# Fallback data
 fashion_labels_example = [
     "t-shirt", "shirt", "trouser", "dress", "coat", "jacket", "sweater", "pullover",
-    "sandal", "sneaker", "shoe", "bag", "backpack", "hat", "scarf", "gloves", "belt",
-    "skirt", "shorts", "suit", "tie", "socks", "boots", "running_shoe", "athletic_shoe", "trainer"
+    "sandal", "sneaker", "shoe", "bag", "backpack", "hat", "scarf", "glove", "belt",
+    "skirt", "short", "suit", "tie", "sock", "boot", "running-shoe", "athletic-shoe", "trainer"
 ]
 
-# Simplified hierarchical category relationships
 category_hierarchy_example = {
-    "coat": ["jacket", "trench_coat"],
-    "trouser": ["jean", "skinny", "skim"],
-    "dress": ["kimono", "velvet", "yes"],
-    "sweatshirt": ["jersey"],
-    "sweater": ["wool"],
-    "tights": ["maillot"],
-    "sneaker": ["running_shoe", "athletic_shoe", "trainer"]
+    "tops": ["t-shirt", "shirt", "sweater", "blouse", "tank-top", "hoodie"],
+    "bottoms": ["trouser", "jean", "short", "skirt", "legging"],
+    "outerwear": ["coat", "jacket", "vest"],
+    "dress": ["maxi-dress", "midi-dress", "mini-dress", "kimono"],
+    "footwear": ["shoe", "sandal", "boot"],
+    "accessories": ["bag", "hat", "belt", "scarf", "glove", "sunglasses"]
 }
 
-# Fallback category mapping
 category_mapping_example = {
     "pants": "trouser",
     "jeans": "trouser",
     "jacket": "coat",
     "sneakers": "sneaker",
-    "running_shoe": "sneaker",
+    "running-shoe": "sneaker",
     "tshirt": "t-shirt",
     "shirt": "t-shirt",
     "sweatshirt": "sweater",
@@ -111,12 +110,23 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
         return False
 
     detected_label = detected_label.lower().strip()
-    # If expected_category is empty, assume the detected label is valid if it's fashion-related
     if not expected_category:
         global FASHION_LABELS
         if FASHION_LABELS is None:
-            FASHION_LABELS = fashion_labels_example
-            logger.info("Using example fashion_labels")
+            for attempt in range(3):
+                try:
+                    response = requests.get(fashion_labels_url, timeout=10)
+                    response.raise_for_status()
+                    FASHION_LABELS = response.json()
+                    if not isinstance(FASHION_LABELS, list):
+                        raise ValueError("fashion_labels must be a list")
+                    logger.info("Loaded FASHION_LABELS")
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to load FASHION_LABELS (attempt {attempt + 1}): {e}")
+                    if attempt == 2:
+                        FASHION_LABELS = fashion_labels_example
+                        logger.info("Using example FASHION_LABELS")
         if detected_label in FASHION_LABELS:
             logger.info(f"No expected category provided; accepting fashion-related label '{detected_label}'")
             return True
@@ -127,7 +137,6 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
     if detected_label in expected_category:
         return True
 
-    # Ensure CATEGORY_MAPPING is loaded
     global CATEGORY_MAPPING
     if CATEGORY_MAPPING is None:
         for attempt in range(3):
@@ -147,15 +156,27 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
     if mapped_label in expected_category:
         return True
 
-    sneaker_synonyms = [
-        "sneaker", "running_shoe", "athletic_shoe", "trainer", "tennis_shoe",
-        "sport_shoe", "kick", "gym_shoe", "footwear"
-    ]
+    sneaker_synonyms = ["sneaker", "running-shoe", "athletic-shoe", "trainer"]
     if "sneaker" in expected_category and detected_label in sneaker_synonyms:
         logger.info(f"Matched '{detected_label}' to 'sneaker' in category '{expected_category}'")
         return True
 
-    for parent, children in category_hierarchy_example.items():
+    global category_hierarchy
+    if category_hierarchy is None:
+        for attempt in range(3):
+            try:
+                response = requests.get(category_hierarchy_url, timeout=10)
+                response.raise_for_status()
+                category_hierarchy = response.json()
+                logger.info("Loaded category_hierarchy")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to load category_hierarchy (attempt {attempt + 1}): {e}")
+                if attempt == 2:
+                    category_hierarchy = category_hierarchy_example
+                    logger.info("Using example category_hierarchy")
+
+    for parent, children in category_hierarchy.items():
         if parent in expected_category and mapped_label in children:
             return True
 
@@ -182,49 +203,6 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         if isinstance(sort_order, (int, float)) and sort_order < 0:
             logger.info(f"Skipping ResultID {result_id} due to negative SortOrder: {sort_order}")
             return result_id, json.dumps({"error": f"Negative SortOrder: {sort_order}"}), None, 0
-
-        global category_hierarchy, FASHION_LABELS
-        if category_hierarchy is None:
-            for attempt in range(3):
-                try:
-                    response = requests.get(category_hierarchy_url, timeout=10)
-                    response.raise_for_status()
-                    json_text = response.text
-                    try:
-                        category_hierarchy = json.loads(json_text)
-                        logger.info("Loaded category_hierarchy")
-                        break
-                    except json.JSONDecodeError as json_err:
-                        logger.error(f"Invalid JSON in category_hierarchy (attempt {attempt + 1}): {json_err}")
-                        logger.debug(f"JSON content: {json_text[:200]}...")
-                        raise
-                except Exception as e:
-                    logger.warning(f"Failed to load category_hierarchy (attempt {attempt + 1}): {e}")
-                    if attempt == 2:
-                        category_hierarchy = category_hierarchy_example
-                        logger.info("Using example category_hierarchy")
-
-        if FASHION_LABELS is None:
-            for attempt in range(3):
-                try:
-                    response = requests.get(fashion_labels_url, timeout=10)
-                    response.raise_for_status()
-                    json_text = response.text
-                    try:
-                        FASHION_LABELS = json.loads(json_text)
-                        if not isinstance(FASHION_LABELS, list):
-                            raise ValueError("fashion_labels must be a list")
-                        logger.info("Loaded fashion_labels")
-                        break
-                    except json.JSONDecodeError as json_err:
-                        logger.error(f"Invalid JSON in fashion_labels (attempt {attempt + 1}): {json_err}")
-                        logger.debug(f"JSON content: {json_text[:200]}...")
-                        raise
-                except Exception as e:
-                    logger.warning(f"Failed to load fashion_labels (attempt {attempt + 1}): {e}")
-                    if attempt == 2:
-                        FASHION_LABELS = fashion_labels_example
-                        logger.info("Using example fashion_labels")
 
         image_urls = [row["ImageUrl"]]
         if pd.notna(row.get("ImageUrlThumbnail")):
@@ -330,6 +308,16 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         extracted_features = features.get("extracted_features", {})
         match_score = features.get("match_score", 0.5)
         reasoning = features.get("reasoning", "No reasoning provided")
+
+        if match_score < 0.1 and product_details:
+            valid_details = sum(1 for v in product_details.values() if v != "None")
+            matches = sum(
+                1 for k, v in product_details.items()
+                if v != "None" and v.lower() in str(extracted_features.get(k, "")).lower()
+            )
+            heuristic_score = matches / max(1, valid_details) if valid_details > 0 else 1.0
+            match_score = max(match_score, heuristic_score)
+            reasoning = reasoning + f" Adjusted with heuristic: {heuristic_score:.2f}"
 
         raw_category = (product_details.get("category") or inferred_category or extracted_features.get("category", "")).strip().lower()
         normalized_category = raw_category
