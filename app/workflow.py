@@ -464,7 +464,8 @@ async def batch_vision_reason(
         def process_entry_wrapper(entry_id):
             entry_df = df[df['EntryID'] == entry_id]
             logger.info(f"Processing EntryID: {entry_id} in thread")
-            return process_entry(file_id, entry_id, entry_df, logger)
+            # Run the async process_entry in a thread-safe manner
+            return run_async_in_thread(process_entry(file_id, entry_id, entry_df, logger))
 
         valid_updates = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
