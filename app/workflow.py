@@ -495,6 +495,7 @@ def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) ->
     except json.JSONDecodeError as e:
         logger.warning(f"Invalid AI result: AiJson is not valid JSON: {e}")
         return False
+
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
@@ -527,11 +528,11 @@ async def batch_vision_reason(
 
         valid_updates = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            tasks = [
-                (entry_id, process_entry_wrapper(file_id, entry_id, df[df['EntryID'] == entry_id], logger))
+            futures = [
+                executor.submit(process_entry_wrapper, file_id, entry_id, df[df['EntryID'] == entry_id], logger)
                 for entry_id in entry_ids_to_process
             ]
-            results = list(executor.map(lambda x: x[1], tasks))
+            results = [future.result() for future in futures]
             
             for entry_id, updates in zip(entry_ids_to_process, results):
                 if not updates:
