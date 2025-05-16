@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import re
+import requests
 from PIL import Image
 from io import BytesIO
 import google.generativeai as genai
@@ -36,24 +37,49 @@ FASHION_MNIST_CLASSES = [
     "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"
 ]
 
-CATEGORY_MAPPING = {
-    "jersey": "sweatshirt",
-    "jacket": "coat",
-    "wool": "sweater",
-    "suit": "jacket",
-    "trench_coat": "coat",
-    "maillot": "tights",
-    "velvet": "dress",
-    "jean": "trouser",
-    "kimono": "dress",
-    "skim": "trouser",
-    "skinny": "trouser",
-    "yes": "dress"
-}
+# Load CATEGORY_MAPPING
+CATEGORY_MAPPING = None
+try:
+    for attempt in range(3):
+        try:
+            response = requests.get("https://iconluxury.group/static_settings/category_mapping.json", timeout=10)
+            response.raise_for_status()
+            CATEGORY_MAPPING = response.json()
+            default_logger.info("Loaded CATEGORY_MAPPING")
+            break
+        except Exception as e:
+            default_logger.warning(f"Failed to load CATEGORY_MAPPING (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                CATEGORY_MAPPING = {
+                    "pants": "trouser", "slacks": "trouser", "jeans": "trouser", "chino": "trouser",
+                    "tshirt": "t-shirt", "tee": "t-shirt", "shirt": "t-shirt", "jacket": "coat",
+                    "parka": "coat", "overcoat": "coat", "sneakers": "sneaker", "running-shoe": "sneaker",
+                    "athletic-shoe": "sneaker", "trainer": "sneaker", "sweatshirt": "sweater",
+                    "hoodie": "sweater", "cardigan": "sweater", "jersey": "sweatshirt", "wool": "sweater",
+                    "suit": "jacket", "trench-coat": "coat", "maillot": "legging", "velvet": "dress",
+                    "kimono": "dress", "skinny": "trouser", "cargo-pant": "trouser", "blouse": "shirt",
+                    "tank": "tank-top", "shorts": "short", "sandals": "sandal", "boots": "boot",
+                    "heels": "heel", "hat": "cap", "gloves": "glove", "scarves": "scarf", "bags": "bag",
+                    "T-shirt/top": "t-shirt", "Trouser": "trouser", "Pullover": "sweater", "Dress": "dress",
+                    "Coat": "coat", "Sandal": "sandal", "Shirt": "t-shirt", "Sneaker": "sneaker",
+                    "Bag": "bag", "Ankle boot": "boot"
+                }
+                default_logger.info("Using fallback CATEGORY_MAPPING")
+except Exception as e:
+    default_logger.error(f"Critical failure loading CATEGORY_MAPPING: {e}")
+    raise
 
 NON_FASHION_LABELS = [
-    "soap_dispenser", "parking meter", "spoon", "screw", "safety_pin", "tick",
-    "ashcan", "loudspeaker", "joystick", "perfume", "car", "dog", "bench"
+    "soap_dispenser", "parking_meter", "spoon", "screw", "safety_pin", "tick",
+    "ashcan", "loudspeaker", "joystick", "perfume", "car", "dog", "bench",
+    "chair", "table", "sofa", "bed", "tv", "laptop", "phone", "book", "clock",
+    "vase", "scissors", "teddy_bear", "hair_drier", "toothbrush", "bottle",
+    "wine_glass", "cup", "fork", "knife", "bowl", "banana", "apple", "sandwich",
+    "orange", "broccoli", "carrot", "hot_dog", "pizza", "donut", "cake",
+    "refrigerator", "oven", "microwave", "sink", "toaster", "bus", "train",
+    "truck", "boat", "traffic_light", "fire_hydrant", "stop_sign", "umbrella",
+    "bird", "cat", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+    "kite", "baseball_bat", "baseball_glove", "skateboard", "surfboard", "tennis_racket"
 ]
 
 async def detect_objects_with_computer_vision_async(
