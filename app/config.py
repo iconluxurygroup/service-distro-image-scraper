@@ -45,7 +45,6 @@ conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};Server=35.172.243.170;Data
 from urllib.parse import quote_plus
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
-conn_str = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=host;DATABASE=db;UID=user;PWD=pass"
 encoded_conn_str = quote_plus(conn_str)
 async_engine = create_async_engine(f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}", echo=True)
 engine = create_engine(f"mssql+pyodbc:///?odbc_connect={conn_str}")
