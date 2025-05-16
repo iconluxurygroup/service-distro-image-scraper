@@ -470,23 +470,35 @@ async def batch_vision_reason(
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             results = list(executor.map(process_entry_wrapper, entry_ids_to_process))
             for entry_id, updates in zip(entry_ids_to_process, results):
-                if updates:
-                    for update in updates:
-                        try:
-                            ai_json = update[0]
-                            if ai_json:
-                                json.loads(ai_json)  # Validate JSON
-                                logger.debug(f"Valid AiJson for ResultID {update[3]}: {ai_json[:100]}...")
-                            else:
-                                logger.warning(f"Empty AiJson for ResultID {update[3]}")
-                        except json.JSONDecodeError as e:
-                            logger.error(f"Invalid JSON for ResultID {update[3]}: {ai_json[:100]}... Error: {e}")
-                            continue
-                        valid_updates.append(update)
-                    logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
-                else:
+                if not updates:
                     logger.warning(f"No updates for EntryID: {entry_id}")
-
+                    continue
+                if not isinstance(updates, list):
+                    logger.error(f"Invalid updates format for EntryID {entry_id}: {updates} (expected list)")
+                    continue
+                for update in updates:
+                    if not isinstance(update, (list, tuple)) or len(update) != 4:
+                        logger.error(f"Invalid update tuple for EntryID {entry_id}: {update}")
+                        continue
+                    ai_json, image_is_fashion, ai_caption, result_id = update
+                    if not isinstance(ai_json, (str, bytes, bytearray)):
+                        logger.error(
+                            f"Invalid ai_json type for ResultID {result_id} (EntryID {entry_id}): "
+                            f"type={type(ai_json).__name__}, value={ai_json}"
+                        )
+                        continue
+                    if not ai_json:
+                        logger.warning(f"Empty AiJson for ResultID {result_id} (EntryID {entry_id})")
+                        continue
+                    try:
+                        json.loads(ai_json)  # Validate JSON
+                        logger.debug(f"Valid AiJson for ResultID {result_id}: {ai_json[:100]}...")
+                        valid_updates.append(update)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON for ResultID {result_id}: {ai_json[:100]}... Error: {e}")
+                        continue
+                logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
+               
         if valid_updates:
             with pyodbc.connect(conn_str) as conn:
                 cursor = conn.cursor()
