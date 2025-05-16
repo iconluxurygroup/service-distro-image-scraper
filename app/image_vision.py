@@ -69,7 +69,8 @@ except Exception as e:
     default_logger.error(f"Critical failure loading CATEGORY_MAPPING: {e}")
     raise
 
-NON_FASHION_LABELS = [
+# Fallback NON_FASHION_LABELS
+FALLBACK_NON_FASHION_LABELS = [
     "soap_dispenser", "parking_meter", "spoon", "screw", "safety_pin", "tick",
     "ashcan", "loudspeaker", "joystick", "perfume", "car", "dog", "bench",
     "chair", "table", "sofa", "bed", "tv", "laptop", "phone", "book", "clock",
@@ -81,6 +82,26 @@ NON_FASHION_LABELS = [
     "bird", "cat", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
     "kite", "baseball_bat", "baseball_glove", "skateboard", "surfboard", "tennis_racket"
 ]
+
+# Load NON_FASHION_LABELS from URL
+NON_FASHION_LABELS = None
+try:
+    for attempt in range(3):
+        try:
+            response = requests.get("https://iconluxury.group/static_settings/non_fashion_labels.json", timeout=10)
+            response.raise_for_status()
+            NON_FASHION_LABELS = response.json()
+            default_logger.info("Loaded NON_FASHION_LABELS from URL")
+            break
+        except Exception as e:
+            default_logger.warning(f"Failed to load NON_FASHION_LABELS (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                NON_FASHION_LABELS = FALLBACK_NON_FASHION_LABELS
+                default_logger.info("Using fallback NON_FASHION_LABELS")
+except Exception as e:
+    default_logger.error(f"Critical failure loading NON_FASHION_LABELS: {e}")
+    NON_FASHION_LABELS = FALLBACK_NON_FASHION_LABELS
+    default_logger.info("Using fallback NON_FASHION_LABELS due to critical failure")
 
 async def detect_objects_with_computer_vision_async(
     image_base64: str,
