@@ -544,110 +544,68 @@ def sync_update_search_sort_order(
     except Exception as e:
         logger.error(f"Unexpected error updating SortOrder for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
-
-async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, logger: Optional[logging.Logger] = None) -> List[str]:
-    logger = logger or logging.getLogger(__name__)
+async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
+    """Export AiJson data to a JSON file and upload to S3."""
     try:
-        file_id = int(file_id)
-        logger.info(f"Exporting DAI JSON for FileID: {file_id}")
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            query = """
+                SELECT ResultID, EntryID, AiJson, AiCaption, ImageIsFashion
+                FROM utb_ImageScraperResult
+                WHERE FileID = ? AND AiJson IS NOT NULL AND AiCaption IS NOT NULL
+            """
+            params = [file_id]
+            if entry_ids:
+                query += " AND EntryID IN ({})".format(','.join('?' * len(entry_ids)))
+                params.extend(entry_ids)
+            
+            cursor.execute(query, params)
+            results = [
+                {
+                    "ResultID": row[0],
+                    "EntryID": row[1],
+                    "AiJson": json.loads(row[2]),
+                    "AiCaption": row[3],
+                    "ImageIsFashion": row[4]
+                }
+                for row in cursor.fetchall()
+            ]
+        
+        if not results:
+            logger.warning(f"No valid AI results to export for FileID {file_id}")
+            return ""
 
-        # Retry logic for database query
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Use synchronous engine for pandas compatibility
-                with engine.connect() as conn:
-                    query = text("""
-                        SELECT r.ResultID, r.EntryID, r.AiCaption
-                        FROM utb_ImageScraperResult r
-                        INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
-                        WHERE rec.FileID = :file_id
-                    """)
-                    params = {"file_id": file_id}
-                    if entry_ids:
-                        query = text(query.text + " AND r.EntryID IN :entry_ids")
-                        params["entry_ids"] = tuple(entry_ids)
+        # Generate JSON file
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        json_filename = f"job_{file_id}_results_{timestamp}.json"
+        temp_json_dir = f"temp_json_{file_id}"
+        os.makedirs(temp_json_dir, exist_ok=True)
+        local_json_path = os.path.join(temp_json_dir, json_filename)
 
-                    df = pd.read_sql_query(query, conn, params=params)
-                    break
+        async with aiofiles.open(local_json_path, 'w') as f:
+            await f.write(json.dumps(results, indent=2))
+        
+        logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
 
-            except SQLAlchemyError as e:
-                logger.error(f"Database error on attempt {attempt + 1}/{max_retries} for FileID {file_id}: {e}")
-                if attempt < max_retries - 1:
-                    delay = 5 * (2 ** attempt)  # Exponential backoff: 5s, 10s, 20s
-                    logger.info(f"Retrying after {delay} seconds...")
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(f"Max retries reached for FileID {file_id}")
-                    raise
-
-        if df.empty:
-            logger.warning(f"No valid data for FileID {file_id}")
-            return []
-
-        # Generate individual JSON files for each ResultID
-        public_urls = []
-        os.makedirs(f"temp_jobs/{file_id}", exist_ok=True)
-        for row in df.itertuples(index=False):
-            result_id = str(row.ResultID)
-            entry_id = str(row.EntryID)
-            ai_caption = row.AiCaption if row.AiCaption else ""
-
-            # Structure JSON data for this ResultID
-            json_data = {
-                "result_id": result_id,
-                "entry_id": entry_id,
-                "caption": ai_caption
-            }
-
-            # Write to local file
-            output_path = f"super_scraper/jobs/{file_id}/result_{result_id}.json"
-            local_path = f"temp_jobs/{file_id}/result_{result_id}.json"
-
-            async with aiofiles.open(local_path, 'w') as f:
-                await f.write(json.dumps(json_data, indent=2))
-            logger.info(f"Wrote DAI JSON for ResultID {result_id} to {local_path}")
-
-            # Upload to S3 with retry
-            public_url = ""
-            for attempt in range(3):
-                public_url = await upload_file_to_space(local_path, output_path, True, logger, file_id)
-                if public_url:
-                    break
-                logger.warning(f"Retrying S3 upload for ResultID {result_id} (attempt {attempt + 1}/3)")
-                await asyncio.sleep(2)
-
-            if not public_url:
-                logger.error(f"Failed to upload DAI JSON for ResultID {result_id}")
-                continue
-
-            logger.info(f"Uploaded DAI JSON for ResultID {result_id} to {public_url}")
-            public_urls.append(public_url)
-
-            # Update AiCaption with S3 URL
-            async with AsyncSession(async_engine) as session:
-                update_query = text("""
-                    UPDATE utb_ImageScraperResult
-                    SET AiCaption = :public_url
-                    WHERE ResultID = :result_id
-                """)
-                await session.execute(
-                    update_query,
-                    {"public_url": public_url, "result_id": int(result_id)}
-                )
-                await session.commit()
-                logger.info(f"Updated AiCaption with S3 URL {public_url} for ResultID {result_id}")
-
-        if not public_urls:
-            logger.warning(f"No JSON files uploaded for FileID {file_id}")
-            return []
-
-        logger.info(f"Uploaded {len(public_urls)} JSON files for FileID {file_id}")
-        return public_urls
+        # Upload to S3
+        s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
+        public_url = await upload_file_to_space(
+            local_json_path, s3_key, public=True, logger=logger, file_id=file_id
+        )
+        
+        if public_url:
+            logger.info(f"Exported DAI JSON to {public_url}")
+            # Clean up local file
+            os.remove(local_json_path)
+            os.rmdir(temp_json_dir)
+        else:
+            logger.error(f"Failed to upload DAI JSON to S3 for FileID {file_id}")
+        
+        return public_url
 
     except Exception as e:
-        logger.error(f"Failed to export DAI JSON for FileID {file_id}: {e}", exc_info=True)
-        return []
+        logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
+        return ""
 
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger

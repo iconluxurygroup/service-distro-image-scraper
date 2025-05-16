@@ -431,7 +431,70 @@ async def generate_download_file(
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
+def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, logger: logging.Logger, max_retries: int = 3):
+    """Wrapper for process_entry with retry logic."""
+    attempt = 1
+    while attempt <= max_retries:
+        logger.info(f"Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
+        try:
+            updates = run_async_in_thread(process_entry(file_id, entry_id, entry_df, logger))
+            if not updates:
+                logger.warning(f"No updates returned for EntryID {entry_id} on attempt {attempt}")
+                attempt += 1
+                time.sleep(2)  # Delay between retries
+                continue
 
+            valid_updates = []
+            for update in updates:
+                if not isinstance(update, (list, tuple)) or len(update) != 4:
+                    logger.error(f"Invalid update tuple for EntryID {entry_id}: {update}")
+                    continue
+                
+                ai_json, image_is_fashion, ai_caption, result_id = update
+                if not isinstance(ai_json, (str, bytes, bytearray)):
+                    logger.error(f"Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
+                    continue
+                
+                if is_valid_ai_result(ai_json, ai_caption, logger):
+                    valid_updates.append(update)
+                else:
+                    logger.warning(f"Invalid AI result for ResultID {result_id} on attempt {attempt}")
+            
+            if valid_updates:
+                logger.info(f"Valid updates for EntryID {entry_id}: {len(valid_updates)}")
+                return valid_updates
+            else:
+                logger.warning(f"No valid updates for EntryID {entry_id} on attempt {attempt}")
+                attempt += 1
+                time.sleep(2)
+        
+        except Exception as e:
+            logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
+            attempt += 1
+            time.sleep(2)
+    
+    logger.error(f"Failed to process EntryID {entry_id} after {max_retries} attempts")
+    return []
+def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
+    """Validate AI result: ai_json must be valid JSON with scores, ai_caption must be non-empty."""
+    try:
+        if not ai_caption or ai_caption.strip() == "":
+            logger.warning("Invalid AI result: AiCaption is empty")
+            return False
+        
+        parsed_json = json.loads(ai_json)
+        if not isinstance(parsed_json, dict):
+            logger.warning("Invalid AI result: AiJson is not a dictionary")
+            return False
+        
+        if "scores" not in parsed_json or not parsed_json["scores"]:
+            logger.warning("Invalid AI result: AiJson missing or empty 'scores' field")
+            return False
+        
+        return True
+    except json.JSONDecodeError as e:
+        logger.warning(f"Invalid AI result: AiJson is not valid JSON: {e}")
+        return False
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
@@ -440,7 +503,8 @@ async def batch_vision_reason(
     concurrency: int = 10,
     logger: Optional[logging.Logger] = None
 ) -> None:
-    logger = logger or logging.getLogger(__name__)
+    """Process images with AI vision, retrying until valid results, and export to JSON."""
+    logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     try:
         file_id = int(file_id)
         logger.info(f"📷 Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
@@ -461,44 +525,21 @@ async def batch_vision_reason(
         logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
-        def process_entry_wrapper(entry_id):
-            entry_df = df[df['EntryID'] == entry_id]
-            logger.info(f"Processing EntryID: {entry_id} in thread")
-            return run_async_in_thread(process_entry(file_id, entry_id, entry_df, logger))
-
         valid_updates = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            results = list(executor.map(process_entry_wrapper, entry_ids_to_process))
+            tasks = [
+                (entry_id, process_entry_wrapper(file_id, entry_id, df[df['EntryID'] == entry_id], logger))
+                for entry_id in entry_ids_to_process
+            ]
+            results = list(executor.map(lambda x: x[1], tasks))
+            
             for entry_id, updates in zip(entry_ids_to_process, results):
                 if not updates:
-                    logger.warning(f"No updates for EntryID: {entry_id}")
+                    logger.warning(f"No valid updates for EntryID: {entry_id}")
                     continue
-                if not isinstance(updates, list):
-                    logger.error(f"Invalid updates format for EntryID {entry_id}: {updates} (expected list)")
-                    continue
-                for update in updates:
-                    if not isinstance(update, (list, tuple)) or len(update) != 4:
-                        logger.error(f"Invalid update tuple for EntryID {entry_id}: {update}")
-                        continue
-                    ai_json, image_is_fashion, ai_caption, result_id = update
-                    if not isinstance(ai_json, (str, bytes, bytearray)):
-                        logger.error(
-                            f"Invalid ai_json type for ResultID {result_id} (EntryID {entry_id}): "
-                            f"type={type(ai_json).__name__}, value={ai_json}"
-                        )
-                        continue
-                    if not ai_json:
-                        logger.warning(f"Empty AiJson for ResultID {result_id} (EntryID {entry_id})")
-                        continue
-                    try:
-                        json.loads(ai_json)  # Validate JSON
-                        logger.debug(f"Valid AiJson for ResultID {result_id}: {ai_json[:100]}...")
-                        valid_updates.append(update)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Invalid JSON for ResultID {result_id}: {ai_json[:100]}... Error: {e}")
-                        continue
+                valid_updates.extend(updates)
                 logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
-               
+
         if valid_updates:
             with pyodbc.connect(conn_str) as conn:
                 cursor = conn.cursor()
@@ -509,22 +550,25 @@ async def batch_vision_reason(
 
                 # Verify updates
                 result_ids = [update[3] for update in valid_updates]
-                cursor.execute("""
-                    SELECT ResultID, AiJson
-                    FROM utb_ImageScraperResult
-                    WHERE ResultID IN ({})
-                """.format(','.join('?' * len(result_ids))), result_ids)
+                cursor.execute(
+                    "SELECT ResultID, AiJson, AiCaption FROM utb_ImageScraperResult WHERE ResultID IN ({})"
+                    .format(','.join('?' * len(result_ids))),
+                    result_ids
+                )
                 for row in cursor.fetchall():
-                    logger.info(f"Verified ResultID {row[0]}: AiJson = {row[1][:100]}...")
+                    logger.info(f"Verified ResultID {row[0]}: AiJson = {row[1][:100]}..., AiCaption = {row[2][:100]}...")
 
         for entry_id in entry_ids_to_process:
             with pyodbc.connect(conn_str) as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
+                cursor.execute(
+                    """
                     SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
                     FROM utb_ImageScraperRecords
                     WHERE FileID = ? AND EntryID = ?
-                """, (file_id, entry_id))
+                    """,
+                    (file_id, entry_id)
+                )
                 result = cursor.fetchone()
                 product_brand = product_model = product_color = product_category = ''
                 if result:
@@ -533,7 +577,8 @@ async def batch_vision_reason(
                     logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
             await asyncio.get_event_loop().run_in_executor(
-                None, lambda: sync_update_search_sort_order(
+                None,
+                lambda: sync_update_search_sort_order(
                     file_id=str(file_id),
                     entry_id=str(entry_id),
                     brand=product_brand,
@@ -549,7 +594,6 @@ async def batch_vision_reason(
         json_url = await export_dai_json(file_id, entry_ids, logger)
         if json_url:
             logger.info(f"DAI JSON exported to {json_url}")
-            # Update log URL in database (optional, if you want to track JSON URL)
             await update_log_url_in_db(file_id, json_url, logger)
         else:
             logger.warning(f"Failed to export DAI JSON for FileID: {file_id}")
