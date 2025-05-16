@@ -293,64 +293,11 @@ async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] =
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         return pd.DataFrame()
-import logging
-import pandas as pd
-import pyodbc
-import json
-import os
-import aiofiles
-import asyncio
-from typing import Optional, List
-from config import conn_str
-from aws_s3 import upload_file_to_space
-import logging
-import pandas as pd
-import json
-import os
-import aiofiles
-import asyncio
-from typing import Optional, List
-from sqlalchemy.sql import text
-from config import async_engine
-from aws_s3 import upload_file_to_space
-
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         logger.info(f"Exporting DAI JSON for FileID: {file_id}")
-
-        # Ensure AiJson column exists
-        async with async_engine.connect() as conn:
-            await conn.execute(text("""
-                IF NOT EXISTS (
-                    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
-                    WHERE TABLE_NAME = 'utb_ImageScraperResult' 
-                    AND COLUMN_NAME = 'AiJson'
-                )
-                BEGIN
-                    ALTER TABLE utb_ImageScraperResult 
-                    ADD AiJson NVARCHAR(MAX)
-                END
-            """))
-            await conn.commit()
-            logger.info("Verified/Added AiJson column in utb_ImageScraperResult")
-
-        # Ensure JsonFileUrl column exists
-        async with async_engine.connect() as conn:
-            await conn.execute(text("""
-                IF NOT EXISTS (
-                    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
-                    WHERE TABLE_NAME = 'utb_ImageScraperFiles' 
-                    AND COLUMN_NAME = 'JsonFileUrl'
-                )
-                BEGIN
-                    ALTER TABLE utb_ImageScraperFiles 
-                    ADD JsonFileUrl NVARCHAR(MAX)
-                END
-            """))
-            await conn.commit()
-            logger.info("Verified/Added JsonFileUrl column in utb_ImageScraperFiles")
 
         # Query data with SQLAlchemy
         async with async_engine.connect() as conn:
@@ -397,7 +344,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
 
         async with aiofiles.open(local_path, 'w') as f:
             await f.write(json.dumps(json_data, indent=2))
-        logger.info(f"Wrote DAI JSON to {local_path}")
+        logger.info>f"Wrote DAI JSON to {local_path}")
 
         # Upload to S3 with retry
         public_url = ""
@@ -421,27 +368,17 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
                 SET AiJson = :public_url
                 WHERE ResultID = :result_id
             """)
+            # Alternative: Use AiCaption if AiJson is unavailable
+            # update_query = text("""
+            #     UPDATE utb_ImageScraperResult
+            #     SET AiCaption = :public_url
+            #     WHERE ResultID = :result_id
+            # """)
             updates = [{"public_url": public_url, "result_id": int(row.ResultID)} for row in df.itertuples(index=False)]
             for update in updates:
                 await conn.execute(update_query, update)
             await conn.commit()
             logger.info(f"Updated AiJson with S3 URL {public_url} for {len(updates)} records in FileID {file_id}")
-
-        # Update JsonFileUrl in utb_ImageScraperFiles
-        try:
-            async with async_engine.connect() as conn:
-                await conn.execute(
-                    text("""
-                        UPDATE utb_ImageScraperFiles 
-                        SET JsonFileUrl = :public_url 
-                        WHERE ID = :file_id
-                    """),
-                    {"public_url": public_url, "file_id": file_id}
-                )
-                await conn.commit()
-                logger.info(f"Updated JsonFileUrl for FileID {file_id}")
-        except Exception as e:
-            logger.warning(f"Failed to update JsonFileUrl for FileID {file_id}: {e}. Continuing with public URL return.")
 
         return public_url
 
