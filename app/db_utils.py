@@ -349,11 +349,11 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
                 cursor = conn.cursor()
                 cursor.execute("""
                     UPDATE utb_ImageScraperFiles 
-                    SET JsonFileUrl = ? 
+                    SET AiJson = ? 
                     WHERE ID = ?
                 """, (public_url, file_id))
                 conn.commit()
-                logger.info(f"Updated JsonFileUrl for FileID {file_id}")
+                logger.info(f"Updated AiJson for FileID {file_id}")
         else:
             logger.error(f"Failed to upload DAI JSON to S3")
 
