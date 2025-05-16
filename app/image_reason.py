@@ -33,6 +33,10 @@ if not default_logger.handlers:
 category_hierarchy_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/category_hierarchy.json"
 category_hierarchy = None
 
+# Category mapping URL and fallback
+category_mapping_url = "https://raw.githubusercontent.com/iconluxurygroup/settings-static-data/refs/heads/main/category_mapping.json"  # Replace with real URL
+CATEGORY_MAPPING = None
+
 # Simplified hierarchical category relationships
 category_hierarchy_example = {
     "coat": ["jacket", "trench_coat"],
@@ -41,6 +45,19 @@ category_hierarchy_example = {
     "sweatshirt": ["jersey"],
     "sweater": ["wool"],
     "tights": ["maillot"]
+}
+
+# Fallback category mapping
+category_mapping_example = {
+    "pants": "trouser",
+    "jeans": "trouser",
+    "jacket": "coat",
+    "sneakers": "sneaker",
+    "running_shoe": "sneaker",
+    "tshirt": "t-shirt",
+    "shirt": "t-shirt",
+    "sweatshirt": "sweater",
+    "hoodie": "sweater"
 }
 
 async def get_image_data_async(
@@ -88,6 +105,22 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
 
     if detected_label in expected_category:
         return True
+
+    # Ensure CATEGORY_MAPPING is loaded
+    global CATEGORY_MAPPING
+    if CATEGORY_MAPPING is None:
+        for attempt in range(3):
+            try:
+                response = requests.get(category_mapping_url, timeout=10)
+                response.raise_for_status()
+                CATEGORY_MAPPING = response.json()
+                logger.info("Loaded CATEGORY_MAPPING")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to load CATEGORY_MAPPING (attempt {attempt + 1}): {e}")
+                if attempt == 2:
+                    CATEGORY_MAPPING = category_mapping_example
+                    logger.info("Using example CATEGORY_MAPPING")
 
     mapped_label = CATEGORY_MAPPING.get(detected_label, detected_label)
     if mapped_label in expected_category:
@@ -148,10 +181,10 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         if pd.notna(row.get("ImageUrlThumbnail")):
             image_urls.append(row["ImageUrlThumbnail"])
         product_details = {
-    "brand": str(row.get("ProductBrand") or ""),
-    "category": str(row.get("ProductCategory") or ""),
-    "color": str(row.get("ProductColor") or "")
-}
+            "brand": str(row.get("ProductBrand") or ""),
+            "category": str(row.get("ProductCategory") or ""),
+            "color": str(row.get("ProductColor") or "")
+        }
 
         image_data, downloaded_url = await get_image_data_async(image_urls, session, logger)
         if not image_data:
@@ -284,7 +317,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         logger.error(f"Unexpected error in process_image for ResultID {result_id}: {str(e)}", exc_info=True)
         return default_result
 
-def process_entry(
+async def process_entry(
     file_id: int,
     entry_id: int,
     entry_df: pd.DataFrame,
@@ -294,6 +327,7 @@ def process_entry(
     updates = []
 
     try:
+        # Fetch product attributes
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -309,6 +343,7 @@ def process_entry(
             else:
                 logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
+        # Update sort order synchronously
         sync_update_search_sort_order(
             file_id=str(file_id),
             entry_id=str(entry_id),
@@ -320,20 +355,19 @@ def process_entry(
         )
         logger.info(f"Updated sort order for EntryID: {entry_id}")
 
-        async def process_images():
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                results = []
-                for _, row in entry_df.iterrows():
-                    result = await process_image(row, session, logger)
-                    if result is None:
-                        logger.error(f"process_image returned None for row: {row}")
-                        results.append((row.get("ResultID"), '{"error": "process_image returned None"}', None, 1))
-                    else:
-                        results.append(result)
-                return results
+        # Process images concurrently
+        async with aiohttp.ClientSession() as session:
+            tasks = [process_image(row, session, logger) for _, row in entry_df.iterrows()]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Error in process_image: {result}")
+                    continue
+                if result is None:
+                    logger.error(f"process_image returned None for row")
+                    continue
+                updates.append(result)
 
-        updates = run_async_in_thread(process_images())
         logger.info(f"Completed task for EntryID: {entry_id} with {len(updates)} updates")
         return updates
 
