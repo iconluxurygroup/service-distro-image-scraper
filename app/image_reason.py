@@ -164,19 +164,28 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
 async def process_image(row, session: aiohttp.ClientSession, logger: Optional[logging.Logger] = None):
     logger = logger or default_logger
     result_id = row.get("ResultID")
-    default_result = (result_id, json.dumps({"error": "Unknown processing error"}), None, 1)
+    default_result = (result_id, json.dumps({"error": "Unknown processing error", "result_id": result_id}), None, 1)
 
     try:
         logger.debug(f"FASHION_LABELS at start of process_image: {FASHION_LABELS}")
         if result_id is None:
             logger.error(f"Invalid row data: ResultID missing - row: {row}")
-            return result_id, json.dumps({"error": "Invalid row data: ResultID missing"}), None, 1
+            return result_id, json.dumps({"error": "Invalid row data: ResultID missing", "result_id": result_id}), None, 1
+
+        # Check current SortOrder
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT SortOrder FROM utb_ImageScraperResult WHERE ResultID = ?", (result_id,))
+            result = cursor.fetchone()
+            sort_order = result[0] if result else None
+            logger.debug(f"SortOrder for ResultID {result_id}: {sort_order}")
+            if isinstance(sort_order, (int, float)) and sort_order > 0:
+                logger.info(f"Processing image with positive SortOrder for ResultID {result_id}: {sort_order}")
 
         logger.debug(f"Processing row for ResultID {result_id}: {row}")
-        sort_order = row.get("SortOrder")
         if isinstance(sort_order, (int, float)) and sort_order < 0:
             logger.info(f"Skipping ResultID {result_id} due to negative SortOrder: {sort_order}")
-            return result_id, json.dumps({"error": f"Negative SortOrder: {sort_order}"}), None, 0
+            return result_id, json.dumps({"error": f"Negative SortOrder: {sort_order}", "result_id": result_id}), None, 0
 
         image_urls = [row["ImageUrl"]]
         if pd.notna(row.get("ImageUrlThumbnail")):
@@ -190,7 +199,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         image_data, downloaded_url = await get_image_data_async(image_urls, session, logger)
         if not image_data:
             logger.warning(f"Image download failed for ResultID {result_id}")
-            return result_id, json.dumps({"error": f"Image download failed for URLs: {image_urls}"}), None, 1
+            return result_id, json.dumps({"error": f"Image download failed for URLs: {image_urls}", "result_id": result_id}), None, 1
 
         base64_image = base64.b64encode(image_data).decode("utf-8")
         Image.open(BytesIO(image_data)).convert("RGB")
@@ -198,7 +207,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         cv_success, cv_description, person_confidences = await detect_objects_with_computer_vision_async(base64_image, logger)
         if not cv_success and not cv_description:
             logger.warning(f"Computer vision detection failed for ResultID {result_id}: {cv_description}")
-            return result_id, json.dumps({"error": cv_description}), None, 1
+            return result_id, json.dumps({"error": cv_description, "result_id": result_id}), None, 1
 
         def extract_labels(description):
             cls_label = None
@@ -225,12 +234,14 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
                 "match_score": 0.0,
                 "reasoning": f"Multiple non-fashion objects detected: {non_fashion_labels}.",
                 "cv_detection": cv_description,
-                "person_confidences": person_confidences
+                "person_confidences": person_confidences,
+                "result_id": result_id
             })
             with pyodbc.connect(conn_str) as conn:
                 cursor = conn.cursor()
                 cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = -6, AiJson = ? WHERE ResultID = ?", (ai_json, result_id))
                 conn.commit()
+                logger.info(f"Updated database with SortOrder=-6 for ResultID {result_id}")
             return result_id, ai_json, cv_description, 0
 
         person_detected = any(conf > 0.5 for conf in person_confidences)
@@ -244,12 +255,14 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
                 "match_score": 0.0,
                 "reasoning": "No person detected and low confidence in fashion detection.",
                 "cv_detection": cv_description,
-                "person_confidences": person_confidences
+                "person_confidences": person_confidences,
+                "result_id": result_id
             })
             with pyodbc.connect(conn_str) as conn:
                 cursor = conn.cursor()
                 cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = -6, AiJson = ? WHERE ResultID = ?", (ai_json, result_id))
                 conn.commit()
+                logger.info(f"Updated database with SortOrder=-6 for ResultID {result_id}")
             return result_id, ai_json, cv_description, 0
 
         expected_category = product_details.get("category", "").lower()
@@ -280,7 +293,6 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
 
         description = features.get("description", cv_description)
         extracted_features = features.get("extracted_features", {})
-        # Ensure match_score is a float
         try:
             match_score = float(features.get("match_score", 0.5))
         except (ValueError, TypeError) as e:
@@ -325,15 +337,17 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
             "match_score": match_score,
             "reasoning": reasoning,
             "cv_detection": cv_description,
-            "person_confidences": person_confidences
+            "person_confidences": person_confidences,
+            "result_id": result_id
         })
         ai_caption = description
-        logger.info(f"Processed ResultID {result_id} successfully")
-        return result_id, ai_json, ai_caption, 1
+        logger.info(f"Processed ResultID {result_id} successfully with SortOrder {sort_order}")
+        return result_id, ai_json, ai_caption, 1 if is_fashion else 0
 
     except Exception as e:
         logger.error(f"Unexpected error in process_image for ResultID {result_id}: {str(e)}", exc_info=True)
-        return default_result
+        ai_json = json.dumps({"error": f"Processing error: {str(e)}", "result_id": result_id})
+        return result_id, ai_json, None, 1
 
 async def process_entry(
     file_id: int,
@@ -388,4 +402,4 @@ async def process_entry(
 
     except Exception as e:
         logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-        return [(row.get("ResultID"), f'{{"error": "Entry processing error: {str(e)}"}}', None, 1) for _, row in entry_df.iterrows()]
+        return [(row.get("ResultID"), json.dumps({"error": f"Entry processing error: {str(e)}", "result_id": row.get("ResultID")}), None, 1) for _, row in entry_df.iterrows()]

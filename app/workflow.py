@@ -11,9 +11,11 @@ import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
 from config import conn_str
-from db_utils import (sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email,
-                      sync_update_search_sort_order,
-                      get_images_excel_db, fetch_missing_images, update_file_location_complete, update_file_generate_complete)
+from db_utils import (
+    sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email,
+    sync_update_search_sort_order,
+    get_images_excel_db, fetch_missing_images, update_file_location_complete, update_file_generate_complete
+)
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
@@ -24,6 +26,7 @@ from aws_s3 import upload_file_to_space
 import psutil
 from email_utils import send_message_email, send_email
 from image_reason import process_entry
+
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
 def process_entry_search(args):
@@ -226,7 +229,7 @@ async def process_restart_batch(
                 log_memory_usage()
 
         # Final verification
-        with pyodbc.connect(conn_str, autocommit=False) as conn:
+        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -300,8 +303,6 @@ async def process_restart_batch(
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": ""}
-
-
 
 async def generate_download_file(
     file_id: int,
@@ -430,8 +431,6 @@ async def generate_download_file(
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
 
-
-
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
@@ -464,15 +463,17 @@ async def batch_vision_reason(
         def process_entry_wrapper(entry_id):
             entry_df = df[df['EntryID'] == entry_id]
             logger.info(f"Processing EntryID: {entry_id} in thread")
-            # Run the async process_entry in a thread-safe manner
             return run_async_in_thread(process_entry(file_id, entry_id, entry_df, logger))
 
         valid_updates = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             results = list(executor.map(process_entry_wrapper, entry_ids_to_process))
-            for updates in results:
+            for entry_id, updates in zip(entry_ids_to_process, results):
                 if updates:
                     valid_updates.extend(updates)
+                    logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
+                else:
+                    logger.warning(f"No updates for EntryID: {entry_id}")
 
         if valid_updates:
             with pyodbc.connect(conn_str) as conn:
@@ -480,7 +481,7 @@ async def batch_vision_reason(
                 query = "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?"
                 cursor.executemany(query, valid_updates)
                 conn.commit()
-                logger.info(f"Updated {len(valid_updates)} records")
+                logger.info(f"Updated {len(valid_updates)} records: {[update[0] for update in valid_updates]}")
 
         for entry_id in entry_ids_to_process:
             with pyodbc.connect(conn_str) as conn:
