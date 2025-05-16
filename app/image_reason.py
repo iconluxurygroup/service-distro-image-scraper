@@ -139,7 +139,6 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
 
     return False
 
-
 async def process_image(row, session: aiohttp.ClientSession, logger: logging.Logger) -> Tuple[int, str, Optional[str], int]:
     """Process a single image row with Gemini API, ensuring valid JSON output."""
     result_id = row.get("ResultID")
@@ -276,6 +275,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             None,
             1
         )
+
 
 async def process_entry(
     file_id: int,

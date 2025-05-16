@@ -545,6 +545,7 @@ def sync_update_search_sort_order(
         logger.error(f"Unexpected error updating SortOrder for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
 import datetime
+
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
     """Export AiJson and AiCaption data to per-entry JSON files and upload to S3."""
     try:

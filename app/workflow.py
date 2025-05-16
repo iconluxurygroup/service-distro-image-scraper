@@ -431,9 +431,9 @@ async def generate_download_file(
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
-def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, logger: logging.Logger, max_retries: int = 3):
-    """Wrapper for process_entry with retry logic using the main event loop."""
-    loop = asyncio.get_event_loop()
+
+async def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, logger: logging.Logger, max_retries: int = 3) -> List[Tuple[str, bool, str, int]]:
+    """Wrapper for process_entry with retry logic."""
     attempt = 1
     while attempt <= max_retries:
         logger.info(f"Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
@@ -443,17 +443,11 @@ def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, l
                 logger.error(f"Invalid ResultID in entry_df for EntryID {entry_id}")
                 return []
 
-            # Run async process_entry
-            future = asyncio.run_coroutine_threadsafe(
-                process_entry(file_id, entry_id, entry_df, logger),
-                loop
-            )
-            updates = future.result(timeout=60)
-
+            updates = await process_entry(file_id, entry_id, entry_df, logger)
             if not updates:
                 logger.warning(f"No updates returned for EntryID {entry_id} on attempt {attempt}")
                 attempt += 1
-                time.sleep(2)
+                await asyncio.sleep(2)
                 continue
 
             valid_updates = []
@@ -478,12 +472,12 @@ def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, l
             else:
                 logger.warning(f"No valid updates for EntryID {entry_id} on attempt {attempt}")
                 attempt += 1
-                time.sleep(2)
+                await asyncio.sleep(2)
         
         except Exception as e:
             logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
             attempt += 1
-            time.sleep(2)
+            await asyncio.sleep(2)
     
     logger.error(f"Failed to process EntryID {entry_id} after {max_retries} attempts")
     return [
@@ -494,6 +488,7 @@ def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, l
             int(row.get('ResultID', 0))
         ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
     ]
+
 
 def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
     """Validate AI result: ai_json must be valid JSON with scores, ai_caption must be non-empty."""
@@ -548,19 +543,22 @@ async def batch_vision_reason(
         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
         valid_updates = []
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [
-                executor.submit(process_entry_wrapper, file_id, entry_id, df[df['EntryID'] == entry_id], logger)
-                for entry_id in entry_ids_to_process
-            ]
-            results = [future.result() for future in futures]
-            
-            for entry_id, updates in zip(entry_ids_to_process, results):
-                if not updates:
-                    logger.warning(f"No valid updates for EntryID: {entry_id}")
-                    continue
-                valid_updates.extend(updates)
-                logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
+        # Process entries concurrently using asyncio.gather
+        tasks = [
+            process_entry_wrapper(file_id, entry_id, df[df['EntryID'] == entry_id], logger)
+            for entry_id in entry_ids_to_process
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for entry_id, updates in zip(entry_ids_to_process, results):
+            if isinstance(updates, Exception):
+                logger.error(f"Error processing EntryID {entry_id}: {updates}", exc_info=True)
+                continue
+            if not updates:
+                logger.warning(f"No valid updates for EntryID: {entry_id}")
+                continue
+            valid_updates.extend(updates)
+            logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
 
         if valid_updates:
             with pyodbc.connect(conn_str) as conn:
@@ -598,17 +596,14 @@ async def batch_vision_reason(
                 else:
                     logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: sync_update_search_sort_order(
-                    file_id=str(file_id),
-                    entry_id=str(entry_id),
-                    brand=product_brand,
-                    model=product_model,
-                    color=product_color,
-                    category=product_category,
-                    logger=logger
-                )
+            sync_update_search_sort_order(
+                file_id=str(file_id),
+                entry_id=str(entry_id),
+                brand=product_brand,
+                model=product_model,
+                color=product_color,
+                category=product_category,
+                logger=logger
             )
             logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
 
