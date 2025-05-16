@@ -293,11 +293,39 @@ async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] =
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         return pd.DataFrame()
+import logging
+import pandas as pd
+import pyodbc
+import json
+import os
+import aiofiles
+import asyncio
+from typing import Optional, List
+from config import conn_str
+from aws_s3 import upload_file_to_space
+
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         logger.info(f"Exporting DAI JSON for FileID: {file_id}")
+
+        # Ensure AiJson column exists
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                IF NOT EXISTS (
+                    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_NAME = 'utb_ImageScraperResult' 
+                    AND COLUMN_NAME = 'AiJson'
+                )
+                BEGIN
+                    ALTER TABLE utb_ImageScraperResult 
+                    ADD AiJson NVARCHAR(MAX)
+                END
+            """)
+            conn.commit()
+            logger.info("Verified/Added AiJson column in utb_ImageScraperResult")
 
         # Query AiJson from database with join
         with pyodbc.connect(conn_str) as conn:
@@ -305,7 +333,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
                 SELECT r.ResultID, r.EntryID, r.AiJson
                 FROM utb_ImageScraperResult r
                 INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
-                WHERE rec.FileID = ? AND r.AiJson IS NOT NULL AND ISJSON(r.AiJson) = 1
+                WHERE rec.FileID = ? AND (r.AiJson IS NOT NULL OR r.AiJson = '')
             """
             params = [file_id]
             if entry_ids:
@@ -314,22 +342,28 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
             df = pd.read_sql_query(query, conn, params=params)
 
         if df.empty:
-            logger.warning(f"No valid AiJson data for FileID {file_id}")
+            logger.warning(f"No valid data for FileID {file_id}")
             return ""
 
         # Structure JSON data
         json_data = {}
-        for _, row in df.iterrows():
-            entry_id = str(row['EntryID'])
-            result_id = str(row['ResultID'])
+        invalid_json_count = 0
+        for row in df.itertuples(index=False):
+            entry_id = str(row.EntryID)
+            result_id = str(row.ResultID)
             try:
-                ai_json = json.loads(row['AiJson']) if row['AiJson'] else {}
-                if entry_id not in json_data:
-                    json_data[entry_id] = {}
-                json_data[entry_id][result_id] = ai_json
+                ai_json = json.loads(row.AiJson) if row.AiJson else {}
+                json_data.setdefault(entry_id, {})[result_id] = ai_json
             except json.JSONDecodeError as e:
-                logger.warning(f"Invalid JSON for ResultID {result_id}: {row['AiJson'][:100]}...")
+                logger.warning(f"Invalid JSON for ResultID {result_id}: {row.AiJson[:100]}...")
+                invalid_json_count += 1
                 continue
+        if invalid_json_count > 0:
+            logger.warning(f"Skipped {invalid_json_count} rows due to invalid JSON for FileID {file_id}")
+
+        if not json_data:
+            logger.warning(f"No valid JSON data structured for FileID {file_id}")
+            return ""
 
         # Write to local file
         output_path = f"super_scraper/jobs/{file_id}/dai.json"
@@ -340,22 +374,44 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
             await f.write(json.dumps(json_data, indent=2))
         logger.info(f"Wrote DAI JSON to {local_path}")
 
-        # Upload to S3
-        public_url = await upload_file_to_space(local_path, output_path, True, logger, file_id)
-        if public_url:
-            logger.info(f"Uploaded DAI JSON to {public_url}")
-            # Update database with JSON URL
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE utb_ImageScraperFiles 
-                    SET AiJson = ? 
-                    WHERE ID = ?
-                """, (public_url, file_id))
-                conn.commit()
-                logger.info(f"Updated AiJson for FileID {file_id}")
-        else:
-            logger.error(f"Failed to upload DAI JSON to S3")
+        # Upload to S3 with retry
+        public_url = ""
+        for attempt in range(3):
+            public_url = await upload_file_to_space(local_path, output_path, True, logger, file_id, content_type='application/json')
+            if public_url:
+                break
+            logger.warning(f"Retrying S3 upload (attempt {attempt + 1}/3)")
+            await asyncio.sleep(2)
+
+        if not public_url:
+            logger.error(f"Failed to upload DAI JSON to S3 for FileID {file_id}")
+            return ""
+
+        logger.info(f"Uploaded DAI JSON to {public_url}")
+
+        # Update AiJson column with S3 URL for each ResultID
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            update_query = """
+                UPDATE utb_ImageScraperResult
+                SET AiJson = ?
+                WHERE ResultID = ?
+            """
+            updates = [(public_url, int(row.ResultID)) for row in df.itertuples(index=False)]
+            cursor.executemany(update_query, updates)
+            conn.commit()
+            logger.info(f"Updated AiJson with S3 URL {public_url} for {len(updates)} records in FileID {file_id}")
+
+        # Update JsonFileUrl in utb_ImageScraperFiles
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE utb_ImageScraperFiles 
+                SET JsonFileUrl = ? 
+                WHERE ID = ?
+            """, (public_url, file_id))
+            conn.commit()
+            logger.info(f"Updated JsonFileUrl for FileID {file_id}")
 
         return public_url
 
