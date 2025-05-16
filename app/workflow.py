@@ -26,7 +26,7 @@ from email_utils import send_message_email, send_email
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
-def process_entry(args):
+def process_entry_search(args):
     """Wrapper for sync_process_and_tag_results to run in a thread."""
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
     logger = logging.getLogger(f"worker_{entry_id}")
@@ -167,7 +167,7 @@ async def process_restart_batch(
                 ]
                 logger.debug(f"Tasks: {tasks}")
 
-                results = list(executor.map(process_entry, tasks))
+                results = list(executor.map(process_entry_search, tasks))
                 logger.debug(f"Batch {batch_idx} results: {results}")
 
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
@@ -464,7 +464,7 @@ async def batch_vision_reason(
         def process_entry_wrapper(entry_id):
             entry_df = df[df['EntryID'] == entry_id]
             logger.info(f"Processing EntryID: {entry_id} in thread")
-            return process_entry(file_id, entry_id, entry_df, logger)
+            return process_entry_search(file_id, entry_id, entry_df, logger)
 
         valid_updates = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
