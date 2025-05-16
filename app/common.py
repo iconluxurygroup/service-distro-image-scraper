@@ -18,6 +18,9 @@ import asyncio
 import logging
 from typing import Any, Optional
 from functools import lru_cache
+from config import BASE_CONFIG_URL
+
+
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
