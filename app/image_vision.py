@@ -11,7 +11,7 @@ from ultralytics import YOLO
 import numpy as np
 from typing import Optional, List, Tuple, Dict
 from config import GOOGLE_API_KEY
-
+from utils import load_config
 # Default logger setup
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -31,45 +31,27 @@ except Exception as e:
         f"network access is available, and cache directory has write permissions.",
         exc_info=True
     )
-
 FASHION_MNIST_CLASSES = [
     "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
     "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"
 ]
 
-# Load CATEGORY_MAPPING
-CATEGORY_MAPPING = None
-try:
-    for attempt in range(3):
-        try:
-            response = requests.get("https://iconluxury.group/static_settings/category_mapping.json", timeout=10)
-            response.raise_for_status()
-            CATEGORY_MAPPING = response.json()
-            default_logger.info("Loaded CATEGORY_MAPPING")
-            break
-        except Exception as e:
-            default_logger.warning(f"Failed to load CATEGORY_MAPPING (attempt {attempt + 1}): {e}")
-            if attempt == 2:
-                CATEGORY_MAPPING = {
-                    "pants": "trouser", "slacks": "trouser", "jeans": "trouser", "chino": "trouser",
-                    "tshirt": "t-shirt", "tee": "t-shirt", "shirt": "t-shirt", "jacket": "coat",
-                    "parka": "coat", "overcoat": "coat", "sneakers": "sneaker", "running-shoe": "sneaker",
-                    "athletic-shoe": "sneaker", "trainer": "sneaker", "sweatshirt": "sweater",
-                    "hoodie": "sweater", "cardigan": "sweater", "jersey": "sweatshirt", "wool": "sweater",
-                    "suit": "jacket", "trench-coat": "coat", "maillot": "legging", "velvet": "dress",
-                    "kimono": "dress", "skinny": "trouser", "cargo-pant": "trouser", "blouse": "shirt",
-                    "tank": "tank-top", "shorts": "short", "sandals": "sandal", "boots": "boot",
-                    "heels": "heel", "hat": "cap", "gloves": "glove", "scarves": "scarf", "bags": "bag",
-                    "T-shirt/top": "t-shirt", "Trouser": "trouser", "Pullover": "sweater", "Dress": "dress",
-                    "Coat": "coat", "Sandal": "sandal", "Shirt": "t-shirt", "Sneaker": "sneaker",
-                    "Bag": "bag", "Ankle boot": "boot"
-                }
-                default_logger.info("Using fallback CATEGORY_MAPPING")
-except Exception as e:
-    default_logger.error(f"Critical failure loading CATEGORY_MAPPING: {e}")
-    raise
+# Fallback data
+FALLBACK_CATEGORY_MAPPING = {
+    "pants": "trouser", "slacks": "trouser", "jeans": "trouser", "chino": "trouser",
+    "tshirt": "t-shirt", "tee": "t-shirt", "shirt": "t-shirt", "jacket": "coat",
+    "parka": "coat", "overcoat": "coat", "sneakers": "sneaker", "running-shoe": "sneaker",
+    "athletic-shoe": "sneaker", "trainer": "sneaker", "sweatshirt": "sweater",
+    "hoodie": "sweater", "cardigan": "sweater", "jersey": "sweatshirt", "wool": "sweater",
+    "suit": "jacket", "trench-coat": "coat", "maillot": "legging", "velvet": "dress",
+    "kimono": "dress", "skinny": "trouser", "cargo-pant": "trouser", "blouse": "shirt",
+    "tank": "tank-top", "shorts": "short", "sandals": "sandal", "boots": "boot",
+    "heels": "heel", "hat": "cap", "gloves": "glove", "scarves": "scarf", "bags": "bag",
+    "T-shirt/top": "t-shirt", "Trouser": "trouser", "Pullover": "sweater", "Dress": "dress",
+    "Coat": "coat", "Sandal": "sandal", "Shirt": "t-shirt", "Sneaker": "sneaker",
+    "Bag": "bag", "Ankle boot": "boot"
+}
 
-# Fallback NON_FASHION_LABELS
 FALLBACK_NON_FASHION_LABELS = [
     "soap_dispenser", "parking_meter", "spoon", "screw", "safety_pin", "tick",
     "ashcan", "loudspeaker", "joystick", "perfume", "car", "dog", "bench",
@@ -83,25 +65,18 @@ FALLBACK_NON_FASHION_LABELS = [
     "kite", "baseball_bat", "baseball_glove", "skateboard", "surfboard", "tennis_racket"
 ]
 
-# Load NON_FASHION_LABELS from URL
-NON_FASHION_LABELS = None
-try:
-    for attempt in range(3):
-        try:
-            response = requests.get("https://iconluxury.group/static_settings/non_fashion_labels.json", timeout=10)
-            response.raise_for_status()
-            NON_FASHION_LABELS = response.json()
-            default_logger.info("Loaded NON_FASHION_LABELS from URL")
-            break
-        except Exception as e:
-            default_logger.warning(f"Failed to load NON_FASHION_LABELS (attempt {attempt + 1}): {e}")
-            if attempt == 2:
-                NON_FASHION_LABELS = FALLBACK_NON_FASHION_LABELS
-                default_logger.info("Using fallback NON_FASHION_LABELS")
-except Exception as e:
-    default_logger.error(f"Critical failure loading NON_FASHION_LABELS: {e}")
-    NON_FASHION_LABELS = FALLBACK_NON_FASHION_LABELS
-    default_logger.info("Using fallback NON_FASHION_LABELS due to critical failure")
+# Load configurations
+async def initialize_configs():
+    global CATEGORY_MAPPING, NON_FASHION_LABELS
+    CATEGORY_MAPPING = await load_config(
+        "category_mapping", FALLBACK_CATEGORY_MAPPING, default_logger, "CATEGORY_MAPPING", expect_list=False
+    )
+    NON_FASHION_LABELS = await load_config(
+        "non_fashion_labels", FALLBACK_NON_FASHION_LABELS, default_logger, "NON_FASHION_LABELS", expect_list=True
+    )
+
+# Run initialization
+asyncio.run(initialize_configs())
 
 async def detect_objects_with_computer_vision_async(
     image_base64: str,

@@ -32,6 +32,8 @@ S3_CONFIG = {
 # Database credentials
 MSSQLS_PWD =  'Ftu5675FDG54hjhiuu$'
 
+# Existing imports and conn_str
+BASE_CONFIG_URL = "https://iconluxury.group/static_settings/"
 # Grok API settings for image processing
 GROK_API_KEY = os.getenv('GROK_API_KEY', 'xai-ucA8EcERzruUwHAa1duxYallTxycDumI5n3eVY7EJqhZVD0ywiiza3zEmRB4Tw7eNC5k0VuXVndYOUj9')
 GROK_ENDPOINT = os.getenv('GROK_ENDPOINT', 'https://api.x.ai/v1/chat/completions')
