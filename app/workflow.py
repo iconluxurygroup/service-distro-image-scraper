@@ -6,7 +6,7 @@ import os
 import pandas as pd
 import time
 import pyodbc
-import httpx
+import httpx,json
 import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
@@ -14,7 +14,8 @@ from config import conn_str
 from db_utils import (
     sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email,
     sync_update_search_sort_order,
-    get_images_excel_db, fetch_missing_images, update_file_location_complete, update_file_generate_complete
+    get_images_excel_db, fetch_missing_images, update_file_location_complete, update_file_generate_complete,
+    export_dai_json, update_log_url_in_db
 )
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
