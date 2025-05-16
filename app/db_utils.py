@@ -1,34 +1,19 @@
-# db_utils.py
-# Contains database-specific utility functions to avoid circular imports
-
 import logging
 import pandas as pd
-import pyodbc
-import re,httpx
-import requests
-from typing import List, Optional, Dict, Any
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.sql import text
-from requests.exceptions import RequestException
-import aioodbc
 import json
 import os
 import aiofiles
-import pandas as pd
+import re
 import pyodbc
-from typing import Optional, List
-from config import conn_str
+import aioodbc
+import asyncio
+from typing import Optional, List, Dict, Any
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from config import conn_str, engine, async_engine
 from aws_s3 import upload_file_to_space
-import pyodbc
-from typing import Optional, List
-from config import conn_str
-from aws_s3 import upload_file_to_space
-
-# Import shared utilities from common.py
 from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
-# Import check_endpoint_health from utils.py
-# Import database configuration
-from config import conn_str, engine,async_engine
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -306,14 +291,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import conn_str, engine, async_engine
 from aws_s3 import upload_file_to_space
 from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
-async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, logger: Optional[logging.Logger] = None) -> str:
+async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, logger: Optional[logging.Logger] = None) -> List[str]:
     logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         logger.info(f"Exporting DAI JSON for FileID: {file_id}")
 
-        # Query data with SQLAlchemy
-        async with AsyncSession(async_engine) as session:
+        # Query data with SQLAlchemy async connection
+        async with async_engine.connect() as conn:
             query = """
                 SELECT r.ResultID, r.EntryID, r.AiCaption
                 FROM utb_ImageScraperResult r
@@ -325,112 +310,139 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
                 query += " AND r.EntryID IN :entry_ids"
                 params["entry_ids"] = tuple(entry_ids)
             
-            # Ensure query is a string for pandas
-            df = await session.run_sync(
-                lambda conn: pd.read_sql_query(query, conn, params=params)
-            )
+            # Use synchronous connection for pandas
+            with conn.sync_connection as sync_conn:
+                df = pd.read_sql_query(query, sync_conn, params=params)
 
         if df.empty:
             logger.warning(f"No valid data for FileID {file_id}")
-            return ""
+            return []
 
-        # Structure JSON data
-        json_data = {}
+        # Generate individual JSON files for each ResultID
+        public_urls = []
+        os.makedirs(f"temp_jobs/{file_id}", exist_ok=True)
         for row in df.itertuples(index=False):
-            entry_id = str(row.EntryID)
             result_id = str(row.ResultID)
+            entry_id = str(row.EntryID)
             ai_caption = row.AiCaption if row.AiCaption else ""
-            json_data.setdefault(entry_id, {})[result_id] = {"caption": ai_caption}
 
-        if not json_data:
-            logger.warning(f"No valid data structured for FileID {file_id}")
-            return ""
+            # Structure JSON data for this ResultID
+            json_data = {
+                "result_id": result_id,
+                "entry_id": entry_id,
+                "caption": ai_caption
+            }
 
-        # Write to local file
-        output_path = f"super_scraper/jobs/{file_id}/dai.json"
-        local_path = f"temp_jobs/{file_id}_dai.json"
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            # Write to local file
+            output_path = f"super_scraper/jobs/{file_id}/result_{result_id}.json"
+            local_path = f"temp_jobs/{file_id}/result_{result_id}.json"
 
-        async with aiofiles.open(local_path, 'w') as f:
-            await f.write(json.dumps(json_data, indent=2))
-        logger.info(f"Wrote DAI JSON to {local_path}")
+            async with aiofiles.open(local_path, 'w') as f:
+                await f.write(json.dumps(json_data, indent=2))
+            logger.info(f"Wrote DAI JSON for ResultID {result_id} to {local_path}")
 
-        # Upload to S3 with retry
-        public_url = ""
-        for attempt in range(3):
-            public_url = await upload_file_to_space(local_path, output_path, True, logger, file_id)
-            if public_url:
-                break
-            logger.warning(f"Retrying S3 upload (attempt {attempt + 1}/3)")
-            await asyncio.sleep(2)
+            # Upload to S3 with retry
+            public_url = ""
+            for attempt in range(3):
+                public_url = await upload_file_to_space(local_path, output_path, True, logger, file_id)
+                if public_url:
+                    break
+                logger.warning(f"Retrying S3 upload for ResultID {result_id} (attempt {attempt + 1}/3)")
+                await asyncio.sleep(2)
 
-        if not public_url:
-            logger.error(f"Failed to upload DAI JSON to S3 for FileID {file_id}")
-            return ""
+            if not public_url:
+                logger.error(f"Failed to upload DAI JSON for ResultID {result_id}")
+                continue
 
-        logger.info(f"Uploaded DAI JSON to {public_url}")
+            logger.info(f"Uploaded DAI JSON for ResultID {result_id} to {public_url}")
+            public_urls.append(public_url)
 
-        # Update AiCaption column with S3 URL for each ResultID
-        async with AsyncSession(async_engine) as session:
-            update_query = text("""
-                UPDATE utb_ImageScraperResult
-                SET AiCaption = :public_url
-                WHERE ResultID = :result_id
-            """)
-            updates = [{"public_url": public_url, "result_id": int(row.ResultID)} for row in df.itertuples(index=False)]
-            for update in updates:
-                await session.execute(update_query, update)
-            await session.commit()
-            logger.info(f"Updated AiCaption with S3 URL {public_url} for {len(updates)} records in FileID {file_id}")
+            # Update AiCaption with S3 URL
+            async with AsyncSession(async_engine) as session:
+                update_query = text("""
+                    UPDATE utb_ImageScraperResult
+                    SET AiCaption = :public_url
+                    WHERE ResultID = :result_id
+                """)
+                await session.execute(
+                    update_query,
+                    {"public_url": public_url, "result_id": int(result_id)}
+                )
+                await session.commit()
+                logger.info(f"Updated AiCaption with S3 URL {public_url} for ResultID {result_id}")
 
-        return public_url
+        if not public_urls:
+            logger.warning(f"No JSON files uploaded for FileID {file_id}")
+            return []
+
+        logger.info(f"Uploaded {len(public_urls)} JSON files for FileID {file_id}")
+        return public_urls
 
     except Exception as e:
         logger.error(f"Failed to export DAI JSON for FileID {file_id}: {e}", exc_info=True)
-        return ""
+        return []
 
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
     try:
         file_id = int(file_id)
         logger.info(f"Starting fetch_missing_images for FileID {file_id}, ai_analysis_only={ai_analysis_only}, limit={limit}")
-        with pyodbc.connect(conn_str) as conn:
-            if ai_analysis_only:
-                query = """
-                    SELECT t.ResultID, t.EntryID, t.ImageUrl, t.ImageUrlThumbnail,
-                           r.ProductBrand, r.ProductCategory, r.ProductColor
-                    FROM utb_ImageScraperResult t
-                    INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                    WHERE r.FileID = ?
-                    AND (t.AiJson IS NULL OR t.AiJson = '' OR ISJSON(t.AiJson) = 0)
-                    AND t.ImageUrl IS NOT NULL AND t.ImageUrl <> ''
-                    AND t.SortOrder > 0
-                    ORDER BY t.ResultID
-                    OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
-                """
-                params = (file_id, limit)
-            else:
-                query = """
-                    SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
-                           t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
-                    FROM utb_ImageScraperRecords r
-                    LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID AND t.SortOrder >= 0
-                    WHERE r.FileID = ? AND t.ResultID IS NULL
-                    ORDER BY r.EntryID
-                    OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
-                """
-                params = (file_id, limit)
 
-            df = pd.read_sql_query(query, conn, params=params)
-            logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
-            if not df.empty:
-                logger.debug(f"Sample results: {df.head(2).to_dict()}")
-            return df
-    except pyodbc.Error as e:
-        logger.error(f"Database error fetching missing images for FileID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame()
+        # Retry logic for connection
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with async_engine.connect() as conn:
+                    if ai_analysis_only:
+                        query = text("""
+                            SELECT t.ResultID, t.EntryID, t.ImageUrl, t.ImageUrlThumbnail,
+                                   r.ProductBrand, r.ProductCategory, r.ProductColor
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                            WHERE r.FileID = :file_id
+                            AND (t.AiJson IS NULL OR t.AiJson = '' OR ISJSON(t.AiJson) = 0)
+                            AND t.ImageUrl IS NOT NULL AND t.ImageUrl <> ''
+                            AND t.SortOrder > 0
+                            ORDER BY t.ResultID
+                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
+                        """)
+                        params = {"file_id": file_id, "limit": limit}
+                    else:
+                        query = text("""
+                            SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
+                                   t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
+                            FROM utb_ImageScraperRecords r
+                            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID AND t.SortOrder >= 0
+                            WHERE r.FileID = :file_id AND t.ResultID IS NULL
+                            ORDER BY r.EntryID
+                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
+                        """)
+                        params = {"file_id": file_id, "limit": limit}
+
+                    # Use synchronous connection for pandas
+                    with conn.sync_connection as sync_conn:
+                        df = pd.read_sql_query(query, sync_conn, params=params)
+
+                    logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
+                    if not df.empty:
+                        logger.debug(f"Sample results: {df.head(2).to_dict()}")
+                    return df
+
+            except SQLAlchemyError as e:
+                logger.error(f"Database error on attempt {attempt + 1}/{max_retries} for FileID {file_id}: {e}")
+                if attempt < max_retries - 1:
+                    delay = 5 * (2 ** attempt)  # Exponential backoff: 5s, 10s, 20s
+                    logger.info(f"Retrying after {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Max retries reached for FileID {file_id}")
+                    raise
+
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Unexpected error fetching missing images for FileID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
 
 async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None) -> None:
@@ -810,7 +822,10 @@ def sync_update_search_sort_order(
                         if brand_found:
                             valid_indices.append(idx)
                         else:
-                            logger.warning(f"Brand validation failed for ResultID {result_id}, downgrading to no match")
+                            logger.warning(
+                                f"ResultID {result_id}: Brand validation failed for aliases {brand_aliases}, "
+                                f"ImageDesc: {row['ImageDesc']}, ImageSource: {row['ImageSource']}, ImageUrl: {row['ImageUrl']}"
+                            )
                             df.at[idx, 'new_sort_order'] = -2
                             df.at[idx, 'priority'] = 4
                     else:
@@ -820,6 +835,10 @@ def sync_update_search_sort_order(
                         df.at[idx, 'priority'] = 4 if not brand_found else 3
                         if brand_found:
                             valid_indices.append(idx)
+                            logger.warning(
+                                f"ResultID {result_id}: Brand validation failed for aliases {brand_aliases}, "
+                                f"ImageDesc: {row['ImageDesc']}, ImageSource: {row['ImageSource']}, ImageUrl: {row['ImageUrl']}"
+                            )
 
                 valid_match_df = match_df.loc[valid_indices]
                 if not valid_match_df.empty:
