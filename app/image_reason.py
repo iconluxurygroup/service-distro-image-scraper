@@ -1,4 +1,3 @@
-# image_reason.py
 import asyncio
 import base64
 import json
@@ -19,21 +18,14 @@ from db_utils import (
     get_send_to_email, update_file_generate_complete, update_file_location_complete,
     sync_update_search_sort_order, get_records_to_search
 )
-from config import conn_str, BASE_CONFIG_URL  # Import BASE_CONFIG_URL
-from common import clean_string, generate_aliases, generate_brand_aliases
-from utils import load_config
+from config import conn_str, BASE_CONFIG_URL
+from common import clean_string, generate_aliases, generate_brand_aliases, load_config, CONFIG_FILES
+
 # Default logger setup
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-# Configuration file paths (relative to BASE_CONFIG_URL)
-CONFIG_FILES = {
-    "category_hierarchy": "category_hierarchy.json",
-    "category_mapping": "category_mapping.json",
-    "fashion_labels": "fashion_labels.json"
-}
 
 # Fallback data
 fashion_labels_example = [
@@ -52,22 +44,28 @@ category_hierarchy_example = {
 }
 
 category_mapping_example = {
-    "pants": "trouser",
-    "jeans": "trouser",
-    "jacket": "coat",
-    "sneakers": "sneaker",
-    "running-shoe": "sneaker",
-    "tshirt": "t-shirt",
-    "shirt": "t-shirt",
-    "sweatshirt": "sweater",
-    "hoodie": "sweater"
+    "pants": "trouser", "jeans": "trouser", "jacket": "coat", "sneakers": "sneaker",
+    "running-shoe": "sneaker", "tshirt": "t-shirt", "shirt": "t-shirt",
+    "sweatshirt": "sweater", "hoodie": "sweater"
 }
 
 # Load configurations
-FASHION_LABELS = load_config("fashion_labels", fashion_labels_example, default_logger, "FASHION_LABELS", expect_list=True)
-CATEGORY_MAPPING = load_config("category_mapping", category_mapping_example, default_logger, "CATEGORY_MAPPING")
-category_hierarchy = load_config("category_hierarchy", category_hierarchy_example, default_logger, "category_hierarchy")
+async def initialize_configs():
+    global FASHION_LABELS, CATEGORY_MAPPING, category_hierarchy
+    FASHION_LABELS = await load_config(
+        "fashion_labels", fashion_labels_example, default_logger, "FASHION_LABELS", expect_list=True
+    )
+    CATEGORY_MAPPING = await load_config(
+        "category_mapping", category_mapping_example, default_logger, "CATEGORY_MAPPING"
+    )
+    category_hierarchy = await load_config(
+        "category_hierarchy", category_hierarchy_example, default_logger, "category_hierarchy"
+    )
 
+# Run initialization
+asyncio.run(initialize_configs())
+
+# ... (rest of image_reason.py remains unchanged)
 async def get_image_data_async(
     image_urls: List[str],
     session: aiohttp.ClientSession,

@@ -11,14 +11,82 @@ from fuzzywuzzy import fuzz
 from typing import List, Optional, Dict, Any, Tuple
 from requests.exceptions import RequestException
 import asyncio
-
+import os
+import requests
+import aiohttp
+import asyncio
+import logging
+from typing import Any, Optional
+from functools import lru_cache
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
+# Configuration file paths
+CONFIG_FILES = {
+    "category_hierarchy": "category_hierarchy.json",
+    "category_mapping": "category_mapping.json",
+    "fashion_labels": "fashion_labels.json",
+    "non_fashion_labels": "non_fashion_labels.json"
+}
 
+# Cache synchronous loads
+@lru_cache(maxsize=32)
+def sync_load_config(file_key: str, url: str, config_name: str, expect_list: bool = False) -> Any:
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        config = response.json()
+        if expect_list and not isinstance(config, list):
+            raise ValueError(f"{config_name} must be a list")
+        return config
+    except Exception as e:
+        raise e
+
+async def load_config(
+    file_key: str,
+    fallback: Any,
+    logger: Optional[logging.Logger] = None,
+    config_name: str = "",
+    expect_list: bool = False,
+    retries: int = 3,
+    backoff_factor: float = 2.0
+) -> Any:
+    logger = logger or logging.getLogger(__name__)
+    url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
+    
+    # Try cached synchronous load first
+    try:
+        config = sync_load_config(file_key, url, config_name, expect_list)
+        logger.info(f"Loaded {config_name} from cache for {url}")
+        return config
+    except Exception:
+        logger.debug(f"Cache miss for {config_name}, attempting async load")
+
+    # Async load with retries
+    for attempt in range(1, retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    response.raise_for_status()
+                    config = await response.json()
+                    if expect_list and not isinstance(config, list):
+                        raise ValueError(f"{config_name} must be a list")
+                    logger.info(f"Loaded {config_name} from {url} on attempt {attempt}")
+                    sync_load_config.cache_clear()
+                    sync_load_config(file_key, url, config_name, expect_list)
+                    return config
+        except (aiohttp.ClientError, ValueError, asyncio.TimeoutError) as e:
+            logger.warning(f"Failed to load {config_name} from {url} (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(backoff_factor * attempt)
+            else:
+                logger.info(f"Exhausted retries for {config_name}, using fallback")
+                return fallback
+    logger.error(f"Critical failure loading {config_name} from {url}, using fallback")
+    return fallback
 def clean_string(s: str, preserve_url: bool = False) -> str:
     """Clean a string, optionally preserving URL structures."""
     if not isinstance(s, str):
