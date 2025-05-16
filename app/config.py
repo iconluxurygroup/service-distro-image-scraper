@@ -42,9 +42,10 @@ GROK_ENDPOINT = os.getenv('GROK_ENDPOINT', 'https://api.x.ai/v1/chat/completions
 pwd_str = f"Pwd={MSSQLS_PWD};"
 conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;{pwd_str}"
 # Database connection strings
-
+from urllib.parse import quote_plus
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import create_async_engine
+conn_str = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=host;DATABASE=db;UID=user;PWD=pass"
 encoded_conn_str = quote_plus(conn_str)
-ASYNC_DATABASE_URL = f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}"
-# Create async engine
-async_engine = create_async_engine(ASYNC_DATABASE_URL, echo=True)
-engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn_str)
+async_engine = create_async_engine(f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}", echo=True)
+engine = create_engine(f"mssql+pyodbc:///?odbc_connect={conn_str}")
