@@ -544,8 +544,9 @@ def sync_update_search_sort_order(
     except Exception as e:
         logger.error(f"Unexpected error updating SortOrder for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
+import datetime
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
-    """Export AiJson data to a JSON file and upload to S3."""
+    """Export AiJson and AiCaption data to a JSON file and upload to S3."""
     try:
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
@@ -564,7 +565,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
                 {
                     "ResultID": row[0],
                     "EntryID": row[1],
-                    "AiJson": json.loads(row[2]),
+                    "AiJson": json.loads(row[2]) if row[2] else {},
                     "AiCaption": row[3],
                     "ImageIsFashion": row[4]
                 }
@@ -577,7 +578,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
 
         # Generate JSON file
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        json_filename = f"job_{file_id}_results_{timestamp}.json"
+        json_filename = f"result_{file_id}_{timestamp}.json"
         temp_json_dir = f"temp_json_{file_id}"
         os.makedirs(temp_json_dir, exist_ok=True)
         local_json_path = os.path.join(temp_json_dir, json_filename)
@@ -586,6 +587,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
             await f.write(json.dumps(results, indent=2))
         
         logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
+        logger.debug(f"JSON content sample: {json.dumps(results[:2], indent=2)}")
 
         # Upload to S3
         s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
@@ -606,6 +608,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
     except Exception as e:
         logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
         return ""
+
 
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
