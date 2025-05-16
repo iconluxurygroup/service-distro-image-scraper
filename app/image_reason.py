@@ -29,17 +29,10 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# Category hierarchy URL and fallback
+# URLs and configuration variables
 category_hierarchy_url = "https://iconluxury.group/static_settings/category_hierarchy.json"
-category_hierarchy = None
-
-# Category mapping URL and fallback
 category_mapping_url = "https://iconluxury.group/static_settings/category_mapping.json"
-CATEGORY_MAPPING = None
-
-# Fashion labels URL and fallback
 fashion_labels_url = "https://iconluxury.group/static_settings/fashion_labels.json"
-FASHION_LABELS = None
 
 # Fallback data
 fashion_labels_example = [
@@ -68,6 +61,33 @@ category_mapping_example = {
     "sweatshirt": "sweater",
     "hoodie": "sweater"
 }
+
+# Initialize configuration variables
+def load_config(url: str, fallback: any, logger: logging.Logger, config_name: str, expect_list: bool = False) -> any:
+    try:
+        for attempt in range(3):
+            try:
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                config = response.json()
+                if expect_list and not isinstance(config, list):
+                    raise ValueError(f"{config_name} must be a list")
+                logger.info(f"Loaded {config_name}")
+                return config
+            except Exception as e:
+                logger.warning(f"Failed to load {config_name} (attempt {attempt + 1}): {e}")
+                if attempt == 2:
+                    logger.info(f"Using fallback {config_name}")
+                    return fallback
+    except Exception as e:
+        logger.error(f"Critical failure loading {config_name}: {e}")
+        logger.info(f"Using fallback {config_name} due to critical failure")
+        return fallback
+
+FASHION_LABELS = load_config(fashion_labels_url, fashion_labels_example, default_logger, "FASHION_LABELS", expect_list=True)
+CATEGORY_MAPPING = load_config(category_mapping_url, category_mapping_example, default_logger, "CATEGORY_MAPPING")
+category_hierarchy = load_config(category_hierarchy_url, category_hierarchy_example, default_logger, "category_hierarchy")
+
 
 async def get_image_data_async(
     image_urls: List[str],
