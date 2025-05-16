@@ -303,6 +303,16 @@ import asyncio
 from typing import Optional, List
 from config import conn_str
 from aws_s3 import upload_file_to_space
+import logging
+import pandas as pd
+import json
+import os
+import aiofiles
+import asyncio
+from typing import Optional, List
+from sqlalchemy.sql import text
+from config import async_engine
+from aws_s3 import upload_file_to_space
 
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or logging.getLogger(__name__)
@@ -311,9 +321,8 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
         logger.info(f"Exporting DAI JSON for FileID: {file_id}")
 
         # Ensure AiJson column exists
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
+        async with async_engine.connect() as conn:
+            await conn.execute(text("""
                 IF NOT EXISTS (
                     SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
                     WHERE TABLE_NAME = 'utb_ImageScraperResult' 
@@ -323,22 +332,38 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
                     ALTER TABLE utb_ImageScraperResult 
                     ADD AiJson NVARCHAR(MAX)
                 END
-            """)
-            conn.commit()
+            """))
+            await conn.commit()
             logger.info("Verified/Added AiJson column in utb_ImageScraperResult")
 
-        # Query AiJson from database with join
-        with pyodbc.connect(conn_str) as conn:
-            query = """
+        # Ensure JsonFileUrl column exists
+        async with async_engine.connect() as conn:
+            await conn.execute(text("""
+                IF NOT EXISTS (
+                    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_NAME = 'utb_ImageScraperFiles' 
+                    AND COLUMN_NAME = 'JsonFileUrl'
+                )
+                BEGIN
+                    ALTER TABLE utb_ImageScraperFiles 
+                    ADD JsonFileUrl NVARCHAR(MAX)
+                END
+            """))
+            await conn.commit()
+            logger.info("Verified/Added JsonFileUrl column in utb_ImageScraperFiles")
+
+        # Query data with SQLAlchemy
+        async with async_engine.connect() as conn:
+            query = text("""
                 SELECT r.ResultID, r.EntryID, r.AiJson
                 FROM utb_ImageScraperResult r
                 INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
-                WHERE rec.FileID = ? AND (r.AiJson IS NOT NULL OR r.AiJson = '')
-            """
-            params = [file_id]
+                WHERE rec.FileID = :file_id AND (r.AiJson IS NOT NULL OR r.AiJson = '')
+            """)
+            params = {"file_id": file_id}
             if entry_ids:
-                query += " AND r.EntryID IN ({})".format(','.join('?' * len(entry_ids)))
-                params.extend(entry_ids)
+                query = text(query.text + " AND r.EntryID IN :entry_ids")
+                params["entry_ids"] = tuple(entry_ids)
             df = pd.read_sql_query(query, conn, params=params)
 
         if df.empty:
@@ -390,28 +415,33 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
         logger.info(f"Uploaded DAI JSON to {public_url}")
 
         # Update AiJson column with S3 URL for each ResultID
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            update_query = """
+        async with async_engine.connect() as conn:
+            update_query = text("""
                 UPDATE utb_ImageScraperResult
-                SET AiJson = ?
-                WHERE ResultID = ?
-            """
-            updates = [(public_url, int(row.ResultID)) for row in df.itertuples(index=False)]
-            cursor.executemany(update_query, updates)
-            conn.commit()
+                SET AiJson = :public_url
+                WHERE ResultID = :result_id
+            """)
+            updates = [{"public_url": public_url, "result_id": int(row.ResultID)} for row in df.itertuples(index=False)]
+            for update in updates:
+                await conn.execute(update_query, update)
+            await conn.commit()
             logger.info(f"Updated AiJson with S3 URL {public_url} for {len(updates)} records in FileID {file_id}")
 
         # Update JsonFileUrl in utb_ImageScraperFiles
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE utb_ImageScraperFiles 
-                SET JsonFileUrl = ? 
-                WHERE ID = ?
-            """, (public_url, file_id))
-            conn.commit()
-            logger.info(f"Updated JsonFileUrl for FileID {file_id}")
+        try:
+            async with async_engine.connect() as conn:
+                await conn.execute(
+                    text("""
+                        UPDATE utb_ImageScraperFiles 
+                        SET JsonFileUrl = :public_url 
+                        WHERE ID = :file_id
+                    """),
+                    {"public_url": public_url, "file_id": file_id}
+                )
+                await conn.commit()
+                logger.info(f"Updated JsonFileUrl for FileID {file_id}")
+        except Exception as e:
+            logger.warning(f"Failed to update JsonFileUrl for FileID {file_id}: {e}. Continuing with public URL return.")
 
         return public_url
 
