@@ -254,31 +254,28 @@ async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logg
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         return False
-
 async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
     try:
         file_id = int(file_id)
-        query = """
-            SELECT EntryID, ProductModel AS SearchString, 'model_only' AS SearchType, FileID
-            FROM utb_ImageScraperRecords 
-            WHERE FileID = ? AND Step1 IS NULL
-            ORDER BY EntryID, SearchType
-        """
-        with pyodbc.connect(conn_str) as conn:
-            df = pd.read_sql_query(query, conn, params=[file_id])
+        with engine.connect() as conn:
+            query = text("""
+                SELECT EntryID, ProductModel AS SearchString, 'model_only' AS SearchType, FileID
+                FROM utb_ImageScraperRecords 
+                WHERE FileID = :file_id AND Step1 IS NULL
+                ORDER BY EntryID, SearchType
+            """)
+            df = pd.read_sql_query(query, conn, params={"file_id": file_id})
             if not df.empty and (df["FileID"] != file_id).any():
                 logger.error(f"Found rows with incorrect FileID for {file_id}")
                 df = df[df["FileID"] == file_id]
             logger.info(f"Got {len(df)} search records for FileID: {file_id}")
             return df[["EntryID", "SearchString", "SearchType"]]
-    except pyodbc.Error as e:
-        logger.error(f"Database error getting records for FileID {file_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error getting records for FileID {file_id}: {e}")
         return pd.DataFrame()
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        return pd.DataFrame()
-
+    
+    
 import logging
 import pandas as pd
 import json
