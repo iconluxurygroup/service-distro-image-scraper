@@ -10,18 +10,21 @@ import google.generativeai as genai
 from ultralytics import YOLO
 import numpy as np
 from typing import Optional, List, Tuple, Dict
-from config import GOOGLE_API_KEY
-from utils import load_config
+from config import GOOGLE_API_KEY, BASE_CONFIG_URL
+from image_reason import load_config  # Import load_config from image_reason.py
+
 # Default logger setup
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
 # Configuration file paths
 CONFIG_FILES = {
     "category_mapping": "category_mapping.json",
     "non_fashion_labels": "non_fashion_labels.json"
 }
+
 # Initialize YOLOv11 models
 try:
     CLS_MODEL = YOLO("yolo11m-cls.pt", task="classify", verbose=True)
@@ -35,6 +38,7 @@ except Exception as e:
         f"network access is available, and cache directory has write permissions.",
         exc_info=True
     )
+
 FASHION_MNIST_CLASSES = [
     "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
     "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"
