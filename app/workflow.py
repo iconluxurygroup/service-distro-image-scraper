@@ -11,19 +11,17 @@ import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
 from config import conn_str
-from db_utils import (sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email,get_images_excel_db, fetch_missing_images,  
-update_file_location_complete, update_file_generate_complete)
+from db_utils import (sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email,
+                      get_images_excel_db, fetch_missing_images, update_file_location_complete, update_file_generate_complete)
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
 from utils import create_temp_dirs, cleanup_temp_dirs
 from utils import sync_process_and_tag_results
-
 from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space
 import psutil
 from email_utils import send_message_email, send_email
-from typing import Optional
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
@@ -32,7 +30,6 @@ def process_entry(args):
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
     logger = logging.getLogger(f"worker_{entry_id}")
     logger.setLevel(logging.DEBUG)
-    # Ensure thread-safe logging
     handler = logging.FileHandler(f"job_logs/worker_{entry_id}.log")
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
@@ -63,7 +60,7 @@ async def process_restart_batch(
     entry_id: Optional[int] = None,
     use_all_variations: bool = False
 ) -> Dict[str, str]:
-    """Process a batch of entries for a file using threading."""
+    """Process a batch of entries for a file using threading and upload log file to S3."""
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
         # Initialize logger
@@ -93,14 +90,14 @@ async def process_restart_batch(
             cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id_db_int,))
             if cursor.fetchone()[0] == 0:
                 logger.error(f"FileID {file_id_db} does not exist")
-                return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename}
+                return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": ""}
 
         # Fetch brand rules
         logger.debug("Fetching brand rules...")
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning("No brand rules fetched")
-            return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename}
+            return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": ""}
 
         # Fetch endpoint
         logger.debug("Fetching endpoint...")
@@ -118,7 +115,7 @@ async def process_restart_batch(
                 time.sleep(2)
         if not endpoint:
             logger.error("No healthy endpoint")
-            return {"error": "No healthy endpoint", "log_filename": log_filename}
+            return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": ""}
 
         # Fetch entries
         logger.debug("Fetching entries...")
@@ -139,11 +136,11 @@ async def process_restart_batch(
                 logger.info(f"Found {len(entries)} entries")
             except pyodbc.Error as e:
                 logger.error(f"Database query failed: {e}", exc_info=True)
-                return {"error": f"Database query failed: {e}", "log_filename": log_filename}
+                return {"error": f"Database query failed: {e}", "log_filename": log_filename, "log_public_url": ""}
 
         if not entries:
             logger.warning("No entries found")
-            return {"error": "No entries found", "log_filename": log_filename}
+            return {"error": "No entries found", "log_filename": log_filename, "log_public_url": ""}
 
         # Create batches
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
@@ -157,7 +154,7 @@ async def process_restart_batch(
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        # Use ThreadPoolExecutor instead of multiprocessing.Pool
+        # Use ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=4) as executor:
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
@@ -169,7 +166,6 @@ async def process_restart_batch(
                 ]
                 logger.debug(f"Tasks: {tasks}")
 
-                # Submit tasks to ThreadPoolExecutor
                 results = list(executor.map(process_entry, tasks))
                 logger.debug(f"Batch {batch_idx} results: {results}")
 
@@ -187,7 +183,7 @@ async def process_restart_batch(
                             continue
 
                         combined_df = pd.concat(dfs, ignore_index=True)
-                        logger.debug(f"Combined DataFrame for EntryID {entry_id}: {combined_df.to_dict()}")
+                        logger.debug(f"Combined DataFrame for EntryID {entry_id}: {combined_df.to偶.to_dict()}")
 
                         for api_col, db_col in api_to_db_mapping.items():
                             if api_col in combined_df.columns and db_col not in combined_df.columns:
@@ -201,7 +197,6 @@ async def process_restart_batch(
                         deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
                         logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
 
-                        # Ensure thread-safe database operations
                         insert_success = insert_search_results(deduplicated_df, logger=logger)
                         if not insert_success:
                             logger.error(f"Failed to insert results for EntryID {entry_id}")
@@ -257,6 +252,28 @@ async def process_restart_batch(
         logger.info(f"Completed processing. Successful: {successful_entries}, Failed: {failed_entries}")
         log_memory_usage()
 
+        # Upload log file to S3
+        log_public_url = ""
+        if os.path.exists(log_filename):
+            logger.info(f"Uploading log file {log_filename} to S3")
+            try:
+                log_public_url = await upload_file_to_space(
+                    log_filename,
+                    f"super_scraper/logs/job_{file_id_db}.log",
+                    True,
+                    logger,
+                    file_id_db
+                )
+                if log_public_url:
+                    logger.info(f"Log file uploaded successfully. Public URL: {log_public_url}")
+                else:
+                    logger.error("Failed to upload log file to S3")
+            except Exception as e:
+                logger.error(f"Error uploading log file to S3: {e}", exc_info=True)
+        else:
+            logger.error(f"Log file {log_filename} does not exist")
+
+        # Send email notification
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
@@ -264,9 +281,10 @@ async def process_restart_batch(
                 f"Processing for FileID {file_id_db} has completed successfully.\n"
                 f"Successful entries: {successful_entries}/{len(entries)}\n"
                 f"Failed entries: {failed_entries}\n"
-                f"Log file: {log_filename}"
+                f"Log file: {log_filename}\n"
+                f"Log file public URL: {log_public_url if log_public_url else 'Not available'}"
             )
-            await send_message_email(to_emails=to_emails, subject=subject, message=message, logger=logger)
+            await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
         return {
             "message": "Search processing completed",
@@ -274,12 +292,13 @@ async def process_restart_batch(
             "successful_entries": str(successful_entries),
             "total_entries": str(len(entries)),
             "failed_entries": str(failed_entries),
-            "log_filename": log_filename
+            "log_filename": log_filename,
+            "log_public_url": log_public_url
         }
 
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
-        return {"error": str(e), "log_filename": log_filename}
+        return {"error": str(e), "log_filename": log_filename, "log_public_url": ""}
 
 
 
