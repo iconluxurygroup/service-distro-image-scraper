@@ -553,13 +553,14 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             query = """
-                SELECT ResultID, EntryID, AiJson, AiCaption, ImageIsFashion
-                FROM utb_ImageScraperResult
-                WHERE ID = ? AND AiJson IS NOT NULL AND AiCaption IS NOT NULL
+                SELECT t.ResultID, t.EntryID, t.AiJson, t.AiCaption, t.ImageIsFashion
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE r.FileID = ? AND t.AiJson IS NOT NULL AND t.AiCaption IS NOT NULL
             """
             params = [file_id]
             if entry_ids:
-                query += " AND EntryID IN ({})".format(','.join('?' * len(entry_ids)))
+                query += " AND t.EntryID IN ({})".format(','.join('?' * len(entry_ids)))
                 params.extend(entry_ids)
             
             cursor.execute(query, params)
@@ -614,7 +615,6 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
     except Exception as e:
         logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
         return ""
-
 
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
