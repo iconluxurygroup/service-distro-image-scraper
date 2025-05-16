@@ -459,7 +459,7 @@ async def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFr
                 ai_json, image_is_fashion, ai_caption, result_id = update
                 if not isinstance(ai_json, str):
                     logger.error(f"Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
-                    ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id})
+                    ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}})
                 
                 if is_valid_ai_result(ai_json, ai_caption or "", logger):
                     valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
@@ -503,14 +503,13 @@ def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) ->
             return False
         
         if "scores" not in parsed_json or not parsed_json["scores"]:
-            logger.warning("Invalid AI result: AiJson missing or empty 'scores' field")
+            logger.warning(f"Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
             return False
         
         return True
     except json.JSONDecodeError as e:
-        logger.warning(f"Invalid AI result: AiJson is not valid JSON: {e}")
+        logger.warning(f"Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
         return False
-
 
 async def batch_vision_reason(
     file_id: str,
@@ -543,7 +542,6 @@ async def batch_vision_reason(
         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
         valid_updates = []
-        # Process entries concurrently using asyncio.gather
         tasks = [
             process_entry_wrapper(file_id, entry_id, df[df['EntryID'] == entry_id], logger)
             for entry_id in entry_ids_to_process

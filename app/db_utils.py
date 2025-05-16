@@ -555,7 +555,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
             query = """
                 SELECT ResultID, EntryID, AiJson, AiCaption, ImageIsFashion
                 FROM utb_ImageScraperResult
-                WHERE FileID = ? AND AiJson IS NOT NULL AND AiCaption IS NOT NULL
+                WHERE ID = ? AND AiJson IS NOT NULL AND AiCaption IS NOT NULL
             """
             params = [file_id]
             if entry_ids:

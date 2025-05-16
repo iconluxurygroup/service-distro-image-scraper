@@ -138,14 +138,13 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
             return True
 
     return False
-
 async def process_image(row, session: aiohttp.ClientSession, logger: logging.Logger) -> Tuple[int, str, Optional[str], int]:
     """Process a single image row with Gemini API, ensuring valid JSON output."""
     result_id = row.get("ResultID")
     default_result = (
         result_id or 0,
-        json.dumps({"error": "Unknown processing error", "result_id": result_id or 0}),
-        None,
+        json.dumps({"error": "Unknown processing error", "result_id": result_id or 0, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
+        "Processing failed",
         1
     )
 
@@ -153,23 +152,6 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         if not result_id or not isinstance(result_id, int):
             logger.error(f"Invalid ResultID for row: {row}")
             return default_result
-
-        # Check SortOrder
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT SortOrder FROM utb_ImageScraperResult WHERE ResultID = ?", (result_id,))
-            result = cursor.fetchone()
-            sort_order = result[0] if result else None
-            if isinstance(sort_order, (int, float)) and sort_order > 0:
-                logger.info(f"Processing image with positive SortOrder for ResultID {result_id}: {sort_order}")
-            elif isinstance(sort_order, (int, float)) and sort_order < 0:
-                logger.info(f"Skipping ResultID {result_id} due to negative SortOrder: {sort_order}")
-                return (
-                    result_id,
-                    json.dumps({"error": f"Negative SortOrder: {sort_order}", "result_id": result_id}),
-                    None,
-                    0
-                )
 
         image_urls = [row["ImageUrl"]]
         if pd.notna(row.get("ImageUrlThumbnail")):
@@ -186,7 +168,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
                     logger.warning(f"Invalid URL: {url}")
                     continue
                 try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
                         response.raise_for_status()
                         image_data = await response.read()
                         logger.info(f"Downloaded image from {url}")
@@ -200,8 +182,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             logger.warning(f"Image download failed for ResultID {result_id}")
             return (
                 result_id,
-                json.dumps({"error": f"Image download failed for URLs: {image_urls}", "result_id": result_id}),
-                None,
+                json.dumps({"error": f"Image download failed for URLs: {image_urls}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
+                "Image download failed",
                 1
             )
 
@@ -215,10 +197,59 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             logger.warning(f"Computer vision detection failed for ResultID {result_id}: {cv_description}")
             return (
                 result_id,
-                json.dumps({"error": cv_description or "CV detection failed", "result_id": result_id}),
-                None,
+                json.dumps({"error": cv_description or "CV detection failed", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
+                "CV detection failed",
                 1
             )
+
+        # Check for non-fashion or multiple objects
+        def extract_labels(description):
+            cls_label = None
+            seg_label = None
+            if description.startswith("Classification:"):
+                cls_match = re.search(r"Classification: (\w+(?:\s+\w+)*) \(confidence:", description)
+                cls_label = cls_match.group(1) if cls_match else None
+            if "Segmented objects:" in description:
+                seg_match = re.search(r"(\w+(?:\s+\w+)*) \(confidence: [\d.]+, mask area:", description)
+                seg_label = seg_match.group(1) if seg_match else None
+            return cls_label, seg_label
+
+        cls_label, seg_label = extract_labels(cv_description)
+        detected_objects = cv_description.split("\n")[2:] if "Segmented objects:" in cv_description else []
+        fashion_labels = ["t-shirt", "shirt", "trouser", "dress", "coat", "jacket", "sweater", "sandal", "sneaker", "shoe", "bag", "hat", "scarf", "glove", "belt", "skirt", "short", "suit", "boot", "running_shoe"]
+        labels = [label for label in [cls_label, seg_label] if label]
+        is_fashion = any(label.lower() in [fl.lower() for fl in fashion_labels] for label in labels if label)
+        non_fashion_labels = [label for label in labels if label and label.lower() not in [fl.lower() for fl in fashion_labels]]
+
+        person_detected = any(conf > 0.5 for conf in person_confidences)
+        cls_conf = float(re.search(r"Classification: \w+(?:\s+\w+)* \(confidence: ([\d.]+)\)", cv_description).group(1)) if cls_label else 0.0
+        seg_conf = float(re.search(r"confidence: ([\d.]+), mask area:", cv_description).group(1)) if seg_label else 0.0
+
+        if len(detected_objects) > 1 and not is_fashion:
+            logger.info(f"Non-fashion objects detected for ResultID {result_id}: {non_fashion_labels}")
+            ai_json = json.dumps({
+                "description": f"Image contains multiple objects: {non_fashion_labels}, none of which are fashion-related.",
+                "extracted_features": {"brand": "Unknown", "category": "Multiple", "color": "Unknown"},
+                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "reasoning": f"Multiple non-fashion objects detected: {non_fashion_labels}.",
+                "cv_detection": cv_description,
+                "person_confidences": person_confidences,
+                "result_id": result_id
+            })
+            return result_id, ai_json, "Non-fashion objects detected", 0
+
+        if not person_detected and not is_fashion and max(cls_conf, seg_conf) < 0.2:
+            logger.info(f"No fashion items or persons for ResultID {result_id}")
+            ai_json = json.dumps({
+                "description": "Image lacks fashion items and persons with sufficient confidence.",
+                "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown"},
+                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "reasoning": "No person detected and low confidence in fashion detection.",
+                "cv_detection": cv_description,
+                "person_confidences": person_confidences,
+                "result_id": result_id
+            })
+            return result_id, ai_json, "No fashion items detected", 0
 
         gemini_result = await analyze_image_with_gemini_async(base64_image, product_details, logger=logger, cv_description=cv_description)
         logger.debug(f"Gemini raw response for ResultID {result_id}: {json.dumps(gemini_result, indent=2)}")
@@ -227,7 +258,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             logger.warning(f"Gemini analysis failed for ResultID {result_id}: {gemini_result.get('features', {}).get('reasoning', 'No details')}")
             ai_json = json.dumps({
                 "error": gemini_result.get('features', {}).get('reasoning', 'Gemini analysis failed'),
-                "result_id": result_id
+                "result_id": result_id,
+                "scores": {"sentiment": 0.0, "relevance": 0.0}
             })
             return result_id, ai_json, "Gemini analysis failed", 1
 
@@ -238,14 +270,14 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             "reasoning": "Gemini analysis failed; using CV description"
         })
 
-        description = features.get("description", cv_description or "No description")
+        description = features.get("description", cv_description or "No description").encode('utf-8').decode('utf-8')
         extracted_features = features.get("extracted_features", {})
         try:
             match_score = float(features.get("match_score", 0.5))
         except (ValueError, TypeError):
             logger.warning(f"Invalid match_score for ResultID {result_id}: {features.get('match_score')}")
             match_score = 0.5
-        reasoning = features.get("reasoning", "No reasoning provided")
+        reasoning = features.get("reasoning", "No reasoning provided").encode('utf-8').decode('utf-8')
 
         ai_json = json.dumps({
             "scores": {
@@ -261,6 +293,18 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             "person_confidences": person_confidences,
             "result_id": result_id
         })
+        # Validate JSON before returning
+        try:
+            json.loads(ai_json)
+        except json.JSONDecodeError as e:
+            logger.error(f"Malformed JSON for ResultID {result_id}: {e}, AiJson: {ai_json}")
+            return (
+                result_id,
+                json.dumps({"error": f"Malformed JSON: {e}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
+                "JSON generation failed",
+                1
+            )
+
         ai_caption = description if description.strip() else f"{product_details['brand']} {product_details['category']} item"
         is_fashion = extracted_features.get("category", "unknown").lower() != "unknown"
 
@@ -271,11 +315,10 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         logger.error(f"Unexpected error in process_image for ResultID {result_id}: {e}", exc_info=True)
         return (
             result_id or 0,
-            json.dumps({"error": f"Processing error: {e}", "result_id": result_id or 0}),
-            None,
+            json.dumps({"error": f"Processing error: {e}", "result_id": result_id or 0, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
+            "Processing failed",
             1
         )
-
 
 async def process_entry(
     file_id: int,
@@ -308,18 +351,6 @@ async def process_entry(
                 logger.info(f"Fetched attributes for EntryID: {entry_id}")
             else:
                 logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
-
-        # Update sort order
-        sync_update_search_sort_order(
-            file_id=str(file_id),
-            entry_id=str(entry_id),
-            brand=product_brand,
-            model=product_model,
-            color=product_color,
-            category=product_category,
-            logger=logger
-        )
-        logger.info(f"Updated sort order for EntryID: {entry_id}")
 
         # Process images
         async with aiohttp.ClientSession() as session:
