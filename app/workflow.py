@@ -183,7 +183,7 @@ async def process_restart_batch(
                             continue
 
                         combined_df = pd.concat(dfs, ignore_index=True)
-                        logger.debug(f"Combined DataFrame for EntryID {entry_id}: {combined_df.to偶.to_dict()}")
+                        logger.debug(f"Combined DataFrame for EntryID {entry_id}: {combined_df.to_dict()}")
 
                         for api_col, db_col in api_to_db_mapping.items():
                             if api_col in combined_df.columns and db_col not in combined_df.columns:
