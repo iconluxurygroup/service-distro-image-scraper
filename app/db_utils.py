@@ -299,11 +299,13 @@ import json
 import os
 import aiofiles
 import asyncio
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from sqlalchemy.sql import text
-from config import async_engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from config import conn_str, engine, async_engine
 from aws_s3 import upload_file_to_space
-
+from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or logging.getLogger(__name__)
     try:
@@ -311,18 +313,22 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
         logger.info(f"Exporting DAI JSON for FileID: {file_id}")
 
         # Query data with SQLAlchemy
-        async with async_engine.connect() as conn:
-            query = text("""
+        async with AsyncSession(async_engine) as session:
+            query = """
                 SELECT r.ResultID, r.EntryID, r.AiCaption
                 FROM utb_ImageScraperResult r
                 INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
                 WHERE rec.FileID = :file_id
-            """)
+            """
             params = {"file_id": file_id}
             if entry_ids:
-                query = text(query.text + " AND r.EntryID IN :entry_ids")
+                query += " AND r.EntryID IN :entry_ids"
                 params["entry_ids"] = tuple(entry_ids)
-            df = pd.read_sql_query(query, conn, params=params)
+            
+            # Ensure query is a string for pandas
+            df = await session.run_sync(
+                lambda conn: pd.read_sql_query(query, conn, params=params)
+            )
 
         if df.empty:
             logger.warning(f"No valid data for FileID {file_id}")
@@ -365,7 +371,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
         logger.info(f"Uploaded DAI JSON to {public_url}")
 
         # Update AiCaption column with S3 URL for each ResultID
-        async with async_engine.connect() as conn:
+        async with AsyncSession(async_engine) as session:
             update_query = text("""
                 UPDATE utb_ImageScraperResult
                 SET AiCaption = :public_url
@@ -373,8 +379,8 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
             """)
             updates = [{"public_url": public_url, "result_id": int(row.ResultID)} for row in df.itertuples(index=False)]
             for update in updates:
-                await conn.execute(update_query, update)
-            await conn.commit()
+                await session.execute(update_query, update)
+            await session.commit()
             logger.info(f"Updated AiCaption with S3 URL {public_url} for {len(updates)} records in FileID {file_id}")
 
         return public_url
@@ -382,7 +388,6 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
     except Exception as e:
         logger.error(f"Failed to export DAI JSON for FileID {file_id}: {e}", exc_info=True)
         return ""
-    
 
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
@@ -669,7 +674,7 @@ def sync_update_search_sort_order(
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None
 ) -> Optional[bool]:
-    """Synchronously update the sort order for search results."""
+    """Synchronously update the sort order for search results using SQLAlchemy."""
     from utils import normalize_model, generate_aliases, clean_string
     logger = logger or default_logger
     try:
@@ -677,30 +682,24 @@ def sync_update_search_sort_order(
         entry_id = int(entry_id)
         logger.info(f"🔄 Starting SortOrder update for FileID: {file_id}, EntryID: {entry_id}")
 
-        with pyodbc.connect(conn_str, autocommit=False) as conn:
-            cursor = conn.cursor()
+        with engine.begin() as conn:
             # Reset SortOrder to NULL
-            cursor.execute(
-                """
-                UPDATE utb_ImageScraperResult
-                SET SortOrder = NULL
-                WHERE EntryID = ?
-                """,
-                (entry_id,)
+            conn.execute(
+                text("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID = :entry_id"),
+                {"entry_id": entry_id}
             )
             logger.debug(f"Reset SortOrder to NULL for EntryID {entry_id}")
 
             # Fetch attributes if not provided
             if not all([brand, model]):
-                cursor.execute(
-                    """
-                    SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = ? AND EntryID = ?
-                    """,
-                    (file_id, entry_id)
-                )
-                result = cursor.fetchone()
+                result = conn.execute(
+                    text("""
+                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
+                        FROM utb_ImageScraperRecords
+                        WHERE FileID = :file_id AND EntryID = :entry_id
+                    """),
+                    {"file_id": file_id, "entry_id": entry_id}
+                ).fetchone()
                 if result:
                     brand, model, color, category = result
                     logger.info(f"Fetched attributes - Brand: {brand}, Model: {model}, Color: {color}, Category: {category}")
@@ -711,26 +710,36 @@ def sync_update_search_sort_order(
                     color = color or ''
                     category = category or ''
 
-            # Fetch results
-            query = """
+            # Fetch results with JSON validation
+            query = text("""
                 SELECT 
                     t.ResultID, 
                     t.EntryID,
-                    ISNULL(CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0) AS match_score,
+                    CASE 
+                        WHEN ISJSON(t.AiJson) = 1 
+                        THEN ISNULL(TRY_CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0)
+                        ELSE 0
+                    END AS match_score,
                     t.SortOrder,
                     t.ImageDesc, 
                     t.ImageSource, 
                     t.ImageUrl,
                     r.ProductBrand, 
-                    r.ProductModel
+                    r.ProductModel,
+                    t.AiJson
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = ? AND t.EntryID = ?
-            """
-            df = pd.read_sql_query(query, conn, params=(file_id, entry_id))
+                WHERE r.FileID = :file_id AND t.EntryID = :entry_id
+            """)
+            df = pd.read_sql_query(query, conn, params={"file_id": file_id, "entry_id": entry_id})
             if df.empty:
                 logger.warning(f"No eligible data found for FileID: {file_id}, EntryID: {entry_id}")
                 return False
+
+            # Log invalid JSON
+            invalid_json_rows = df[df['AiJson'].notnull() & (df['AiJson'].str.strip() != '') & (df['match_score'] == 0)]
+            for _, row in invalid_json_rows.iterrows():
+                logger.warning(f"Invalid JSON in ResultID {row['ResultID']}: AiJson={row['AiJson'][:100]}...")
 
             logger.info(f"Fetched {len(df)} rows for EntryID {entry_id}")
 
@@ -825,45 +834,36 @@ def sync_update_search_sort_order(
                 try:
                     result_id = int(row['ResultID'])
                     new_sort_order = int(row['new_sort_order'])
-                    cursor.execute(
-                        """
-                        UPDATE utb_ImageScraperResult 
-                        SET SortOrder = ? 
-                        WHERE ResultID = ?
-                        """,
-                        (new_sort_order, result_id)
+                    conn.execute(
+                        text("""
+                            UPDATE utb_ImageScraperResult 
+                            SET SortOrder = :sort_order 
+                            WHERE ResultID = :result_id
+                        """),
+                        {"sort_order": new_sort_order, "result_id": result_id}
                     )
                     update_count += 1
                     success_count += 1
                     logger.debug(f"Updated SortOrder to {new_sort_order} for ResultID {result_id}")
-                except pyodbc.Error as e:
+                except SQLAlchemyError as e:
                     logger.error(f"Failed to update ResultID {row['ResultID']}: {e}")
                     continue
 
-            conn.commit()
             logger.info(f"Updated {success_count}/{update_count} rows for EntryID {entry_id}")
 
             # Verify updates
-            cursor.execute(
-                """
-                SELECT COUNT(*) 
-                FROM utb_ImageScraperResult 
-                WHERE EntryID = ? AND SortOrder IS NOT NULL
-                """,
-                (entry_id,)
-            )
-            temp_verify = cursor.fetchone()[0]
+            temp_verify = conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id AND SortOrder IS NOT NULL"),
+                {"entry_id": entry_id}
+            ).scalar()
             logger.debug(f"Rows with non-NULL SortOrder after update: {temp_verify}")
 
-            cursor.execute(
-                """
+            verify_query = text("""
                 SELECT ResultID, EntryID, SortOrder, ImageDesc, ImageSource, ImageUrl
                 FROM utb_ImageScraperResult
-                WHERE EntryID = ?
+                WHERE EntryID = :entry_id
                 ORDER BY SortOrder DESC
-                """,
-                (entry_id,)
-            )
+            """)
             results = [
                 {
                     "ResultID": r[0], 
@@ -873,7 +873,7 @@ def sync_update_search_sort_order(
                     "ImageSource": r[4], 
                     "ImageUrl": r[5]
                 }
-                for r in cursor.fetchall()
+                for r in conn.execute(verify_query, {"entry_id": entry_id}).fetchall()
             ]
 
             positive_count = sum(1 for r in results if r['SortOrder'] is not None and r['SortOrder'] > 0)
@@ -895,7 +895,7 @@ def sync_update_search_sort_order(
 
             return success_count > 0
 
-    except pyodbc.Error as e:
+    except SQLAlchemyError as e:
         logger.error(f"Database error updating SortOrder for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
     except ValueError as e:
@@ -904,8 +904,6 @@ def sync_update_search_sort_order(
     except Exception as e:
         logger.error(f"Unexpected error updating SortOrder for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
-
-
 async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
     logger = logger or logging.getLogger(__name__)
     try:
