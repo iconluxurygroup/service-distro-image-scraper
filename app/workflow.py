@@ -432,16 +432,28 @@ async def generate_download_file(
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
 def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, logger: logging.Logger, max_retries: int = 3):
-    """Wrapper for process_entry with retry logic."""
+    """Wrapper for process_entry with retry logic using the main event loop."""
+    loop = asyncio.get_event_loop()
     attempt = 1
     while attempt <= max_retries:
         logger.info(f"Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
         try:
-            updates = run_async_in_thread(process_entry(file_id, entry_id, entry_df, logger))
+            # Validate ResultID
+            if not all(pd.notna(entry_df.get('ResultID', pd.Series([])))):
+                logger.error(f"Invalid ResultID in entry_df for EntryID {entry_id}")
+                return []
+
+            # Run async process_entry
+            future = asyncio.run_coroutine_threadsafe(
+                process_entry(file_id, entry_id, entry_df, logger),
+                loop
+            )
+            updates = future.result(timeout=60)
+
             if not updates:
                 logger.warning(f"No updates returned for EntryID {entry_id} on attempt {attempt}")
                 attempt += 1
-                time.sleep(2)  # Delay between retries
+                time.sleep(2)
                 continue
 
             valid_updates = []
@@ -451,15 +463,15 @@ def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, l
                     continue
                 
                 ai_json, image_is_fashion, ai_caption, result_id = update
-                if not isinstance(ai_json, (str, bytes, bytearray)):
+                if not isinstance(ai_json, str):
                     logger.error(f"Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
-                    continue
+                    ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id})
                 
-                if is_valid_ai_result(ai_json, ai_caption, logger):
-                    valid_updates.append(update)
+                if is_valid_ai_result(ai_json, ai_caption or "", logger):
+                    valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
                 else:
                     logger.warning(f"Invalid AI result for ResultID {result_id} on attempt {attempt}")
-            
+
             if valid_updates:
                 logger.info(f"Valid updates for EntryID {entry_id}: {len(valid_updates)}")
                 return valid_updates
@@ -474,7 +486,15 @@ def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, l
             time.sleep(2)
     
     logger.error(f"Failed to process EntryID {entry_id} after {max_retries} attempts")
-    return []
+    return [
+        (
+            json.dumps({"scores": {"sentiment": 0.0, "relevance": 0.0}, "category": "unknown", "error": "Processing failed"}),
+            False,
+            "Failed to generate caption",
+            int(row.get('ResultID', 0))
+        ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
+    ]
+
 def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
     """Validate AI result: ai_json must be valid JSON with scores, ai_caption must be non-empty."""
     try:
@@ -495,6 +515,7 @@ def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) ->
     except json.JSONDecodeError as e:
         logger.warning(f"Invalid AI result: AiJson is not valid JSON: {e}")
         return False
+
 
 async def batch_vision_reason(
     file_id: str,

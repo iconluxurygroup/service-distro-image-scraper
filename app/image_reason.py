@@ -139,204 +139,161 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
 
     return False
 
-async def process_image(row, session: aiohttp.ClientSession, logger: Optional[logging.Logger] = None):
-    logger = logger or default_logger
+
+async def process_image(row, session: aiohttp.ClientSession, logger: logging.Logger) -> Tuple[int, str, Optional[str], int]:
+    """Process a single image row with Gemini API, ensuring valid JSON output."""
     result_id = row.get("ResultID")
-    default_result = (result_id, json.dumps({"error": "Unknown processing error", "result_id": result_id}), None, 1)
+    default_result = (
+        result_id or 0,
+        json.dumps({"error": "Unknown processing error", "result_id": result_id or 0}),
+        None,
+        1
+    )
 
     try:
-        logger.debug(f"FASHION_LABELS at start of process_image: {FASHION_LABELS}")
-        if result_id is None:
-            logger.error(f"Invalid row data: ResultID missing - row: {row}")
-            return result_id, json.dumps({"error": "Invalid row data: ResultID missing", "result_id": result_id}), None, 1
+        if not result_id or not isinstance(result_id, int):
+            logger.error(f"Invalid ResultID for row: {row}")
+            return default_result
 
-        # Check current SortOrder
+        # Check SortOrder
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT SortOrder FROM utb_ImageScraperResult WHERE ResultID = ?", (result_id,))
             result = cursor.fetchone()
             sort_order = result[0] if result else None
-            logger.debug(f"SortOrder for ResultID {result_id}: {sort_order}")
             if isinstance(sort_order, (int, float)) and sort_order > 0:
                 logger.info(f"Processing image with positive SortOrder for ResultID {result_id}: {sort_order}")
-
-        logger.debug(f"Processing row for ResultID {result_id}: {row}")
-        if isinstance(sort_order, (int, float)) and sort_order < 0:
-            logger.info(f"Skipping ResultID {result_id} due to negative SortOrder: {sort_order}")
-            return result_id, json.dumps({"error": f"Negative SortOrder: {sort_order}", "result_id": result_id}), None, 0
+            elif isinstance(sort_order, (int, float)) and sort_order < 0:
+                logger.info(f"Skipping ResultID {result_id} due to negative SortOrder: {sort_order}")
+                return (
+                    result_id,
+                    json.dumps({"error": f"Negative SortOrder: {sort_order}", "result_id": result_id}),
+                    None,
+                    0
+                )
 
         image_urls = [row["ImageUrl"]]
         if pd.notna(row.get("ImageUrlThumbnail")):
             image_urls.append(row["ImageUrlThumbnail"])
         product_details = {
-            "brand": str(row.get("ProductBrand") or ""),
-            "category": str(row.get("ProductCategory") or ""),
-            "color": str(row.get("ProductColor") or "")
+            "brand": str(row.get("ProductBrand") or "None"),
+            "category": str(row.get("ProductCategory") or "None"),
+            "color": str(row.get("ProductColor") or "None")
         }
 
-        image_data, downloaded_url = await get_image_data_async(image_urls, session, logger)
+        async def get_image_data_async(image_urls: List[str], session: aiohttp.ClientSession) -> Tuple[Optional[bytes], Optional[str]]:
+            for url in image_urls:
+                if not url or not isinstance(url, str) or url.strip() == "":
+                    logger.warning(f"Invalid URL: {url}")
+                    continue
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                        response.raise_for_status()
+                        image_data = await response.read()
+                        logger.info(f"Downloaded image from {url}")
+                        return image_data, url
+                except Exception as e:
+                    logger.warning(f"Failed to download {url}: {e}")
+            return None, None
+
+        image_data, downloaded_url = await get_image_data_async(image_urls, session)
         if not image_data:
             logger.warning(f"Image download failed for ResultID {result_id}")
-            return result_id, json.dumps({"error": f"Image download failed for URLs: {image_urls}", "result_id": result_id}), None, 1
+            return (
+                result_id,
+                json.dumps({"error": f"Image download failed for URLs: {image_urls}", "result_id": result_id}),
+                None,
+                1
+            )
 
         base64_image = base64.b64encode(image_data).decode("utf-8")
+        from PIL import Image
+        from io import BytesIO
         Image.open(BytesIO(image_data)).convert("RGB")
 
         cv_success, cv_description, person_confidences = await detect_objects_with_computer_vision_async(base64_image, logger)
-        if not cv_success and not cv_description:
+        if not cv_success or not cv_description:
             logger.warning(f"Computer vision detection failed for ResultID {result_id}: {cv_description}")
-            return result_id, json.dumps({"error": cv_description, "result_id": result_id}), None, 1
-
-        def extract_labels(description):
-            cls_label = None
-            seg_label = None
-            if description.startswith("Classification:"):
-                cls_match = re.search(r"Classification: (\w+(?:\s+\w+)*) \(confidence:", description)
-                cls_label = cls_match.group(1) if cls_match else None
-            if "Segmented objects:" in description:
-                seg_match = re.search(r"(\w+(?:\s+\w+)*) \(confidence: [\d.]+, mask area:", description)
-                seg_label = seg_match.group(1) if seg_match else None
-            return cls_label, seg_label
-
-        cls_label, seg_label = extract_labels(cv_description)
-
-        detected_objects = cv_description.split("\n")[2:] if "Segmented objects:" in cv_description else []
-        labels = [label for label in [cls_label, seg_label] if label]
-        is_fashion = any(label.lower() in [fl.lower() for fl in FASHION_LABELS] for label in labels if label)
-        non_fashion_labels = [label for label in labels if label.lower() not in [fl.lower() for fl in FASHION_LABELS]]
-        if len(detected_objects) > 1 and not is_fashion:
-            logger.info(f"Discarding image for ResultID {result_id} due to multiple non-fashion objects: {non_fashion_labels}")
-            ai_json = json.dumps({
-                "description": f"Image contains multiple objects: {non_fashion_labels}, none of which are fashion-related.",
-                "extracted_features": {"brand": "Unknown", "category": "Multiple", "color": "Unknown"},
-                "match_score": 0.0,
-                "reasoning": f"Multiple non-fashion objects detected: {non_fashion_labels}.",
-                "cv_detection": cv_description,
-                "person_confidences": person_confidences,
-                "result_id": result_id
-            })
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = -6, AiJson = ? WHERE ResultID = ?", (ai_json, result_id))
-                conn.commit()
-                logger.info(f"Updated database with SortOrder=-6 for ResultID {result_id}")
-            return result_id, ai_json, cv_description, 0
-
-        person_detected = any(conf > 0.5 for conf in person_confidences)
-        cls_conf = float(re.search(r"Classification: \w+(?:\s+\w+)* \(confidence: ([\d.]+)\)", cv_description).group(1)) if cls_label else 0.0
-        seg_conf = float(re.search(r"confidence: ([\d.]+), mask area:", cv_description).group(1)) if seg_label else 0.0
-        if not person_detected and not is_fashion and max(cls_conf, seg_conf) < 0.2:
-            logger.info(f"Discarding image for ResultID {result_id} due to no person and low confidence")
-            ai_json = json.dumps({
-                "description": "Image lacks fashion items and persons with sufficient confidence.",
-                "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown"},
-                "match_score": 0.0,
-                "reasoning": "No person detected and low confidence in fashion detection.",
-                "cv_detection": cv_description,
-                "person_confidences": person_confidences,
-                "result_id": result_id
-            })
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE utb_ImageScraperResult SET SortOrder = -6, AiJson = ? WHERE ResultID = ?", (ai_json, result_id))
-                conn.commit()
-                logger.info(f"Updated database with SortOrder=-6 for ResultID {result_id}")
-            return result_id, ai_json, cv_description, 0
-
-        expected_category = product_details.get("category", "").lower()
-        inferred_category = None
-        if not expected_category and is_fashion:
-            for label in labels:
-                if label.lower() in [fl.lower() for fl in FASHION_LABELS]:
-                    inferred_category = label
-                    logger.info(f"Inferred category '{inferred_category}' for ResultID {result_id} from detected label")
-                    break
-
-        if cls_label and not is_related_to_category(cls_label, expected_category or inferred_category or ""):
-            logger.warning(f"Detected label '{cls_label}' not related to category '{expected_category or inferred_category or 'None'}'")
-            cv_description += f"\nWarning: Detected classification may be irrelevant to category '{expected_category or inferred_category or 'None'}'."
-        if seg_label and not is_related_to_category(seg_label, expected_category or inferred_category or ""):
-            logger.warning(f"Detected label '{seg_label}' not related to category '{expected_category or inferred_category or 'None'}'")
-            cv_description += f"\nWarning: Detected segmentation may be irrelevant to category '{expected_category or inferred_category or 'None'}'."
+            return (
+                result_id,
+                json.dumps({"error": cv_description or "CV detection failed", "result_id": result_id}),
+                None,
+                1
+            )
 
         gemini_result = await analyze_image_with_gemini_async(base64_image, product_details, logger=logger, cv_description=cv_description)
-        if not gemini_result["success"]:
+        logger.debug(f"Gemini raw response for ResultID {result_id}: {json.dumps(gemini_result, indent=2)}")
+
+        if not gemini_result.get("success", False):
             logger.warning(f"Gemini analysis failed for ResultID {result_id}: {gemini_result.get('features', {}).get('reasoning', 'No details')}")
+            ai_json = json.dumps({
+                "error": gemini_result.get('features', {}).get('reasoning', 'Gemini analysis failed'),
+                "result_id": result_id
+            })
+            return result_id, ai_json, "Gemini analysis failed", 1
+
         features = gemini_result.get("features", {
             "description": cv_description,
-            "extracted_features": {"brand": "Unknown", "category": inferred_category or "Unknown", "color": "Unknown"},
+            "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown"},
             "match_score": 0.5,
-            "reasoning": "Gemini analysis failed; using computer vision description with default score."
+            "reasoning": "Gemini analysis failed; using CV description"
         })
 
-        description = features.get("description", cv_description)
+        description = features.get("description", cv_description or "No description")
         extracted_features = features.get("extracted_features", {})
         try:
             match_score = float(features.get("match_score", 0.5))
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid match_score value '{features.get('match_score')}' for ResultID {result_id}: {e}. Using default 0.5")
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid match_score for ResultID {result_id}: {features.get('match_score')}")
             match_score = 0.5
-        logger.debug(f"match_score type: {type(match_score)}, value: {match_score} for ResultID {result_id}")
         reasoning = features.get("reasoning", "No reasoning provided")
 
-        if match_score < 0.1 and product_details:
-            valid_details = sum(1 for v in product_details.values() if v != "None")
-            matches = sum(
-                1 for k, v in product_details.items()
-                if v != "None" and v.lower() in str(extracted_features.get(k, "")).lower()
-            )
-            heuristic_score = matches / max(1, valid_details) if valid_details > 0 else 1.0
-            match_score = max(match_score, heuristic_score)
-            reasoning = reasoning + f" Adjusted with heuristic: {heuristic_score:.2f}"
-
-        raw_category = (product_details.get("category") or inferred_category or extracted_features.get("category", "")).strip().lower()
-        normalized_category = raw_category
-        if raw_category:
-            category_parts = raw_category.split()
-            base_candidates = [part for part in category_parts if part]
-            for candidate in reversed(base_candidates):
-                singular = candidate[:-1] if candidate.endswith("s") else candidate
-                plural = f"{candidate}s" if not candidate.endswith("s") else candidate
-                for form in [candidate, singular, plural]:
-                    if form in category_hierarchy or any(form in sublist for sublist in category_hierarchy.values()):
-                        normalized_category = form
-                        logger.info(f"Normalized '{raw_category}' to '{normalized_category}'")
-                        break
-                if normalized_category != raw_category:
-                    break
-
         ai_json = json.dumps({
-            "description": description,
-            "extracted_features": {
-                "brand": extracted_features.get("brand", "Unknown"),
-                "color": extracted_features.get("color", "Unknown"),
-                "category": normalized_category
+            "scores": {
+                "sentiment": match_score,
+                "relevance": match_score
             },
-            "match_score": match_score,
+            "category": extracted_features.get("category", "unknown"),
+            "keywords": [extracted_features.get("category", "unknown").lower()],
+            "description": description,
+            "extracted_features": extracted_features,
             "reasoning": reasoning,
             "cv_detection": cv_description,
             "person_confidences": person_confidences,
             "result_id": result_id
         })
-        ai_caption = description
-        logger.info(f"Processed ResultID {result_id} successfully with SortOrder {sort_order}")
+        ai_caption = description if description.strip() else f"{product_details['brand']} {product_details['category']} item"
+        is_fashion = extracted_features.get("category", "unknown").lower() != "unknown"
+
+        logger.info(f"Processed ResultID {result_id} successfully")
         return result_id, ai_json, ai_caption, 1 if is_fashion else 0
 
     except Exception as e:
-        logger.error(f"Unexpected error in process_image for ResultID {result_id}: {str(e)}", exc_info=True)
-        ai_json = json.dumps({"error": f"Processing error: {str(e)}", "result_id": result_id})
-        return result_id, ai_json, None, 1
+        logger.error(f"Unexpected error in process_image for ResultID {result_id}: {e}", exc_info=True)
+        return (
+            result_id or 0,
+            json.dumps({"error": f"Processing error: {e}", "result_id": result_id or 0}),
+            None,
+            1
+        )
 
 async def process_entry(
     file_id: int,
     entry_id: int,
     entry_df: pd.DataFrame,
     logger: logging.Logger
-) -> List[Tuple[int, str, Optional[str], int]]:
+) -> List[Tuple[str, bool, str, int]]:
+    """Process image entries for an EntryID, ensuring valid updates."""
     logger.info(f"Starting task for EntryID: {entry_id} with {len(entry_df)} rows for FileID: {file_id}")
     updates = []
 
     try:
+        # Validate entry_df
+        if not all(col in entry_df.columns for col in ['ResultID', 'ImageUrl']):
+            logger.error(f"Missing required columns in entry_df for EntryID {entry_id}: {entry_df.columns}")
+            return []
+
+        # Fetch product attributes
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -352,6 +309,7 @@ async def process_entry(
             else:
                 logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
+        # Update sort order
         sync_update_search_sort_order(
             file_id=str(file_id),
             entry_id=str(entry_id),
@@ -363,21 +321,23 @@ async def process_entry(
         )
         logger.info(f"Updated sort order for EntryID: {entry_id}")
 
+        # Process images
         async with aiohttp.ClientSession() as session:
-            tasks = [process_image(row, session, logger) for _, row in entry_df.iterrows()]
+            tasks = [process_image(row, session, logger) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
                     logger.error(f"Error in process_image: {result}")
                     continue
-                if result is None:
-                    logger.error(f"process_image returned None for row")
+                if not result or not isinstance(result, tuple) or len(result) != 4:
+                    logger.error(f"Invalid result from process_image: {result}")
                     continue
-                updates.append(result)
+                result_id, ai_json, ai_caption, is_fashion = result
+                updates.append((ai_json, is_fashion, ai_caption, result_id))
 
         logger.info(f"Completed task for EntryID: {entry_id} with {len(updates)} updates")
         return updates
 
     except Exception as e:
         logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-        return [(row.get("ResultID"), json.dumps({"error": f"Entry processing error: {str(e)}", "result_id": row.get("ResultID")}), None, 1) for _, row in entry_df.iterrows()]
+        return []

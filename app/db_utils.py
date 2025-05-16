@@ -546,8 +546,9 @@ def sync_update_search_sort_order(
         return None
 import datetime
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
-    """Export AiJson and AiCaption data to a JSON file and upload to S3."""
+    """Export AiJson and AiCaption data to per-entry JSON files and upload to S3."""
     try:
+        json_urls = []
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             query = """
@@ -561,49 +562,53 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
                 params.extend(entry_ids)
             
             cursor.execute(query, params)
-            results = [
-                {
+            entry_results = {}
+            for row in cursor.fetchall():
+                entry_id = row[1]
+                result = {
                     "ResultID": row[0],
                     "EntryID": row[1],
                     "AiJson": json.loads(row[2]) if row[2] else {},
                     "AiCaption": row[3],
-                    "ImageIsFashion": row[4]
+                    "ImageIsFashion": bool(row[4])
                 }
-                for row in cursor.fetchall()
-            ]
-        
-        if not results:
+                if entry_id not in entry_results:
+                    entry_results[entry_id] = []
+                entry_results[entry_id].append(result)
+
+        if not entry_results:
             logger.warning(f"No valid AI results to export for FileID {file_id}")
             return ""
 
-        # Generate JSON file
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        json_filename = f"result_{file_id}_{timestamp}.json"
         temp_json_dir = f"temp_json_{file_id}"
         os.makedirs(temp_json_dir, exist_ok=True)
-        local_json_path = os.path.join(temp_json_dir, json_filename)
 
-        async with aiofiles.open(local_json_path, 'w') as f:
-            await f.write(json.dumps(results, indent=2))
-        
-        logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
-        logger.debug(f"JSON content sample: {json.dumps(results[:2], indent=2)}")
+        for entry_id, results in entry_results.items():
+            json_filename = f"result_{entry_id}_{timestamp}.json"
+            local_json_path = os.path.join(temp_json_dir, json_filename)
 
-        # Upload to S3
-        s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
-        public_url = await upload_file_to_space(
-            local_json_path, s3_key, public=True, logger=logger, file_id=file_id
-        )
-        
-        if public_url:
-            logger.info(f"Exported DAI JSON to {public_url}")
-            # Clean up local file
+            async with aiofiles.open(local_json_path, 'w') as f:
+                await f.write(json.dumps(results, indent=2))
+            
+            logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
+            logger.debug(f"JSON content sample for EntryID {entry_id}: {json.dumps(results[:2], indent=2)}")
+
+            s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
+            public_url = await upload_file_to_space(
+                local_json_path, s3_key, public=True, logger=logger, file_id=file_id
+            )
+            
+            if public_url:
+                logger.info(f"Exported JSON for EntryID {entry_id} to {public_url}")
+                json_urls.append(public_url)
+            else:
+                logger.error(f"Failed to upload JSON for EntryID {entry_id}")
+            
             os.remove(local_json_path)
-            os.rmdir(temp_json_dir)
-        else:
-            logger.error(f"Failed to upload DAI JSON to S3 for FileID {file_id}")
-        
-        return public_url
+
+        os.rmdir(temp_json_dir)
+        return json_urls[0] if json_urls else ""
 
     except Exception as e:
         logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
