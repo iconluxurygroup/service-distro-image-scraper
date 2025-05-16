@@ -153,7 +153,10 @@ def double_encode_plus(filename, logger=None):
     logger.debug(f"Double-encoded filename: {second_pass}")
     return second_pass
 
-async def upload_file_to_space(file_src, save_as, is_public=True, logger=None, file_id=None):
+async def upload_file_to_space(file_src, save_as, is_public=True, public=None, logger=None, file_id=None):
+    if public is not None:
+        is_public = public  # Map public to is_public
+        logger.warning("Use of 'public' parameter is deprecated; use 'is_public' instead")
     logger = logger or default_logger
     if logger == default_logger and file_id:
         logger, _ = setup_job_logger(job_id=file_id, console_output=True)
