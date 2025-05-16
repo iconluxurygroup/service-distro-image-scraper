@@ -299,16 +299,17 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
         file_id = int(file_id)
         logger.info(f"Exporting DAI JSON for FileID: {file_id}")
 
-        # Query AiJson from database
+        # Query AiJson from database with join
         with pyodbc.connect(conn_str) as conn:
             query = """
-                SELECT ResultID, EntryID, AiJson
-                FROM utb_ImageScraperResult
-                WHERE FileID = ? AND AiJson IS NOT NULL AND ISJSON(AiJson) = 1
+                SELECT r.ResultID, r.EntryID, r.AiJson
+                FROM utb_ImageScraperResult r
+                INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
+                WHERE rec.FileID = ? AND r.AiJson IS NOT NULL AND ISJSON(r.AiJson) = 1
             """
             params = [file_id]
             if entry_ids:
-                query += " AND EntryID IN ({})".format(','.join('?' * len(entry_ids)))
+                query += " AND r.EntryID IN ({})".format(','.join('?' * len(entry_ids)))
                 params.extend(entry_ids)
             df = pd.read_sql_query(query, conn, params=params)
 
