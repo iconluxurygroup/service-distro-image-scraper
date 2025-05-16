@@ -470,7 +470,18 @@ async def batch_vision_reason(
             results = list(executor.map(process_entry_wrapper, entry_ids_to_process))
             for entry_id, updates in zip(entry_ids_to_process, results):
                 if updates:
-                    valid_updates.extend(updates)
+                    for update in updates:
+                        try:
+                            ai_json = update[0]
+                            if ai_json:
+                                json.loads(ai_json)  # Validate JSON
+                                logger.debug(f"Valid AiJson for ResultID {update[3]}: {ai_json[:100]}...")
+                            else:
+                                logger.warning(f"Empty AiJson for ResultID {update[3]}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Invalid JSON for ResultID {update[3]}: {ai_json[:100]}... Error: {e}")
+                            continue
+                        valid_updates.append(update)
                     logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
                 else:
                     logger.warning(f"No updates for EntryID: {entry_id}")
@@ -481,7 +492,17 @@ async def batch_vision_reason(
                 query = "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?"
                 cursor.executemany(query, valid_updates)
                 conn.commit()
-                logger.info(f"Updated {len(valid_updates)} records: {[update[0] for update in valid_updates]}")
+                logger.info(f"Updated {len(valid_updates)} records: {[update[3] for update in valid_updates]}")
+
+                # Verify updates
+                result_ids = [update[3] for update in valid_updates]
+                cursor.execute("""
+                    SELECT ResultID, AiJson
+                    FROM utb_ImageScraperResult
+                    WHERE ResultID IN ({})
+                """.format(','.join('?' * len(result_ids))), result_ids)
+                for row in cursor.fetchall():
+                    logger.info(f"Verified ResultID {row[0]}: AiJson = {row[1][:100]}...")
 
         for entry_id in entry_ids_to_process:
             with pyodbc.connect(conn_str) as conn:
@@ -511,12 +532,20 @@ async def batch_vision_reason(
             )
             logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
 
+        # Export AiJson to DAI JSON file
+        json_url = await export_dai_json(file_id, entry_ids, logger)
+        if json_url:
+            logger.info(f"DAI JSON exported to {json_url}")
+            # Update log URL in database (optional, if you want to track JSON URL)
+            await update_log_url_in_db(file_id, json_url, logger)
+        else:
+            logger.warning(f"Failed to export DAI JSON for FileID: {file_id}")
+
     except Exception as e:
         logger.error(f"🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
         raise
 
 def run_async_in_thread(coro):
-    """Run an async coroutine in a thread and return the result."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
