@@ -377,7 +377,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]] = None, l
         # Upload to S3 with retry
         public_url = ""
         for attempt in range(3):
-            public_url = await upload_file_to_space(local_path, output_path, True, logger, file_id, content_type='application/json')
+            public_url = await upload_file_to_space(local_path, output_path, True, logger, file_id)
             if public_url:
                 break
             logger.warning(f"Retrying S3 upload (attempt {attempt + 1}/3)")
