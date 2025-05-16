@@ -431,6 +431,7 @@ async def generate_download_file(
         logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
 
 
+
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
@@ -469,7 +470,8 @@ async def batch_vision_reason(
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             results = list(executor.map(process_entry_wrapper, entry_ids_to_process))
             for updates in results:
-                valid_updates.extend(updates)
+                if updates:
+                    valid_updates.extend(updates)
 
         if valid_updates:
             with pyodbc.connect(conn_str) as conn:
@@ -488,11 +490,12 @@ async def batch_vision_reason(
                     WHERE FileID = ? AND EntryID = ?
                 """, (file_id, entry_id))
                 result = cursor.fetchone()
+                product_brand = product_model = product_color = product_category = ''
                 if result:
                     product_brand, product_model, product_color, product_category = result
                 else:
-                    product_brand = product_model = product_color = product_category = ''
-            
+                    logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
+
             await asyncio.get_event_loop().run_in_executor(
                 None, lambda: sync_update_search_sort_order(
                     file_id=str(file_id),
@@ -509,3 +512,12 @@ async def batch_vision_reason(
     except Exception as e:
         logger.error(f"🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
         raise
+
+def run_async_in_thread(coro):
+    """Run an async coroutine in a thread and return the result."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()

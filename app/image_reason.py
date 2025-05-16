@@ -284,13 +284,14 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
         logger.error(f"Unexpected error in process_image for ResultID {result_id}: {str(e)}", exc_info=True)
         return default_result
 
-async def process_entry(
+def process_entry(
     file_id: int,
     entry_id: int,
     entry_df: pd.DataFrame,
     logger: logging.Logger
 ) -> List[Tuple[int, str, Optional[str], int]]:
-    logger.info(f"Starting task for EntryID: {entry_id} with {len(entry_df)} rows")
+    logger.info(f"Starting task for EntryID: {entry_id} with {len(entry_df)} rows for FileID: {file_id}")
+    updates = []
 
     try:
         with pyodbc.connect(conn_str) as conn:
@@ -301,133 +302,41 @@ async def process_entry(
                 WHERE FileID = ? AND EntryID = ?
             """, (file_id, entry_id))
             result = cursor.fetchone()
+            product_brand = product_model = product_color = product_category = ''
             if result:
                 product_brand, product_model, product_color, product_category = result
                 logger.info(f"Fetched attributes for EntryID: {entry_id}")
             else:
-                logger.warning(f"No attributes found for FileID: {file_id}, EntryID: {entry_id}")
-                product_brand = product_model = product_color = product_category = ''
+                logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: sync_update_search_sort_order(
-                file_id=str(file_id),
-                entry_id=str(entry_id),
-                brand=product_brand,
-                model=product_model,
-                color=product_color,
-                category=product_category,
-                logger=logger
-            )
+        sync_update_search_sort_order(
+            file_id=str(file_id),
+            entry_id=str(entry_id),
+            brand=product_brand,
+            model=product_model,
+            color=product_color,
+            category=product_category,
+            logger=logger
         )
-        logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
+        logger.info(f"Updated sort order for EntryID: {entry_id}")
 
-        async with aiohttp.ClientSession() as session:
-            updates = []
-            for _, row in entry_df.iterrows():
-                result = await process_image(row, session, logger)
-                if result is None:
-                    logger.error(f"process_image returned None for row: {row}")
-                    updates.append((row.get("ResultID"), json.dumps({"error": "process_image returned None"}), None, 1))
-                else:
-                    updates.append(result)
-        logger.info(f"Completed task for EntryID: {entry_id}")
+        async def process_images():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                results = []
+                for _, row in entry_df.iterrows():
+                    result = await process_image(row, session, logger)
+                    if result is None:
+                        logger.error(f"process_image returned None for row: {row}")
+                        results.append((row.get("ResultID"), '{"error": "process_image returned None"}', None, 1))
+                    else:
+                        results.append(result)
+                return results
+
+        updates = run_async_in_thread(process_images())
+        logger.info(f"Completed task for EntryID: {entry_id} with {len(updates)} updates")
         return updates
 
     except Exception as e:
         logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-        return [(row.get("ResultID"), json.dumps({"error": f"Entry processing error: {str(e)}"}), None, 1) for _, row in entry_df.iterrows()]
-
-@ray.remote(num_cpus=1, num_gpus=0.5)  # Adjust based on hardware
-def process_entry_remote(
-    file_id: int,
-    entry_id: int,
-    entry_df: pd.DataFrame,
-    logger: logging.Logger
-) -> List[Tuple[int, str, Optional[str], int]]:
-    return asyncio.run(process_entry(file_id, entry_id, entry_df, logger))
-
-async def batch_process_images(
-    file_id: str,
-    entry_ids: Optional[List[int]] = None,
-    step: int = 0,
-    limit: int = 5000,
-    concurrency: int = 10,
-    logger: Optional[logging.Logger] = None
-) -> None:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        logger.info(f"📷 Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
-
-        df = await fetch_missing_images(file_id, limit, True, logger)
-        if df.empty:
-            logger.warning(f"⚠️ No missing images found for FileID: {file_id}")
-            return
-
-        if entry_ids is not None:
-            df = df[df['EntryID'].isin(entry_ids)]
-            if df.empty:
-                logger.warning(f"⚠️ No missing images found for specified EntryIDs: {entry_ids}")
-                return
-
-        columns_to_drop = ['Step1', 'Step2', 'Step3', 'Step4', 'CreateTime_1', 'CreateTime_2']
-        df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
-        logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
-        entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
-
-        semaphore = asyncio.Semaphore(concurrency)
-        futures = []
-
-        async def submit_task(entry_id, entry_df):
-            async with semaphore:
-                logger.info(f"Submitting Ray task for EntryID: {entry_id}")
-                future = process_entry_remote.remote(file_id, entry_id, entry_df, logger)
-                futures.append(future)
-
-        tasks = [submit_task(entry_id, df[df['EntryID'] == entry_id]) for entry_id in entry_ids_to_process]
-        await asyncio.gather(*tasks)
-
-        results = ray.get(futures)
-        valid_updates = []
-        for updates in results:
-            valid_updates.extend(updates)
-
-        if valid_updates:
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                query = "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?"
-                cursor.executemany(query, valid_updates)
-                conn.commit()
-                logger.info(f"Updated {len(valid_updates)} records")
-
-        for entry_id in entry_ids_to_process:
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = ? AND EntryID = ?
-                """, (file_id, entry_id))
-                result = cursor.fetchone()
-                if result:
-                    product_brand, product_model, product_color, product_category = result
-                else:
-                    product_brand = product_model = product_color = product_category = ''
-            
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: sync_update_search_sort_order(
-                    file_id=str(file_id),
-                    entry_id=str(entry_id),
-                    brand=product_brand,
-                    model=product_model,
-                    color=product_color,
-                    category=product_category,
-                    logger=logger
-                )
-            )
-            logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
-
-    except Exception as e:
-        logger.error(f"🔴 Error in batch_process_images for FileID {file_id}: {e}", exc_info=True)
-        raise
+        return [(row.get("ResultID"), f'{{"error": "Entry processing error: {str(e)}"}}', None, 1) for _, row in entry_df.iterrows()]

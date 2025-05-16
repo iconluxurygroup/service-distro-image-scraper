@@ -243,6 +243,9 @@ async def api_restart_search_all(file_id: str, entry_id: int = None):
                 logger=logger
             )
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
+
+
+
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
     file_id: str,
@@ -267,8 +270,8 @@ async def api_process_ai_images(
         if result["status_code"] != 200:
             logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        logger.info(f"Completed AI image processing for FileID {file_id}")
-        return {"status_code": 200, "message": f"AI image processing completed for FileID {file_id}", "data": result["data"]}
+        logger.info(f"Completed AI image processing for FileID: {file_id}")
+        return {"status_code": 200, "message": f"AI image processing completed for FileID: {file_id}", "data": result["data"]}
     except Exception as e:
         logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
         if os.path.exists(log_filename):
@@ -277,6 +280,7 @@ async def api_process_ai_images(
             )
             await update_log_url_in_db(file_id, upload_url, logger)
         raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
+
     
 # Export-related endpoints
 @router.post("/generate-download-file/{file_id}", tags=["Export"])
