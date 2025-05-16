@@ -17,7 +17,11 @@ default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
+# Configuration file paths
+CONFIG_FILES = {
+    "category_mapping": "category_mapping.json",
+    "non_fashion_labels": "non_fashion_labels.json"
+}
 # Initialize YOLOv11 models
 try:
     CLS_MODEL = YOLO("yolo11m-cls.pt", task="classify", verbose=True)
