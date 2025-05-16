@@ -88,7 +88,6 @@ FASHION_LABELS = load_config(fashion_labels_url, fashion_labels_example, default
 CATEGORY_MAPPING = load_config(category_mapping_url, category_mapping_example, default_logger, "CATEGORY_MAPPING")
 category_hierarchy = load_config(category_hierarchy_url, category_hierarchy_example, default_logger, "category_hierarchy")
 
-
 async def get_image_data_async(
     image_urls: List[str],
     session: aiohttp.ClientSession,
@@ -131,22 +130,6 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
 
     detected_label = detected_label.lower().strip()
     if not expected_category:
-        global FASHION_LABELS
-        if FASHION_LABELS is None:
-            for attempt in range(3):
-                try:
-                    response = requests.get(fashion_labels_url, timeout=10)
-                    response.raise_for_status()
-                    FASHION_LABELS = response.json()
-                    if not isinstance(FASHION_LABELS, list):
-                        raise ValueError("fashion_labels must be a list")
-                    logger.info("Loaded FASHION_LABELS")
-                    break
-                except Exception as e:
-                    logger.warning(f"Failed to load FASHION_LABELS (attempt {attempt + 1}): {e}")
-                    if attempt == 2:
-                        FASHION_LABELS = fashion_labels_example
-                        logger.info("Using example FASHION_LABELS")
         if detected_label in FASHION_LABELS:
             logger.info(f"No expected category provided; accepting fashion-related label '{detected_label}'")
             return True
@@ -157,21 +140,6 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
     if detected_label in expected_category:
         return True
 
-    global CATEGORY_MAPPING
-    if CATEGORY_MAPPING is None:
-        for attempt in range(3):
-            try:
-                response = requests.get(category_mapping_url, timeout=10)
-                response.raise_for_status()
-                CATEGORY_MAPPING = response.json()
-                logger.info("Loaded CATEGORY_MAPPING")
-                break
-            except Exception as e:
-                logger.warning(f"Failed to load CATEGORY_MAPPING (attempt {attempt + 1}): {e}")
-                if attempt == 2:
-                    CATEGORY_MAPPING = category_mapping_example
-                    logger.info("Using example CATEGORY_MAPPING")
-
     mapped_label = CATEGORY_MAPPING.get(detected_label, detected_label)
     if mapped_label in expected_category:
         return True
@@ -180,21 +148,6 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
     if "sneaker" in expected_category and detected_label in sneaker_synonyms:
         logger.info(f"Matched '{detected_label}' to 'sneaker' in category '{expected_category}'")
         return True
-
-    global category_hierarchy
-    if category_hierarchy is None:
-        for attempt in range(3):
-            try:
-                response = requests.get(category_hierarchy_url, timeout=10)
-                response.raise_for_status()
-                category_hierarchy = response.json()
-                logger.info("Loaded category_hierarchy")
-                break
-            except Exception as e:
-                logger.warning(f"Failed to load category_hierarchy (attempt {attempt + 1}): {e}")
-                if attempt == 2:
-                    category_hierarchy = category_hierarchy_example
-                    logger.info("Using example category_hierarchy")
 
     for parent, children in category_hierarchy.items():
         if parent in expected_category and mapped_label in children:
@@ -214,6 +167,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
     default_result = (result_id, json.dumps({"error": "Unknown processing error"}), None, 1)
 
     try:
+        logger.debug(f"FASHION_LABELS at start of process_image: {FASHION_LABELS}")
         if result_id is None:
             logger.error(f"Invalid row data: ResultID missing - row: {row}")
             return result_id, json.dumps({"error": "Invalid row data: ResultID missing"}), None, 1
@@ -326,7 +280,13 @@ async def process_image(row, session: aiohttp.ClientSession, logger: Optional[lo
 
         description = features.get("description", cv_description)
         extracted_features = features.get("extracted_features", {})
-        match_score = features.get("match_score", 0.5)
+        # Ensure match_score is a float
+        try:
+            match_score = float(features.get("match_score", 0.5))
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid match_score value '{features.get('match_score')}' for ResultID {result_id}: {e}. Using default 0.5")
+            match_score = 0.5
+        logger.debug(f"match_score type: {type(match_score)}, value: {match_score} for ResultID {result_id}")
         reasoning = features.get("reasoning", "No reasoning provided")
 
         if match_score < 0.1 and product_details:
