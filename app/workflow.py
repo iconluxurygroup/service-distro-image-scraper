@@ -458,6 +458,22 @@ from aws_s3 import upload_file_to_space
 from email_utils import send_email
 from config import conn_str
 import pyodbc
+import pandas as pd
+import logging
+import os
+import asyncio
+import httpx
+import aiofiles
+import datetime
+from typing import Optional, Dict, List
+from database import get_images_excel_db
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from image_utils import download_all_images
+from common import create_temp_dirs, cleanup_temp_dirs
+from aws_s3 import upload_file_to_space
+from email_utils import send_email
+from config import conn_str
+import pyodbc
 
 async def generate_download_file(
     file_id: int,
@@ -484,7 +500,7 @@ async def generate_download_file(
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory before fetching images: RSS={mem_info.rss / 1024**2:.2f} MB")
         
-        # Use synchronous query to avoid aioodbc issues
+        # Use synchronous query (no await)
         selected_images_df = get_images_excel_db(str(file_id), logger=logger)
         logger.info(f"Fetched DataFrame for ID {file_id}, shape: {selected_images_df.shape}, columns: {list(selected_images_df.columns)}")
         
@@ -632,7 +648,6 @@ async def generate_download_file(
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"Worker PID {process.pid}: 🧹 Cleaned up temporary directories for ID {file_id}")
-
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
