@@ -284,35 +284,234 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
             await update_log_url_in_db(file_id, upload_url, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
 
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space, upload_file_to_space_sync
+from email_utils import send_message_email
+import logging
+import asyncio
+import os
+import json
+import traceback
+import psutil
+import pyodbc
+import datetime
+from typing import Optional, List
+from workflow import process_restart_batch
+from database import update_log_url_in_db, fetch_last_valid_entry
+from config import conn_str  # Import conn_str from config
+
+# Initialize FastAPI app
+app = FastAPI(title="super_scraper", version="1.0")
+router = APIRouter()
+
+# Default logger
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+# Existing run_job_with_logging and monitor_and_resubmit_failed_jobs (unchanged)
+async def run_job_with_logging(job_func, file_id, **kwargs) -> dict:
+    file_id_str = str(file_id)
+    logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
+    result = None
+    debug_info = {"memory_usage": {}, "log_file": log_file}
+    try:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.info(f"Starting job {func_name} for FileID: {file_id}")
+
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
+
+        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+            result = await job_func(file_id, **kwargs)
+        else:
+            result = job_func(file_id, **kwargs)
+
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        if debug_info["memory_usage"]["after"] > 1000:
+            logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+
+        logger.info(f"Completed job {func_name} for FileID: {file_id}")
+        return {
+            "status_code": 200,
+            "message": f"Job {func_name} completed successfully for FileID: {file_id}",
+            "data": result,
+            "debug_info": debug_info
+        }
+    except Exception as e:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {str(e)}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        debug_info["error_traceback"] = traceback.format_exc()
+        return {
+            "status_code": 500,
+            "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
+            "data": None,
+            "debug_info": debug_info
+        }
+    finally:
+        if os.path.exists(log_file):
+            try:
+                upload_result = upload_file_to_space(
+                    file_src=log_file,
+                    save_as=f"job_logs/job_{file_id_str}.log",
+                    is_public=True,
+                    logger=logger,  # Pass logger object
+                    file_id=file_id_str
+                )
+                upload_url = await upload_result if asyncio.iscoroutine(upload_result) else upload_result
+                await update_log_url_in_db(file_id_str, upload_url, logger)
+                logger.info(f"Log uploaded to: {upload_url}")
+                debug_info["log_url"] = upload_url
+            except Exception as upload_error:
+                logger.warning(f"Async upload failed for FileID {file_id_str}: {upload_error}")
+                upload_url = upload_file_to_space_sync(
+                    file_src=log_file,
+                    save_as=f"job_logs/job_{file_id_str}.log",
+                    is_public=True,
+                    logger=logger,  # Pass logger object
+                    file_id=file_id_str
+                )
+                await update_log_url_in_db(file_id_str, upload_url, logger)
+                logger.info(f"Log uploaded to: {upload_url}")
+                debug_info["log_url"] = upload_url
+        else:
+            logger.warning(f"Log file {log_file} does not exist, skipping upload")
+            debug_info["log_url"] = None
+
+async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger):
+    log_file = f"job_logs/job_{file_id}.log"
+    max_attempts = 3
+    attempt = 1
+
+    while attempt <= max_attempts:
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                log_content = f.read()
+                if "WORKER TIMEOUT" in log_content or "SIGKILL" in log_content:
+                    logger.warning(f"Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
+                    last_entry_id = await fetch_last_valid_entry(file_id, logger)
+                    if last_entry_id:
+                        logger.info(f"Resubmitting job for FileID: {file_id} starting from EntryID: {last_entry_id}")
+                        result = await process_restart_batch(
+                            file_id_db=int(file_id),
+                            logger=logger,
+                            entry_id=last_entry_id,
+                            use_all_variations=False
+                        )
+                        if "error" not in result:
+                            logger.info(f"Resubmission successful for FileID: {file_id}")
+                            await send_message_email(
+                                to_emails=["nik@iconluxurygroup.com"],
+                                subject=f"Success: Batch Resubmission for FileID {file_id}",
+                                message=f"Resubmission succeeded for FileID {file_id} starting from EntryID {last_entry_id}.\nLog: {log_file}",
+                                logger=logger
+                            )
+                            return
+                        else:
+                            logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
+                    else:
+                        logger.warning(f"No last EntryID found for FileID: {file_id}, restarting from beginning")
+                        result = await process_restart_batch(
+                            file_id_db=int(file_id),
+                            logger=logger,
+                            entry_id=None,
+                            use_all_variations=False
+                        )
+                        if "error" not in result:
+                            logger.info(f"Resubmission successful for FileID: {file_id}")
+                            await send_message_email(
+                                to_emails=["nik@iconluxurygroup.com"],
+                                subject=f"Success: Batch Resubmission for FileID {file_id}",
+                                message=f"Resubmission succeeded for FileID {file_id} from beginning.\nLog: {log_file}",
+                                logger=logger
+                            )
+                            return
+                        else:
+                            logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
+                    attempt += 1
+                else:
+                    logger.info(f"No failure detected in logs for FileID: {file_id}")
+                    return
+        else:
+            logger.warning(f"Log file {log_file} does not exist for FileID: {file_id}")
+            return
+        await asyncio.sleep(60)
+
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
-async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, background_tasks: BackgroundTasks = None):
+async def api_restart_search_all(
+    file_id: str,
+    entry_id: Optional[int] = None,
+    background_tasks: BackgroundTasks = None
+):
+    """Restart batch processing for a file, searching all variations for each entry."""
     logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
     debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
     timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
 
     try:
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory before job: RSS={debug_info['memory_usage']['before']:.2f} MB")
+
+        # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = fetch_last_valid_entry(file_id, logger)
+            entry_id = fetch_last_valid_entry(file_id, logger)  # Synchronous call
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
 
-        with pyodbc.connect(conn_str) as conn:  # Use imported conn_str
-            cursor = conn.cursor()
-            cursor.execute("SELECT AiJson, AiCaption, SortOrder FROM utb_ImageScraperResult WHERE EntryID = ? AND FileID = ?", (69801, file_id))
-            result = cursor.fetchone()
-            debug_info["database_state"]["entry_69801"] = {"AiJson": result[0], "AiCaption": result[1], "SortOrder": result[2]} if result else "Not found for FileID"
+        # Query database for EntryID 69801 state
+        try:
+            with pyodbc.connect(conn_str) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT AiJson, AiCaption, SortOrder
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID = ? AND FileID = ?
+                """, (69801, file_id))
+                result = cursor.fetchone()
+                if result:
+                    debug_info["database_state"]["entry_69801"] = {
+                        "AiJson": result[0],
+                        "AiCaption": result[1],
+                        "SortOrder": result[2]
+                    }
+                else:
+                    debug_info["database_state"]["entry_69801"] = "Not found for FileID"
+        except pyodbc.Error as db_error:
+            logger.error(f"Database error querying EntryID 69801 for FileID {file_id}: {db_error}")
+            debug_info["database_state"]["entry_69801"] = f"Database error: {str(db_error)}"
 
-        result = await run_job_with_logging(process_restart_batch, file_id, entry_id=entry_id, use_all_variations=True)
+        result = await run_job_with_logging(
+            process_restart_batch,
+            file_id,
+            entry_id=entry_id,
+            use_all_variations=True
+        )
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
+
         if result["status_code"] != 200:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
 
+        # Schedule failure monitoring
         if background_tasks:
             background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
+        # Upload log file
         if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id)  # Pass logger object
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
             await update_log_url_in_db(file_id, upload_url, logger)
             debug_info["log_url"] = upload_url
 
+        logger.info(f"Completed restart batch for FileID: {file_id}")
         return {
             "status": "success",
             "status_code": 200,
@@ -353,7 +552,7 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
                     "recommendations": [
                         "Increase worker memory limit to 1GB+",
                         "Monitor API response times for thedataproxy.com",
-                        "Confirmed FileID 225 for EntryID 69801"
+                        f"Confirmed FileID 225 for EntryID 69801"
                     ],
                     "debug_info": debug_info
                 },
@@ -365,9 +564,17 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         debug_info["error_traceback"] = traceback.format_exc()
         if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id)
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
             await update_log_url_in_db(file_id, upload_url, logger)
             debug_info["log_url"] = upload_url
+            await send_message_email(
+                to_emails=["nik@iconluxurygroup.com"],
+                subject=f"Failure: Batch Restart for FileID {file_id}",
+                message=f"Batch restart for FileID {file_id} failed.\nError: {str(e)}\nLog file: {upload_url}",
+                logger=logger
+            )
         return {
             "status": "error",
             "status_code": 500,
@@ -408,7 +615,7 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
                     "recommendations": [
                         "Increase worker memory limit to 1GB+",
                         "Monitor API response times for thedataproxy.com",
-                        "Confirmed FileID 225 for EntryID 69801"
+                        f"Confirmed FileID 225 for EntryID 69801"
                     ],
                     "debug_info": debug_info
                 },
@@ -416,6 +623,9 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
             },
             "timestamp": timestamp
         }
+
+# Include the router in the FastAPI app
+app.include_router(router, prefix="/api/v3")
 
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
