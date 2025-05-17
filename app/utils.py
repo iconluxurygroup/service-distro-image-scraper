@@ -124,7 +124,10 @@ async def process_search_row_gcloud(
             try:
                 logger.info(f"Worker PID {process.pid}: Attempt {attempt}: Fetching {search_url} via {fetch_endpoint} with region {region}")
                 async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
-                    logger.debug(f"Worker PID {process.pid}: GCloud response: status={response.status}, headers={response.headers}, body={await response.text()[:200]}")
+                    # Corrected logging of response body
+                    body_text = await response.text()  # Await the coroutine to get the string
+                    body_preview = body_text[:200] if body_text else ""  # Safely slice the string
+                    logger.debug(f"Worker PID {process.pid}: GCloud response: status={response.status}, headers={response.headers}, body={body_preview}")
                     response.raise_for_status()
                     result = await response.json()
                     result_data = result.get("result")
@@ -146,6 +149,9 @@ async def process_search_row_gcloud(
                 continue
     logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     return pd.DataFrame()
+
+
+
 
 @retry(
     stop=stop_after_attempt(3),
