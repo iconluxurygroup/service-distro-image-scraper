@@ -707,7 +707,6 @@ async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None
             logger.info(f"Marked endpoint as blocked: {endpoint}")
     except pyodbc.Error as e:
         logger.error(f"Error marking endpoint as blocked: {e}")
-
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -772,7 +771,6 @@ async def update_search_sort_order(
             logger.debug(f"Executing query: {query} with FileID: {file_id}, EntryID: {entry_id}")
             df = await conn.execute(query, {"file_id": file_id, "entry_id": entry_id})
             df = pd.DataFrame(df.fetchall(), columns=df.keys())
-            # ... (rest of the function unchanged)
             if df.empty:
                 logger.warning(f"No eligible data found for FileID: {file_id}, EntryID: {entry_id}")
                 return []
@@ -836,7 +834,7 @@ async def update_search_sort_order(
                     if row['priority'] in [1, 2] and validate_model(row, model_aliases, result_id, logger):
                         valid_indices.append(idx)
                     elif row['priority'] == 3:
-                        brand_found = validate_brand(row, brand_aliases, result_id, None, logger)  # Pass None
+                        brand_found = validate_brand(row, brand_aliases, result_id, None, logger)
                         if brand_found:
                             valid_indices.append(idx)
                         else:
@@ -845,13 +843,12 @@ async def update_search_sort_order(
                             df.at[idx, 'priority'] = 4
                     else:
                         logger.warning(f"Model validation failed for ResultID {result_id}, checking brand")
-                        brand_found = validate_brand(row, brand_aliases, result_id, None, logger)  # Pass None
+                        brand_found = validate_brand(row, brand_aliases, result_id, None, logger)
                         df.at[idx, 'new_sort_order'] = -2 if not brand_found else None
                         df.at[idx, 'priority'] = 4 if not brand_found else 3
                         if brand_found:
                             valid_indices.append(idx)
                             logger.debug(f"Downgraded ResultID {result_id} to new_sort_order={df.at[idx, 'new_sort_order']}")
-                # ... (rest unchanged)
 
                 valid_match_df = match_df.loc[valid_indices]
                 if not valid_match_df.empty:
@@ -866,7 +863,6 @@ async def update_search_sort_order(
                 try:
                     result_id = int(row['ResultID'])
                     new_sort_order = int(row['new_sort_order'])
-               # After
                     result = await conn.execute(
                         text("""
                             UPDATE utb_ImageScraperResult 
@@ -875,6 +871,7 @@ async def update_search_sort_order(
                         """),
                         {"sort_order": new_sort_order, "result_id": result_id}
                     )
+                    update_count += 1
                     success_count += result.rowcount
                     logger.debug(f"Updated SortOrder to {new_sort_order} for ResultID {result_id}")
                 except SQLAlchemyError as e:
@@ -883,11 +880,12 @@ async def update_search_sort_order(
 
             logger.info(f"Updated {success_count}/{update_count} rows for EntryID {entry_id}")
 
-            temp_verify = conn.execute(
+            temp_verify = await conn.execute(
                 text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id AND SortOrder IS NOT NULL"),
                 {"entry_id": entry_id}
-            ).scalar()
-            logger.debug(f"Rows with non-NULL SortOrder after update: {temp_verify}")
+            )
+            temp_verify_count = temp_verify.scalar()
+            logger.debug(f"Rows with non-NULL SortOrder after update: {temp_verify_count}")
 
             verify_query = text("""
                 SELECT ResultID, EntryID, SortOrder, ImageDesc, ImageSource, ImageUrl
@@ -904,7 +902,7 @@ async def update_search_sort_order(
                     "ImageSource": r[4], 
                     "ImageUrl": r[5]
                 }
-                for r in conn.execute(verify_query, {"entry_id": entry_id}).fetchall()
+                for r in (await conn.execute(verify_query, {"entry_id": entry_id})).fetchall()
             ]
 
             positive_count = sum(1 for r in results if r['SortOrder'] is not None and r['SortOrder'] > 0)
