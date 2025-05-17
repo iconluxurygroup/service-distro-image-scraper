@@ -1,48 +1,40 @@
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from pydantic import BaseModel, Field
 import logging
 import asyncio
 import os
-import pandas as pd
-import time
-import pyodbc
-import httpx
 import json
-import aiofiles
-import datetime
-from typing import Optional, Dict, List, Tuple
-from search_utils import update_search_sort_order, insert_search_results
-from db_utils import (
-    get_send_to_email,
-    get_images_excel_db,
-    update_file_location_complete,
-    update_file_generate_complete,
-    export_dai_json,
-    update_log_url_in_db,
-    fetch_last_valid_entry,
-)
-from vision_utils import fetch_missing_images  # New module
-from endpoint_utils import sync_get_endpoint
-from image_utils import download_all_images
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from common import fetch_brand_rules
-from utils import (
-    create_temp_dirs,
-    cleanup_temp_dirs,
-    process_and_tag_results,
-    generate_search_variations,
-    process_search_row_gcloud
-)
-from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space
+import traceback
 import psutil
+import pyodbc
+import datetime
+import hashlib
+import time
+from typing import Optional, List, Dict, Any, Callable
+from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
-from image_reason import process_entry
-from tenacity import retry, stop_after_attempt, wait_exponential
-from database_config import conn_str  # Import conn_str from database_config
+from vision_utils import fetch_missing_images
+from workflow import generate_download_file, process_restart_batch, batch_vision_reason
+from db_utils import (
+    update_log_url_in_db,
+    get_send_to_email,
+    fetch_last_valid_entry,
+    update_initial_sort_order,
+    update_sort_order,
+    update_sort_no_image_entry,
+    update_sort_order_per_entry,
+    get_images_excel_db,
+    update_file_generate_complete,
+    update_file_location_complete,
+)
+from database_config import conn_str
 from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import aioodbc
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import async_engine
+
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)
 
@@ -178,17 +170,14 @@ async def run_generate_download_file(file_id: str, logger: logging.Logger, log_f
     Wrapper to run generate_download_file in a background task, updating job status.
     """
     try:
-        # Update job status to running
         JOB_STATUS[file_id] = {
             "status": "running",
             "message": "Job is running",
             "timestamp": datetime.datetime.now().isoformat()
         }
         
-        # Execute generate_download_file
         result = await generate_download_file(int(file_id), logger=logger)
         
-        # Update job status based on result
         if "error" in result:
             JOB_STATUS[file_id] = {
                 "status": "failed",
@@ -277,7 +266,6 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
             return
         await asyncio.sleep(60)
 
-# Highlight: Generate Download File Endpoint
 @router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
     """
@@ -287,7 +275,6 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
     logger.info(f"Received request to generate download file for FileID: {file_id}")
     
     try:
-        # Validate file_id using conn_str from database_config
         with pyodbc.connect(conn_str, timeout=10) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
@@ -296,17 +283,14 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
                 logger.error(f"Invalid FileID: {file_id}")
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
         
-        # Initialize job status
         JOB_STATUS[file_id] = {
             "status": "queued",
             "message": "Job queued for processing",
             "timestamp": datetime.datetime.now().isoformat()
         }
         
-        # Queue the job as a background task
         background_tasks.add_task(run_generate_download_file, file_id, logger, log_filename)
         
-        # Send email notification to confirm job queuing
         send_to_email = await get_send_to_email(int(file_id), logger=logger)
         if send_to_email:
             await send_message_email(
@@ -339,7 +323,7 @@ async def api_get_job_status(file_id: str):
     job_status = JOB_STATUS.get(file_id)
     if not job_status:
         logger.warning(f"No job found for FileID: {file_id}")
-        raise HTTPException(status_code=404, detail=f"No job found for FileID: {file_id}")
+        raise HTTPException(status_code=404, detail=f"No job found for FileID {file_id}")
     
     return JobStatusResponse(
         status=job_status["status"],
@@ -368,14 +352,12 @@ async def api_update_sort_order_per_entry(
     logger.info(f"Queueing per-entry SortOrder update for FileID: {file_id}, limit: {limit}")
 
     try:
-        # Initialize job status
         JOB_STATUS[file_id] = {
             "status": "queued",
             "message": "Per-entry sort order update queued",
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-        # Queue the job
         background_tasks.add_task(run_per_entry_sort_job, file_id, limit, logger, log_filename)
 
         return {
@@ -396,14 +378,13 @@ async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: log
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-        # Validate file_id
         with pyodbc.connect(conn_str, timeout=10) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
             if not cursor.fetchone():
                 raise ValueError(f"FileID {file_id} not found")
 
-        result = await update_sort_order_per_entry(file_id, logger=logger, limit=limit)
+        result = await update_sort_order_per_entry(file_id, logger=logger)
         if result is None:
             raise ValueError("update_sort_order_per_entry returned None")
 
@@ -582,7 +563,7 @@ async def get_images_excel_db_endpoint(file_id: str):
     logger, _ = setup_job_logger(job_id=file_id)
     logger.info(f"Fetching Excel images for FileID: {file_id}")
     try:
-        result = get_images_excel_db(file_id, logger)
+        result = await get_images_excel_db(file_id, logger)
         if result.empty:
             return {"status_code": 200, "message": f"No images found for Excel export for FileID: {file_id}", "data": []}
         return {"status_code": 200, "message": f"Fetched Excel images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}

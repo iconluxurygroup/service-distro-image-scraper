@@ -3,24 +3,19 @@ import base64
 import json
 import logging
 import re
-import requests
 import urllib.parse
-import pyodbc
-import pandas as pd
 import aiohttp
 from PIL import Image
 from io import BytesIO
-from typing import Optional, List, Tuple, Dict, Set
+from typing import Optional, List, Tuple, Dict
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from image_vision import detect_objects_with_computer_vision_async, analyze_image_with_gemini_async
-from db_utils import (
-    fetch_missing_images,
-    update_search_sort_order, update_log_url_in_db,
-    get_send_to_email, update_file_generate_complete, update_file_location_complete,
-get_records_to_search
-)
+from vision_utils import fetch_missing_images  # Updated import
 from config import BASE_CONFIG_URL
 from common import clean_string, generate_aliases, generate_brand_aliases, load_config, CONFIG_FILES
+import pandas as pd
+import pyodbc
+from database_config import conn_str
 
 # Default logger setup
 default_logger = logging.getLogger(__name__)
@@ -159,23 +154,19 @@ async def fetch_stored_thumbnail(
                 logger.warning(f"No thumbnail found in database for ResultID {result_id}")
                 return None
 
-            thumbnail_url, thumbnail_base64 = result
-            if thumbnail_base64:
-                try:
-                    base64.b64decode(thumbnail_base64)
-                    logger.info(f"Using stored ImageUrlThumbnail for ResultID {result_id}")
-                    return thumbnail_base64
-                except Exception as e:
-                    logger.warning(f"Invalid ImageUrlThumbnail for ResultID {result_id}: {e}")
-
+            thumbnail_url = result[0]
             if thumbnail_url:
-                image_data, _ = await get_image_data_async([thumbnail_url], session, logger, retries=3)
-                if image_data:
-                    thumbnail_base64 = await generate_thumbnail(image_data, logger)
-                    logger.info(f"Generated thumbnail from stored ImageUrlThumbnail for ResultID {result_id}")
-                    return thumbnail_base64
-                logger.warning(f"Failed to download stored ImageUrlThumbnail {thumbnail_url} for ResultID {result_id}")
-
+                try:
+                    base64.b64decode(thumbnail_url)
+                    logger.info(f"Using stored ImageUrlThumbnail for ResultID {result_id}")
+                    return thumbnail_url
+                except Exception:
+                    image_data, _ = await get_image_data_async([thumbnail_url], session, logger, retries=3)
+                    if image_data:
+                        thumbnail_base64 = await generate_thumbnail(image_data, logger)
+                        logger.info(f"Generated thumbnail from stored ImageUrlThumbnail for ResultID {result_id}")
+                        return thumbnail_base64
+                    logger.warning(f"Failed to download stored ImageUrlThumbnail {thumbnail_url} for ResultID {result_id}")
             return None
     except pyodbc.Error as e:
         logger.error(f"Database error fetching thumbnail for ResultID {result_id}: {e}")
@@ -244,9 +235,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             "color": str(row.get("ProductColor") or "None")
         }
 
-        # Fetch stored thumbnail from database
         thumbnail_base64 = await fetch_stored_thumbnail(result_id, session, logger)
-
         image_data, downloaded_url = await get_image_data_async(image_urls, session, logger)
         if not thumbnail_base64:
             thumbnail_base64 = await generate_thumbnail(image_data, logger)
