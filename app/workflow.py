@@ -79,31 +79,52 @@ async def async_process_entry_search(
         logger.warning(f"Worker PID {process.pid}: No variations generated for EntryID {entry_id}")
         return []
     
-    async def process_variation(variation: str) -> List[pd.DataFrame]:
+    
+    async def process_variation(
+        variation: str,
+        endpoint: str,
+        entry_id: int,
+        search_type: str,
+        brand: Optional[str] = None,
+        category: Optional[str] = None,
+        logger: Optional[logging.Logger] = None
+    ) -> Dict:
+        logger = logger or default_logger
         try:
-            logger.debug(f"Processing variation '{variation}' for EntryID {entry_id} using endpoint {endpoint}")
-            result = await process_and_tag_results(
-                search_string=variation,
-                brand=brand,
-                model=search_string,
-                endpoint=endpoint,
-                entry_id=entry_id,
-                logger=logger,
-                use_all_variations=use_all_variations,
-                file_id_db=file_id_db
-            )
-            for df in result:
-                if not all(col in df.columns for col in ['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']):
-                    logger.error(f"Invalid DataFrame for variation '{variation}' in EntryID {entry_id}: missing columns {df.columns}")
-                    return []
-                if df['ImageUrl'].str.contains('placeholder://error').any():
-                    logger.warning(f"Placeholder error in results for variation '{variation}' in EntryID {entry_id}: {df['ImageUrl'].tolist()}")
-                    return []
-            logger.debug(f"Processed variation '{variation}' with {len(result)} DataFrames")
+            result = await search_variation(variation, endpoint, entry_id, search_type, brand, category, logger)
+            required_columns = ['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']
+            result_data = result.get('result', [])
+            
+            if not result_data:
+                logger.warning(f"No results for variation '{variation}' for EntryID {entry_id}")
+                return result
+            
+            # Validate required columns
+            for item in result_data:
+                if not all(col in item for col in required_columns):
+                    missing_cols = set(required_columns) - set(item.keys())
+                    logger.error(f"Missing required columns {missing_cols} in result for EntryID {entry_id}")
+                    result['status'] = 'failed'
+                    result['error'] = f"Missing required columns: {missing_cols}"
+                    return result
+
+            logger.info(f"Processed variation '{variation}' for EntryID {entry_id} with {len(result_data)} results")
             return result
         except Exception as e:
             logger.error(f"Error processing variation '{variation}' for EntryID {entry_id}: {e}", exc_info=True)
-            return []
+            return {
+                'variation': variation,
+                'result': [{
+                    'EntryID': entry_id,
+                    'ImageUrl': 'placeholder://error',
+                    'ImageDesc': f"Error: {str(e)}",
+                    'ImageSource': 'N/A',
+                    'ImageUrlThumbnail': 'placeholder://error'
+                }],
+                'status': 'failed',
+                'result_count': 1,
+                'error': str(e)
+            }
     
     semaphore = asyncio.Semaphore(4)  # Limit concurrency
     async def process_with_semaphore(variation: str) -> List[pd.DataFrame]:
