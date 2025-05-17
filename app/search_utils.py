@@ -256,7 +256,7 @@ async def update_search_sort_order(
             res["priority"] = None
             res["new_sort_order"] = -2  # Default sort order
 
-        # Simplified brand validation
+        # Brand validation and ranking
         match_results = []
         for res in results:
             image_desc = res["ImageDesc_clean"]
@@ -269,13 +269,26 @@ async def update_search_sort_order(
             for alias in brand_aliases:
                 if alias and alias in image_desc:
                     brand_found = True
-                    res["new_sort_order"] = 1  # Positive SortOrder for brand match
                     res["priority"] = 3
                     match_results.append(res)
                     logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Matched brand alias '{alias}' in ImageDesc: {image_desc[:100]}")
                     break
             if not brand_found:
                 logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: No brand match in ImageDesc: {image_desc[:100]}")
+
+        # Rank brand matches
+        if match_results:
+            # Sort by match_score (descending) and field presence (ImageDesc first)
+            def rank_key(res):
+                has_desc = 1 if res["ImageDesc_clean"] else 0
+                has_source = 1 if res["ImageSource_clean"] else 0
+                has_url = 1 if res["ImageUrl_clean"] else 0
+                return (-res["match_score"], -has_desc, -has_source, -has_url)
+            
+            match_results.sort(key=rank_key)
+            for index, res in enumerate(match_results, 1):
+                res["new_sort_order"] = index  # 1 for best, 2 for second, etc.
+                logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Assigned SortOrder={index}, match_score={res['match_score']}, ImageDesc: {res['ImageDesc_clean'][:100]}")
 
         # Update SortOrder
         async with async_engine.connect() as conn:
