@@ -263,7 +263,7 @@ async def process_restart_batch(
                             continue
 
                         deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-                        insert_success = insert_search_results(deduplicated_df, logger=logger)
+                        insert_success = await insert_search_results(deduplicated_df, logger=logger)
                         if not insert_success:
                             logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
                             failed_entries += 1

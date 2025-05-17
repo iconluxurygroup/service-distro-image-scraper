@@ -752,7 +752,7 @@ async def process_single_row(
                 return False
             deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
             logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows")
-            insert_success = insert_search_results(deduplicated_df, logger=logger)
+            insert_success = await insert_search_results(deduplicated_df, logger=logger)
             if not insert_success:
                 logger.error(f"Worker PID {process.pid}: Failed to insert deduplicated results for EntryID {entry_id}")
                 return False
@@ -818,7 +818,7 @@ async def process_single_row(
         "ImageUrlThumbnail": "placeholder://no-results"
     }])
     try:
-        insert_success = insert_search_results(placeholder_df, logger=logger)
+        insert_success = await insert_search_results(placeholder_df, logger=logger)
         if insert_success:
             logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
             with pyodbc.connect(conn_str, autocommit=False) as conn:
