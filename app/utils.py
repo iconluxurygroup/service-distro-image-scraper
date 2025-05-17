@@ -81,183 +81,6 @@ def get_healthy_endpoint(endpoints: List[str], logger: Optional[logging.Logger] 
     logger.error("No healthy endpoints found")
     return None
 
-async def process_search_row_gcloud(
-    search_string: str,
-    entry_id: int,
-    logger: Optional[logging.Logger] = None,
-    remaining_retries: int = 5,
-    total_attempts: Optional[List[int]] = None
-) -> List[Dict]:
-    logger = logger or default_logger
-    if not search_string or len(search_string.strip()) < 3:
-        logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
-        return []
-
-    total_attempts = total_attempts or [0]
-    base_url = "https://api.thedataproxy.com/v2/proxy/fetch"
-    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
-    regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
-    headers = {
-        "accept": "application/json",
-        "x-api-key": api_key,
-        "Content-Type": "application/json"
-    }
-
-    process = psutil.Process()
-    async def log_gcloud_retry(attempt: int, region: str) -> bool:
-        total_attempts[0] += 1
-        if total_attempts[0] > remaining_retries:
-            logger.error(f"Worker PID {process.pid}: Exceeded remaining retries ({remaining_retries}) for EntryID {entry_id} at GCloud attempt {attempt}")
-            return False
-        logger.info(f"Worker PID {process.pid}: GCloud attempt {attempt} (Total attempts: {total_attempts[0]}/{remaining_retries}) for EntryID {entry_id} in region {region}")
-        return True
-
-    search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_string)}&tbm=isch"
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for attempt, region in enumerate(regions, 1):
-            if not await log_gcloud_retry(attempt, region):
-                break
-            fetch_endpoint = f"{base_url}?region={region}"
-            mem_info = process.memory_info()
-            logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-            try:
-                logger.info(f"Worker PID {process.pid}: Attempt {attempt}: Fetching {search_url} via {fetch_endpoint} with region {region}")
-                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
-                    body_text = await response.text()
-                    body_preview = body_text[:200] if body_text else ""
-                    logger.debug(f"Worker PID {process.pid}: GCloud response: status={response.status}, headers={response.headers}, body={body_preview}")
-                    response.raise_for_status()
-                    result = await response.json()
-                    result_data = result.get("result")
-                    if not result_data:
-                        logger.warning(f"Worker PID {process.pid}: No result returned for EntryID {entry_id} in region {region}")
-                        continue
-                    results_html_bytes = result_data if isinstance(result_data, bytes) else result_data.encode("utf-8")
-                    results = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
-                    mem_info = process.memory_info()
-                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                    if results:
-                        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
-                        filtered_results = [
-                            res for res in results
-                            if not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
-                        ]
-                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
-                        return filtered_results
-                    logger.warning(f"Worker PID {process.pid}: Empty results for EntryID {entry_id} in region {region}")
-            except (aiohttp.ClientError, json.JSONDecodeError) as e:
-                logger.warning(f"Worker PID {process.pid}: Attempt {attempt} failed for {fetch_endpoint} in region {region}: {e}")
-                continue
-    logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
-    return []
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type((aiohttp.ClientError, httpx.HTTPStatusError, TimeoutError, json.JSONDecodeError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Worker PID {psutil.Process().pid}: Retrying process_search_row for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def process_search_row(
-    search_string: str,
-    endpoint: str,
-    entry_id: int,
-    logger: Optional[logging.Logger] = None,
-    search_type: str = "default",
-    max_retries: int = 15,
-    brand: Optional[str] = None,
-    category: Optional[str] = None
-) -> List[Dict]:
-    logger = logger or default_logger
-    process = psutil.Process()
-    if not search_string or not endpoint:
-        logger.warning(f"Worker PID {process.pid}: Invalid input for EntryID {entry_id}: search_string={search_string}, endpoint={endpoint}")
-        return []
-
-    total_attempts = [0]
-    
-    async def log_retry_status(attempt_type: str, attempt_num: int) -> bool:
-        total_attempts[0] += 1
-        if total_attempts[0] > max_retries:
-            logger.error(f"Worker PID {process.pid}: Exceeded max retries ({max_retries}) for EntryID {entry_id} after {attempt_type} attempt {attempt_num}")
-            return False
-        logger.info(f"Worker PID {process.pid}: {attempt_type} attempt {attempt_num} (Total attempts: {total_attempts[0]}/{max_retries}) for EntryID {entry_id}")
-        return True
-
-    query = search_string
-    if brand:
-        query += f" {brand}"
-    if category:
-        query += f" {category}"
-    search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=isch"
-    fetch_endpoint = f"{endpoint}/fetch"
-
-    attempt_num = 1
-    while attempt_num <= 3:
-        if not await log_retry_status("Primary", attempt_num):
-            break
-        mem_info = process.memory_info()
-        logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-        try:
-            logger.info(f"Worker PID {process.pid}: Fetching {search_url} via {fetch_endpoint}")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
-                    logger.debug(f"Worker PID {process.pid}: Endpoint response: status={response.status}, headers={response.headers}, body={await response.text()[:200]}")
-                    if response.status in (429, 503):
-                        logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
-                        raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
-                    response.raise_for_status()
-                    try:
-                        result = await response.json()
-                        result_data = result.get("result")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Worker PID {process.pid}: JSON decode error for {search_url}: {e}")
-                        raise
-                    if not result_data:
-                        logger.warning(f"Worker PID {process.pid}: No result data in response for {search_url}")
-                        raise ValueError("Empty response result")
-                    unpacked_html = unpack_content(result_data, logger)
-                    if not unpacked_html or len(unpacked_html) < 100:
-                        logger.warning(f"Worker PID {process.pid}: Invalid HTML for {search_url}")
-                        raise ValueError("Invalid HTML content")
-                    results = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
-                    mem_info = process.memory_info()
-                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                    if results:
-                        irrelevant_keywords = ['wallpaper', 'furniture', 'decor', 'stock photo', 'pistol', 'mattress', 'trunk', 'clutch', 'solenoid', 'card', 'pokemon']
-                        filtered_results = [
-                            res for res in results
-                            if 'scotch' in res.get('ImageDesc', '').lower() or
-                               'soda' in res.get('ImageDesc', '').lower() or
-                               'sneaker' in res.get('ImageDesc', '').lower() or
-                               'shoe' in res.get('ImageDesc', '').lower() or
-                               'hoodie' in res.get('ImageDesc', '').lower() or
-                               'shirt' in res.get('ImageDesc', '').lower() or
-                               'jacket' in res.get('ImageDesc', '').lower() or
-                               'pants' in res.get('ImageDesc', '').lower() or
-                               'apparel' in res.get('ImageDesc', '').lower() or
-                               'clothing' in res.get('ImageDesc', '').lower()
-                               and not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
-                        ]
-                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
-                        return filtered_results
-                    logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id}")
-                    return []
-        except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {fetch_endpoint}: {e}")
-            attempt_num += 1
-            if attempt_num > 3:
-                break
-
-    if total_attempts[0] < max_retries:
-        gcloud_results = await process_search_row_gcloud(search_string, entry_id, logger, max_retries - total_attempts[0], total_attempts)
-        if gcloud_results:
-            logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_results)} images")
-            return gcloud_results
-        logger.error(f"Worker PID {process.pid}: GCloud fallback also failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
-    
-    return []
 
 def generate_search_variations(
     search_string: str,
@@ -344,6 +167,237 @@ def generate_search_variations(
         logger.debug(f"Worker PID {process.pid}: No color suffix detected, no_color variation same as original: '{search_string}'")
     
     return variations
+import logging
+import asyncio
+import os
+import time
+from typing import List, Dict, Optional, Tuple, Any
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from common import (
+    clean_string,
+    generate_aliases,
+    fetch_brand_rules,
+    normalize_model,
+    generate_brand_aliases,
+    validate_model,
+    validate_brand,
+    filter_model_results,
+    calculate_priority
+)
+from database_config import conn_str, async_engine
+from search_utils import update_search_sort_order, insert_search_results
+from endpoint_utils import get_endpoint, sync_get_endpoint
+from image_utils import download_all_images
+from excel_utils import write_excel_image
+from email_utils import send_email, send_message_email
+from file_utils import create_temp_dirs, cleanup_temp_dirs
+from aws_s3 import upload_file_to_space
+import httpx
+import aiofiles
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import json
+import re
+import base64
+import zlib
+import urllib.parse
+from requests.exceptions import RequestException
+from icon_image_lib.google_parser import process_search_result
+import psutil
+from ai_utils import batch_vision_reason
+
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
+
+async def process_search_row_gcloud(
+    search_string: str,
+    entry_id: int,
+    logger: Optional[logging.Logger] = None,
+    remaining_retries: int = 5,
+    total_attempts: Optional[List[int]] = None
+) -> List[Dict]:
+    logger = logger or default_logger
+    if not search_string or len(search_string.strip()) < 3:
+        logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
+        return []
+
+    total_attempts = total_attempts or [0]
+    base_url = "https://api.thedataproxy.com/v2/proxy/fetch"
+    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
+    regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
+    headers = {
+        "accept": "application/json",
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+
+    process = psutil.Process()
+    async def log_gcloud_retry(attempt: int, region: str) -> bool:
+        total_attempts[0] += 1
+        if total_attempts[0] > remaining_retries:
+            logger.error(f"Worker PID {process.pid}: Exceeded remaining retries ({remaining_retries}) for EntryID {entry_id} at GCloud attempt {attempt}")
+            return False
+        logger.info(f"Worker PID {process.pid}: GCloud attempt {attempt} (Total attempts: {total_attempts[0]}/{remaining_retries}) for EntryID {entry_id} in region {region}")
+        return True
+
+    search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_string)}&tbm=isch"
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for attempt, region in enumerate(regions, 1):
+            if not await log_gcloud_retry(attempt, region):
+                break
+            fetch_endpoint = f"{base_url}?region={region}"
+            mem_info = process.memory_info()
+            logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+            try:
+                logger.info(f"Worker PID {process.pid}: Attempt {attempt}: Fetching {search_url} via {fetch_endpoint} with region {region}")
+                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                    body_text = await response.text()
+                    body_preview = body_text[:200] if body_text else ""
+                    logger.debug(f"Worker PID {process.pid}: GCloud response: status={response.status}, headers={response.headers}, body={body_preview}")
+                    response.raise_for_status()
+                    result = await response.json()
+                    result_data = result.get("result")
+                    if not result_data:
+                        logger.warning(f"Worker PID {process.pid}: No result returned for EntryID {entry_id} in region {region}")
+                        continue
+                    results_html_bytes = result_data if isinstance(result_data, bytes) else result_data.encode("utf-8")
+                    results = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
+                    # Handle case where results might be a DataFrame (defensive)
+                    try:
+                        import pandas as pd
+                        if isinstance(results, pd.DataFrame):
+                            logger.warning(f"Worker PID {process.pid}: Received DataFrame from process_search_result for EntryID {entry_id}, converting to List[Dict]")
+                            results = results.to_dict('records')
+                    except ImportError:
+                        pass  # No pandas, assume results is List[Dict]
+                    mem_info = process.memory_info()
+                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+                    if results:  # Check if list is non-empty
+                        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
+                        filtered_results = [
+                            res for res in results
+                            if not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
+                        ]
+                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
+                        return filtered_results
+                    logger.warning(f"Worker PID {process.pid}: Empty results for EntryID {entry_id} in region {region}")
+            except (aiohttp.ClientError, json.JSONDecodeError) as e:
+                logger.warning(f"Worker PID {process.pid}: Attempt {attempt} failed for {fetch_endpoint} in region {region}: {e}")
+                continue
+    logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
+    return []
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, httpx.HTTPStatusError, TimeoutError, json.JSONDecodeError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Worker PID {psutil.Process().pid}: Retrying process_search_row for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def process_search_row(
+    search_string: str,
+    endpoint: str,
+    entry_id: int,
+    logger: Optional[logging.Logger] = None,
+    search_type: str = "default",
+    max_retries: int = 15,
+    brand: Optional[str] = None,
+    category: Optional[str] = None
+) -> List[Dict]:
+    logger = logger or default_logger
+    process = psutil.Process()
+    if not search_string or not endpoint:
+        logger.warning(f"Worker PID {process.pid}: Invalid input for EntryID {entry_id}: search_string={search_string}, endpoint={endpoint}")
+        return []
+
+    total_attempts = [0]
+    
+    async def log_retry_status(attempt_type: str, attempt_num: int) -> bool:
+        total_attempts[0] += 1
+        if total_attempts[0] > max_retries:
+            logger.error(f"Worker PID {process.pid}: Exceeded max retries ({max_retries}) for EntryID {entry_id} after {attempt_type} attempt {attempt_num}")
+            return False
+        logger.info(f"Worker PID {process.pid}: {attempt_type} attempt {attempt_num} (Total attempts: {total_attempts[0]}/{max_retries}) for EntryID {entry_id}")
+        return True
+
+    query = search_string
+    if brand:
+        query += f" {brand}"
+    if category:
+        query += f" {category}"
+    search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=isch"
+    fetch_endpoint = f"{endpoint}/fetch"
+
+    attempt_num = 1
+    while attempt_num <= 3:
+        if not await log_retry_status("Primary", attempt_num):
+            break
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+        try:
+            logger.info(f"Worker PID {process.pid}: Fetching {search_url} via {fetch_endpoint}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                    logger.debug(f"Worker PID {process.pid}: Endpoint response: status={response.status}, headers={response.headers}, body={await response.text()[:200]}")
+                    if response.status in (429, 503):
+                        logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
+                        raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
+                    response.raise_for_status()
+                    try:
+                        result = await response.json()
+                        result_data = result.get("result")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Worker PID {process.pid}: JSON decode error for {search_url}: {e}")
+                        raise
+                    if not result_data:
+                        logger.warning(f"Worker PID {process.pid}: No result data in response for {search_url}")
+                        raise ValueError("Empty response result")
+                    unpacked_html = unpack_content(result_data, logger)
+                    if not unpacked_html or len(unpacked_html) < 100:
+                        logger.warning(f"Worker PID {process.pid}: Invalid HTML for {search_url}")
+                        raise ValueError("Invalid HTML content")
+                    results = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
+                    # Handle case where results might be a DataFrame
+                    try:
+                        import pandas as pd
+                        if isinstance(results, pd.DataFrame):
+                            logger.warning(f"Worker PID {process.pid}: Received DataFrame from process_search_result for EntryID {entry_id}, converting to List[Dict]")
+                            results = results.to_dict('records')
+                    except ImportError:
+                        pass  # No pandas, assume results is List[Dict]
+                    mem_info = process.memory_info()
+                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+                    if results:
+                        irrelevant_keywords = ['wallpaper', 'furniture', 'decor', 'stock photo', 'pistol', 'mattress', 'trunk', 'clutch', 'solenoid', 'card', 'pokemon']
+                        filtered_results = [
+                            res for res in results
+                            if any(kw.lower() in res.get('ImageDesc', '').lower() for kw in ['scotch', 'soda', 'sneaker', 'shoe', 'hoodie', 'shirt', 'jacket', 'pants', 'apparel', 'clothing'])
+                            and not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
+                        ]
+                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
+                        return filtered_results
+                    logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id}")
+                    return []
+        except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {fetch_endpoint}: {e}")
+            attempt_num += 1
+            if attempt_num > 3:
+                break
+
+    if total_attempts[0] < max_retries:
+        gcloud_results = await process_search_row_gcloud(search_string, entry_id, logger, max_retries - total_attempts[0], total_attempts)
+        if gcloud_results:
+            logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_results)} images")
+            return gcloud_results
+        logger.error(f"Worker PID {process.pid}: GCloud fallback also failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
+    
+    return []
 
 async def search_variation(
     variation: str,
@@ -416,7 +470,6 @@ async def search_variation(
             "result_count": 1,
             "error": str(e)
         }
-
 async def process_single_all(
     entry_id: int,
     search_string: str,
