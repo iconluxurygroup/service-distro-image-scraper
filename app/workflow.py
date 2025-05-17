@@ -24,8 +24,8 @@ from db_utils import (
     update_log_url_in_db,
 )
 from search_utils import update_search_sort_order, insert_search_results
-from image_utils import download_all_images
-from excel_utils import write_excel_image
+from image_utils import download_all_images , process_images_and_anchor
+
 from common import fetch_brand_rules
 from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
 from endpoint_utils import sync_get_endpoint
@@ -440,7 +440,7 @@ async def generate_download_file(
             failed_downloads = [(url, int(row_id)) for url, row_id in failed_downloads]
 
             header_index = 5
-            await write_excel_image(local_filename, temp_images_dir, selected_image_list, "A", header_index, logger)
+            await process_images_and_anchor(local_filename, temp_images_dir, selected_image_list, "A", header_index, logger)
 
             successful_entries = len(entries) - len(failed_downloads)
             failed_entries = len(failed_downloads)
