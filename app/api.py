@@ -4,7 +4,7 @@ import os
 from typing import Dict, Any, Callable, Union, List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 from workflow import process_restart_batch, generate_download_file, batch_vision_reason
-from database import (
+from db_utils import (
     update_initial_sort_order,
     update_sort_order,
     update_log_url_in_db,
@@ -15,8 +15,7 @@ from database import (
     update_file_location_complete,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
-    store_last_entry_id,
-    get_last_entry_id,
+    fetch_last_valid_entry,
 )
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
@@ -76,7 +75,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str,
             try:
                 upload_result = upload_file_to_space(
                     file_src=log_file,
-                    save_as=f"job_logs/job_{file_id_str}.log",
+                    save_as=f"super_scraper/logs/job_{file_id_str}.log",
                     is_public=True,
                     logger=logger,
                     file_id=file_id_str
@@ -91,7 +90,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: Union[str,
                 logger.warning(f"Async upload failed for FileID {file_id_str}: {upload_error}")
                 upload_url = upload_file_to_space_sync(
                     file_src=log_file,
-                    save_as=f"job_logs/job_{file_id_str}.log",
+                    save_as=f"super_scraper/logs/job_{file_id_str}.log",
                     is_public=True,
                     logger=logger,
                     file_id=file_id_str
@@ -115,22 +114,31 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
                 log_content = f.read()
                 if "WORKER TIMEOUT" in log_content or "SIGKILL" in log_content:
                     logger.warning(f"Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
-                    last_entry_id = await get_last_entry_id(file_id, logger)
+                    last_entry_id = await fetch_last_valid_entry(file_id, logger)
                     if last_entry_id:
-                        logger.info(f"Resubmitting job for FileID: {file_id} starting from EntryID: {last_entry_id}")
-                        result = await process_restart_batch(
-                            file_id_db=int(file_id),
-                            logger=logger,
-                            entry_id=last_entry_id,
-                            use_all_variations=False
-                        )
-                        if "error" not in result:
-                            logger.info(f"Resubmission successful for FileID: {file_id}")
-                            return
-                        else:
-                            logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
+                        # Resume from the next EntryID
+                        with pyodbc.connect(conn_str) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID > ?",
+                                (int(file_id), last_entry_id)
+                            )
+                            next_entry = cursor.fetchone()
+                            resume_entry_id = next_entry[0] if next_entry and next_entry[0] else None
+                            logger.info(f"Resubmitting job for FileID: {file_id} starting from EntryID: {resume_entry_id}")
+                            result = await process_restart_batch(
+                                file_id_db=int(file_id),
+                                logger=logger,
+                                entry_id=resume_entry_id,
+                                use_all_variations=False
+                            )
+                            if "error" not in result:
+                                logger.info(f"Resubmission successful for FileID: {file_id}")
+                                return
+                            else:
+                                logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
                     else:
-                        logger.warning(f"No last EntryID found for FileID: {file_id}, restarting from beginning")
+                        logger.warning(f"No last valid EntryID found for FileID: {file_id}, restarting from beginning")
                         result = await process_restart_batch(
                             file_id_db=int(file_id),
                             logger=logger,
@@ -151,99 +159,6 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
             return
         await asyncio.sleep(60)  # Wait before retrying
 
-# Sorting-related endpoints
-@router.get("/sort-by-search/{file_id}", tags=["Sorting"])
-async def api_match_and_search_sort(file_id: str):
-    """Run sort order update based on match_score and search-based priority."""
-    result = await run_job_with_logging(update_sort_order, file_id)
-    if result["status_code"] != 200:
-        raise HTTPException(status_code=result["status_code"], detail=result["message"])
-    return result
-
-@router.get("/update-sort-order-per-entry/{file_id}", tags=["Sorting"])
-async def api_update_sort_order_per_entry(file_id: str):
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
-    
-    try:
-        result = await update_sort_order_per_entry(file_id, logger)
-        if result is None:
-            logger.error(f"Failed to update SortOrder for FileID {file_id}: update_sort_order_per_entry returned None")
-            raise HTTPException(status_code=500, detail=f"Failed to update SortOrder for FileID {file_id}")
-        
-        if os.path.exists(log_filename):
-            try:
-                upload_result = upload_file_to_space(
-                    file_src=log_filename,
-                    save_as=f"job_logs/job_{file_id}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id
-                )
-                if asyncio.iscoroutine(upload_result):
-                    upload_url = await upload_result
-                else:
-                    upload_url = upload_result
-                await update_log_url_in_db(file_id, upload_url, logger)
-                logger.info(f"Log uploaded to: {upload_url}")
-            except Exception as upload_error:
-                logger.warning(f"Async upload failed for FileID {file_id}: {upload_error}")
-                upload_url = upload_file_to_space_sync(
-                    file_src=log_filename,
-                    save_as=f"job_logs/job_{file_id}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id
-                )
-                await update_log_url_in_db(file_id, upload_url, logger)
-                logger.info(f"Log uploaded to: {upload_url}")
-        
-        return {"status_code": 200, "message": f"Per-entry SortOrder updated successfully for FileID: {file_id}", "data": result}
-    
-    except Exception as e:
-        logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            try:
-                upload_result = upload_file_to_space(
-                    file_src=log_filename,
-                    save_as=f"job_logs/job_{file_id}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id
-                )
-                if asyncio.iscoroutine(upload_result):
-                    upload_url = await upload_result
-                else:
-                    upload_url = upload_result
-                await update_log_url_in_db(file_id, upload_url, logger)
-            except Exception as upload_error:
-                logger.warning(f"Async upload failed for FileID {file_id}: {upload_error}")
-                upload_url = upload_file_to_space_sync(
-                    file_src=log_filename,
-                    save_as=f"job_logs/job_{file_id}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id
-                )
-                await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error updating SortOrder for FileID {file_id}: {str(e)}")
-
-@router.get("/initial-sort/{file_id}", tags=["Sorting"])
-async def api_initial_sort(file_id: str):
-    """Run initial sort order update."""
-    result = await run_job_with_logging(update_initial_sort_order, file_id)
-    if result["status_code"] != 200:
-        raise HTTPException(status_code=result["status_code"], detail=result["message"])
-    return result
-
-@router.get("/no-image-sort/{file_id}", tags=["Sorting"])
-async def api_no_image_sort(file_id: str):
-    """Remove entries with no image results for a given file ID."""
-    result = await run_job_with_logging(update_sort_no_image_entry, file_id)
-    if result["status_code"] != 200:
-        raise HTTPException(status_code=result["status_code"], detail=result["message"])
-    return result
-
 @router.post("/restart-job/{file_id}", tags=["Processing"])
 async def api_process_restart(file_id: str, entry_id: Optional[int] = None, background_tasks: BackgroundTasks = None):
     logger, log_filename = setup_job_logger(job_id=file_id)
@@ -251,8 +166,18 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
     try:
         # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = await get_last_entry_id(file_id, logger)
-            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            if entry_id:
+                # Resume from the next EntryID
+                with pyodbc.connect(conn_str) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID > ?",
+                        (int(file_id), entry_id)
+                    )
+                    next_entry = cursor.fetchone()
+                    entry_id = next_entry[0] if next_entry and next_entry[0] else None
+                    logger.info(f"Retrieved last valid EntryID: {entry_id} for FileID: {file_id}")
 
         result = await process_restart_batch(
             file_id_db=int(file_id),
@@ -262,11 +187,6 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         if "error" in result:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
             raise HTTPException(status_code=500, detail=result["error"])
-        
-        # Store the last processed EntryID
-        if result.get("last_entry_id"):
-            await store_last_entry_id(file_id, result["last_entry_id"], logger)
-            logger.info(f"Stored last EntryID: {result['last_entry_id']} for FileID: {file_id}")
 
         # Schedule failure monitoring
         if background_tasks:
@@ -278,7 +198,7 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         if os.path.exists(log_filename):
             upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+                log_filename, f"super_scraper/logs/job_{file_id}.log", True, logger, file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
@@ -291,8 +211,18 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
     try:
         # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = await get_last_entry_id(file_id, logger)
-            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            if entry_id:
+                # Resume from the next EntryID
+                with pyodbc.connect(conn_str) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID > ?",
+                        (int(file_id), entry_id)
+                    )
+                    next_entry = cursor.fetchone()
+                    entry_id = next_entry[0] if next_entry and next_entry[0] else None
+                    logger.info(f"Retrieved last valid EntryID: {entry_id} for FileID: {file_id}")
 
         result = await run_job_with_logging(
             process_restart_batch,
@@ -303,11 +233,6 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
         if result["status_code"] != 200:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        
-        # Store the last processed EntryID
-        if result["data"].get("last_entry_id"):
-            await store_last_entry_id(file_id, result["data"]["last_entry_id"], logger)
-            logger.info(f"Stored last EntryID: {result['data']['last_entry_id']} for FileID: {file_id}")
 
         # Schedule failure monitoring
         if background_tasks:
@@ -319,7 +244,7 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         if os.path.exists(log_filename):
             upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+                log_filename, f"super_scraper/logs/job_{file_id}.log", True, logger, file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
             # Send email on failure
@@ -332,129 +257,6 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
                 logger=logger
             )
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
-
-@router.post("/process-images-ai/{file_id}", tags=["Processing"])
-async def api_process_ai_images(
-    file_id: str,
-    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to process"),
-    step: int = Query(0, description="Retry step for logging"),
-    limit: int = Query(5000, description="Maximum number of images to process"),
-    concurrency: int = Query(10, description="Maximum concurrent threads"),
-    background_tasks: BackgroundTasks = None
-):
-    """Trigger AI image processing for a file, analyzing images with YOLOv11 and Gemini."""
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing AI image processing for FileID: {file_id}, EntryIDs: {entry_ids}, Step: {step}")
-    try:
-        result = await run_job_with_logging(
-            batch_vision_reason,
-            file_id,
-            entry_ids=entry_ids,
-            step=step,
-            limit=limit,
-            concurrency=concurrency,
-            logger=logger
-        )
-        if result["status_code"] != 200:
-            logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
-            raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        
-        # Schedule failure monitoring
-        if background_tasks:
-            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-
-        logger.info(f"Completed AI image processing for FileID: {file_id}")
-        return {"status_code": 200, "message": f"AI image processing completed for FileID: {file_id}", "data": result["data"]}
-    except Exception as e:
-        logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
-
-@router.post("/generate-download-file/{file_id}", tags=["Export"])
-async def api_generate_download_file(background_tasks: BackgroundTasks, file_id: str):
-    """Queue generation of a download file."""
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Received request to generate download file for FileID: {file_id}")
-    try:
-        background_tasks.add_task(run_job_with_logging, generate_download_file, file_id)
-        background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-        return {"status_code": 202, "message": f"Download file generation queued for FileID: {file_id}", "data": None}
-    except Exception as e:
-        logger.error(f"Error queuing download file for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error queuing download file for FileID {file_id}: {str(e)}")
-
-@router.get("/fetch-missing-images/{file_id}", tags=["Database"])
-async def fetch_missing_images_endpoint(file_id: str, limit: int = Query(1000), ai_analysis_only: bool = Query(True)):
-    """Fetch missing images."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Fetching missing images for FileID: {file_id}, limit: {limit}, ai_analysis_only: {ai_analysis_only}")
-    try:
-        result = await fetch_missing_images(file_id, limit, ai_analysis_only, logger)
-        if result.empty:
-            return {"status_code": 200, "message": f"No missing images found for FileID: {file_id}", "data": []}
-        return {"status_code": 200, "message": f"Fetched missing images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
-    except Exception as e:
-        logger.error(f"Error fetching missing images for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error fetching missing images for FileID {file_id}: {str(e)}")
-
-@router.get("/get-images-excel-db/{file_id}", tags=["Database"])
-async def get_images_excel_db_endpoint(file_id: str):
-    """Get images from Excel DB."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Fetching Excel images for FileID: {file_id}")
-    try:
-        result = await get_images_excel_db(file_id, logger)
-        if result.empty:
-            return {"status_code": 200, "message": f"No images found for Excel export for FileID: {file_id}", "data": []}
-        return {"status_code": 200, "message": f"Fetched Excel images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
-    except Exception as e:
-        logger.error(f"Error fetching Excel images for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error fetching Excel images for FileID {file_id}: {str(e)}")
-
-@router.get("/get-send-to-email/{file_id}", tags=["Database"])
-async def get_send_to_email_endpoint(file_id: str):
-    """Get email address for a file."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Retrieving email for FileID: {file_id}")
-    try:
-        result = await get_send_to_email(int(file_id), logger)
-        return {"status_code": 200, "message": f"Retrieved email successfully for FileID: {file_id}", "data": result}
-    except Exception as e:
-        logger.error(f"Error retrieving email for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error retrieving email for FileID {file_id}: {str(e)}")
-
-@router.post("/update-file-generate-complete/{file_id}", tags=["Database"])
-async def update_file_generate_complete_endpoint(file_id: str):
-    """Update file generation completion status."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Updating file generate complete for FileID: {file_id}")
-    try:
-        await update_file_generate_complete(file_id, logger)
-        return {"status_code": 200, "message": f"Updated file generate complete successfully for FileID: {file_id}", "data": None}
-    except Exception as e:
-        logger.error(f"Error updating file generate complete for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error updating file generate complete for FileID {file_id}: {str(e)}")
-
-@router.post("/update-file-location-complete/{file_id}", tags=["Database"])
-async def update_file_location_complete_endpoint(file_id: str, file_location: str):
-    """Update file location completion status."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Updating file location complete for FileID: {file_id}, file_location: {file_location}")
-    try:
-        await update_file_location_complete(file_id, file_location, logger)
-        return {"status_code": 200, "message": f"Updated file location successfully for FileID: {file_id}", "data": None}
-    except Exception as e:
-        logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
 
 # Include the router in the FastAPI app
 app.include_router(router, prefix="/api/v3")
