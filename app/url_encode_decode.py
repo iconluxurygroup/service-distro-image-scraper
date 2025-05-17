@@ -12,15 +12,11 @@ def double_encode_plus(url: str, logger: Optional[logging.Logger] = None) -> str
     logger = logger or default_logger
     logger.debug(f"Encoding URL: {url}")
     try:
-        # Parse URL components
         parsed = urllib.parse.urlparse(url)
-        # Encode path, preserving slashes
         path = urllib.parse.quote(parsed.path, safe='/')
-        # Encode query parameters, handling multi-valued queries
-        query = urllib.parse.urlencode(urllib.parse.parse_qs(parsed.query), doseq=True) if parsed.query else ''
-        # Encode fragment
+        query_dict = urllib.parse.parse_qs(parsed.query)
+        query = urllib.parse.urlencode(query_dict, doseq=True) if query_dict else ''
         fragment = urllib.parse.quote(parsed.fragment, safe='') if parsed.fragment else ''
-        # Reconstruct URL
         encoded = f"{parsed.scheme}://{parsed.netloc}{path}"
         if query:
             encoded += f"?{query}"
@@ -36,38 +32,71 @@ def decode_url(url: str, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     logger.debug(f"Decoding URL: {url}")
     try:
-        # Remove all backslashes aggressively
+        # Remove all backslashes
         cleaned = re.sub(r'\\+', '', url)
-        # Remove encoded backslashes (%5C, %255C, etc.)
+        # Remove encoded backslashes (%5C, %255C)
         cleaned = re.sub(r'%25{0,2}5[Cc]', '', cleaned)
-        # Fix Google-specific patterns
-        cleaned = cleaned.replace('q=tbn', 'q=tbn').replace('q=tbn:', 'q=tbn:').replace('tbn\\:', 'tbn:')
-        # Handle other common escape mistakes
-        cleaned = cleaned.replace('&=s', '&s').replace('&=t', '&t')
-        # Repeatedly unquote to resolve double-encoding
-        decoded = cleaned
-        for _ in range(10):  # Increased for stubborn cases
-            new_decoded = urllib.parse.unquote(decoded)
-            if new_decoded == decoded:
-                break
-            decoded = new_decoded
-            logger.debug(f"Unquote iteration: {decoded}")
-        # Parse URL to normalize components
-        parsed = urllib.parse.urlparse(decoded)
-        # Reconstruct query parameters
-        query = urllib.parse.urlencode(urllib.parse.parse_qs(parsed.query), doseq=True) if parsed.query else ''
-        # Reconstruct URL
-        final_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if query:
-            final_url += f"?{query}"
-        if parsed.fragment:
-            final_url += f"#{urllib.parse.quote(parsed.fragment, safe='')}"
-        # Validate URL structure
+        # Handle Google image thumbnail URLs
+        is_google_thumb = 'tbn:' in cleaned or 'tbn%3A' in cleaned
+        if is_google_thumb:
+            logger.debug("Detected Google thumbnail URL")
+            # Extract metadata
+            parsed = urllib.parse.urlparse(cleaned)
+            query_dict = urllib.parse.parse_qs(parsed.query)
+            # Fix 'q' parameter for tbn
+            if 'q' in query_dict:
+                q_values = query_dict['q']
+                fixed_q = []
+                for q in q_values:
+                    # Remove backslashes and fix tbn
+                    q = re.sub(r'\\+', '', q)
+                    if 'tbn' in q:
+                        # Ensure tbn: is intact
+                        q = q.replace('tbn\\:', 'tbn:').replace('tbn%3A', 'tbn:')
+                        # Extract tbn ID
+                        tbn_match = re.search(r'tbn:([A-Za-z0-9_-]+)', q)
+                        if tbn_match:
+                            tbn_id = tbn_match.group(1)
+                            fixed_q.append(f"tbn:{tbn_id}")
+                        else:
+                            fixed_q.append(q)
+                    else:
+                        fixed_q.append(q)
+                query_dict['q'] = fixed_q
+            # Normalize other query parameters
+            for key, values in query_dict.items():
+                query_dict[key] = [re.sub(r'\\+', '', v) for v in values]
+            # Reconstruct query
+            query = urllib.parse.urlencode(query_dict, doseq=True) if query_dict else ''
+            # Reconstruct URL
+            decoded = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if query:
+                decoded += f"?{query}"
+            if parsed.fragment:
+                decoded += f"#{urllib.parse.quote(parsed.fragment, safe='')}"
+        else:
+            # Generic URL handling
+            decoded = cleaned
+            for _ in range(5):
+                new_decoded = urllib.parse.unquote(decoded)
+                if new_decoded == decoded:
+                    break
+                decoded = new_decoded
+                logger.debug(f"Unquote iteration: {decoded}")
+            parsed = urllib.parse.urlparse(decoded)
+            query_dict = urllib.parse.parse_qs(parsed.query)
+            query = urllib.parse.urlencode(query_dict, doseq=True) if query_dict else ''
+            decoded = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if query:
+                decoded += f"?{query}"
+            if parsed.fragment:
+                decoded += f"#{urllib.parse.quote(parsed.fragment, safe='')}"
+        # Validate URL
         if not parsed.scheme or not parsed.netloc:
-            logger.warning(f"Invalid URL structure after decoding: {final_url}")
+            logger.warning(f"Invalid URL structure after decoding: {decoded}")
             return url
-        logger.debug(f"Decoded URL: {final_url}")
-        return final_url
+        logger.debug(f"Decoded URL: {decoded}")
+        return decoded
     except Exception as e:
         logger.error(f"Error decoding URL {url}: {e}", exc_info=True)
         return url
