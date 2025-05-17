@@ -1,32 +1,47 @@
-
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import logging
-import pandas as pd
-import json
+import asyncio
 import os
-import aiofiles
-import re
-import pyodbc
-import aioodbc
-import asyncio
-import datetime
-from typing import Optional, List, Dict, Any
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError, DBAPIError
-from sqlalchemy.ext.asyncio import AsyncSession
-from database_config import conn_str, async_engine, engine
-from aws_s3 import upload_file_to_space
-from common import clean_string, validate_model, validate_brand, generate_aliases, calculate_priority, generate_brand_aliases
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import logging
 import pandas as pd
-import re
-import aioodbc
-import asyncio
-from typing import Optional, List, Dict, Any
-from sqlalchemy.exc import SQLAlchemyError
+import time
+import pyodbc
+import httpx
+import json
+import aiofiles
+import datetime
+from typing import Optional, Dict, List, Tuple
+from db_utils import (
+    sync_get_endpoint,
+    get_send_to_email,
+    insert_search_results,
+    get_images_excel_db,
+    fetch_missing_images,
+    update_file_location_complete,
+    update_file_generate_complete,
+    export_dai_json,
+    update_log_url_in_db,
+    fetch_last_valid_entry,
+)
+from image_utils import download_all_images
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from common import fetch_brand_rules
+from utils import (
+    create_temp_dirs,
+    cleanup_temp_dirs,
+    process_and_tag_results,
+    generate_search_variations,
+    process_search_row_gcloud
+)
+from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space
+import psutil
+from email_utils import send_message_email
+from image_reason import process_entry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from database_config import conn_str
-from common import clean_string, validate_model, validate_brand, generate_aliases, calculate_priority, generate_brand_aliases
+import aiohttp
+from database_config import conn_str, async_engine, engine
+from sqlalchemy.sql import text
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
