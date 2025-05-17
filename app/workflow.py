@@ -16,7 +16,7 @@ from search_utils import update_search_sort_order, insert_search_results
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
-from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations
+from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
 from endpoint_utils import sync_get_endpoint
 from logging_config import setup_job_logger
 from config import S3_CONFIG
@@ -424,6 +424,9 @@ async def generate_download_file(
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     process = psutil.Process()
     temp_images_dir, temp_excel_dir = None, None
+    successful_entries = 0
+    failed_entries = 0
+    entries = []
 
     try:
         file_id = int(file_id)
@@ -447,6 +450,10 @@ async def generate_download_file(
         if list(selected_images_df.columns) != expected_columns:
             logger.error(f"Invalid columns in DataFrame for ID {file_id}. Got: {list(selected_images_df.columns)}")
             return {"error": f"Invalid DataFrame columns", "log_filename": log_filename}
+
+        # Track unique EntryIDs as entries
+        entries = selected_images_df['ExcelRowID'].unique().tolist()
+        logger.info(f"Processing {len(entries)} unique entries for FileID {file_id}")
 
         template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
         base_name, extension = os.path.splitext(original_filename)
@@ -474,6 +481,7 @@ async def generate_download_file(
             logger.warning(f"No valid images found for ID {file_id}")
             with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
                 pd.DataFrame({"Message": [f"No valid images found for FileID {file_id}."]}).to_excel(writer, sheet_name="NoImages", index=False)
+            failed_entries = len(entries)
         else:
             selected_image_list = [
                 {
@@ -495,6 +503,11 @@ async def generate_download_file(
 
             header_index = 5
             await write_excel_image(local_filename, temp_images_dir, selected_image_list, "A", header_index, logger)
+
+            # Update successful and failed entries based on downloads
+            successful_entries = len(entries) - len(failed_downloads)
+            failed_entries = len(failed_downloads)
+            logger.info(f"Processed {successful_entries} successful entries, {failed_entries} failed entries")
 
             if failed_downloads:
                 logger.info(f"Writing {len(failed_downloads)} failed downloads to Excel")
@@ -549,7 +562,7 @@ async def generate_download_file(
             f"Processing for FileID {file_id} completed.\n"
             f"Successful entries: {successful_entries}/{len(entries)}\n"
             f"Failed entries: {failed_entries}\n"
-            f"Last EntryID: {last_entry_id_processed}\n"
+            f"Last EntryID: {max(entries) if entries else 0}\n"
             f"Log file: {log_filename}"
         )
         logger.debug(f"Scheduling admin email to {admin_email} with message: {admin_message}")
@@ -587,139 +600,3 @@ async def generate_download_file(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Cleaned up resources for ID {file_id}")
-
-async def process_and_tag_results(
-    search_string: str,
-    brand: Optional[str] = None,
-    model: Optional[str] = None,
-    endpoint: str = None,
-    entry_id: int = None,
-    logger: Optional[logging.Logger] = None,
-    use_all_variations: bool = False,
-    file_id_db: Optional[int] = None
-) -> List[Dict]:
-    """
-    Process search results for a given search string and tag them with metadata.
-    
-    Args:
-        search_string: The search query string.
-        brand: The brand name, if available.
-        model: The model name, if available.
-        endpoint: The search endpoint URL.
-        entry_id: The EntryID from utb_ImageScraperRecords.
-        logger: Logger instance for logging.
-        use_all_variations: Whether to use all search variations or stop after first successful type.
-        file_id_db: The FileID from utb_ImageScraperFiles.
-    
-    Returns:
-        List of dictionaries containing tagged search results with required fields.
-    """
-    logger = logger or default_logger
-    process = psutil.Process()
-    
-    try:
-        logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
-        
-        # Generate search variations
-        variations = generate_search_variations(
-            search_string=search_string,
-            brand=brand,
-            model=model,
-            logger=logger
-        )
-        
-        all_results = []
-        search_types = [
-            "default", "delimiter_variations", "color_delimiter",
-            "brand_alias", "no_color"
-        ]
-        
-        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
-        
-        for search_type in search_types:
-            if search_type not in variations:
-                logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
-                continue
-            
-            logger.info(f"Worker PID {process.pid}: Processing search type '{search_type}' for EntryID {entry_id}")
-            for variation in variations[search_type]:
-                logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
-                search_result = await search_variation(
-                    variation=variation,
-                    endpoint=endpoint,
-                    entry_id=entry_id,
-                    search_type=search_type,
-                    brand=brand,
-                    logger=logger
-                )
-                
-                if search_result["status"] == "success" and search_result["result"]:
-                    logger.info(f"Worker PID {process.pid}: Found {search_result['result_count']} results for variation '{variation}'")
-                    tagged_results = []
-                    for res in search_result["result"]:
-                        tagged_result = {
-                            "EntryID": entry_id,
-                            "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
-                            "ImageDesc": res.get("ImageDesc", ""),
-                            "ImageSource": res.get("ImageSource", "N/A"),
-                            "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
-                            "ProductCategory": res.get("ProductCategory", "")
-                        }
-                        if all(col in tagged_result for col in required_columns):
-                            tagged_results.append(tagged_result)
-                        else:
-                            logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
-                    
-                    all_results.extend(tagged_results)
-                    logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{variation}'")
-                
-                else:
-                    logger.warning(f"Worker PID {process.pid}: No valid results for variation '{variation}' in search type '{search_type}'")
-            
-            if all_results and not use_all_variations:
-                logger.info(f"Worker PID {process.pid}: Stopping after {len(all_results)} results from '{search_type}' for EntryID {entry_id}")
-                break
-        
-        if not all_results:
-            logger.error(f"Worker PID {process.pid}: No valid results found across all search types for EntryID {entry_id}")
-            return [{
-                "EntryID": entry_id,
-                "ImageUrl": "placeholder://no-results",
-                "ImageDesc": f"No results found for {search_string}",
-                "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://no-results",
-                "ProductCategory": ""
-            }]
-        
-        # Deduplicate results based on ImageUrl
-        deduplicated_results = []
-        seen_urls = set()
-        for res in all_results:
-            image_url = res["ImageUrl"]
-            if image_url not in seen_urls and image_url != "placeholder://no-results":
-                seen_urls.add(image_url)
-                deduplicated_results.append(res)
-        
-        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
-        
-        # Filter out irrelevant results
-        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
-        filtered_results = [
-            res for res in deduplicated_results
-            if not any(kw.lower() in res.get("ImageDesc", "").lower() for kw in irrelevant_keywords)
-        ]
-        
-        logger.info(f"Worker PID {process.pid}: Filtered to {len(filtered_results)} results after removing irrelevant items for EntryID {entry_id}")
-        
-        return filtered_results
-    
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
-        return [{
-            "EntryID": entry_id,
-            "ImageUrl": "placeholder://error",
-            "ImageDesc": f"Error processing: {str(e)}",
-            "ImageSource": "N/A",
-            "ImageUrlThumbnail": "placeholder://error",
-            "ProductCategory": ""
-        }]
