@@ -2,6 +2,7 @@ import logging
 import pandas as pd
 import re
 import asyncio
+import json
 from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
@@ -113,22 +114,43 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Fetched {len(rows)} rows with columns: {columns}")
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
-            return None
+            async with async_engine.connect() as conn:
+                await conn.execute(
+                    text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id"),
+                    {"entry_id": entry_id}
+                )
+                await conn.commit()
+            return False
         
         try:
             df = pd.DataFrame(rows, columns=columns)
         except ValueError as e:
             logger.error(f"Worker PID {process.pid}: DataFrame creation failed for EntryID {entry_id}: {e}")
-            return None
+            async with async_engine.connect() as conn:
+                await conn.execute(
+                    text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id"),
+                    {"entry_id": entry_id}
+                )
+                await conn.commit()
+            return False
         
         async with async_engine.connect() as conn:
             for _, row in df.iterrows():
                 match_score = row['match_score']
+                ai_json = row['AiJson']
                 if pd.isna(match_score) or not isinstance(match_score, (int, float)):
                     logger.warning(f"Invalid match_score for ResultID {row['ResultID']}: {match_score}")
                     sort_order = -2
+                elif ai_json:
+                    try:
+                        json.loads(ai_json)
+                        sort_order = 1.0 if match_score > 0 else 0.0
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid AiJson for ResultID {row['ResultID']}: {ai_json[:100]}...")
+                        sort_order = -2
                 else:
-                    sort_order = 1.0 if match_score > 0 else 0.0
+                    logger.warning(f"Missing AiJson for ResultID {row['ResultID']}")
+                    sort_order = -2
                 await conn.execute(
                     text("UPDATE utb_ImageScraperResult SET SortOrder = :sort_order WHERE ResultID = :result_id"),
                     {"sort_order": sort_order, "result_id": row['ResultID']}
@@ -139,7 +161,13 @@ async def update_search_sort_order(
         return True
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
-        return None
+        async with async_engine.connect() as conn:
+            await conn.execute(
+                text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id"),
+                {"entry_id": entry_id}
+            )
+            await conn.commit()
+        return False
 
 @retry(
     stop=stop_after_attempt(3),
@@ -183,7 +211,7 @@ def sync_update_search_sort_order(
                     brand, model, color, category = row
                     logger.debug(f"Fetched attributes - Brand: {brand}, Model: {model}")
                 else:
-                    logger.warning(f"No attributes found for FileID: {file_id}, EntryID {entry_id}")
+                    logger.warning(f"No attributes found for FileID: {file_id}, EntryID: {entry_id}")
                     brand, model, color, category = brand or '', model or '', color or '', category or ''
 
             cursor.execute(
@@ -297,7 +325,7 @@ def sync_update_search_sort_order(
                 )
                 logger.info(f"Updated {len(updates)} rows for EntryID {entry_id}")
             else:
-                logger.warning(f"No updates applied for EntryID {entry_id}, setting SortOrder to -2")
+                logger.warning(f"No valid matches for EntryID {entry_id}, setting SortOrder to -2")
                 cursor.execute(
                     "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ?",
                     (entry_id,)
@@ -341,6 +369,11 @@ def sync_update_search_sort_order(
         raise
     except Exception as e:
         logger.error(f"Unexpected error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
+        cursor.execute(
+            "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ?",
+            (entry_id,)
+        )
+        conn.commit()
         return None
 
 @retry(
@@ -353,7 +386,7 @@ def sync_update_search_sort_order(
     )
 )
 async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
@@ -452,6 +485,7 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
         
         async with async_engine.begin() as conn:
+            # Delete placeholder entries
             result = await conn.execute(
                 text("""
                     DELETE FROM utb_ImageScraperResult
@@ -464,10 +498,26 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                 """),
                 {"file_id": file_id}
             )
-            rows_affected = result.rowcount
-            logger.info(f"Deleted {rows_affected} placeholder entries for FileID: {file_id}")
+            rows_deleted = result.rowcount
+            logger.info(f"Deleted {rows_deleted} placeholder entries for FileID: {file_id}")
+
+            # Set NULL SortOrder to -2
+            result = await conn.execute(
+                text("""
+                    UPDATE utb_ImageScraperResult
+                    SET SortOrder = -2
+                    WHERE EntryID IN (
+                        SELECT r.EntryID
+                        FROM utb_ImageScraperRecords r
+                        WHERE r.FileID = :file_id
+                    ) AND SortOrder IS NULL
+                """),
+                {"file_id": file_id}
+            )
+            rows_updated = result.rowcount
+            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID: {file_id}")
             
-            return {"file_id": file_id, "rows_affected": rows_affected}
+            return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
     
     except ValueError as ve:
         logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
