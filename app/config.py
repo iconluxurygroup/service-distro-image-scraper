@@ -1,10 +1,6 @@
 import os
-#from dotenv import load_dotenv 
-from sqlalchemy import create_engine
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 import logging
 from typing import Optional, Dict
-from sqlalchemy.sql import text
 from urllib.parse import quote_plus
 VERSION="3.4.21"
 SENDER_EMAIL="nik@luxurymarket.com"
