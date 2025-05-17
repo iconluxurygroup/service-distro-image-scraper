@@ -796,7 +796,6 @@ async def api_process_ai_images(
             },
             "timestamp": timestamp
         }
-
 @router.post("/generate-download-file/{file_id}", tags=["Export"])
 async def api_generate_download_file(
     background_tasks: BackgroundTasks,
@@ -819,7 +818,7 @@ async def api_generate_download_file(
                 SELECT r.AiJson, r.AiCaption, r.SortOrder
                 FROM utb_ImageScraperResult r
                 INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID
-                WHERE r.EntryID = ? AND s.FileID = ?
+                WHERE r.EntryID = ? AND s.FileAPEID = ?
             """, (69801, file_id))
             result = cursor.fetchone()
             if result:
@@ -844,27 +843,31 @@ async def api_generate_download_file(
             await update_log_url_in_db(file_id, upload_url, logger)
             debug_info["log_url"] = upload_url
 
+        # Check if entry_69801 is a dictionary before accessing AiJson
+        entry_69801 = debug_info["database_state"].get("entry_69801", "Not found")
+        is_error = isinstance(entry_69801, dict) and "Processing failed" in entry_69801.get("AiJson", "")
+
         return {
             "status": "success",
             "status_code": 202,
             "message": f"Download file generation queued for FileID: {file_id}",
             "data": {
                 "validated_response": {
-                    "status": "error" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "unknown",
-                    "status_code": 500 if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else 200,
-                    "message": "Image processing failed due to worker timeout or resource exhaustion" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "No error detected",
+                    "status": "error" if is_error else "unknown",
+                    "status_code": 500 if is_error else 200,
+                    "message": "Image processing failed due to worker timeout or resource exhaustion" if is_error else "No error detected",
                     "data": {
                         "original_response": {
                             "scores": {"sentiment": 0.0, "relevance": 0.0},
                             "category": "unknown",
                             "error": "Processing failed",
                             "caption": "Failed to generate caption"
-                        } if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else {},
+                        } if is_error else {},
                         "entry_id": 69801,
                         "file_id": file_id,
                         "result_id": None
                     },
-                    "retry_flag": True if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else False,
+                    "retry_flag": is_error,
                     "timestamp": "2025-05-17T00:36:00-04:00"
                 },
                 "implementation_details": {
@@ -949,7 +952,6 @@ async def api_generate_download_file(
             },
             "timestamp": timestamp
         }
-
 
 @router.get("/fetch-missing-images/{file_id}", tags=["Database"])
 async def fetch_missing_images_endpoint(file_id: str, limit: int = Query(1000), ai_analysis_only: bool = Query(True)):
