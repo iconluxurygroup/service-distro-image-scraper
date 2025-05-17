@@ -14,7 +14,6 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 def clean_url(url: str, attempt: int = 1) -> str:
-    """Clean URLs iteratively with different strategies based on attempt number."""
     try:
         if attempt == 1:
             url = re.sub(r'\\+|%5[Cc]', '', url)
@@ -51,7 +50,6 @@ def clean_url(url: str, attempt: int = 1) -> str:
         return url
 
 def encode_url(url: str) -> str:
-    """Encode URL, preserving slashes in path and encoding query values."""
     try:
         parsed = urlparse(url)
         path = parsed.path
@@ -74,7 +72,6 @@ def encode_url(url: str) -> str:
         return url
 
 async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bool:
-    """Check if URL is accessible with a HEAD request."""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124',
@@ -99,7 +96,6 @@ async def download_image(
     timeout: int = 30,
     max_clean_attempts: int = 3
 ) -> bool:
-    """Download image, trying multiple cleaned versions of the URL."""
     for attempt in range(1, max_clean_attempts + 1):
         try:
             cleaned_url = clean_url(url, attempt)
