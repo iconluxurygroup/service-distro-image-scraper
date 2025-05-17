@@ -11,10 +11,14 @@ from database_config import async_engine
 from common import clean_string, normalize_model, generate_aliases
 import psutil
 import pyodbc
+import re
+import urllib.parse
+
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
+    logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 
