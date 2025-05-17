@@ -87,7 +87,7 @@ async def download_image(
     timeout: int = 30,
     max_clean_attempts: int = 3
 ) -> bool:
-    extracted_url = extract submer_url(url, logger)
+    extracted_url = extract_thumbnail_url(url, logger)
     logger.debug(f"Extracted URL: {extracted_url}")
     for attempt in range(1, max_clean_attempts + 1):
         try:
