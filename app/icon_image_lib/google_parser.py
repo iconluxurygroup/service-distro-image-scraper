@@ -2,17 +2,8 @@ import re
 import logging
 from charset_normalizer import detect
 from bs4 import BeautifulSoup
-import pandas as pd
-from typing import Tuple, List, Optional
-
-# Assuming LR class is in icon_image_lib.LR; otherwise, include it directly here
+from typing import List, Dict, Optional
 from icon_image_lib.LR import LR
-
-# Configure logging with detailed format
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s - [File: %(filename)s, Line: %(lineno)d]'
-)
 
 def clean_source_url(s: str) -> str:
     """Clean and decode URL string by replacing encoded characters."""
@@ -49,145 +40,106 @@ def get_original_images(
     html_bytes: bytes,
     logger: Optional[logging.Logger] = None,
     max_results: int = 50
-) -> Tuple[List[str], List[str], List[str], List[str]]:
+) -> List[Dict]:
     """Extract image data from Google image search HTML."""
     logger = logger or logging.getLogger(__name__)
     
-    # Validate input
     if not isinstance(html_bytes, bytes):
         logger.error("html_bytes must be bytes")
-        return [], [], [], []
+        return []
 
-    # Decode HTML
     html_content = decode_html_bytes(html_bytes, logger)
 
-    # Extract data between specific tags using LR
-    start_tag = 'FINANCE",[22,1]]]]]'
-    end_tag = ':[null,null,null,"glbl'
+    # Updated tags for modern Google Image Search (2025)
+    start_tag = 'data:image/jpeg;base64,'  # Common prefix for inline images
+    end_tag = '</script>'  # End of relevant script tag
     matched_google_image_data = LR().get(html_content, start_tag, end_tag, logger)
     
     if not matched_google_image_data:
         logger.warning(f"No data extracted between '{start_tag}' and '{end_tag}'. HTML structure may have changed.")
-        return [], [], [], []
+        return []
 
-    # Process extracted data
-    thumbnails = str(matched_google_image_data).replace('\u003d', '=').replace('\u0026', '&')
-    if '"2003":' not in thumbnails:
-        logger.warning("No '2003' tag found in thumbnails. Check HTML structure or regex patterns.")
-        return [], [], [], []
+    # Parse with BeautifulSoup for robustness
+    soup = BeautifulSoup(html_content, 'lxml')
+    results = []
+    image_divs = soup.find_all('div', class_='isv-r')  # Common class for image results
+    trusted_domains = ['scotchandsoda.com', 'scotch-soda.com.au', 'shopninenorth.com']
 
-    # Extract main thumbnails, descriptions, and source URLs
-    main_thumbs = [clean_source_url(url) for url in re.findall(
-        r'\[\"(https:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]', thumbnails)]
-    main_descriptions = re.findall(r'"2003":\[null,"[^"]*","[^"]*","(.*?)"', thumbnails)
-    main_source_urls = [clean_source_url(url) for url in re.findall(r'"2003":\[null,"[^"]*","(.*?)"', thumbnails)]
-    
-    # Extract main image URLs
-    removed_thumbs = re.sub(r'\[\"(https:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]', "", thumbnails)
-    main_image_urls = [clean_image_url(url) for url in re.findall(
-        r"(?:|,),\[\"(https:|http.*?)\",\d+,\d+\]", removed_thumbs)]
-    
-    # Fallback to thumbnails if no main image URLs
-    if not main_image_urls:
-        main_image_urls = main_thumbs
-        logger.debug("No main image URLs found; using thumbnails as fallback.")
+    for div in image_divs[:max_results]:
+        img_tag = div.find('img')
+        if not img_tag or 'src' not in img_tag.attrs or 'data:image' in img_tag['src']:
+            continue
 
-    # Truncate to minimum length and apply max_results cap
-    min_length = min(len(main_image_urls), len(main_descriptions), len(main_source_urls), len(main_thumbs))
-    if min_length < max(len(main_image_urls), len(main_descriptions), len(main_source_urls), len(main_thumbs)):
-        logger.warning(f"Data mismatch in main results: URLs={len(main_image_urls)}, "
-                      f"Descriptions={len(main_descriptions)}, Sources={len(main_source_urls)}, "
-                      f"Thumbs={len(main_thumbs)}. Truncating to {min_length}")
-        for i in range(min_length, max(len(main_image_urls), len(main_descriptions), len(main_source_urls), len(main_thumbs))):
-            logger.debug(f"Mismatched item at index {i}: "
-                        f"URL={main_image_urls[i] if i < len(main_image_urls) else None}, "
-                        f"Desc={main_descriptions[i] if i < len(main_descriptions) else None}, "
-                        f"Source={main_source_urls[i] if i < len(main_source_urls) else None}, "
-                        f"Thumb={main_thumbs[i] if i < len(main_thumbs) else None}")
+        image_url = clean_image_url(img_tag['src'])
+        desc_tag = div.find('div', class_='ZGwO7')  # Description class
+        description = desc_tag.get_text(strip=True) if desc_tag else 'No description'
+        source_tag = div.find('a', class_='fH9F7')  # Source link
+        source_url = clean_source_url(source_tag['href']) if source_tag and 'href' in source_tag.attrs else 'No source'
+        thumb_url = image_url  # Use main image as thumbnail if no separate thumbnail
 
-    main_image_urls = main_image_urls[:min_length][:max_results]
-    main_descriptions = main_descriptions[:min_length][:max_results]
-    main_source_urls = main_source_urls[:min_length][:max_results]
-    main_thumbs = main_thumbs[:min_length][:max_results]
+        result = {
+            'ImageUrl': image_url,
+            'ImageDesc': description,
+            'ImageSource': source_url,
+            'ImageUrlThumbnail': thumb_url,
+            'Priority': 1 if any(domain in source_url.lower() for domain in trusted_domains) else 2
+        }
+        results.append(result)
 
-    logger.debug(f"Main results extracted: URLs={len(main_image_urls)}, Descriptions={len(main_descriptions)}, "
-                 f"Sources={len(main_source_urls)}, Thumbs={len(main_thumbs)}")
-    return main_image_urls, main_descriptions, main_source_urls, main_thumbs
+    logger.debug(f"Extracted {len(results)} main images for EntryID")
+    return sorted(results, key=lambda x: x['Priority'])[:max_results]
 
 def get_results_page_results(
     html_bytes: bytes,
-    final_urls: List[str],
-    final_descriptions: List[str],
-    final_sources: List[str],
-    final_thumbs: List[str],
+    existing_results: List[Dict],
     logger: Optional[logging.Logger] = None,
     max_total: int = 100
-) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """Extract additional image data from results page HTML without base64."""
+) -> List[Dict]:
+    """Extract additional image data from results page HTML."""
     logger = logger or logging.getLogger(__name__)
     
-    # Validate input
     if not isinstance(html_bytes, bytes):
         logger.error("html_bytes must be bytes")
-        return final_urls, final_descriptions, final_sources, final_thumbs
+        return existing_results
 
-    # Decode HTML
     html_content = decode_html_bytes(html_bytes, logger)
-
-    # Parse HTML with lxml for efficiency
     try:
         soup = BeautifulSoup(html_content, 'lxml')
     except Exception as e:
         logger.error(f"BeautifulSoup parsing error: {e}", exc_info=True)
-        return final_urls, final_descriptions, final_sources, final_thumbs
+        return existing_results
 
-    # Find result divs
     result_divs = soup.find_all('div', class_='H8Rx8c')
-    if not result_divs:
-        logger.warning("No result items found in additional results page. Check class name 'H8Rx8c'.")
-        return final_urls, final_descriptions, final_sources, final_thumbs
+    trusted_domains = ['scotchandsoda.com', 'scotch-soda.com.au', 'shopninenorth.com']
 
-    # Process each result div
     for div in result_divs:
-        if len(final_urls) >= max_total:
+        if len(existing_results) >= max_total:
             logger.debug(f"Reached maximum total results: {max_total}")
             break
 
-        # Extract thumbnail
         img_tag = div.find('img', class_='gdOPf uhHOwf ez24Df')
-        thumb = img_tag.get('src') if img_tag and 'src' in img_tag.attrs and 'data:image' not in img_tag['src'] else None
-        if not thumb:
-            logger.debug("No valid thumbnail URL in result item")
+        if not img_tag or 'src' not in img_tag.attrs or 'data:image' in img_tag['src']:
             continue
-        final_thumbs.append(thumb)
 
-        # Extract description
+        thumb_url = img_tag['src']
         desc_div = div.find_next('div', class_='VwiC3b')
         description = desc_div.get_text(strip=True) if desc_div else 'No description'
-        final_descriptions.append(description)
-
-        # Extract source URL
         source_tag = div.find_next('cite', class_='qLRx3b')
-        source = clean_source_url(source_tag.get_text(strip=True)) if source_tag else 'No source'
-        final_sources.append(source)
-
-        # Extract image URL
+        source_url = clean_source_url(source_tag.get_text(strip=True)) if source_tag else 'No source'
         link_tag = div.find_next('a', class_='zReHs')
-        url = clean_image_url(link_tag['href']) if link_tag and 'href' in link_tag.attrs else 'No image URL'
-        final_urls.append(url)
+        image_url = clean_image_url(link_tag['href']) if link_tag and 'href' in link_tag.attrs else thumb_url
 
-    # Cap total results
-    if len(final_urls) > max_total:
-        final_urls = final_urls[:max_total]
-        final_descriptions = final_descriptions[:max_total]
-        final_sources = final_sources[:max_total]
-        final_thumbs = final_thumbs[:max_total]
-        logger.debug(f"Capped total results at {max_total}")
+        result = {
+            'ImageUrl': image_url,
+            'ImageDesc': description,
+            'ImageSource': source_url,
+            'ImageUrlThumbnail': thumb_url,
+            'Priority': 1 if any(domain in source_url.lower() for domain in trusted_domains) else 2
+        }
+        existing_results.append(result)
 
-    logger.debug(f"Appended results from additional page. Total now: URLs={len(final_urls)}, "
-                 f"Descriptions={len(final_descriptions)}, Sources={len(final_sources)}, "
-                 f"Thumbs={len(final_thumbs)}")
-    return final_urls, final_descriptions, final_sources, final_thumbs
+    logger.debug(f"Appended {len(existing_results)} total results")
+    return sorted(existing_results, key=lambda x: x['Priority'])[:max_total]
 
 def process_search_result(
     image_html_bytes: bytes,
@@ -195,64 +147,37 @@ def process_search_result(
     entry_id: int,
     logger: Optional[logging.Logger] = None,
     max_results: int = 100
-) -> pd.DataFrame:
-    """Process search result HTML bytes and return a DataFrame with image data."""
+) -> List[Dict]:
+    """Process search result HTML bytes and return a list of image data dictionaries."""
     logger = logger or logging.getLogger(__name__)
     
-    # Input validation
     if not isinstance(image_html_bytes, bytes):
         logger.error("image_html_bytes must be bytes")
-        return pd.DataFrame(columns=['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail'])
+        return []
     if results_html_bytes and not isinstance(results_html_bytes, bytes):
         logger.error("results_html_bytes must be bytes")
-        return pd.DataFrame(columns=['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail'])
+        return []
     if not isinstance(entry_id, int):
         logger.error("entry_id must be an integer")
-        return pd.DataFrame(columns=['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail'])
+        return []
 
-    # Extract main images
-    final_urls, final_descriptions, final_sources, final_thumbs = get_original_images(
-        image_html_bytes, logger, max_results=max_results // 2
-    )
+    results = get_original_images(image_html_bytes, logger, max_results=max_results // 2)
     
-    # Extract additional results if provided
     if results_html_bytes:
-        final_urls, final_descriptions, final_sources, final_thumbs = get_results_page_results(
-            results_html_bytes, final_urls, final_descriptions, final_sources, final_thumbs,
-            logger, max_total=max_results
-        )
-    
-    # Handle empty results
-    min_length = min(len(final_urls), len(final_descriptions), len(final_sources), len(final_thumbs))
-    if min_length == 0:
+        results = get_results_page_results(results_html_bytes, results, logger, max_total=max_results)
+
+    # Add EntryID and validate
+    for res in results:
+        res['EntryID'] = entry_id
+        required_fields = ['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']
+        for field in required_fields:
+            if field not in res:
+                logger.warning(f"Missing field {field} in result: {res}")
+                res[field] = ''
+
+    if not results:
         logger.warning(f"No valid data for EntryID {entry_id}")
-        return pd.DataFrame(columns=['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail'])
+        return []
 
-    # Handle length mismatches
-    if min_length < max(len(final_urls), len(final_descriptions), len(final_sources), len(final_thumbs)):
-        logger.warning(f"Data mismatch: URLs={len(final_urls)}, Descriptions={len(final_descriptions)}, "
-                      f"Sources={len(final_sources)}, Thumbs={len(final_thumbs)}. Truncating to {min_length}")
-        for i in range(min_length, max(len(final_urls), len(final_descriptions), len(final_sources), len(final_thumbs))):
-            logger.debug(f"Mismatched item at index {i}: "
-                        f"URL={final_urls[i] if i < len(final_urls) else None}, "
-                        f"Desc={final_descriptions[i] if i < len(final_descriptions) else None}, "
-                        f"Source={final_sources[i] if i < len(final_sources) else None}, "
-                        f"Thumb={final_thumbs[i] if i < len(final_thumbs) else None}")
-
-    # Truncate to minimum length
-    final_urls = final_urls[:min_length]
-    final_descriptions = final_descriptions[:min_length]
-    final_sources = final_sources[:min_length]
-    final_thumbs = final_thumbs[:min_length]
-
-    # Create DataFrame
-    df = pd.DataFrame({
-        'EntryID': [entry_id] * min_length,
-        'ImageUrl': final_urls,
-        'ImageDesc': final_descriptions,
-        'ImageSource': final_sources,
-        'ImageUrlThumbnail': final_thumbs
-    })
-    
-    logger.info(f"Processed EntryID {entry_id} with {len(df)} images")
-    return df
+    logger.info(f"Processed EntryID {entry_id} with {len(results)} images")
+    return results
