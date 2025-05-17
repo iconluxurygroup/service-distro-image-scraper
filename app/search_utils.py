@@ -10,6 +10,18 @@ from common import clean_string, normalize_model, validate_model, validate_brand
 import psutil
 import pyodbc
 
+import logging
+import asyncio
+import json
+from typing import Optional, List, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import conn_str, async_engine
+from common import clean_string, normalize_model, validate_model, validate_brand, generate_aliases, generate_brand_aliases, calculate_priority, filter_model_results
+import psutil
+import re
+
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -104,23 +116,7 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
-```python
-import logging
-import asyncio
-import json
-from typing import Optional, List, Dict
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from database_config import conn_str, async_engine
-from common import clean_string, normalize_model, validate_model, validate_brand, generate_aliases, generate_brand_aliases, calculate_priority, filter_model_results
-import psutil
-import re
 
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 @retry(
     stop=stop_after_attempt(3),
@@ -392,7 +388,6 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
-```
 
 @retry(
     stop=stop_after_attempt(3),
