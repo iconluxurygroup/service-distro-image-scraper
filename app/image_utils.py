@@ -63,6 +63,10 @@ async def download_all_images(
     failed_downloads = []
     logger.info(f"📥 Starting download of {len(image_list)} images to {temp_dir}")
 
+    if not image_list:
+        logger.error("Image list is empty")
+        return []
+
     os.makedirs(temp_dir, exist_ok=True)
     logger.info(f"📁 Ensured directory exists: {temp_dir}")
 
@@ -102,7 +106,7 @@ async def download_all_images(
 
     async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bool:
         try:
-            if not re.match(r'^https?://', url):
+            if not url or not re.match(r'^https?://', url):
                 logger.warning(f"Invalid URL format: {url}")
                 return False
             headers = {
@@ -140,6 +144,9 @@ async def download_all_images(
         timeout: int = 30,
         max_clean_attempts: int = 3
     ) -> bool:
+        if not url:
+            logger.error(f"Empty URL for filename {filename}")
+            return False
         extracted_url = extract_thumbnail_url(url, logger)
         logger.debug(f"Extracted URL: {extracted_url}")
         for attempt in range(1, max_clean_attempts + 1):
@@ -161,7 +168,14 @@ async def download_all_images(
                             return False
                         continue
                     async with aiofiles.open(filename, 'wb') as f:
-                        await f.write(await response.read())
+                        content = await response.read()
+                        if not content:
+                            logger.error(f"Empty content downloaded for {extracted_url}")
+                            return False
+                        await f.write(content)
+                    if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+                        logger.error(f"Downloaded file {filename} is missing or empty")
+                        return False
                     logger.debug(f"Attempt {attempt} - Successfully downloaded {extracted_url} to {filename}")
                     return True
             except aiohttp.ClientResponseError as e:
@@ -187,9 +201,12 @@ async def download_all_images(
     ]
 
     async def process_image(image: Dict, index: int) -> None:
-        excel_row_id = image['ExcelRowID']
-        main_url = image['ImageUrl']
+        excel_row_id = image.get('ExcelRowID')
+        main_url = image.get('ImageUrl')
         thumb_url = image.get('ImageUrlThumbnail', '')
+        if not excel_row_id or not isinstance(excel_row_id, (int, str)):
+            logger.error(f"Invalid ExcelRowID: {excel_row_id}")
+            return
         filename = os.path.join(temp_dir, f"{excel_row_id}_image.jpg")
 
         logger.debug(f"Processing ExcelRowID {excel_row_id} at index {index}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
@@ -216,7 +233,7 @@ async def download_all_images(
         logger.info(f"Trying sort strategy {strategy_idx}")
         sorted_tail = sort_func(original_tail)
         current_list = fixed_prefix + sorted_tail
-        logger.debug(f"Current list order: {[item['ExcelRowID'] for item in current_list]}")
+        logger.debug(f"Current list order: {[item.get('ExcelRowID', 'N/A') for item in current_list]}")
 
         batches = [current_list[i:i + batch_size] for i in range(0, len(current_list), batch_size)]
         for batch_idx, batch in enumerate(batches, 1):
@@ -235,15 +252,16 @@ async def download_all_images(
         logger.info(f"Retrying {len(best_failed_downloads)} failed downloads with fallback strategy")
         retry_failed = []
         for url, excel_row_id in best_failed_downloads:
-            image = next((img for img in image_list if img['ExcelRowID'] == excel_row_id), None)
+            image = next((img for img in image_list if img.get('ExcelRowID') == excel_row_id), None)
             if not image:
+                logger.warning(f"No image data found for ExcelRowID {excel_row_id} during retry")
                 continue
             filename = os.path.join(temp_dir, f"{excel_row_id}_image.jpg")
             async with aiohttp.ClientSession() as session:
-                main_url = clean_url(image['ImageUrl'], attempt=3)
+                main_url = clean_url(image.get('ImageUrl', ''), attempt=3)
                 success = await download_image(main_url, filename, session, logger, entry_index=image_list.index(image))
                 if not success and image.get('ImageUrlThumbnail'):
-                    thumb_url = clean_url(image['ImageUrlThumbnail'], attempt=3)
+                    thumb_url = clean_url(image.get('ImageUrlThumbnail', ''), attempt=3)
                     success = await download_image(thumb_url, filename, session, logger, entry_index=image_list.index(image))
                 if not success:
                     retry_failed.append((url, excel_row_id))
@@ -255,9 +273,15 @@ async def download_all_images(
 async def verify_png_image_single(image_path: str, logger: Optional[logging.Logger] = None) -> bool:
     logger = logger or default_logger
     try:
+        if not os.path.exists(image_path):
+            logger.error(f"Image file does not exist: {image_path}")
+            return False
         logger.debug(f"🔎 Verifying image: {image_path}")
         async with aiofiles.open(image_path, 'rb') as f:
             img_data = await f.read()
+        if not img_data:
+            logger.error(f"Empty image data for {image_path}")
+            return False
         img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
         if img is None:
             logger.error(f"❌ Failed to open image: {image_path}")
@@ -278,6 +302,9 @@ async def verify_png_image_single(image_path: str, logger: Optional[logging.Logg
 
         async with aiofiles.open(image_path, 'rb') as f:
             img_data = await f.read()
+        if not img_data:
+            logger.error(f"Empty image data after resize for {image_path}")
+            return False
         img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
         if img is None:
             logger.error(f"❌ Failed to open image after resize: {image_path}")
@@ -295,6 +322,9 @@ async def resize_image(image_path: str, logger: Optional[logging.Logger] = None)
         logger.debug(f"📂 Attempting to open image: {image_path}")
         async with aiofiles.open(image_path, 'rb') as f:
             img_data = await f.read()
+        if not img_data:
+            logger.error(f"Empty image data for {image_path}")
+            return False
         img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
         logger.debug(f"After opening: img={img}, type={type(img)}, has_size={hasattr(img, 'size')}")
         if img is None or not hasattr(img, 'size'):
@@ -372,7 +402,11 @@ async def resize_image(image_path: str, logger: Optional[logging.Logger] = None)
         logger.info(f"✅ Image processed and saved: {image_path}")
 
         if await aiofiles.os.path.exists(image_path):
-            logger.debug(f"📏 File size after save: {(await aiofiles.os.stat(image_path)).st_size} bytes")
+            file_size = (await aiofiles.os.stat(image_path)).st_size
+            logger.debug(f"📏 File size after save: {file_size} bytes")
+            if file_size == 0:
+                logger.error(f"Resized file {image_path} is empty")
+                return False
         else:
             logger.error(f"❌ File not found after save: {image_path}")
             return False
@@ -394,6 +428,8 @@ async def anchor_images_to_excel(
     failed_rows = []
 
     try:
+        if not os.path.exists(excel_file):
+            logger.warning(f"Excel file {excel_file} does not exist, creating new")
         logger.debug(f"📂 Loading or creating workbook at {excel_file}")
         if os.path.exists(excel_file):
             wb = await asyncio.to_thread(load_workbook, excel_file)
@@ -416,14 +452,21 @@ async def anchor_images_to_excel(
             return failed_rows
 
         image_files = await asyncio.to_thread(os.listdir, temp_dir)
+        logger.debug(f"Found {len(image_files)} files in temp_dir: {image_files}")
         image_map = {}
         for f in image_files:
             if '_' in f and f.split('_')[0].isdigit():
                 row_id = int(f.split('_')[0])
                 image_map[row_id] = f
+            else:
+                logger.warning(f"Skipping invalid filename {f} in temp_dir")
 
         for item in image_data:
-            row_id = item['ExcelRowID']
+            row_id = item.get('ExcelRowID')
+            if not row_id or not isinstance(row_id, (int, str)):
+                logger.error(f"Invalid ExcelRowID: {row_id}")
+                failed_rows.append(row_id)
+                continue
             try:
                 row_id_int = int(row_id)
             except (ValueError, TypeError) as e:
@@ -437,29 +480,42 @@ async def anchor_images_to_excel(
             status = "Failed"
             width, height, format_ = 0, 0, "Unknown"
 
-            if row_id_int in image_map and await verify_png_image_single(image_path, logger):
-                img = await asyncio.to_thread(OpenpyxlImage, image_path)
-                img.width, img.height = 80, 80
-                if preferred_image_method in ["append", "overwrite"]:
-                    anchor = f"{column}{row_number}"
-                elif preferred_image_method == "NewColumn":
-                    anchor = f"B{row_number}"
+            if row_id_int in image_map:
+                if await verify_png_image_single(image_path, logger):
+                    img = await asyncio.to_thread(OpenpyxlImage, image_path)
+                    img.width, img.height = 80, 80
+                    if preferred_image_method in ["append", "overwrite"]:
+                        anchor = f"{column}{row_number}"
+                    elif preferred_image_method == "NewColumn":
+                        anchor = f"B{row_number}"
+                    else:
+                        logger.error(f"Unrecognized preferred image method: {preferred_image_method}")
+                        failed_rows.append(row_id_int)
+                        continue
+
+                    try:
+                        await asyncio.to_thread(ws.add_image, img, anchor)
+                        ws.row_dimensions[row_number].height = 60
+                        logger.info(f"✅ Image added at {anchor}")
+                    except Exception as e:
+                        logger.error(f"Failed to anchor image at {anchor}: {e}", exc_info=True)
+                        failed_rows.append(row_id_int)
+                        continue
+
+                    async with aiofiles.open(image_path, 'rb') as f:
+                        img_data = await f.read()
+                    if not img_data:
+                        logger.error(f"Empty image data for {image_path} after anchoring")
+                        failed_rows.append(row_id_int)
+                        continue
+                    pil_img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
+                    width, height, format_ = pil_img.width, pil_img.height, pil_img.format or "Unknown"
+                    status = "Success"
                 else:
-                    logger.error(f"Unrecognized preferred image method: {preferred_image_method}")
+                    logger.warning(f"⚠️ Image verification failed for {image_path}")
                     failed_rows.append(row_id_int)
-                    continue
-
-                await asyncio.to_thread(ws.add_image, img, anchor)
-                ws.row_dimensions[row_number].height = 60
-                logger.info(f"✅ Image added at {anchor}")
-
-                async with aiofiles.open(image_path, 'rb') as f:
-                    img_data = await f.read()
-                pil_img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
-                width, height, format_ = pil_img.width, pil_img.height, pil_img.format
-                status = "Success"
             else:
-                logger.warning(f"⚠️ Image verification failed or no image for row {row_id_int}")
+                logger.warning(f"⚠️ No image found for row {row_id_int}")
                 failed_rows.append(row_id_int)
 
             ws[f"B{row_number}"] = item.get('Brand', '')
@@ -476,13 +532,21 @@ async def anchor_images_to_excel(
             if not ws[f"C{row_number}"].value:
                 logger.warning(f"⚠️ Missing Style in C{row_number}")
 
-        max_data_row = max(int(item['ExcelRowID']) for item in image_data) + row_offset
+        max_data_row = max(int(item.get('ExcelRowID', 0)) for item in image_data) + row_offset if image_data else row_offset
         if ws.max_row > max_data_row:
             logger.info(f"🗑️ Removing rows {max_data_row + 1} to {ws.max_row}")
             await asyncio.to_thread(ws.delete_rows, max_data_row + 1, ws.max_row - max_data_row)
 
-        await asyncio.to_thread(wb.save, excel_file)
-        logger.info(f"🏁 Excel file saved with anchored images: {excel_file}")
+        try:
+            await asyncio.to_thread(wb.save, excel_file)
+            file_size = os.path.getsize(excel_file) if os.path.exists(excel_file) else 0
+            logger.info(f"🏁 Excel file saved with anchored images: {excel_file}, size: {file_size} bytes")
+            if file_size < 1000:
+                logger.warning(f"Excel file {excel_file} is suspiciously small ({file_size} bytes)")
+        except Exception as e:
+            logger.error(f"Failed to save Excel file {excel_file}: {e}", exc_info=True)
+            return failed_rows
+
         return failed_rows
     except Exception as e:
         logger.error(f"❌ Error anchoring images to Excel: {e}", exc_info=True)
@@ -497,11 +561,14 @@ async def write_failed_downloads_to_excel(
     if failed_downloads:
         try:
             logger.debug(f"📂 Loading workbook from {excel_file}")
+            if not os.path.exists(excel_file):
+                logger.error(f"Excel file {excel_file} does not exist for writing failed downloads")
+                return False
             wb = await asyncio.to_thread(load_workbook, excel_file)
             ws = wb.create_sheet("FailedDownloads") if "FailedDownloads" not in wb else wb["FailedDownloads"]
 
             max_row = ws.max_row or 1
-            max_failed_row = max(row_id for _, row_id in failed_downloads)
+            max_failed_row = max(row_id for _, row_id in failed_downloads) if failed_downloads else max_row
             if max_failed_row > max_row:
                 logger.debug(f"Extending worksheet from {max_row} to {max_failed_row} rows")
                 for i in range(max_row + 1, max_failed_row + 1):
@@ -510,7 +577,7 @@ async def write_failed_downloads_to_excel(
             for url, row_id in failed_downloads:
                 cell_reference = f"A{row_id}"
                 logger.debug(f"✍️ Writing URL {url} to cell {cell_reference}")
-                ws[cell_reference] = str(url)
+                ws[cell_reference] = str(url) if url else "No valid URL"
                 ws[cell_reference].fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
             await asyncio.to_thread(wb.save, excel_file)
@@ -532,14 +599,32 @@ async def process_images_and_anchor(
     logger = logger or default_logger
     logger.info(f"🚀 Starting image processing pipeline with method {preferred_image_method}")
 
-    failed_downloads = await download_all_images(image_list, temp_dir, logger)
-    
-    failed_rows = await anchor_images_to_excel(excel_file, temp_dir, image_data=image_list, preferred_image_method=preferred_image_method, logger=logger)
-    
-    success = await write_failed_downloads_to_excel(failed_downloads, excel_file, logger)
-    
-    logger.info(f"🎉 Pipeline completed. Failed downloads: {len(failed_downloads)}, Failed rows: {len(failed_rows)}")
-    return success and not failed_rows
+    if not image_list:
+        logger.error("Image list is empty, cannot process")
+        return False
+
+    if preferred_image_method not in ["append", "overwrite", "NewColumn"]:
+        logger.warning(f"Invalid preferred_image_method '{preferred_image_method}', defaulting to 'append'")
+        preferred_image_method = "append"
+
+    try:
+        failed_downloads = await download_all_images(image_list, temp_dir, logger)
+        logger.debug(f"Download completed with {len(failed_downloads)} failed downloads")
+        
+        failed_rows = await anchor_images_to_excel(
+            excel_file, temp_dir, image_data=image_list, 
+            preferred_image_method=preferred_image_method, logger=logger
+        )
+        logger.debug(f"Anchoring completed with {len(failed_rows)} failed rows")
+        
+        success = await write_failed_downloads_to_excel(failed_downloads, excel_file, logger)
+        logger.debug(f"Writing failed downloads completed with success={success}")
+        
+        logger.info(f"🎉 Pipeline completed. Failed downloads: {len(failed_downloads)}, Failed rows: {len(failed_rows)}")
+        return success and len(failed_rows) == 0
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}", exc_info=True)
+        return False
 
 # Original process_restart_batch (As Provided)
 async def process_restart_batch(
@@ -799,6 +884,9 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
                 logger=logger,
                 file_id=file_id
             )
+            if not upload_url:
+                logger.error(f"S3 upload returned empty URL for {log_filename}")
+                raise ValueError("Empty upload URL")
             await update_log_url_in_db(file_id, upload_url, logger)
             LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
             logger.info(f"Log uploaded to R2: {upload_url}")
@@ -841,6 +929,7 @@ async def generate_download_file(
                 logger.error(f"No file found for ID {file_id}")
                 return {"error": f"No file found for ID {file_id}", "log_filename": log_filename}
             original_filename = row[0]
+        logger.debug(f"Original filename: {original_filename}")
 
         logger.info(f"Fetching images for ID: {file_id}")
         selected_images_df = await get_images_excel_db(str(file_id), logger=logger)
@@ -848,8 +937,12 @@ async def generate_download_file(
 
         expected_columns = ["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"]
         if list(selected_images_df.columns) != expected_columns:
-            logger.error(f"Invalid columns in DataFrame for ID {file_id}. Got: {list(selected_images_df.columns)}")
+            logger.error(f"Invalid columns in DataFrame for ID {file_id}. Got: {list(selected_images_df.columns)}, Expected: {expected_columns}")
             return {"error": f"Invalid DataFrame columns", "log_filename": log_filename}
+
+        if selected_images_df.empty:
+            logger.error(f"DataFrame is empty for FileID {file_id}")
+            return {"error": f"No image data found for FileID {file_id}", "log_filename": log_filename}
 
         entries = selected_images_df['ExcelRowID'].unique().tolist()
         logger.info(f"Processing {len(entries)} unique entries for FileID {file_id}")
@@ -859,25 +952,45 @@ async def generate_download_file(
         processed_file_name = f"excel_files/{file_id}/{base_name}{extension}"
 
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
+        logger.debug(f"Created temp directories: images={temp_images_dir}, excel={temp_excel_dir}")
         local_filename = os.path.join(temp_excel_dir, original_filename)
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
-            response.raise_for_status()
-            async with aiofiles.open(local_filename, 'wb') as f:
-                await f.write(response.content)
+            logger.debug(f"Downloading template from {template_file_path}")
+            try:
+                response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
+                response.raise_for_status()
+                async with aiofiles.open(local_filename, 'wb') as f:
+                    content = await response.read()
+                    if not content:
+                        logger.error(f"Empty content downloaded from {template_file_path}")
+                        return {"error": f"Failed to download template file: empty content", "log_filename": log_filename}
+                    await f.write(content)
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error downloading template: {e}")
+                return {"error": f"Failed to download template file: {e}", "log_filename": log_filename}
+            except httpx.RequestError as e:
+                logger.error(f"Request error downloading template: {e}")
+                return {"error": f"Failed to download template file: {e}", "log_filename": log_filename}
 
         if not os.path.exists(local_filename):
             logger.error(f"Template file not found at {local_filename}")
             return {"error": f"Failed to download template file", "log_filename": log_filename}
-        logger.debug(f"Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
+        template_size = os.path.getsize(local_filename)
+        logger.debug(f"Template file saved: {local_filename}, size: {template_size} bytes")
+        if template_size < 1000:
+            logger.warning(f"Template file {local_filename} is suspiciously small ({template_size} bytes)")
 
         has_valid_images = not selected_images_df.empty and any(pd.notna(row['ImageUrl']) and row['ImageUrl'] for _, row in selected_images_df.iterrows())
         
         if not has_valid_images:
             logger.warning(f"No valid images found for ID {file_id}")
-            with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
-                pd.DataFrame({"Message": [f"No valid images found for FileID {file_id}."]}).to_excel(writer, sheet_name="NoImages", index=False)
+            try:
+                with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
+                    pd.DataFrame({"Message": [f"No valid images found for FileID {file_id}."]}).to_excel(writer, sheet_name="NoImages", index=False)
+            except Exception as e:
+                logger.error(f"Failed to write no-images message to Excel: {e}", exc_info=True)
+                return {"error": f"Failed to write Excel file: {e}", "log_filename": log_filename}
             failed_entries = len(entries)
         else:
             selected_image_list = [
@@ -895,42 +1008,60 @@ async def generate_download_file(
                 if pd.notna(row['ImageUrl']) and row['ImageUrl']
             ]
             logger.info(f"Selected {len(selected_image_list)} valid images")
+            if not selected_image_list:
+                logger.error("No valid images after filtering, despite has_valid_images=True")
+                return {"error": "No valid images after filtering", "log_filename": log_filename}
 
-            success = await process_images_and_anchor(
-                selected_image_list,
-                temp_images_dir,
-                local_filename,
-                preferred_image_method=preferred_image_method,
-                logger=logger
-            )
+            try:
+                success = await process_images_and_anchor(
+                    selected_image_list,
+                    temp_images_dir,
+                    local_filename,
+                    preferred_image_method=preferred_image_method,
+                    logger=logger
+                )
+            except Exception as e:
+                logger.error(f"Image processing pipeline failed: {e}", exc_info=True)
+                return {"error": f"Image processing failed: {e}", "log_filename": log_filename}
             
             successful_entries = len(entries) - sum(1 for item in selected_image_list if not os.path.exists(os.path.join(temp_images_dir, f"{item['ExcelRowID']}_image.jpg")))
             failed_entries = len(entries) - successful_entries
             logger.info(f"Processed {successful_entries} successful entries, {failed_entries} failed entries")
 
         if not os.path.exists(local_filename):
-            logger.error(f"Excel file not found at {local_filename}")
+            logger.error(f"Excel file not found at {local_filename} after processing")
             return {"error": f"Excel file not found", "log_filename": log_filename}
-        logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
+        final_size = os.path.getsize(local_filename)
+        logger.debug(f"Excel file exists: {local_filename}, size: {final_size} bytes")
+        if final_size < 1000:
+            logger.warning(f"Final Excel file {local_filename} is suspiciously small ({final_size} bytes)")
 
         logger.info(f"Uploading Excel file to R2: {processed_file_name}")
-        public_url = await upload_file_to_space(
-            file_src=local_filename,
-            save_as=processed_file_name,
-            is_public=True,
-            logger=logger,
-            file_id=file_id
-        )
+        try:
+            public_url = await upload_file_to_space(
+                file_src=local_filename,
+                save_as=processed_file_name,
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            if not public_url:
+                logger.error(f"Upload failed for ID {file_id}: No public URL returned")
+                return {"error": "Failed to upload processed file", "log_filename": log_filename}
+            logger.info(f"Excel file uploaded to R2, public_url: {public_url}")
+        except Exception as e:
+            logger.error(f"S3 upload failed for {local_filename}: {e}", exc_info=True)
+            return {"error": f"Failed to upload processed file: {e}", "log_filename": log_filename}
 
-        if not public_url:
-            logger.error(f"Upload failed for ID {file_id}")
-            return {"error": "Failed to upload processed file", "log_filename": log_filename}
-        logger.info(f"Excel file uploaded to R2, public_url: {public_url}")
-
-        await update_file_location_complete(str(file_id), public_url, logger=logger)
-        await update_file_generate_complete(str(file_id), logger=logger)
+        try:
+            await update_file_location_complete(str(file_id), public_url, logger=logger)
+            await update_file_generate_complete(str(file_id), logger=logger)
+        except Exception as e:
+            logger.error(f"Failed to update database with file location: {e}", exc_info=True)
 
         log_public_url = await upload_log_file(str(file_id), log_filename, logger)
+        if not log_public_url:
+            logger.warning(f"Log upload failed for {log_filename}")
 
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
@@ -997,6 +1128,9 @@ async def generate_download_file(
         return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename, "log_public_url": log_public_url or ""}
     finally:
         if temp_images_dir and temp_excel_dir:
-            await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
+            try:
+                await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
+            except Exception as e:
+                logger.error(f"Failed to clean up temp directories: {e}", exc_info=True)
         await async_engine.dispose()
         logger.info(f"Cleaned up resources for ID {file_id}")
