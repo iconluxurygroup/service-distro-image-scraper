@@ -124,9 +124,8 @@ async def process_search_row_gcloud(
             try:
                 logger.info(f"Worker PID {process.pid}: Attempt {attempt}: Fetching {search_url} via {fetch_endpoint} with region {region}")
                 async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
-                    # Corrected logging of response body
-                    body_text = await response.text()  # Await the coroutine to get the string
-                    body_preview = body_text[:200] if body_text else ""  # Safely slice the string
+                    body_text = await response.text()
+                    body_preview = body_text[:200] if body_text else ""
                     logger.debug(f"Worker PID {process.pid}: GCloud response: status={response.status}, headers={response.headers}, body={body_preview}")
                     response.raise_for_status()
                     result = await response.json()
@@ -149,9 +148,6 @@ async def process_search_row_gcloud(
                 continue
     logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     return pd.DataFrame()
-
-
-
 
 @retry(
     stop=stop_after_attempt(3),
@@ -546,7 +542,7 @@ async def process_single_all(
                 entry_ids=[entry_id],
                 step=0,
                 limit=1000,
-                concurrency=10,
+                concurrency=5,  # Reduced concurrency
                 logger=logger
             )
             if ai_result.get("status_code") != 200:
@@ -581,6 +577,7 @@ async def process_single_all(
                     if total_count == 0:
                         logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
                         return False
+                    result.close()
             except SQLAlchemyError as e:
                 logger.error(f"Worker PID {process.pid}: Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
                 return False
@@ -760,7 +757,7 @@ async def process_single_row(
                 entry_ids=[entry_id],
                 step=0,
                 limit=1000,
-                concurrency=10,
+                concurrency=5,  # Reduced concurrency
                 logger=logger
             )
             if ai_result.get("status_code") != 200:
@@ -795,6 +792,7 @@ async def process_single_row(
                     if total_count == 0:
                         logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
                         return False
+                    result.close()
             except SQLAlchemyError as e:
                 logger.error(f"Worker PID {process.pid}: Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
                 return False
