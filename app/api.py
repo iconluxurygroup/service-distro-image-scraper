@@ -15,8 +15,8 @@ from database import (
     update_file_location_complete,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
-fetch_last_valid_entry,
 )
+from db_utils import fetch_last_valid_entry
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
 from logging_config import setup_job_logger
@@ -285,7 +285,7 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
     try:
         # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = await get_last_entry_id(file_id, logger)
+            entry_id = await fetch_last_valid_entry(file_id, logger)
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
 
         result = await run_job_with_logging(
