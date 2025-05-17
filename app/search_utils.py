@@ -6,7 +6,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import conn_str, async_engine
-from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
+from common import clean_string, normalize_model, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
 import psutil
 import pyodbc
 
@@ -148,7 +148,7 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
         brand_clean = clean_string(brand).lower() if brand else ""
-        model_clean = validate_model(model) if model else ""
+        model_clean = normalize_model(model) if model else ""  # Replaced validate_model with normalize_model
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
         brand_aliases = []
@@ -383,3 +383,94 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
     except Exception as e:
         logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
         return None
+
+def generate_search_variations(
+    search_string: str,
+    brand: Optional[str] = None,
+    model: Optional[str] = None,
+    brand_rules: Optional[Dict] = None,
+    logger: Optional[logging.Logger] = None
+) -> Dict[str, List[str]]:
+    logger = logger or default_logger
+    process = psutil.Process()
+    variations = {
+        "default": [],
+        "delimiter_variations": [],
+        "color_delimiter": [],
+        "brand_alias": [],
+        "no_color": []
+    }
+    
+    if not search_string:
+        logger.warning(f"Worker PID {process.pid}: Empty search string provided")
+        return variations
+    
+    # Normalize all inputs to lowercase to suppress case sensitivity
+    search_string = search_string.lower()
+    brand = clean_string(brand).lower() if brand else None
+    model = clean_string(model).lower() if model else search_string
+    
+    variations["default"].append(search_string)
+    
+    delimiters = [' ', '-', '_', '/']
+    delimiter_variations = []
+    for delim in delimiters:
+        if delim in search_string:
+            delimiter_variations.append(search_string.replace(delim, ' '))
+            delimiter_variations.append(search_string.replace(delim, '-'))
+            delimiter_variations.append(search_string.replace(delim, '_'))
+    variations["delimiter_variations"] = list(set(delimiter_variations))
+    
+    variations["color_delimiter"].append(search_string)
+    
+    if brand:
+        brand_aliases = generate_aliases(brand)
+        variations["brand_alias"] = [f"{alias} {search_string}" for alias in brand_aliases]
+    
+    no_color_string = search_string
+    if brand and brand_rules and "brand_rules" in brand_rules:
+        for rule in brand_rules["brand_rules"]:
+            if any(brand in name.lower() for name in rule.get("names", [])):
+                sku_format = rule.get("sku_format", {})
+                color_separator = sku_format.get("color_separator", "_")
+                expected_length = rule.get("expected_length", {})
+                base_length = expected_length.get("base", [6])[0]
+                with_color_length = expected_length.get("with_color", [10])[0]
+                
+                if not color_separator:
+                    logger.warning(f"Worker PID {process.pid}: Empty color_separator for brand {brand}, skipping color split")
+                    no_color_string = search_string
+                    logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: No color split, no_color='{no_color_string}'")
+                    break
+                
+                if color_separator in search_string:
+                    logger.debug(f"Worker PID {process.pid}: Applying color_separator '{color_separator}' to search_string '{search_string}'")
+                    parts = search_string.split(color_separator)
+                    base_part = parts[0]
+                    if len(base_part) == base_length and len(search_string) <= with_color_length:
+                        no_color_string = base_part
+                        logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: Extracted no_color='{no_color_string}' from '{search_string}'")
+                        break
+                elif len(search_string) == base_length:
+                    no_color_string = search_string
+                    logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: No color suffix, no_color='{no_color_string}'")
+                    break
+    
+    if no_color_string == search_string:
+        for delim in ['_', '-', ' ']:
+            if delim in search_string:
+                no_color_string = search_string.rsplit(delim, 1)[0]
+                logger.debug(f"Worker PID {process.pid}: Delimiter fallback: Extracted no_color='{no_color_string}' from '{search_string}' using delimiter '{delim}'")
+                break
+    
+    variations["no_color"].append(no_color_string if no_color_string else search_string)
+    if no_color_string != search_string:
+        logger.info(f"Worker PID {process.pid}: Generated no_color variation: '{no_color_string}' from original '{search_string}'")
+    else:
+        logger.debug(f"Worker PID {process.pid}: No color suffix detected, no_color variation same as original: '{search_string}'")
+    
+    # Ensure all variations are lowercase and unique
+    for key in variations:
+        variations[key] = list(set(v.lower() for v in variations[key]))
+    
+    return variations
