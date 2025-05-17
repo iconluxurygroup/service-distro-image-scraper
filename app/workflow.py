@@ -310,14 +310,14 @@ async def generate_download_file(
         await send_message_email(
             to_emails=send_to_email_addr,
             subject=subject_line,
-            message=f"Excel file generation for FileID {file_id} completed successfully.\nDownload URL: {public_url_file}",
+            message=f"Excel file generation for FileID {file_id} completed successfully.\nDownload URL: {public_url}",
             logger=logger
         )
 
         logger.info(f"Completed ID {file_id}")
         mem_info = process.memory_info()
         logger.debug(f"Memory after completion: RSS={mem_info.rss / 1024**2:.2f} MB")
-        return {"message": "Processing completed successfully", "public_url": public_url_file, "log_filename": log_filename}
+        return {"message": "Processing completed successfully", "public_url": public_url, "log_filename": log_filename}
     except Exception as e:
         logger.error(f"Error for ID {file_id}: {e}", exc_info=True)
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
