@@ -170,7 +170,7 @@ async def update_search_sort_order(
                     """,
                     (file_id, entry_id)
                 )
-                columns = [column[0] for column in await cursor.description]
+                columns = [column[0] for column in cursor.description]
                 rows = await cursor.fetchall()
                 df = pd.DataFrame(rows, columns=columns)
                 if df.empty:
