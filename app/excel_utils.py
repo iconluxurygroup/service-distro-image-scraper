@@ -42,30 +42,39 @@ def clean_string(value: str, is_url: bool = False) -> str:
             cleaned = ""
     return cleaned
 
-def verify_png_image_single(image_path, logger=None):
+async def verify_png_image_single(image_path, logger=None):
     logger = logger or default_logger
     try:
         logger.debug(f"🔎 Verifying image: {image_path}")
-        img = IMG2.open(image_path)
-        img.verify()
+        # Run synchronous PIL verify in executor
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: IMG2.open(image_path).verify())
         logger.info(f"✅ Image verified successfully: {image_path}")
     except Exception as e:
         logger.error(f"❌ Image verify failed: {e}, for image: {image_path}", exc_info=True)
         return False
 
-    imageSize = os.path.getsize(image_path)
-    logger.debug(f"📏 Image size: {imageSize} bytes")
+    # Async file size check
+    try:
+        stat = await aiofiles.os.stat(image_path)
+        imageSize = stat.st_size
+        logger.debug(f"📏 Image size: {imageSize} bytes")
+    except Exception as e:
+        logger.error(f"❌ Error getting file size for {image_path}: {e}", exc_info=True)
+        return False
 
     if imageSize < 3000:
         logger.warning(f"⚠️ File may be corrupted or too small: {image_path}")
         return False
 
     try:
-        if not resize_image(image_path, logger=logger):
+        # Run synchronous resize_image in executor
+        success = await loop.run_in_executor(None, resize_image, image_path, logger)
+        if not success:
             logger.warning(f"⚠️ Resize failed for: {image_path}")
             return False
-        img = IMG2.open(image_path)
-        img.verify()
+        # Re-verify after resizing
+        await loop.run_in_executor(None, lambda: IMG2.open(image_path).verify())
         logger.info(f"✅ Post-resize verification successful: {image_path}")
         return True
     except Exception as e:
@@ -156,7 +165,11 @@ async def write_excel_image(local_filename, temp_dir, image_data: List[Dict], co
     try:
         # Run synchronous openpyxl load_workbook in executor
         loop = asyncio.get_running_loop()
-        wb = await loop.run_in_executor(None, load_workbook, local_filename)
+        try:
+            wb = await loop.run_in_executor(None, load_workbook, local_filename)
+        except Exception as e:
+            logger.error(f"❌ Failed to load workbook {local_filename}: {e}", exc_info=True)
+            raise
         ws = wb.active
         logger.debug(f"📂 Loaded workbook from {local_filename}")
 
@@ -171,7 +184,7 @@ async def write_excel_image(local_filename, temp_dir, image_data: List[Dict], co
             return failed_rows
 
         # Async list directory
-        image_files = [clean_string(f, is_url=False) async for f in aiofiles.os.scandir(temp_dir) if f.is_file()]
+        image_files = [clean_string(f.name, is_url=False) async for f in aiofiles.os.scandir(temp_dir) if f.is_file()]
         if not image_files:
             logger.warning(f"⚠️ No images found in {temp_dir}")
             return failed_rows
@@ -179,6 +192,7 @@ async def write_excel_image(local_filename, temp_dir, image_data: List[Dict], co
         # Clean and validate image_data
         cleaned_data = []
         for item in image_data:
+            raw_item = item.copy()  # Log raw data for debugging
             cleaned_item = {
                 'ExcelRowID': item.get('ExcelRowID', 0),
                 'Brand': clean_string(item.get('Brand', '')),
@@ -188,9 +202,10 @@ async def write_excel_image(local_filename, temp_dir, image_data: List[Dict], co
                 'SortOrder': item.get('SortOrder', 9999)
             }
             if not isinstance(cleaned_item['ExcelRowID'], int) or cleaned_item['ExcelRowID'] < 1:
-                logger.warning(f"⚠️ Invalid ExcelRowID: {cleaned_item['ExcelRowID']}")
+                logger.warning(f"⚠️ Invalid ExcelRowID: {cleaned_item['ExcelRowID']} in {raw_item}")
                 continue
             cleaned_data.append(cleaned_item)
+            logger.debug(f"🧹 Raw item: {raw_item}, Cleaned item: {cleaned_item}")
         logger.info(f"🧹 Cleaned {len(cleaned_data)} of {len(image_data)} entries")
 
         # Sort image_data
@@ -217,7 +232,11 @@ async def write_excel_image(local_filename, temp_dir, image_data: List[Dict], co
                 image_file = image_map[row_id]
                 image_path = os.path.join(temp_dir, image_file)
                 # Run synchronous verify_png_image_single in executor
-                success = await loop.run_in_executor(None, verify_png_image_single, image_path, logger)
+                try:
+                    success = await verify_png_image_single(image_path, logger)
+                except Exception as e:
+                    logger.error(f"❌ Executor error verifying {image_file}: {e}", exc_info=True)
+                    success = False
                 if success:
                     img = Image(image_path)
                     anchor = f"{column}{row_number}"
@@ -251,7 +270,11 @@ async def write_excel_image(local_filename, temp_dir, image_data: List[Dict], co
             ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
 
         # Run synchronous wb.save in executor
-        await loop.run_in_executor(None, wb.save, local_filename)
+        try:
+            await loop.run_in_executor(None, wb.save, local_filename)
+        except Exception as e:
+            logger.error(f"❌ Failed to save workbook {local_filename}: {e}", exc_info=True)
+            raise
         logger.info("🏁 Finished processing images")
         return failed_rows
 
