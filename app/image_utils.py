@@ -52,7 +52,7 @@ if not default_logger.handlers:
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
-# Image Processing Functions (From Old Logic)
+# Image Processing Functions (Optimized for Async Smoothness)
 async def download_all_images(
     image_list: List[Dict],
     temp_dir: str,
@@ -72,6 +72,8 @@ async def download_all_images(
 
     def clean_url(url: str, attempt: int = 1) -> str:
         try:
+            if not url:
+                return url
             if attempt == 1:
                 url = re.sub(r'\\+|%5[Cc]', '', url)
                 parsed = urlparse(url)
@@ -114,7 +116,7 @@ async def download_all_images(
                 'Accept': 'image/*,*/*;q=0.8',
                 'Referer': 'https://www.google.com/'
             }
-            async with session.head(url, timeout=5, headers=headers) as response:
+            async with session.head(url, timeout=5, headers=headers, allow_redirects=True) as response:
                 if response.status == 200:
                     logger.debug(f"URL {url} is accessible")
                     return True
@@ -125,6 +127,9 @@ async def download_all_images(
                 return False
         except aiohttp.ClientError as e:
             logger.warning(f"URL {url} is not accessible: {e}")
+            return False
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout validating URL {url}")
             return False
 
     @retry(
@@ -151,32 +156,32 @@ async def download_all_images(
         logger.debug(f"Extracted URL: {extracted_url}")
         for attempt in range(1, max_clean_attempts + 1):
             try:
-                logger.debug(f"Attempt {attempt} - Raw URL: {url}")
-                logger.debug(f"Attempt {attempt} - Extracted URL: {extracted_url}")
-                if not await validate_url(extracted_url, session, logger):
-                    logger.warning(f"Attempt {attempt} - Skipping inaccessible URL: {extracted_url}")
+                cleaned_url = clean_url(extracted_url, attempt)
+                logger.debug(f"Attempt {attempt} - Raw URL: {url}, Cleaned URL: {cleaned_url}")
+                if not await validate_url(cleaned_url, session, logger):
+                    logger.warning(f"Attempt {attempt} - Skipping inaccessible URL: {cleaned_url}")
                     continue
                 headers = {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124',
                     'Accept': 'image/*,*/*;q=0.8',
                     'Referer': 'https://www.google.com/'
                 }
-                async with session.get(extracted_url, timeout=timeout, headers=headers) as response:
+                async with session.get(cleaned_url, timeout=timeout, headers=headers, allow_redirects=True) as response:
                     if response.status != 200:
-                        logger.warning(f"Attempt {attempt} - HTTP error for image {extracted_url}: {response.status} {response.reason}")
+                        logger.warning(f"Attempt {attempt} - HTTP error for image {cleaned_url}: {response.status} {response.reason}")
                         if response.status == 404:
                             return False
                         continue
                     async with aiofiles.open(filename, 'wb') as f:
                         content = await response.read()
                         if not content:
-                            logger.error(f"Empty content downloaded for {extracted_url}")
+                            logger.error(f"Empty content downloaded for {cleaned_url}")
                             return False
                         await f.write(content)
                     if not os.path.exists(filename) or os.path.getsize(filename) == 0:
                         logger.error(f"Downloaded file {filename} is missing or empty")
                         return False
-                    logger.debug(f"Attempt {attempt} - Successfully downloaded {extracted_url} to {filename}")
+                    logger.debug(f"Attempt {attempt} - Successfully downloaded {cleaned_url} to {filename}")
                     return True
             except aiohttp.ClientResponseError as e:
                 if e.status == 404:
@@ -200,33 +205,36 @@ async def download_all_images(
         lambda lst: sorted(lst, key=lambda x: x.get('ExcelRowID', 0)),
     ]
 
-    async def process_image(image: Dict, index: int) -> None:
-        excel_row_id = image.get('ExcelRowID')
-        main_url = image.get('ImageUrl')
-        thumb_url = image.get('ImageUrlThumbnail', '')
-        if not excel_row_id or not isinstance(excel_row_id, (int, str)):
-            logger.error(f"Invalid ExcelRowID: {excel_row_id}")
-            return
-        filename = os.path.join(temp_dir, f"{excel_row_id}_image.jpg")
+    async def process_image(image: Dict, index: int, semaphore: asyncio.Semaphore) -> None:
+        async with semaphore:
+            excel_row_id = image.get('ExcelRowID')
+            main_url = image.get('ImageUrl')
+            thumb_url = image.get('ImageUrlThumbnail', '')
+            if not excel_row_id or not isinstance(excel_row_id, (int, str)):
+                logger.error(f"Invalid ExcelRowID: {excel_row_id}")
+                failed_downloads.append(("Invalid ExcelRowID", excel_row_id))
+                return
+            filename = os.path.join(temp_dir, f"{excel_row_id}_image.jpg")
 
-        logger.debug(f"Processing ExcelRowID {excel_row_id} at index {index}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
+            logger.debug(f"Processing ExcelRowID {excel_row_id} at index {index}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
 
-        async with aiohttp.ClientSession() as session:
-            success = await download_image(main_url, filename, session, logger, entry_index=index)
-            if not success and thumb_url:
-                logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
-                success = await download_image(thumb_url, filename, session, logger, entry_index=index)
-            
-            if not success:
-                logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
-                failed_downloads.append((main_url or thumb_url or "No valid URL", excel_row_id))
-                if not main_url and not thumb_url:
-                    logger.critical(f"No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID {image.get('FileID', 'unknown')}.")
+            async with aiohttp.ClientSession() as session:
+                success = await download_image(main_url, filename, session, logger, entry_index=index)
+                if not success and thumb_url:
+                    logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
+                    success = await download_image(thumb_url, filename, session, logger, entry_index=index)
+                
+                if not success:
+                    logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
+                    failed_downloads.append((main_url or thumb_url or "No valid URL", excel_row_id))
+                    if not main_url and not thumb_url:
+                        logger.critical(f"No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID {image.get('FileID', 'unknown')}.")
 
     best_failed_downloads = []
     min_failures = float('inf')
     original_tail = image_list[2:] if len(image_list) > 2 else []
     fixed_prefix = image_list[:2] if len(image_list) >= 2 else image_list
+    semaphore = asyncio.Semaphore(batch_size)  # Control concurrency
 
     for strategy_idx, sort_func in enumerate(sort_strategies, 1):
         failed_downloads.clear()
@@ -235,13 +243,10 @@ async def download_all_images(
         current_list = fixed_prefix + sorted_tail
         logger.debug(f"Current list order: {[item.get('ExcelRowID', 'N/A') for item in current_list]}")
 
-        batches = [current_list[i:i + batch_size] for i in range(0, len(current_list), batch_size)]
-        for batch_idx, batch in enumerate(batches, 1):
-            logger.info(f"Processing batch {batch_idx} with {len(batch)} images")
-            await asyncio.gather(*(process_image(image, idx) for idx, image in enumerate(current_list)))
-            logger.info(f"Batch {batch_idx} completed, failures: {len(failed_downloads)}")
-
+        tasks = [process_image(image, idx, semaphore) for idx, image in enumerate(current_list)]
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.info(f"Sort strategy {strategy_idx} completed with {len(failed_downloads)} failures")
+
         if len(failed_downloads) < min_failures:
             min_failures = len(failed_downloads)
             best_failed_downloads = failed_downloads.copy()
@@ -251,18 +256,19 @@ async def download_all_images(
     if best_failed_downloads:
         logger.info(f"Retrying {len(best_failed_downloads)} failed downloads with fallback strategy")
         retry_failed = []
-        for url, excel_row_id in best_failed_downloads:
-            image = next((img for img in image_list if img.get('ExcelRowID') == excel_row_id), None)
-            if not image:
-                logger.warning(f"No image data found for ExcelRowID {excel_row_id} during retry")
-                continue
-            filename = os.path.join(temp_dir, f"{excel_row_id}_image.jpg")
-            async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession() as session:
+            for url, excel_row_id in best_failed_downloads:
+                image = next((img for img in image_list if img.get('ExcelRowID') == excel_row_id), None)
+                if not image:
+                    logger.warning(f"No image data found for ExcelRowID {excel_row_id} during retry")
+                    retry_failed.append((url, excel_row_id))
+                    continue
+                filename = os.path.join(temp_dir, f"{excel_row_id}_image.jpg")
                 main_url = clean_url(image.get('ImageUrl', ''), attempt=3)
-                success = await download_image(main_url, filename, session, logger, entry_index=image_list.index(image))
+                success = await download_image(main_url, filename, session, logger, entry_index=0)
                 if not success and image.get('ImageUrlThumbnail'):
                     thumb_url = clean_url(image.get('ImageUrlThumbnail', ''), attempt=3)
-                    success = await download_image(thumb_url, filename, session, logger, entry_index=image_list.index(image))
+                    success = await download_image(thumb_url, filename, session, logger, entry_index=0)
                 if not success:
                     retry_failed.append((url, excel_row_id))
         best_failed_downloads = retry_failed
@@ -398,7 +404,11 @@ async def resize_image(image_path: str, logger: Optional[logging.Logger] = None)
         buffer = BytesIO()
         await asyncio.to_thread(new_img.save, buffer, format='PNG')
         async with aiofiles.open(image_path, 'wb') as f:
-            await f.write(buffer.getvalue())
+            content = buffer.getvalue()
+            if not content:
+                logger.error(f"Empty buffer after saving image {image_path}")
+                return False
+            await f.write(content)
         logger.info(f"✅ Image processed and saved: {image_path}")
 
         if await aiofiles.os.path.exists(image_path):
@@ -867,7 +877,8 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
             logger.warning(f"Log file {log_filename} does not exist, skipping upload")
             return None
 
-        file_hash = hashlib.md5(open(log_filename, "rb").read()).hexdigest()
+        file_hash = await asyncio.to_thread(hashlib.md5, open(log_filename, "rb").read())
+        file_hash = file_hash.hexdigest()
         current_time = time.time()
         key = (log_filename, file_id)
 
@@ -901,7 +912,7 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
         logger.error(f"Failed to upload log for FileID {file_id} after retries: {e}", exc_info=True)
         return None
 
-# Main FastAPI Endpoint (Updated to Use process_images_and_anchor)
+# Main FastAPI Endpoint (Optimized for Async Smoothness)
 async def generate_download_file(
     file_id: int,
     background_tasks: BackgroundTasks = None,
@@ -910,7 +921,7 @@ async def generate_download_file(
     preferred_image_method: str = "append"
 ) -> Dict[str, str]:
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
-    process = psutil.Process()
+    logger.setLevel(logging.DEBUG)  # Enable debug logging for diagnostics
     temp_images_dir, temp_excel_dir = None, None
     successful_entries = 0
     failed_entries = 0
@@ -934,6 +945,7 @@ async def generate_download_file(
         logger.info(f"Fetching images for ID: {file_id}")
         selected_images_df = await get_images_excel_db(str(file_id), logger=logger)
         logger.info(f"Fetched DataFrame for ID {file_id}, shape: {selected_images_df.shape}")
+        logger.debug(f"DataFrame contents:\n{selected_images_df.to_string()}")
 
         expected_columns = ["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"]
         if list(selected_images_df.columns) != expected_columns:
@@ -955,10 +967,10 @@ async def generate_download_file(
         logger.debug(f"Created temp directories: images={temp_images_dir}, excel={temp_excel_dir}")
         local_filename = os.path.join(temp_excel_dir, original_filename)
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10)) as client:
             logger.debug(f"Downloading template from {template_file_path}")
             try:
-                response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
+                response = await client.get(template_file_path)
                 response.raise_for_status()
                 async with aiofiles.open(local_filename, 'wb') as f:
                     content = await response.read()
@@ -986,8 +998,11 @@ async def generate_download_file(
         if not has_valid_images:
             logger.warning(f"No valid images found for ID {file_id}")
             try:
-                with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
-                    pd.DataFrame({"Message": [f"No valid images found for FileID {file_id}."]}).to_excel(writer, sheet_name="NoImages", index=False)
+                async with aiofiles.open(local_filename, 'rb') as f:
+                    wb = await asyncio.to_thread(load_workbook, f)
+                ws = wb.create_sheet("NoImages") if "NoImages" not in wb else wb["NoImages"]
+                ws["A1"] = f"No valid images found for FileID {file_id}."
+                await asyncio.to_thread(wb.save, local_filename)
             except Exception as e:
                 logger.error(f"Failed to write no-images message to Excel: {e}", exc_info=True)
                 return {"error": f"Failed to write Excel file: {e}", "log_filename": log_filename}
@@ -1020,6 +1035,8 @@ async def generate_download_file(
                     preferred_image_method=preferred_image_method,
                     logger=logger
                 )
+                if not success:
+                    logger.error("Image processing pipeline reported failure")
             except Exception as e:
                 logger.error(f"Image processing pipeline failed: {e}", exc_info=True)
                 return {"error": f"Image processing failed: {e}", "log_filename": log_filename}
