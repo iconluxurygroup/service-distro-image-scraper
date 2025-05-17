@@ -16,7 +16,6 @@ if not default_logger.handlers:
 def clean_url(url: str, attempt: int = 1) -> str:
     """Clean URLs iteratively with different strategies based on attempt number."""
     try:
-        # Attempt 1: Basic cleaning (remove backslashes, fix %2f in path)
         if attempt == 1:
             url = re.sub(r'\\+|%5[Cc]', '', url)
             parsed = urlparse(url)
@@ -28,8 +27,6 @@ def clean_url(url: str, attempt: int = 1) -> str:
             if parsed.fragment:
                 cleaned_url += f"#{parsed.fragment}"
             return cleaned_url
-
-        # Attempt 2: Remove all %2f and %5C, decode double-encoded %25
         elif attempt == 2:
             url = re.sub(r'\\+|%5[Cc]|%2[Ff]', '', url)
             while '%25' in url:
@@ -42,18 +39,13 @@ def clean_url(url: str, attempt: int = 1) -> str:
             if parsed.fragment:
                 cleaned_url += f"#{parsed.fragment}"
             return cleaned_url
-
-        # Attempt 3: Minimal cleaning, only remove invalid characters
         elif attempt == 3:
             url = re.sub(r'[\x00-\x1F\x7F]', '', url)
             parsed = urlparse(url)
             return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" + \
                    (f"?{parsed.query}" if parsed.query else "") + \
                    (f"#{parsed.fragment}" if parsed.fragment else "")
-
-        # Fallback: Return original URL
         return url
-
     except Exception as e:
         default_logger.warning(f"Error cleaning URL {url} on attempt {attempt}: {e}")
         return url
@@ -177,7 +169,6 @@ async def download_all_images(
         logger.debug(f"Processing ExcelRowID {excel_row_id}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
 
         async with aiohttp.ClientSession() as session:
-            # Try main image
             success = await download_image(main_url, filename, session, logger)
             if not success:
                 if thumb_url:

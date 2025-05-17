@@ -1,521 +1,193 @@
-import logging
-import pandas as pd
-import pyodbc
-import asyncio
-import json
-import datetime
 import os
+import asyncio
+import logging
+import aiohttp
 import aiofiles
-from typing import Optional, List, Dict
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
+from typing import List, Dict, Tuple, Optional
+from urllib.parse import quote, urlparse, parse_qs, urlencode
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from database_config import conn_str, async_engine
-from s3_utils import upload_file_to_space
+import re
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
-    logger = logger or default_logger
+def clean_url(url: str, attempt: int = 1) -> str:
+    """Clean URLs iteratively with different strategies based on attempt number."""
     try:
-        file_id = int(file_id)
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT EntryID, ProductModel AS SearchString, 'model_only' AS SearchType, FileID
-                FROM utb_ImageScraperRecords 
-                WHERE FileID = :file_id AND Step1 IS NULL
-                ORDER BY EntryID, SearchType
-            """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id}")
-            result = await conn.execute(query, {"file_id": file_id})
-            df = pd.DataFrame(result.fetchall(), columns=result.keys())
-            result.close()
-            if not df.empty and (df["FileID"] != file_id).any():
-                logger.error(f"Found rows with incorrect FileID for {file_id}")
-                df = df[df["FileID"] == file_id]
-            logger.info(f"Got {len(df)} search records for FileID: {file_id}")
-            return df[["EntryID", "SearchString", "SearchType"]]
+        if attempt == 1:
+            url = re.sub(r'\\+|%5[Cc]', '', url)
+            parsed = urlparse(url)
+            path = parsed.path.replace('%2F', '/').replace('%2f', '/')
+            cleaned_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+            if parsed.query:
+                query = parsed.query.replace('%5C', '').replace('%5c', '')
+                cleaned_url += f"?{query}"
+            if parsed.fragment:
+                cleaned_url += f"#{parsed.fragment}"
+            return cleaned_url
+        elif attempt == 2:
+            url = re.sub(r'\\+|%5[Cc]|%2[Ff]', '', url)
+            while '%25' in url:
+                url = url.replace('%25', '%')
+            parsed = urlparse(url)
+            path = parsed.path
+            cleaned_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+            if parsed.query:
+                cleaned_url += f"?{parsed.query}"
+            if parsed.fragment:
+                cleaned_url += f"#{parsed.fragment}"
+            return cleaned_url
+        elif attempt == 3:
+            url = re.sub(r'[\x00-\x1F\x7F]', '', url)
+            parsed = urlparse(url)
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" + \
+                   (f"?{parsed.query}" if parsed.query else "") + \
+                   (f"#{parsed.fragment}" if parsed.fragment else "")
+        return url
     except Exception as e:
-        logger.error(f"Error getting records for FileID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame()
+        default_logger.warning(f"Error cleaning URL {url} on attempt {attempt}: {e}")
+        return url
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying get_images_excel_db for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
-    logger = logger or default_logger
-    expected_columns = ["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"]
-    
+def encode_url(url: str) -> str:
+    """Encode URL, preserving slashes in path and encoding query values."""
     try:
-        file_id = int(file_id)
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT DISTINCT
-                    CAST(s.ExcelRowID AS INT) AS ExcelRowID,
-                    ISNULL(r.ImageUrl, '') AS ImageUrl,
-                    ISNULL(r.ImageUrlThumbnail, '') AS ImageUrlThumbnail,
-                    ISNULL(s.ProductBrand, '') AS Brand,
-                    ISNULL(s.ProductModel, '') AS Style,
-                    ISNULL(s.ProductColor, '') AS Color,
-                    ISNULL(s.ProductCategory, '') AS Category
-                FROM utb_ImageScraperFiles f
-                INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
-                LEFT JOIN (
-                    SELECT EntryID, ImageUrl, ImageUrlThumbnail
-                    FROM utb_ImageScraperResult
-                    WHERE SortOrder = 1
-                ) r ON r.EntryID = s.EntryID
-                WHERE f.ID = :file_id
-                ORDER BY ExcelRowID
-            """)
-            logger.debug(f"Executing query: {query} with ID: {file_id}")
-            result = await conn.execute(query, {"file_id": file_id})
-            rows = result.fetchall()
-            columns = result.keys()
-            result.close()
-
-        if not rows:
-            logger.warning(f"No valid rows returned for ID {file_id}")
-            return pd.DataFrame(columns=expected_columns)
-
-        df = pd.DataFrame(rows, columns=columns)
-        if list(df.columns) != expected_columns:
-            logger.error(f"Invalid columns returned for ID {file_id}. Got: {list(df.columns)}, Expected: {expected_columns}")
-            return pd.DataFrame(columns=expected_columns)
-
-        df['ExcelRowID'] = pd.to_numeric(df['ExcelRowID'], errors='coerce').astype('Int64')
-        df = df[df['ImageUrl'].notnull() & (df['ImageUrl'] != '')]
-        logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
-        
-        if df.empty:
-            logger.warning(f"No valid images found for ID {file_id} after filtering")
-        return df
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame(columns=expected_columns)
-    except Exception as e:
-        logger.error(f"Unexpected error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame(columns=expected_columns)
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying fetch_last_valid_entry for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[int]:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT MAX(t.EntryID)
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = :file_id AND t.SortOrder IS NOT NULL
-            """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id}")
-            result = await conn.execute(query, {"file_id": file_id})
-            row = result.fetchone()
-            result.close()
-            if row and row[0]:
-                logger.info(f"Last valid EntryID for FileID {file_id}: {row[0]}")
-                return row[0]
-            logger.info(f"No valid EntryIDs found for FileID {file_id}")
-            return None
-    except Exception as e:
-        logger.error(f"Error fetching last valid EntryID for FileID {file_id}: {e}", exc_info=True)
-        return None
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_file_location_complete for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_file_location_complete(file_id: str, file_location: str, logger: Optional[logging.Logger] = None) -> None:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE utb_ImageScraperFiles SET FileLocationURLComplete = ? WHERE ID = ?", (file_location, file_id))
-            conn.commit()
-            cursor.close()
-            logger.info(f"Updated file location for FileID: {file_id}")
-    except pyodbc.Error as e:
-        logger.error(f"Database error in update_file_location_complete: {e}", exc_info=True)
-        raise
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        raise
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_file_generate_complete for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_file_generate_complete(file_id: str, logger: Optional[logging.Logger] = None) -> None:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileCompleteTime = GETDATE() WHERE ID = ?", (file_id,))
-            conn.commit()
-            cursor.close()
-            logger.info(f"Marked file generation complete for FileID: {file_id}")
-    except pyodbc.Error as e:
-        logger.error(f"Database error in update_file_generate_complete: {e}", exc_info=True)
-        raise
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        raise
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying get_send_to_email for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT UserEmail FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            if result and result[0]:
-                logger.info(f"Retrieved email for FileID {file_id}: {result[0]}")
-                return result[0]
-            logger.warning(f"No email found for FileID {file_id}")
-            return "nik@accessx.com"
-    except pyodbc.Error as e:
-        logger.error(f"Database error fetching email for FileID {file_id}: {e}", exc_info=True)
-        return "nik@accessx.com"
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        return "nik@accessx.com"
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_log_url_in_db for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logging.Logger] = None) -> bool:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        async with async_engine.connect() as conn:
-            await conn.execute(
-                text("""
-                    IF NOT EXISTS (
-                        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
-                        WHERE TABLE_NAME = 'utb_ImageScraperFiles' 
-                        AND COLUMN_NAME = 'LogFileUrl'
-                    )
-                    BEGIN
-                        ALTER TABLE utb_ImageScraperFiles 
-                        ADD LogFileUrl NVARCHAR(MAX)
-                    END
-                """)
+        parsed = urlparse(url)
+        path = parsed.path
+        if parsed.query:
+            query_dict = parse_qs(parsed.query)
+            encoded_query = urlencode(
+                {k: [quote(v, safe=':') for v in vs] for k, vs in query_dict.items()},
+                doseq=True
             )
-            await conn.execute(
-                text("UPDATE utb_ImageScraperFiles SET LogFileUrl = :log_url WHERE ID = :file_id"),
-                {"log_url": log_url, "file_id": file_id}
-            )
-            await conn.commit()
-            logger.info(f"Updated log URL '{log_url}' for FileID {file_id}")
-            return True
-    except SQLAlchemyError as e:
-        logger.error(f"Database error updating log URL for FileID {file_id}: {e}", exc_info=True)
-        return False
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        return False
+        else:
+            encoded_query = ''
+        encoded_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+        if encoded_query:
+            encoded_url += f"?{encoded_query}"
+        if parsed.fragment:
+            encoded_url += f"#{quote(parsed.fragment)}"
+        return encoded_url
     except Exception as e:
-        logger.error(f"Unexpected error updating log URL for FileID {file_id}: {e}", exc_info=True)
+        default_logger.warning(f"Error encoding URL {url}: {e}")
+        return url
+
+async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bool:
+    """Check if URL is accessible with a HEAD request."""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124',
+            'Accept': 'image/*,*/*;q=0.8',
+            'Referer': 'https://www.google.com/'
+        }
+        async with session.head(url, timeout=5, headers=headers) as response:
+            if response.status == 200:
+                logger.debug(f"URL {url} is accessible")
+                return True
+            logger.warning(f"URL {url} returned status {response.status}")
+            return False
+    except aiohttp.ClientError as e:
+        logger.warning(f"URL {url} is not accessible: {e}")
         return False
 
+async def download_image(
+    url: str,
+    filename: str,
+    session: aiohttp.ClientSession,
+    logger: logging.Logger,
+    timeout: int = 30,
+    max_clean_attempts: int = 3
+) -> bool:
+    """Download image, trying multiple cleaned versions of the URL."""
+    for attempt in range(1, max_clean_attempts + 1):
+        try:
+            cleaned_url = clean_url(url, attempt)
+            encoded_url = encode_url(cleaned_url)
+            logger.debug(f"Attempt {attempt} - Raw URL: {url}")
+            logger.debug(f"Attempt {attempt} - Cleaned URL: {cleaned_url}")
+            logger.debug(f"Attempt {attempt} - Encoded URL: {encoded_url}")
+
+            if not await validate_url(encoded_url, session, logger):
+                logger.warning(f"Attempt {attempt} - Skipping inaccessible URL: {encoded_url}")
+                continue
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124',
+                'Accept': 'image/*,*/*;q=0.8',
+                'Referer': 'https://www.google.com/'
+            }
+            async with session.get(encoded_url, timeout=timeout, headers=headers) as response:
+                if response.status != 200:
+                    logger.warning(f"Attempt {attempt} - HTTP error for image {encoded_url}: {response.status} {response.reason}")
+                    continue
+                async with aiofiles.open(filename, 'wb') as f:
+                    await f.write(await response.read())
+                logger.debug(f"Attempt {attempt} - Successfully downloaded {encoded_url} to {filename}")
+                return True
+        except aiohttp.ClientError as e:
+            logger.error(f"Attempt {attempt} - HTTP error for image {encoded_url}: {str(e)}")
+            continue
+        except asyncio.TimeoutError:
+            logger.error(f"Attempt {attempt} - Timeout downloading image {encoded_url}")
+            continue
+        except Exception as e:
+            logger.error(f"Attempt {attempt} - Error downloading image {encoded_url}: {str(e)}", exc_info=True)
+            continue
+    logger.error(f"All {max_clean_attempts} attempts failed for URL {url}")
+    return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying get_send_to_email for FileID {retry_state.kwargs['file_id']} "
+    retry=retry_if_exception_type(Exception),
+    before_sleep=lambda retry_state: retry_state.kwargs.get('logger', default_logger).info(
+        f"Retrying download_all_images for {len(retry_state.args[0])} images "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
+async def download_all_images(
+    image_list: List[Dict],
+    temp_dir: str,
+    logger: Optional[logging.Logger] = None,
+    batch_size: int = 10
+) -> List[Tuple[str, int]]:
     logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT UserEmail FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            if result and result[0]:
-                logger.info(f"Retrieved email for FileID {file_id}: {result[0]}")
-                return result[0]
-            logger.warning(f"No email found for FileID {file_id}")
-            return "nik@accessx.com"
-    except pyodbc.Error as e:
-        logger.error(f"Database error fetching email for FileID {file_id}: {e}", exc_info=True)
-        return "nik@accessx.com"
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        return "nik@accessx.com"
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying export_dai_json for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
-    try:
-        json_urls = []
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT t.ResultID, t.EntryID, t.AiJson, t.AiCaption, t.ImageIsFashion
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = :file_id AND t.AiJson IS NOT NULL AND t.AiCaption IS NOT NULL
-            """)
-            params = {"file_id": file_id}
-            if entry_ids:
-                query = text(query.text + " AND t.EntryID IN :entry_ids")
-                params["entry_ids"] = tuple(entry_ids)
-            
-            logger.debug(f"Executing query: {query} with params: {params}")
-            result = await conn.execute(query, params)
-            entry_results = {}
-            for row in result.fetchall():
-                entry_id = row[1]
-                result_dict = {
-                    "ResultID": row[0],
-                    "EntryID": row[1],
-                    "AiJson": json.loads(row[2]) if row[2] else {},
-                    "AiCaption": row[3],
-                    "ImageIsFashion": bool(row[4])
-                }
-                if entry_id not in entry_results:
-                    entry_results[entry_id] = []
-                entry_results[entry_id].append(result_dict)
-            result.close()
+    failed_downloads = []
+    logger.info(f"📥 Starting download of {len(image_list)} images to {temp_dir}")
+    logger.debug(f"Image list: {image_list}")
 
-        if not entry_results:
-            logger.warning(f"No valid AI results to export for FileID {file_id}")
-            return ""
+    os.makedirs(temp_dir, exist_ok=True)
+    logger.info(f"📁 Ensured directory exists: {temp_dir}")
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        temp_json_dir = f"temp_json_{file_id}"
-        os.makedirs(temp_json_dir, exist_ok=True)
+    async def process_image(image: Dict) -> None:
+        excel_row_id = image['ExcelRowID']
+        main_url = image['ImageUrl']
+        thumb_url = image.get('ImageUrlThumbnail', '')
+        filename = os.path.join(temp_dir, f"image_{excel_row_id}.jpg")
 
-        for entry_id, results in entry_results.items():
-            json_filename = f"result_{entry_id}_{timestamp}.json"
-            local_json_path = os.path.join(temp_json_dir, json_filename)
+        logger.debug(f"Processing ExcelRowID {excel_row_id}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
 
-            async with aiofiles.open(local_json_path, 'w') as f:
-                await f.write(json.dumps(results, indent=2))
-            
-            logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
-            logger.debug(f"JSON content sample for EntryID {entry_id}: {json.dumps(results[:2], indent=2)}")
+        async with aiohttp.ClientSession() as session:
+            success = await download_image(main_url, filename, session, logger)
+            if not success:
+                if thumb_url:
+                    logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
+                    success = await download_image(thumb_url, filename, session, logger)
+                else:
+                    logger.warning(f"No thumbnail URL available for ExcelRowID {excel_row_id}")
 
-            s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
-            public_url = await upload_file_to_space(
-                local_json_path, s3_key, is_public=True, logger=logger, file_id=file_id
-            )
-            
-            if public_url:
-                logger.info(f"Exported JSON for EntryID {entry_id} to {public_url}")
-                json_urls.append(public_url)
-            else:
-                logger.error(f"Failed to upload JSON for EntryID {entry_id}")
-            
-            os.remove(local_json_path)
+            if not success:
+                logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
+                failed_downloads.append((main_url, excel_row_id))
+                if not main_url and not thumb_url:
+                    logger.critical(f"No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID 315.")
 
-        os.rmdir(temp_json_dir)
-        return json_urls[0] if json_urls else ""
+    batches = [image_list[i:i + batch_size] for i in range(0, len(image_list), batch_size)]
+    for batch_idx, batch in enumerate(batches, 1):
+        logger.info(f"Processing batch {batch_idx} with {len(batch)} images")
+        await asyncio.gather(*(process_image(image) for image in batch))
+        logger.info(f"Batch {batch_idx} completed, failures: {len(failed_downloads)}")
 
-    except Exception as e:
-        logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
-        return ""
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying remove_endpoint for endpoint {retry_state.kwargs['endpoint']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None) -> None:
-    logger = logger or default_logger
-    try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE utb_Endpoints SET EndpointIsBlocked = 1 WHERE EndpointURL = ?", (endpoint,))
-            conn.commit()
-            cursor.close()
-            logger.info(f"Marked endpoint as blocked: {endpoint}")
-    except pyodbc.Error as e:
-        logger.error(f"Error marking endpoint as blocked: {e}", exc_info=True)
-        raise
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_initial_sort_order for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        logger.info(f"Starting initial SortOrder update for FileID: {file_id}")
-
-        with pyodbc.connect(conn_str, autocommit=False) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT 
-                    t.ResultID,
-                    t.EntryID,
-                    CASE WHEN ISJSON(t.AiJson) = 1 
-                         THEN ISNULL(TRY_CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0)
-                         ELSE 0 END AS match_score,
-                    t.ImageDesc,
-                    t.ImageSource,
-                    t.ImageUrl,
-                    t.SortOrder
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = ?
-                """,
-                (file_id,)
-            )
-            columns = [desc[0] for desc in cursor.description]
-            rows = cursor.fetchall()
-            if not rows:
-                logger.warning(f"No data found for FileID: {file_id}")
-                return []
-
-            results = [dict(zip(columns, row)) for row in rows]
-            updates = []
-            for result in results:
-                result_id = result['ResultID']
-                match_score = result['match_score']
-                new_sort_order = int(match_score * 100) if match_score > 0 else -2
-                updates.append((result_id, new_sort_order))
-
-            cursor.execute(
-                "UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID IN "
-                "(SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)",
-                (file_id,)
-            )
-
-            if updates:
-                values_clause = ", ".join(f"({result_id}, {sort_order})" for result_id, sort_order in updates)
-                cursor.execute(
-                    f"""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = v.sort_order
-                    FROM (VALUES {values_clause}) AS v(result_id, sort_order)
-                    WHERE utb_ImageScraperResult.ResultID = v.result_id
-                    """
-                )
-                logger.info(f"Updated {len(updates)} rows for FileID: {file_id}")
-
-            cursor.execute(
-                """
-                SELECT 
-                    COUNT(*) AS total_count,
-                    SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                    SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = ?
-                """,
-                (file_id,)
-            )
-            row = cursor.fetchone()
-            total_count, positive_count, null_count = row
-            logger.info(f"Verification for FileID {file_id}: {total_count} total rows, "
-                       f"{positive_count} positive SortOrder, {null_count} NULL SortOrder")
-            if null_count > 0:
-                logger.warning(f"Found {null_count} rows with NULL SortOrder for FileID {file_id}")
-                cursor.execute(
-                    "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID IN "
-                    "(SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) AND SortOrder IS NULL",
-                    (file_id,)
-                )
-                logger.info(f"Set {null_count} NULL SortOrder rows to -2 for FileID: {file_id}")
-
-            cursor.execute(
-                """
-                SELECT ResultID, EntryID, SortOrder, ImageDesc, ImageSource, ImageUrl
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = ?
-                ORDER BY SortOrder DESC
-                """,
-                (file_id,)
-            )
-            final_results = [
-                {
-                    "ResultID": r[0],
-                    "EntryID": r[1],
-                    "SortOrder": r[2],
-                    "ImageDesc": r[3],
-                    "ImageSource": r[4],
-                    "ImageUrl": r[5]
-                }
-                for r in cursor.fetchall()
-            ]
-
-            conn.commit()
-            logger.info(f"Completed initial SortOrder update for FileID: {file_id} with {len(final_results)} results")
-            return final_results
-
-    except pyodbc.Error as e:
-        logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error for FileID {file_id}: {e}", exc_info=True)
-        return None
+    logger.info(f"📸 Completed image downloads. Total failed: {len(failed_downloads)}/{len(image_list)}")
+    return failed_downloads
