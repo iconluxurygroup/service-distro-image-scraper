@@ -492,6 +492,7 @@ from email_utils import send_message_email
 from config import conn_str
 import pyodbc
 
+
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
@@ -520,16 +521,7 @@ async def generate_download_file(
         selected_images_df = get_images_excel_db(str(file_id), logger=logger)
         logger.info(f"Fetched DataFrame for ID {file_id}, shape: {selected_images_df.shape}, columns: {list(selected_images_df.columns)}")
         
-        # Validate DataFrame
-        expected_columns = [
-            "ExcelRowID",
-            "ImageUrl",
-            "ImageUrlThumbnail",
-            "Brand",
-            "Style",
-            "Color",
-            "Category"
-        ]
+        expected_columns = ["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"]
         if list(selected_images_df.columns) != expected_columns:
             logger.error(f"Invalid columns in DataFrame for ID {file_id}. Got: {list(selected_images_df.columns)}, Expected: {expected_columns}")
             return {"error": f"Invalid DataFrame columns: {list(selected_images_df.columns)}", "log_filename": log_filename}
@@ -538,10 +530,21 @@ async def generate_download_file(
             logger.error(f"Invalid DataFrame shape for ID {file_id}: got {selected_images_df.shape}, expected (N, 7)")
             return {"error": f"Invalid DataFrame shape: {selected_images_df.shape}", "log_filename": log_filename}
         
-        # Handle empty DataFrame
         if selected_images_df.empty:
             logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for ID {file_id}. Creating empty Excel file.")
-            # Create an empty Excel file
+            with pyodbc.connect(conn_str, timeout=30) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+                file_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = ?", (file_id,))
+                record_count = cursor.fetchone()[0]
+                cursor.execute(
+                    "SELECT COUNT(*) FROM utb_ImageScraperResult r INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID WHERE s.FileID = ? AND r.SortOrder >= 0",
+                    (file_id,)
+                )
+                result_count = cursor.fetchone()[0]
+                logger.info(f"Diagnostics: Files={file_count}, Records={record_count}, Results={result_count}")
+            
             template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
             base_name, extension = os.path.splitext(original_filename)
             timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -551,25 +554,20 @@ async def generate_download_file(
             temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
             local_filename = os.path.join(temp_excel_dir, original_filename)
             
-            # Download template file
-            logger.info(f"Worker PID {process.pid}: 📥 Downloading template file from {template_file_path}")
             async with httpx.AsyncClient() as client:
                 response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
                 response.raise_for_status()
                 async with aiofiles.open(local_filename, 'wb') as f:
                     await f.write(response.content)
             
-            # Verify template file
             if not os.path.exists(local_filename):
                 logger.error(f"Worker PID {process.pid}: Template file not found at {local_filename}")
                 return {"error": f"Failed to download template file", "log_filename": log_filename}
             logger.debug(f"Worker PID {process.pid}: Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
             
-            # Write empty sheet
             with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
-                pd.DataFrame({"Message": ["No images found for this file"]}).to_excel(writer, sheet_name="NoImages", index=False)
+                pd.DataFrame({"Message": [f"No images found for FileID {file_id}. Check utb_ImageScraperResult for valid images."]}).to_excel(writer, sheet_name="NoImages", index=False)
             
-            # Upload to S3
             public_url = await upload_file_to_space(
                 file_src=local_filename,
                 save_as=processed_file_name,
@@ -582,11 +580,9 @@ async def generate_download_file(
                 logger.error(f"Worker PID {process.pid}: ❌ Upload failed for ID {file_id}")
                 return {"error": "Failed to upload processed file", "log_filename": log_filename}
             
-            # Update database
             await update_file_location_complete(str(file_id), public_url, logger=logger)
             await update_file_generate_complete(str(file_id), logger=logger)
             
-            # Send email notification
             send_to_email_addr = await get_send_to_email(file_id, logger=logger)
             if not send_to_email_addr:
                 logger.error(f"Worker PID {process.pid}: ❌ No email address for ID {file_id}")
@@ -595,20 +591,22 @@ async def generate_download_file(
             await send_message_email(
                 to_emails=send_to_email_addr,
                 subject=subject_line,
-                message=f"No images were found for FileID {file_id}. An empty Excel file has been generated.\nDownload URL: {public_url}",
+                message=(
+                    f"No images were found for FileID {file_id}. An empty Excel file has been generated.\n"
+                    f"Download URL: {public_url}\n"
+                    f"Diagnostics: {file_count} files, {record_count} records, {result_count} image results."
+                ),
                 logger=logger
             )
             
             logger.info(f"Worker PID {process.pid}: 🏁 Completed ID {file_id} with no images")
             return {"message": "No images found, empty Excel file generated", "public_url": public_url, "log_filename": log_filename}
         
-        # Log sample data
         logger.debug(f"Sample DataFrame rows: {selected_images_df.head(2).to_dict(orient='records')}")
         
-        # Filter valid rows
         selected_image_list = [
             {
-                'ExcelRowID': row['ExcelRowID'],
+                'ExcelRowID': int(row['ExcelRowID']),
                 'ImageUrl': row['ImageUrl'],
                 'ImageUrlThumbnail': row['ImageUrlThumbnail'],
                 'Brand': row.get('Brand', ''),
@@ -623,7 +621,62 @@ async def generate_download_file(
         
         if not selected_image_list:
             logger.warning(f"Worker PID {process.pid}: ⚠️ No valid images after filtering for ID {file_id}")
-            return {"error": "No valid images after filtering", "log_filename": log_filename}
+            template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
+            base_name, extension = os.path.splitext(original_filename)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            unique_id = base_name[-8:] if len(base_name) >= 8 else base_name
+            processed_file_name = f"super_scraper/jobs/{file_id}/{base_name}_scraper_{timestamp}_{unique_id}{extension}"
+            
+            temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
+            local_filename = os.path.join(temp_excel_dir, original_filename)
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
+                response.raise_for_status()
+                async with aiofiles.open(local_filename, 'wb') as f:
+                    await f.write(response.content)
+            
+            if not os.path.exists(local_filename):
+                logger.error(f"Worker PID {process.pid}: Template file not found at {local_filename}")
+                return {"error": f"Failed to download template file", "log_filename": log_filename}
+            
+            with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
+                pd.DataFrame({"Message": [f"No valid images found for FileID {file_id} after filtering."]}).to_excel(writer, sheet_name="NoImages", index=False)
+            
+            public_url = await upload_file_to_space(
+                file_src=local_filename,
+                save_as=processed_file_name,
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            
+            if not public_url:
+                logger.error(f"Worker PID {process.pid}: ❌ Upload failed for ID {file_id}")
+                return {"error": "Failed to upload processed file", "log_filename": log_filename}
+            
+            await update_file_location_complete(str(file_id), public_url, logger=logger)
+            await update_file_generate_complete(str(file_id), logger=logger)
+            
+            send_to_email_addr = await get_send_to_email(file_id, logger=logger)
+            if not send_to_email_addr:
+                logger.error(f"Worker PID {process.pid}: ❌ No email address for ID {file_id}")
+                return {"error": "Failed to retrieve email address", "log_filename": log_filename}
+            subject_line = f"{original_filename} Job Notification - No Images"
+            await send_message_email(
+                to_emails=send_to_email_addr,
+                subject=subject_line,
+                message=(
+                    f"No valid images were found for FileID {file_id} after filtering.\n"
+                    f"An empty Excel file has been generated.\n"
+                    f"Download URL: {public_url}\n"
+                    f"Diagnostics: {file_count} files, {record_count} records, {result_count} image results."
+                ),
+                logger=logger
+            )
+            
+            logger.info(f"Worker PID {process.pid}: 🏁 Completed ID {file_id} with no images")
+            return {"message": "No valid images found, empty Excel file generated", "public_url": public_url, "log_filename": log_filename}
         
         logger.debug(f"Selected image list sample: {selected_image_list[:2]}")
         
@@ -638,7 +691,6 @@ async def generate_download_file(
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
         local_filename = os.path.join(temp_excel_dir, original_filename)
 
-        # Download template file
         logger.info(f"Worker PID {process.pid}: 📥 Downloading template file from {template_file_path}")
         async with httpx.AsyncClient() as client:
             response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
@@ -646,38 +698,35 @@ async def generate_download_file(
             async with aiofiles.open(local_filename, 'wb') as f:
                 await f.write(response.content)
         
-        # Verify template file
         if not os.path.exists(local_filename):
             logger.error(f"Worker PID {process.pid}: Template file not found at {local_filename}")
             return {"error": f"Failed to download template file", "log_filename": log_filename}
         logger.debug(f"Worker PID {process.pid}: Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
 
-        # Download images
         logger.debug(f"Worker PID {process.pid}: Using temp_images_dir: {temp_images_dir}")
-        failed_img_urls = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
-        logger.info(f"Worker PID {process.pid}: 📥 Downloaded images, {len(failed_img_urls)} failed")
+        failed_downloads = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
+        logger.info(f"Worker PID {process.pid}: 📥 Downloaded images, {len(failed_downloads)} failed")
 
-        # Write images to Excel
+        # Convert failed_downloads row_id to integers
+        failed_downloads = [(url, int(row_id)) for url, row_id in failed_downloads]
+        
         logger.info(f"Worker PID {process.pid}: 🖼️ Writing images with row_offset={header_index}")
         failed_rows = await write_excel_image(
             local_filename, temp_images_dir, selected_image_list, "A", header_index, logger
         )
 
-        # Write failed downloads
-        if failed_img_urls:
-            logger.info(f"Worker PID {process.pid}: 📝 Writing {len(failed_img_urls)} failed downloads to Excel")
-            success = await write_failed_downloads_to_excel(failed_img_urls, local_filename, logger=logger)
+        if failed_downloads:
+            logger.info(f"Worker PID {process.pid}: 📝 Writing {len(failed_downloads)} failed downloads to Excel")
+            success = await write_failed_downloads_to_excel(failed_downloads, local_filename, logger=logger)
             if not success:
                 logger.warning(f"Worker PID {process.pid}: ⚠️ Failed to write some failed downloads to Excel")
 
-        # Verify Excel file
         if not os.path.exists(local_filename):
             logger.error(f"Worker PID {process.pid}: Excel file not found at {local_filename}")
             return {"error": f"Excel file not found", "log_filename": log_filename}
         logger.debug(f"Worker PID {process.pid}: Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
         logger.debug(f"Worker PID {process.pid}: Temp excel dir contents: {os.listdir(temp_excel_dir)}")
 
-        # Upload to S3
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory before S3 upload: RSS={mem_info.rss / 1024**2:.2f} MB")
         public_url = await upload_file_to_space(
@@ -692,11 +741,9 @@ async def generate_download_file(
             logger.error(f"Worker PID {process.pid}: ❌ Upload failed for ID {file_id}")
             return {"error": "Failed to upload processed file", "log_filename": log_filename}
 
-        # Update database
         await update_file_location_complete(str(file_id), public_url, logger=logger)
         await update_file_generate_complete(str(file_id), logger=logger)
 
-        # Send email notification
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
             logger.error(f"Worker PID {process.pid}: ❌ No email address for ID {file_id}")
@@ -713,10 +760,8 @@ async def generate_download_file(
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory after completion: RSS={mem_info.rss / 1024**2:.2f} MB")
         return {"message": "Processing completed successfully", "public_url": public_url, "log_filename": log_filename}
-
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: 🔴 Error for ID {file_id}: {e}", exc_info=True)
-        # Send error email
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if send_to_email_addr:
             await send_message_email(
