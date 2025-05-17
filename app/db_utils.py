@@ -113,10 +113,20 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases
 from database_config import conn_str
 
+import pandas as pd
+import re
+import aioodbc
+import pyodbc
+import asyncio
+from typing import Optional, List, Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases
+from database_config import conn_str
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
+    retry=retry_if_exception_type((pyodbc.Error, ValueError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -160,8 +170,7 @@ async def update_search_sort_order(
                         brand, model, color, category = brand or '', model or '', color or '', category or ''
 
                 # Fetch search results
-                await cursor.execute(
-                    """
+                query = """
                     SELECT 
                         t.ResultID, 
                         t.EntryID,
@@ -177,9 +186,8 @@ async def update_search_sort_order(
                     FROM utb_ImageScraperResult t
                     INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                     WHERE r.FileID = ? AND t.EntryID = ?
-                    """,
-                    (file_id, entry_id)
-                )
+                """
+                await cursor.execute(query, (file_id, entry_id))
                 columns = [column[0] for column in cursor.description]
                 rows = await cursor.fetchall()
                 logger.debug(f"Raw rows (first 2): {rows[:2]}")
@@ -193,7 +201,20 @@ async def update_search_sort_order(
                 malformed_rows = [i for i, row in enumerate(rows) if len(row) != expected_columns]
                 if malformed_rows:
                     logger.error(f"Malformed rows detected at indices {malformed_rows[:10]}: expected {expected_columns} columns, got {[len(rows[i]) for i in malformed_rows[:10]]}")
-                    return []
+                    # Fallback to pyodbc
+                    logger.info("Falling back to pyodbc for query execution")
+                    loop = asyncio.get_event_loop()
+                    def sync_fetch():
+                        with pyodbc.connect(conn_str) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(query, (file_id, entry_id))
+                            return cursor.fetchall()
+                    rows = await loop.run_in_executor(None, sync_fetch)
+                    logger.debug(f"pyodbc rows (first 2): {rows[:2]}")
+                    malformed_rows = [i for i, row in enumerate(rows) if len(row) != expected_columns]
+                    if malformed_rows:
+                        logger.error(f"pyodbc also returned malformed rows at indices {malformed_rows[:10]}")
+                        return []
 
                 df = pd.DataFrame(rows, columns=columns)
                 if df.empty:
@@ -315,7 +336,6 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Unexpected error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
-
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or logging.getLogger(__name__)
     try:
