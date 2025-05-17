@@ -6,12 +6,13 @@ import aiofiles
 from typing import List, Dict, Tuple, Optional
 from urllib.parse import quote, urlparse, parse_qs, urlencode
 from url_encode_decode import double_encode_plus, decode_url
+from url_extract import extract_thumbnail_url   
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import re
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
+    default_logger.setLevel(logging.INFO)   
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 def clean_url(url: str, attempt: int = 1) -> str:
