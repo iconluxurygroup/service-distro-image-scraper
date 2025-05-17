@@ -97,76 +97,6 @@ def get_healthy_endpoint(endpoints: List[str], logger: Optional[logging.Logger] 
     logger.error("No healthy endpoints found")
     return None
 
-async def process_search_row_gcloud(
-    search_string: str,
-    entry_id: int,
-    logger: Optional[logging.Logger] = None,
-    remaining_retries: int = 5,
-    total_attempts: Optional[List[int]] = None
-) -> List[Dict]:
-    logger = logger or default_logger
-    if not search_string or len(search_string.strip()) < 3:
-        logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
-        return []
-
-    total_attempts = total_attempts or [0]
-    base_url = "https://api.thedataproxy.com/v2/proxy/fetch"
-    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
-    regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
-    headers = {
-        "accept": "application/json",
-        "x-api-key": api_key,
-        "Content-Type": "application/json"
-    }
-
-    process = psutil.Process()
-    async def log_gcloud_retry(attempt: int, region: str) -> bool:
-        total_attempts[0] += 1
-        if total_attempts[0] > remaining_retries:
-            logger.error(f"Worker PID {process.pid}: Exceeded remaining retries ({remaining_retries}) for EntryID {entry_id} at GCloud attempt {attempt}")
-            return False
-        logger.info(f"Worker PID {process.pid}: GCloud attempt {attempt} (Total attempts: {total_attempts[0]}/{remaining_retries}) for EntryID {entry_id} in region {region}")
-        return True
-
-    search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_string)}&tbm=isch"
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for attempt, region in enumerate(regions, 1):
-            if not await log_gcloud_retry(attempt, region):
-                break
-            fetch_endpoint = f"{base_url}?region={region}"
-            mem_info = process.memory_info()
-            logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-            try:
-                logger.info(f"Worker PID {process.pid}: Attempt {attempt}: Fetching {search_url} via {fetch_endpoint} with region {region}")
-                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
-                    body_text = await response.text()
-                    body_preview = body_text[:200] if body_text else ""
-                    logger.debug(f"Worker PID {process.pid}: GCloud response: status={response.status}, headers={response.headers}, body={body_preview}")
-                    response.raise_for_status()
-                    result = await response.json()
-                    result_data = result.get("result")
-                    if not result_data:
-                        logger.warning(f"Worker PID {process.pid}: No result returned for EntryID {entry_id} in region {region}")
-                        continue
-                    results_html_bytes = result_data if isinstance(result_data, bytes) else result_data.encode("utf-8")
-                    results = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
-                    mem_info = process.memory_info()
-                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                    if results:
-                        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
-                        filtered_results = [
-                            res for res in results
-                            if not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
-                        ]
-                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
-                        return filtered_results
-                    logger.warning(f"Worker PID {process.pid}: Empty results for EntryID {entry_id} in region {region}")
-            except (aiohttp.ClientError, json.JSONDecodeError) as e:
-                logger.warning(f"Worker PID {process.pid}: Attempt {attempt} failed for {fetch_endpoint} in region {region}: {e}")
-                continue
-    logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
-    return []
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -264,6 +194,76 @@ async def process_search_row(
             return gcloud_results
         logger.error(f"Worker PID {process.pid}: GCloud fallback also failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     
+    return []
+
+async def process_search_row_gcloud(
+    search_string: str,
+    entry_id: int,
+    logger: Optional[logging.Logger] = None,
+    remaining_retries: int = 5,
+    total_attempts: Optional[List[int]] = None
+) -> List[Dict]:
+    logger = logger or default_logger
+    if not search_string or len(search_string.strip()) < 3:
+        logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
+        return []
+
+    total_attempts = total_attempts or [0]
+    base_url = "https://api.thedataproxy.com/v2/proxy/fetch"
+    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
+    regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
+    headers = {
+        "accept": "application/json",
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+
+    process = psutil.Process()
+    async def log_gcloud_retry(attempt: int, region: str) -> bool:
+        total_attempts[0] += 1
+        if total_attempts[0] > remaining_retries:
+            logger.error(f"Worker PID {process.pid}: Exceeded remaining retries ({remaining_retries}) for EntryID {entry_id} at GCloud attempt {attempt}")
+            return False
+        logger.info(f"Worker PID {process.pid}: GCloud attempt {attempt} (Total attempts: {total_attempts[0]}/{remaining_retries}) for EntryID {entry_id} in region {region}")
+        return True
+
+    search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_string)}&tbm=isch"
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for attempt, region in enumerate(regions, 1):
+            if not await log_gcloud_retry(attempt, region):
+                break
+            fetch_endpoint = f"{base_url}?region={region}"
+            mem_info = process.memory_info()
+            logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+            try:
+                logger.info(f"Worker PID {process.pid}: Attempt {attempt}: Fetching {search_url} via {fetch_endpoint} with region {region}")
+                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                    body_text = await response.text()
+                    body_preview = body_text[:200] if body_text else ""
+                    logger.debug(f"Worker PID {process.pid}: GCloud response: status={response.status}, headers={response.headers}, body={body_preview}")
+                    response.raise_for_status()
+                    result = await response.json()
+                    result_data = result.get("result")
+                    if not result_data:
+                        logger.warning(f"Worker PID {process.pid}: No result returned for EntryID {entry_id} in region {region}")
+                        continue
+                    results_html_bytes = result_data if isinstance(result_data, bytes) else result_data.encode("utf-8")
+                    results = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
+                    mem_info = process.memory_info()
+                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+                    if results:
+                        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
+                        filtered_results = [
+                            res for res in results
+                            if not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
+                        ]
+                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
+                        return filtered_results
+                    logger.warning(f"Worker PID {process.pid}: Empty results for EntryID {entry_id} in region {region}")
+            except (aiohttp.ClientError, json.JSONDecodeError) as e:
+                logger.warning(f"Worker PID {process.pid}: Attempt {attempt} failed for {fetch_endpoint} in region {region}: {e}")
+                continue
+    logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     return []
 
 def generate_search_variations(
@@ -424,6 +424,123 @@ async def search_variation(
             "error": str(e)
         }
 
+async def process_and_tag_results(
+    search_string: str,
+    brand: Optional[str] = None,
+    model: Optional[str] = None,
+    endpoint: str = None,
+    entry_id: int = None,
+    logger: Optional[logging.Logger] = None,
+    use_all_variations: bool = False,
+    file_id_db: Optional[int] = None
+) -> List[Dict]:
+    logger = logger or default_logger
+    process = psutil.Process()
+    
+    try:
+        logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
+        
+        variations = generate_search_variations(
+            search_string=search_string,
+            brand=brand,
+            model=model,
+            logger=logger
+        )
+        
+        all_results = []
+        search_types = [
+            "default", "delimiter_variations", "color_delimiter",
+            "brand_alias", "no_color"
+        ]
+        
+        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+        
+        for search_type in search_types:
+            if search_type not in variations:
+                logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
+                continue
+            
+            logger.info(f"Worker PID {process.pid}: Processing search type '{search_type}' for EntryID {entry_id}")
+            for variation in variations[search_type]:
+                logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
+                search_result = await search_variation(
+                    variation=variation,
+                    endpoint=endpoint,
+                    entry_id=entry_id,
+                    search_type=search_type,
+                    brand=brand,
+                    logger=logger
+                )
+                
+                if search_result["status"] == "success" and search_result["result"]:
+                    logger.info(f"Worker PID {process.pid}: Found {search_result['result_count']} results for variation '{variation}'")
+                    tagged_results = []
+                    for res in search_result["result"]:
+                        tagged_result = {
+                            "EntryID": entry_id,
+                            "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
+                            "ImageDesc": res.get("ImageDesc", ""),
+                            "ImageSource": res.get("ImageSource", "N/A"),
+                            "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
+                            "ProductCategory": res.get("ProductCategory", "")
+                        }
+                        if all(col in tagged_result for col in required_columns):
+                            tagged_results.append(tagged_result)
+                        else:
+                            logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
+                    
+                    all_results.extend(tagged_results)
+                    logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{variation}'")
+                
+                else:
+                    logger.warning(f"Worker PID {process.pid}: No valid results for variation '{variation}' in search type '{search_type}'")
+            
+            if all_results and not use_all_variations:
+                logger.info(f"Worker PID {process.pid}: Stopping after {len(all_results)} results from '{search_type}' for EntryID {entry_id}")
+                break
+        
+        if not all_results:
+            logger.error(f"Worker PID {process.pid}: No valid results found across all search types for EntryID {entry_id}")
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No results found for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results",
+                "ProductCategory": ""
+            }]
+        
+        deduplicated_results = []
+        seen_urls = set()
+        for res in all_results:
+            image_url = res["ImageUrl"]
+            if image_url not in seen_urls and image_url != "placeholder://no-results":
+                seen_urls.add(image_url)
+                deduplicated_results.append(res)
+        
+        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
+        
+        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
+        filtered_results = [
+            res for res in deduplicated_results
+            if not any(kw.lower() in res.get("ImageDesc", "").lower() for kw in irrelevant_keywords)
+        ]
+        
+        logger.info(f"Worker PID {process.pid}: Filtered to {len(filtered_results)} results after removing irrelevant items for EntryID {entry_id}")
+        
+        return filtered_results
+    
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
+        return [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://error",
+            "ImageDesc": f"Error processing: {str(e)}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://error",
+            "ProductCategory": ""
+        }]
+
 async def process_single_all(
     entry_id: int,
     search_string: str,
@@ -526,7 +643,7 @@ async def process_single_all(
 
         if all_results:
             logger.info(f"Worker PID {process.pid}: Found {len(all_results)} total results for search type '{search_type}' for EntryID {entry_id}")
-            break  # Stop after finding results for one search type
+            break
 
     if not all_results:
         logger.error(f"Worker PID {process.pid}: No results found across all search types for EntryID {entry_id}")
