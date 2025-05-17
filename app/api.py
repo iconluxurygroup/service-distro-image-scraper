@@ -403,3 +403,97 @@ async def api_restart_search_all(
             )
             await update_log_url_in_db(file_id, upload_url, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
+
+@router.post("/process-images-ai/{file_id}", tags=["Processing"])
+async def api_process_ai_images(
+    file_id: str,
+    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to process"),
+    step: int = Query(0, description="Retry step for logging"),
+    limit: int = Query(5000, description="Maximum number of images to process"),
+    concurrency: int = Query(10, description="Maximum concurrent threads"),
+    background_tasks: BackgroundTasks = None
+):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing AI image processing for FileID: {file_id}, EntryIDs: {entry_ids}, Step: {step}")
+    
+    try:
+        result = await run_job_with_logging(
+            batch_vision_reason,
+            file_id,
+            entry_ids=entry_ids,
+            step=step,
+            limit=limit,
+            concurrency=concurrency,
+            logger=logger
+        )
+        
+        if result["status_code"] != 200:
+            logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
+            raise HTTPException(status_code=result["status_code"], detail=result["message"])
+        
+        if background_tasks:
+            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+        
+        logger.info(f"Completed AI image processing for FileID: {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"AI image processing completed for FileID: {file_id}",
+            "data": result["data"]
+        }
+    except Exception as e:
+        logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
+        if os.path.exists(log_filename):
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+        raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
+
+@router.get("/get-images-excel-db/{file_id}", tags=["Database"])
+async def get_images_excel_db_endpoint(file_id: str):
+    logger, _ = setup_job_logger(job_id=file_id)
+    logger.info(f"Fetching Excel images for FileID: {file_id}")
+    try:
+        result = await get_images_excel_db(file_id, logger)
+        if result.empty:
+            return {"status_code": 200, "message": f"No images found for Excel export for FileID: {file_id}", "data": []}
+        return {"status_code": 200, "message": f"Fetched Excel images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
+    except Exception as e:
+        logger.error(f"Error fetching Excel images for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error fetching Excel images for FileID {file_id}: {str(e)}")
+
+@router.get("/get-send-to-email/{file_id}", tags=["Database"])
+async def get_send_to_email_endpoint(file_id: str):
+    logger, _ = setup_job_logger(job_id=file_id)
+    logger.info(f"Retrieving email for FileID: {file_id}")
+    try:
+        result = await get_send_to_email(int(file_id), logger)
+        return {"status_code": 200, "message": f"Retrieved email successfully for FileID: {file_id}", "data": result}
+    except Exception as e:
+        logger.error(f"Error retrieving email for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error retrieving email for FileID {file_id}: {str(e)}")
+
+@router.post("/update-file-generate-complete/{file_id}", tags=["Database"])
+async def update_file_generate_complete_endpoint(file_id: str):
+    logger, _ = setup_job_logger(job_id=file_id)
+    logger.info(f"Updating file generate complete for FileID: {file_id}")
+    try:
+        await update_file_generate_complete(file_id, logger)
+        return {"status_code": 200, "message": f"Updated file generate complete successfully for FileID: {file_id}", "data": None}
+    except Exception as e:
+        logger.error(f"Error updating file generate complete for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error updating file generate complete for FileID {file_id}: {str(e)}")
+
+@router.post("/update-file-location-complete/{file_id}", tags=["Database"])
+async def update_file_location_complete_endpoint(file_id: str, file_location: str):
+    logger, _ = setup_job_logger(job_id=file_id)
+    logger.info(f"Updating file location complete for FileID: {file_id}, file_location: {file_location}")
+    try:
+        await update_file_location_complete(file_id, file_location, logger)
+        return {"status_code": 200, "message": f"Updated file location successfully for FileID: {file_id}", "data": None}
+    except Exception as e:
+        logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
+
+app.include_router(router, prefix="/api/v3")
