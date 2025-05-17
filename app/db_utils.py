@@ -11,7 +11,6 @@ from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from database_config import conn_str, async_engine
-from s3_utils import upload_file_to_space
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -264,85 +263,6 @@ async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logg
     except Exception as e:
         logger.error(f"Unexpected error updating log URL for FileID {file_id}: {e}", exc_info=True)
         return False
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying export_dai_json for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
-    try:
-        json_urls = []
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT t.ResultID, t.EntryID, t.AiJson, t.AiCaption, t.ImageIsFashion
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = :file_id AND t.AiJson IS NOT NULL AND t.AiCaption IS NOT NULL
-            """)
-            params = {"file_id": file_id}
-            if entry_ids:
-                query = text(query.text + " AND t.EntryID IN :entry_ids")
-                params["entry_ids"] = tuple(entry_ids)
-            
-            logger.debug(f"Executing query: {query} with params: {params}")
-            result = await conn.execute(query, params)
-            entry_results = {}
-            for row in result.fetchall():
-                entry_id = row[1]
-                result_dict = {
-                    "ResultID": row[0],
-                    "EntryID": row[1],
-                    "AiJson": json.loads(row[2]) if row[2] else {},
-                    "AiCaption": row[3],
-                    "ImageIsFashion": bool(row[4])
-                }
-                if entry_id not in entry_results:
-                    entry_results[entry_id] = []
-                entry_results[entry_id].append(result_dict)
-            result.close()
-
-        if not entry_results:
-            logger.warning(f"No valid AI results to export for FileID {file_id}")
-            return ""
-
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        temp_json_dir = f"temp_json_{file_id}"
-        os.makedirs(temp_json_dir, exist_ok=True)
-
-        for entry_id, results in entry_results.items():
-            json_filename = f"result_{entry_id}_{timestamp}.json"
-            local_json_path = os.path.join(temp_json_dir, json_filename)
-
-            async with aiofiles.open(local_json_path, 'w') as f:
-                await f.write(json.dumps(results, indent=2))
-            
-            logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
-            logger.debug(f"JSON content sample for EntryID {entry_id}: {json.dumps(results[:2], indent=2)}")
-
-            s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
-            public_url = await upload_file_to_space(
-                local_json_path, s3_key, is_public=True, logger=logger, file_id=file_id
-            )
-            
-            if public_url:
-                logger.info(f"Exported JSON for EntryID {entry_id} to {public_url}")
-                json_urls.append(public_url)
-            else:
-                logger.error(f"Failed to upload JSON for EntryID {entry_id}")
-            
-            os.remove(local_json_path)
-
-        os.rmdir(temp_json_dir)
-        return json_urls[0] if json_urls else ""
-
-    except Exception as e:
-        logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
-        return ""
 
 @retry(
     stop=stop_after_attempt(3),
