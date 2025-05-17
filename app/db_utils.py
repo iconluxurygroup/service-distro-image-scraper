@@ -1625,6 +1625,12 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                     logger.error(f"Invalid columns returned for ID {file_id}. Got: {columns}, Expected: {expected_columns}")
                     return pd.DataFrame(columns=expected_columns)
                 
+                # Validate row structure
+                for i, row in enumerate(rows):
+                    if len(row) != len(columns):
+                        logger.error(f"Row {i} has incorrect number of columns: got {len(row)}, expected {len(columns)}")
+                        return pd.DataFrame(columns=expected_columns)
+                
                 df = pd.DataFrame(rows, columns=columns)
                 logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
                 if df.empty:
