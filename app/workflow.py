@@ -96,7 +96,7 @@ async def async_process_entry_search(
     
     async def process_variation(variation: str) -> List[pd.DataFrame]:
         try:
-            logger.debug(f"Processing variation '{variation}' for EntryID {entry_id}")
+            logger.debug(f"Processing variation '{variation}' for EntryID {entry_id} using endpoint {endpoint}")
             result = await process_and_tag_results(
                 search_string=variation,
                 brand=brand,
@@ -117,7 +117,7 @@ async def async_process_entry_search(
             logger.debug(f"Processed variation '{variation}' with {len(result)} DataFrames")
             return result
         except Exception as e:
-            logger.error(f"Error processing variation '{variation}' for EntryID {entry_id}: {e}")
+            logger.error(f"Error processing variation '{variation}' for EntryID {entry_id}: {e}", exc_info=True)
             return []
     
     semaphore = asyncio.Semaphore(10)
@@ -133,7 +133,7 @@ async def async_process_entry_search(
     combined_results = []
     for idx, result in enumerate(results):
         if isinstance(result, Exception):
-            logger.error(f"Error processing variation {variations[idx]} for EntryID {entry_id}: {result}")
+            logger.error(f"Error processing variation {variations[idx]} for EntryID {entry_id}: {result}", exc_info=True)
             continue
         if result:
             combined_results.extend(result)
@@ -162,24 +162,21 @@ def process_entry_search(args):
     try:
         mem_info = process.memory_info()
         logger.debug(f"Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                async_process_entry_search(
-                    search_string=search_string,
-                    brand=brand,
-                    endpoint=endpoint,
-                    entry_id=entry_id,
-                    use_all_variations=use_all_variations,
-                    file_id_db=file_id_db,
-                    logger=logger
-                )
+        # Use the existing event loop instead of creating a new one
+        loop = asyncio.get_running_loop()
+        result = loop.run_until_complete(
+            async_process_entry_search(
+                search_string=search_string,
+                brand=brand,
+                endpoint=endpoint,
+                entry_id=entry_id,
+                use_all_variations=use_all_variations,
+                file_id_db=file_id_db,
+                logger=logger
             )
-            logger.debug(f"Result for EntryID {entry_id}: {result}")
-            return result
-        finally:
-            loop.close()
+        )
+        logger.debug(f"Result for EntryID {entry_id}: {result}")
+        return result
     except Exception as e:
         logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
         return None
