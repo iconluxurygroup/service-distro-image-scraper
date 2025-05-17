@@ -15,7 +15,6 @@ from db_utils import (
     fetch_last_valid_entry,
 )
 from vision_utils import fetch_missing_images
-import httpx, aiofiles
 from endpoint_utils import sync_get_endpoint
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
@@ -33,21 +32,13 @@ import psutil
 from email_utils import send_message_email
 from image_reason import process_entry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import aiohttp
+import aiohttp, httpx, aiofiles
 from database_config import conn_str, async_engine, engine
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=15),
-    retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, pd.errors.EmptyDataError, ValueError)),
-    before_sleep=lambda retry_state: logging.getLogger(f"worker_{retry_state.kwargs['entry_id']}").info(
-        f"Worker PID {psutil.Process().pid}: Retrying task for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -98,7 +89,7 @@ async def async_process_entry_search(
                 endpoint=endpoint,
                 entry_id=entry_id,
                 logger=logger,
-                use_all_variations=False,
+                use_all_variations=use_all_variations,
                 file_id_db=file_id_db
             )
             for df in result:
@@ -114,7 +105,7 @@ async def async_process_entry_search(
             logger.error(f"Error processing variation '{variation}' for EntryID {entry_id}: {e}", exc_info=True)
             return []
     
-    semaphore = asyncio.Semaphore(10)
+    semaphore = asyncio.Semaphore(4)  # Limit concurrency
     async def process_with_semaphore(variation: str) -> List[pd.DataFrame]:
         async with semaphore:
             return await process_variation(variation)
@@ -142,7 +133,7 @@ async def async_process_entry_search(
             raise ValueError(f"EntryID mismatch in DataFrame for EntryID {entry_id}")
     
     mem_info = process.memory_info()
-    logger.debug(f"Memory after task ಇದರಿಂದ EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+    logger.debug(f"Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
     return combined_results
 
 async def process_restart_batch(
@@ -292,6 +283,8 @@ async def process_restart_batch(
                         logger.error(f"SortOrder update failed for EntryID {entry_id}")
                         return entry_id, False
 
+                    successful_entries += 1
+                    last_entry_id_processed = entry_id
                     return entry_id, True
                 except Exception as e:
                     logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
@@ -301,7 +294,6 @@ async def process_restart_batch(
             logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
             start_time = datetime.datetime.now()
 
-            # Process entries concurrently using asyncio
             results = await asyncio.gather(
                 *(process_entry(entry) for entry in batch_entries),
                 return_exceptions=True
