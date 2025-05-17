@@ -24,14 +24,30 @@ async def send_email(to_emails, subject, download_url, job_id, logger=None):
     """
     logger = logger or default_logger
     try:
+        # Handle string or list input for to_emails
+        if isinstance(to_emails, str):
+            email_list = [to_emails]
+        else:
+            email_list = []
+            for item in to_emails:
+                if isinstance(item, list):
+                    email_list.extend(item)
+                else:
+                    email_list.append(item)
+        
+        # Validate email addresses
+        valid_emails = [email for email in email_list if isinstance(email, str) and '@' in email]
+        if not valid_emails:
+            logger.error("No valid email addresses provided")
+            return False
+
         # Create MIME message
         msg = MIMEMultipart()
         msg['From'] = f'{SENDER_NAME} <{SENDER_EMAIL}>'
-        msg['To'] = to_emails
-        msg['Subject'] = subject
+        msg['To'] = ', '.join(valid_emails)
         
         # Set CC recipient
-        cc_recipient = 'nik@iconluxurygroup.com' if to_emails != 'nik@iconluxurygroup.com' else 'nik@luxurymarket.com'
+        cc_recipient = 'nik@iconluxurygroup.com' if 'nik@luxurymarket.com' not in valid_emails else 'nik@luxurymarket.com'
         msg['Cc'] = cc_recipient
 
         # HTML content
@@ -42,7 +58,7 @@ async def send_email(to_emails, subject, download_url, job_id, logger=None):
             <p>Your file is ready to <a href="{download_url}" class="download-button">download</a></p>            
             <p>--</p>
             <p><small>This is an automated notification.<br>
-            User: {to_emails}<br>
+            User: {', '.join(valid_emails)}<br>
             Job ID: {str(job_id)}<br>
             Version: <a href="https://dashboard.iconluxury.group">{VERSION}</a>
             </small>
@@ -57,16 +73,16 @@ async def send_email(to_emails, subject, download_url, job_id, logger=None):
         smtp_client = aiosmtplib.SMTP(
             hostname=SMTP_SERVER,
             port=SMTP_PORT,
-            use_tls=False,  # Start in non-TLS mode
-            start_tls=True  # Automatically handle STARTTLS
+            use_tls=False,
+            start_tls=True
         )
         await smtp_client.connect()
         await smtp_client.login(SENDER_EMAIL, SENDER_PASSWORD)
-        recipients = [to_emails, cc_recipient]
+        recipients = valid_emails + [cc_recipient]
         await smtp_client.send_message(msg, sender=SENDER_EMAIL, recipients=recipients)
         await smtp_client.quit()
 
-        logger.info(f"📧 Email sent successfully to {to_emails}")
+        logger.info(f"📧 Email sent successfully to {', '.join(valid_emails)}")
         return True
     except Exception as e:
         logger.error(f"🔴 Error sending email to {to_emails}: {e}", exc_info=True)
@@ -79,14 +95,30 @@ async def send_message_email(to_emails, subject, message, logger=None):
     """
     logger = logger or default_logger
     try:
+        # Handle string or list input for to_emails
+        if isinstance(to_emails, str):
+            email_list = [to_emails]
+        else:
+            email_list = []
+            for item in to_emails:
+                if isinstance(item, list):
+                    email_list.extend(item)
+                else:
+                    email_list.append(item)
+        
+        # Validate email addresses
+        valid_emails = [email for email in email_list if isinstance(email, str) and '@' in email]
+        if not valid_emails:
+            logger.error("No valid email addresses provided")
+            return False
+
         # Create MIME message
         msg = MIMEMultipart()
         msg['From'] = f'{SENDER_NAME} <{SENDER_EMAIL}>'
-        msg['To'] = to_emails
-        msg['Subject'] = subject
+        msg['To'] = ', '.join(valid_emails)
         
         # Set CC recipient
-        cc_recipient = 'nik@iconluxurygroup.com' if to_emails != 'nik@iconluxurygroup.com' else 'nik@luxurymarket.com'
+        cc_recipient = 'nik@iconluxurygroup.com' if 'nik@luxurymarket.com' not in valid_emails else 'nik@luxurymarket.com'
         msg['Cc'] = cc_recipient
 
         # HTML content
@@ -100,7 +132,7 @@ async def send_message_email(to_emails, subject, message, logger=None):
             <p><small>This is an automated notification.<br>
             Version: <a href="https://dashboard.iconluxury.group">{VERSION}</a>
             <br>
-            User: {to_emails}</small></p>
+            User: {', '.join(valid_emails)}</small></p>
         </div>
         </body>
         </html>
@@ -111,16 +143,16 @@ async def send_message_email(to_emails, subject, message, logger=None):
         smtp_client = aiosmtplib.SMTP(
             hostname=SMTP_SERVER,
             port=SMTP_PORT,
-            use_tls=False,  # Start in non-TLS mode
-            start_tls=True  # Automatically handle STARTTLS
+            use_tls=False,
+            start_tls=True
         )
         await smtp_client.connect()
         await smtp_client.login(SENDER_EMAIL, SENDER_PASSWORD)
-        recipients = [to_emails, cc_recipient]
+        recipients = valid_emails + [cc_recipient]
         await smtp_client.send_message(msg, sender=SENDER_EMAIL, recipients=recipients)
         await smtp_client.quit()
 
-        logger.info(f"📧 Message email sent successfully to {to_emails}")
+        logger.info(f"📧 Message email sent successfully to {', '.join(valid_emails)}")
         return True
     except Exception as e:
         logger.error(f"🔴 Error sending message email to {to_emails}: {e}", exc_info=True)
