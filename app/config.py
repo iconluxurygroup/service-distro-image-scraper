@@ -1,7 +1,11 @@
 import os
+#from dotenv import load_dotenv 
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 import logging
 from typing import Optional, Dict
-
+from sqlalchemy.sql import text
+from urllib.parse import quote_plus
 VERSION="3.4.21"
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"
@@ -26,6 +30,7 @@ S3_CONFIG = {
     "r2_custom_domain": "https://iconluxury.group",
 }
 
+DB_PASSWORD=  'Ftu5675FDG54hjhiuu$'
 
 # Existing imports and conn_str
 BASE_CONFIG_URL = "https://iconluxury.group/static_settings/"
