@@ -151,7 +151,7 @@ async def fetch_stored_thumbnail(
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT ImageUrlThumbnail, ThumbnailBase64 FROM utb_ImageScraperResult WHERE ResultID = ?",
+                "SELECT ImageUrlThumbnail FROM utb_ImageScraperResult WHERE ResultID = ?",
                 (result_id,)
             )
             result = cursor.fetchone()
@@ -163,10 +163,10 @@ async def fetch_stored_thumbnail(
             if thumbnail_base64:
                 try:
                     base64.b64decode(thumbnail_base64)
-                    logger.info(f"Using stored ThumbnailBase64 for ResultID {result_id}")
+                    logger.info(f"Using stored ImageUrlThumbnail for ResultID {result_id}")
                     return thumbnail_base64
                 except Exception as e:
-                    logger.warning(f"Invalid ThumbnailBase64 for ResultID {result_id}: {e}")
+                    logger.warning(f"Invalid ImageUrlThumbnail for ResultID {result_id}: {e}")
 
             if thumbnail_url:
                 image_data, _ = await get_image_data_async([thumbnail_url], session, logger, retries=3)
