@@ -54,7 +54,6 @@ async def insert_search_results(
             return False
 
     try:
-        # Validate and cast EntryID to integer
         parameters = []
         for res in results:
             try:
@@ -63,7 +62,6 @@ async def insert_search_results(
                 logger.error(f"Worker PID {process.pid}: Invalid EntryID value: {res.get('EntryID')}")
                 return False
 
-            # Filter irrelevant URLs based on category
             category = res.get("ProductCategory", "")
             image_url = str(res.get("ImageUrl", "")) if res.get("ImageUrl") else ""
             if category.lower() == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
@@ -84,7 +82,6 @@ async def insert_search_results(
             return False
 
         async with async_engine.connect() as conn:
-            # Clear connection state
             try:
                 await conn.execute(text("SELECT 1"))
                 await conn.commit()
@@ -133,9 +130,10 @@ async def update_search_sort_order(
     try:
         async with async_engine.connect() as conn:
             query = text("""
-                SELECT ResultID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
-                FROM utb_ImageScraperResult
-                WHERE EntryID = :entry_id AND FileID = :file_id
+                SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
+                FROM utb_ImageScraperResult r
+                INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
+                WHERE r.EntryID = :entry_id AND rec.FileID = :file_id
             """)
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
