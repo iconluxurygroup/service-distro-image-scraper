@@ -15,10 +15,11 @@ from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
 from workflow import generate_download_file, process_restart_batch, batch_vision_reason
-from db_utils import (
+from database import (
     update_log_url_in_db,
     get_send_to_email,
     fetch_last_valid_entry,
+    update_initial_sort_order,
     update_sort_order,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
@@ -265,7 +266,8 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
             return
         await asyncio.sleep(60)
 
-@router.post("/generate-download-fileaminen/{file_id}", tags=["Export"], response_model=JobStatusResponse)
+# Highlight: Generate Download File Endpoint
+@router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
     """
     Queue the generation of an Excel file with embedded images for a given file_id.
@@ -274,8 +276,8 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
     logger.info(f"Received request to generate download file for FileID: {file_id}")
     
     try:
-        # Validate file_id
-        with pyodbc.connect(conn_str, timeout=10) as conn:  # Use conn_str from database_config
+        # Validate file_id using conn_str from database_config
+        with pyodbc.connect(conn_str, timeout=10) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
             result = cursor.fetchone()
@@ -384,7 +386,7 @@ async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: log
         }
 
         # Validate file_id
-        with pyodbc.connect(conn_str, timeout=10) as conn:  # Use conn_str from database_config
+        with pyodbc.connect(conn_str, timeout=10) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
             if not cursor.fetchone():
@@ -425,7 +427,15 @@ async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: log
             "timestamp": datetime.datetime.now().isoformat()
         }
         return {"status_code": 500, "message": JOB_STATUS[file_id]["message"], "data": None}
-        
+
+@router.get("/initial-sort/{file_id}", tags=["Sorting"])
+async def api_initial_sort(file_id: str):
+    """Run initial sort order update."""
+    result = await run_job_with_logging(update_initial_sort_order, file_id)
+    if result["status_code"] != 200:
+        raise HTTPException(status_code=result["status_code"], detail=result["message"])
+    return result
+
 @router.get("/no-image-sort/{file_id}", tags=["Sorting"])
 async def api_no_image_sort(file_id: str):
     """Remove entries with no image results for a given file ID."""
