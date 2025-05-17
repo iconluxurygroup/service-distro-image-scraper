@@ -87,6 +87,8 @@ async def async_process_entry_search(
     logger.debug(f"Worker PID {process.pid}: Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
     return result
 
+    
+
 def process_entry_search(args):
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
     logger = logging.getLogger(f"worker_{entry_id}")
@@ -94,9 +96,10 @@ def process_entry_search(args):
     handler = logging.FileHandler(f"job_logs/worker_{entry_id}.log")
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
+    process = psutil.Process()  # Define process here
     try:
-        mem_info = psutil.Process().memory_info()
-        logger.debug(f"Worker PID {process.pid}: Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
+        mem_info = process.memory_info()  # Use process instead of psutil.Process()
+        logger.debug(f"Worker PID {process.pid}: Memory: RSS={mem_info.rss / 1024**2:.2f} MB")  # Fixed
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -116,7 +119,7 @@ def process_entry_search(args):
         finally:
             loop.close()
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Task failed for EntryID {entry_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: Task failed for EntryID {entry_id}: {e}", exc_info=True)  # Fixed
         return None
     finally:
         logger.removeHandler(handler)
