@@ -10,7 +10,7 @@ import aiobotocore.session
 from aiobotocore.config import AioConfig
 from config import S3_CONFIG
 from sqlalchemy.sql import text
-from database_config import async_engine
+from database_config import async_engine, conn_str
 import pyodbc
 
 default_logger = logging.getLogger(__name__)
