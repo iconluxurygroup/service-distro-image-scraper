@@ -14,6 +14,15 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+import logging
+from typing import Dict, List, Optional
+from common import clean_string, generate_aliases, generate_brand_aliases
+
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
 def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
