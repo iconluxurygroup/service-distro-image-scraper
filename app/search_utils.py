@@ -148,7 +148,7 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
         brand_clean = clean_string(brand).lower() if brand else ""
-        model_clean = normalize_model(model) if model else ""  # Replaced validate_model with normalize_model
+        model_clean = normalize_model(model) if model else ""
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
         brand_aliases = []
@@ -175,6 +175,7 @@ async def update_search_sort_order(
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
+            # Simplified calculate_priority call
             res["priority"] = calculate_priority(model_matched, brand_matched)
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
@@ -473,4 +474,5 @@ def generate_search_variations(
     for key in variations:
         variations[key] = list(set(v.lower() for v in variations[key]))
     
+    logger.debug(f"Worker PID {process.pid}: Generated variations: {variations}")
     return variations
