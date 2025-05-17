@@ -94,10 +94,19 @@ from common import clean_string, validate_model, validate_brand, calculate_prior
 from database_config import conn_str  # Import conn_str from database_config
 from sqlalchemy.sql import text
 
+import logging
+import pandas as pd
+import aioodbc
+import pyodbc  # Added for pyodbc.Error
+from typing import Optional, List, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
+from database_config import conn_str  # Import conn_str from database_config
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(aioodbc.Error),
+    retry=retry_if_exception_type(pyodbc.Error),  # Changed from aioodbc.Error to pyodbc.Error
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -277,7 +286,7 @@ async def update_search_sort_order(
                 await conn.commit()
                 return results
 
-    except aioodbc.Error as e:
+    except pyodbc.Error as e:
         logger.error(f"Database error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         raise
     except Exception as e:
