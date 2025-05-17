@@ -12,7 +12,6 @@ import hashlib
 import time
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from search_utils import update_sort_order, update_sort_no_image_entry
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images

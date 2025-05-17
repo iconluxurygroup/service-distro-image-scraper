@@ -268,7 +268,6 @@ async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logg
 )
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
     # Defer import to avoid circular dependency
-    from aws_s3 import upload_file_to_space
     try:
         json_urls = []
         async with async_engine.connect() as conn:

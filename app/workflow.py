@@ -16,7 +16,7 @@ from search_utils import update_search_sort_order, insert_search_results
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
-from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, search_variation
+from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
 from endpoint_utils import sync_get_endpoint
 from logging_config import setup_job_logger
 from config import S3_CONFIG
@@ -160,118 +160,36 @@ async def async_process_entry_search(
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory before task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
     
-    brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
-    if not brand_rules:
-        logger.warning(f"Worker PID {process.pid}: No brand rules fetched for EntryID {entry_id}")
-        brand_rules = {}
-    
     try:
-        variations_dict = generate_search_variations(
+        results = await process_and_tag_results(
             search_string=search_string,
             brand=brand,
             model=search_string,
-            brand_rules=brand_rules,
-            logger=logger
+            endpoint=endpoint,
+            entry_id=entry_id,
+            logger=logger,
+            use_all_variations=use_all_variations,
+            file_id_db=file_id_db
         )
+        logger.info(f"Worker PID {process.pid}: Processed EntryID {entry_id} with {len(results)} results")
+        
+        if not results:
+            logger.warning(f"Worker PID {process.pid}: No results for EntryID {entry_id}")
+            return []
+        
+        required_columns = ['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']
+        for item in results:
+            if not all(col in item for col in required_columns):
+                missing_cols = set(required_columns) - set(item.keys())
+                logger.error(f"Worker PID {process.pid}: Missing required columns {missing_cols} in result for EntryID {entry_id}")
+                return []
+        
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+        return results
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Failed to generate variations for EntryID {entry_id}: {e}")
-        raise ValueError(f"Failed to generate search variations: {e}")
-    
-    variations = []
-    search_types = []
-    for category, var_list in variations_dict.items():
-        for var in var_list:
-            variations.append(var)
-            search_types.append(category)
-    variations = list(dict.fromkeys(variations))
-    logger.debug(f"Worker PID {process.pid}: Generated {len(variations)} unique search variations for EntryID {entry_id}: {variations}")
-    
-    if not variations:
-        logger.warning(f"Worker PID {process.pid}: No variations generated for EntryID {entry_id}")
+        logger.error(f"Worker PID {process.pid}: Failed to process EntryID {entry_id}: {e}", exc_info=True)
         return []
-    
-    async def process_variation(
-        variation: str,
-        endpoint: str,
-        entry_id: int,
-        search_type: str,
-        brand: Optional[str] = None,
-        category: Optional[str] = None,
-        logger: Optional[logging.Logger] = None
-    ) -> Dict:
-        logger = logger or default_logger
-        try:
-            result = await search_variation(variation, endpoint, entry_id, search_type, brand, category, logger)
-            required_columns = ['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']
-            result_data = result.get('result', [])
-            
-            if not result_data:
-                logger.warning(f"No results for variation '{variation}' for EntryID {entry_id}")
-                return result
-            
-            for item in result_data:
-                if not all(col in item for col in required_columns):
-                    missing_cols = set(required_columns) - set(item.keys())
-                    logger.error(f"Missing required columns {missing_cols} in result for EntryID {entry_id}")
-                    result['status'] = 'failed'
-                    result['error'] = f"Missing required columns: {missing_cols}"
-                    return result
-            logger.info(f"Processed variation '{variation}' for EntryID {entry_id} with {len(result_data)} results")
-            return result
-        except Exception as e:
-            logger.error(f"Error processing variation '{variation}' for EntryID {entry_id}: {e}", exc_info=True)
-            return {
-                'variation': variation,
-                'result': [{
-                    'EntryID': entry_id,
-                    'ImageUrl': 'placeholder://error',
-                    'ImageDesc': f"Error: {str(e)}",
-                    'ImageSource': 'N/A',
-                    'ImageUrlThumbnail': 'placeholder://error'
-                }],
-                'status': 'failed',
-                'result_count': 1,
-                'error': str(e)
-            }
-    
-    semaphore = asyncio.Semaphore(4)
-    async def process_with_semaphore(variation: str, search_type: str) -> Dict:
-        async with semaphore:
-            return await process_variation(
-                variation=variation,
-                endpoint=endpoint,
-                entry_id=entry_id,
-                search_type=search_type,
-                brand=brand,
-                category=None,
-                logger=logger
-            )
-    
-    results = await asyncio.gather(
-        *(process_with_semaphore(variation, search_type) for variation, search_type in zip(variations, search_types)),
-        return_exceptions=True
-    )
-    
-    combined_results = []
-    for idx, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(f"Error processing variation {variations[idx]} for EntryID {entry_id}: {result}", exc_info=True)
-            continue
-        if result.get('status') == 'success' and result.get('result'):
-            combined_results.extend(result['result'])
-    
-    if not combined_results:
-        logger.warning(f"No valid results for EntryID {entry_id} after processing {len(variations)} variations")
-        return []
-    
-    for item in combined_results:
-        if item.get('EntryID') != entry_id:
-            logger.error(f"EntryID mismatch in result for EntryID {entry_id}: {item.get('EntryID')}")
-            raise ValueError(f"EntryID mismatch in result for EntryID {entry_id}")
-    
-    mem_info = process.memory_info()
-    logger.debug(f"Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
-    return combined_results
 
 async def process_restart_batch(
     file_id_db: int,
@@ -366,14 +284,6 @@ async def process_restart_batch(
         successful_entries = 0
         failed_entries = 0
         last_entry_id_processed = entry_id or 0
-        api_to_db_mapping = {
-            'image_url': 'ImageUrl',
-            'thumbnail_url': 'ImageUrlThumbnail',
-            'url': 'ImageUrl',
-            'thumb': 'ImageUrlThumbnail',
-            'image': 'ImageUrl',
-            'thumbnail': 'ImageUrlThumbnail'
-        }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -395,21 +305,13 @@ async def process_restart_batch(
                         logger.error(f"No results for EntryID {entry_id}")
                         return entry_id, False
 
-                    combined_results = []
-                    for res in results:
-                        new_res = {}
-                        for key, value in res.items():
-                            new_key = api_to_db_mapping.get(key, key)
-                            new_res[new_key] = value
-                        combined_results.append(new_res)
-
-                    if not all(all(col in res for col in required_columns) for res in combined_results):
+                    if not all(all(col in res for col in required_columns) for res in results):
                         logger.error(f"Missing columns for EntryID {entry_id}")
                         return entry_id, False
 
                     deduplicated_results = []
                     seen = set()
-                    for res in combined_results:
+                    for res in results:
                         key = (res['EntryID'], res['ImageUrl'])
                         if key not in seen:
                             seen.add(key)
