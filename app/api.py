@@ -298,7 +298,7 @@ import pyodbc
 import datetime
 from typing import Optional, List
 from workflow import process_restart_batch
-from database import update_log_url_in_db, fetch_last_valid_entry
+from database import update_log_url_in_db
 from config import conn_str  # Import conn_str from config
 
 # Initialize FastAPI app
