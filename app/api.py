@@ -12,7 +12,7 @@ import hashlib
 import time
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
-from image_utils import process_restart_batch, upload_log_file
+from image_utils import process_restart_batch, upload_log_file,insert_search_results,update_search_sort_order
 from search_utils import update_sort_order, update_sort_no_image_entry
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images
@@ -25,6 +25,8 @@ from db_utils import (
     update_file_generate_complete,
     update_file_location_complete,
 )
+from config import BRAND_RULES_URL
+from common import fetch_brand_rules
 from database_config import conn_str, async_engine
 from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
