@@ -866,7 +866,8 @@ async def update_search_sort_order(
                 try:
                     result_id = int(row['ResultID'])
                     new_sort_order = int(row['new_sort_order'])
-                    result = conn.execute(
+               # After
+                    result = await conn.execute(
                         text("""
                             UPDATE utb_ImageScraperResult 
                             SET SortOrder = :sort_order 
@@ -874,7 +875,6 @@ async def update_search_sort_order(
                         """),
                         {"sort_order": new_sort_order, "result_id": result_id}
                     )
-                    update_count += 1
                     success_count += result.rowcount
                     logger.debug(f"Updated SortOrder to {new_sort_order} for ResultID {result_id}")
                 except SQLAlchemyError as e:
