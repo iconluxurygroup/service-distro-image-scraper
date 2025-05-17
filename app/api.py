@@ -92,7 +92,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         }
     except Exception as e:
         func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
-        logger.error(f"Error in job {func_name} for FileID: {file_id}: {str(e)}")
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
         logger.debug(f"Traceback: {traceback.format_exc()}")
         debug_info["error_traceback"] = traceback.format_exc()
         return {
@@ -209,7 +209,7 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
                         if "error" not in result:
                             logger.info(f"Resubmission successful for FileID: {file_id}")
                             await send_message_email(
-                                to_emails=["nik@iconluxurygroup.com"],
+                                to_emails=["nik@luxurymarket.com"],
                                 subject=f"Success: Batch Resubmission for FileID {file_id}",
                                 message=f"Resubmission succeeded for FileID {file_id} starting from EntryID {last_entry_id}.\nLog: {log_file}",
                                 logger=logger
@@ -228,7 +228,7 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
                         if "error" not in result:
                             logger.info(f"Resubmission successful for FileID: {file_id}")
                             await send_message_email(
-                                to_emails=["nik@iconluxurygroup.com"],
+                                to_emails=["nik@luxurymarket.com"],
                                 subject=f"Success: Batch Resubmission for FileID {file_id}",
                                 message=f"Resubmission succeeded for FileID {file_id} from beginning.\nLog: {log_file}",
                                 logger=logger
@@ -504,8 +504,8 @@ async def api_process_ai_images(
             upload_url = await upload_file_to_space(
                 log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
             )
-            await update_log_url_in_db(file_id, update_log_url_in_db(file_id, upload_url, logger))
-        raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID: {file_id}: {str(e)}")
+            await update_log_url_in_db(file_id, upload_url, logger)
+        raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
 
 @router.get("/fetch-missing-images/{file_id}", tags=["Database"])
 async def fetch_missing_images_endpoint(file_id: str, limit: int = Query(1000), ai_analysis_only: bool = Query(True)):
@@ -525,7 +525,7 @@ async def get_images_excel_db_endpoint(file_id: str):
     logger, _ = setup_job_logger(job_id=file_id)
     logger.info(f"Fetching Excel images for FileID: {file_id}")
     try:
-        result = await get_images_excel_db(file_id, logger)
+        result = get_images_excel_db(file_id, logger)
         if result.empty:
             return {"status_code": 200, "message": f"No images found for Excel export for FileID: {file_id}", "data": []}
         return {"status_code": 200, "message": f"Fetched Excel images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
