@@ -14,52 +14,52 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 def clean_url(url: str) -> str:
-    """Clean URLs by fixing common issues like backslashes or double-encoding."""
-    # Replace backslashes with forward slashes or remove them
-    url = re.sub(r'\\+', '/', url)
-    # Remove erroneous %5C or literal backslashes in query strings
-    url = url.replace('%5C', '')
-    # Decode any double-encoded % signs (e.g., %25 -> %)
-    try:
-        while '%25' in url:
-            url = url.replace('%25', '%')
-    except Exception as e:
-        default_logger.warning(f"Error decoding URL {url}: {e}")
-    return url
+    """Clean URLs by fixing backslashes, %2f in paths, and double-encoding."""
+    # Replace backslashes with nothing or forward slashes
+    url = re.sub(r'\\+|%5[Cc]', '', url)
+    # Decode %2f in path to /
+    parsed = urlparse(url)
+    path = parsed.path.replace('%2F', '/').replace('%2f', '/')
+    # Reconstruct URL
+    cleaned_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+    if parsed.query:
+        # Clean %5C in query
+        query = parsed.query.replace('%5C', '').replace('%5c', '')
+        cleaned_url += f"?{query}"
+    if parsed.fragment:
+        cleaned_url += f"#{parsed.fragment}"
+    # Fix double-encoded % signs (e.g., %25 -> %)
+    while '%25' in cleaned_url:
+        cleaned_url = cleaned_url.replace('%25', '%')
+    return cleaned_url
 
 def encode_url(url: str) -> str:
-    """Encode a URL, preserving scheme, netloc, and reserved characters where appropriate."""
-    parsed = urlparse(url)
-    # Clean the URL first
-    cleaned_url = clean_url(url)
-    parsed = urlparse(cleaned_url)
-    
-    # Encode path and query separately
-    path = quote(parsed.path, safe='/')
+    """Encode URL, preserving slashes in path and encoding query values."""
+    parsed = urlparse(clean_url(url))
+    # Preserve path slashes
+    path = parsed.path  # Already cleaned, no encoding needed
+    # Encode query values
     if parsed.query:
-        # Parse query string into key-value pairs
         query_dict = parse_qs(parsed.query)
-        # Encode each value
         encoded_query = urlencode(
-            {k: [quote(v, safe='') for v in vs] for k, vs in query_dict.items()},
+            {k: [quote(v, safe=':') for v in vs] for k, vs in query_dict.items()},
             doseq=True
         )
     else:
         encoded_query = ''
-    
     # Reconstruct URL
     encoded_url = f"{parsed.scheme}://{parsed.netloc}{path}"
     if encoded_query:
         encoded_url += f"?{encoded_query}"
     if parsed.fragment:
         encoded_url += f"#{quote(parsed.fragment)}"
-    
     return encoded_url
 
 async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bool:
-    """Validate if a URL is accessible with a HEAD request."""
+    """Check if URL is accessible with a HEAD request."""
     try:
-        async with session.head(url, timeout=5) as response:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124'}
+        async with session.head(url, timeout=5, headers=headers) as response:
             if response.status == 200:
                 logger.debug(f"URL {url} is accessible")
                 return True
@@ -77,21 +77,19 @@ async def download_image(
     timeout: int = 30
 ) -> bool:
     try:
-        # Clean and encode the URL
+        # Clean and encode URL
         cleaned_url = clean_url(url)
         encoded_url = encode_url(cleaned_url)
         logger.debug(f"Raw URL: {url}")
         logger.debug(f"Cleaned URL: {cleaned_url}")
         logger.debug(f"Encoded URL: {encoded_url}")
 
-        # Validate URL accessibility
+        # Validate URL
         if not await validate_url(encoded_url, session, logger):
             logger.warning(f"Skipping download for inaccessible URL: {encoded_url}")
             return False
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124'}
         async with session.get(encoded_url, timeout=timeout, headers=headers) as response:
             if response.status != 200:
                 logger.warning(f"⚠️ HTTP error for image {encoded_url}: {response.status} {response.reason}")
@@ -140,7 +138,7 @@ async def download_all_images(
 
         async with aiohttp.ClientSession() as session:
             # Try main image
-            success = await download_image(main_url, filename, session, logger)
+            success = await downloadImage(main_url, filename, session, logger)
             if not success and thumb_url:
                 # Fallback to thumbnail
                 logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
