@@ -283,86 +283,65 @@ async def process_restart_batch(
 
         # Use ThreadPoolExecutor with dynamic workers
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for batch_idx, batch_entries in enumerate(entry_batches, 1):
-                logger.info(f"Worker PID {process.pid}: Processing batch {batch_idx}/{len(entry_batches)}")
-                start_time = datetime.datetime.now()
+                for batch_idx, batch_entries in enumerate(entry_batches, 1):
+                    logger.info(f"Worker PID {process.pid}: Processing batch {batch_idx}/{len(entry_batches)}")
+                    start_time = datetime.datetime.now()
 
-                tasks = [
-                    (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db_int)
-                    for entry_id, search_string, brand, color, category in batch_entries
-                ]
-                logger.debug(f"Worker PID {process.pid}: Tasks: {tasks}")
+                    tasks = [
+                        (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db)
+                        for entry_id, search_string, brand, color, category in batch_entries
+                    ]
+                    results = [executor.submit(process_entry_search, task) for task in tasks]
+                    results = [future.result() for future in results]
 
-                # Process tasks and collect results in order
-                results = [executor.submit(process_entry_search, task) for task in tasks]
-                results = [future.result() for future in results]
+                    for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
+                        try:
+                            if result is None or not result:
+                                logger.error(f"Worker PID {process.pid}: No results for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
 
-                for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
-                    try:
-                        if result is None:
-                            logger.error(f"Worker PID {process.pid}: No results for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
+                            combined_df = pd.concat(result, ignore_index=True, copy=False)
+                            if 'EntryID' not in combined_df.columns or not combined_df['EntryID'].eq(entry_id).all():
+                                logger.error(f"Worker PID {process.pid}: EntryID mismatch for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
 
-                        dfs = result
-                        if not dfs:
-                            logger.error(f"Worker PID {process.pid}: Empty results for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
+                            for api_col, db_col in api_to_db_mapping.items():
+                                if api_col in combined_df.columns and db_col not in combined_df.columns:
+                                    combined_df.rename(columns={api_col: db_col}, inplace=True)
 
-                        # Process DataFrame incrementally to reduce memory usage
-                        combined_df = pd.concat(dfs, ignore_index=True, copy=False)
-                        logger.debug(f"Worker PID {process.pid}: Combined DataFrame for EntryID {entry_id}: {combined_df.to_dict()}")
+                            if not all(col in combined_df.columns for col in required_columns):
+                                logger.error(f"Worker PID {process.pid}: Missing columns for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
 
-                        # Validate EntryID in DataFrame
-                        if 'EntryID' not in combined_df.columns or not combined_df['EntryID'].eq(entry_id).all():
-                            logger.error(f"Worker PID {process.pid}: EntryID mismatch for EntryID {entry_id}: {combined_df['EntryID'].tolist()}")
-                            failed_entries += 1
-                            continue
+                            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
+                            insert_success = insert_search_results(deduplicated_df, logger=logger)
+                            if not insert_success:
+                                logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
 
-                        for api_col, db_col in api_to_db_mapping.items():
-                            if api_col in combined_df.columns and db_col not in combined_df.columns:
-                                combined_df.rename(columns={api_col: db_col}, inplace=True)
-
-                        if not all(col in combined_df.columns for col in required_columns):
-                            logger.error(f"Worker PID {process.pid}: Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
-
-                        deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
-                        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
-
-                        # Insert results with transaction isolation
-                        insert_success = insert_search_results(deduplicated_df, logger=logger)
-                        if not insert_success:
-                            logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
-
-                        logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
-
-                        # Update sort order with lock
-                        with SORT_ORDER_LOCK:
+                            # Update sort order with retry
                             update_result = await update_search_sort_order(
-                                str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                                str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                             )
                             if update_result is None:
                                 logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
                                 failed_entries += 1
                                 continue
 
-                        logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
-                        successful_entries += 1
-                        last_entry_id_processed = entry_id
+                            successful_entries += 1
+                            last_entry_id_processed = entry_id
 
-                    except Exception as e:
-                        logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {e}", exc_info=True)
-                        failed_entries += 1
+                        except Exception as e:
+                            logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {e}", exc_info=True)
+                            failed_entries += 1
 
-                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                logger.info(f"Worker PID {process.pid}: Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
-                log_memory_usage()
-
+                    elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                    logger.info(f"Worker PID {process.pid}: Completed batch {batch_idx} in {elapsed_time:.2f}s")
+                    log_memory_usage()
         # Final verification
         with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
             cursor = conn.cursor()
@@ -438,9 +417,13 @@ async def process_restart_batch(
             "last_entry_id": str(last_entry_id_processed)
         }
 
-    except Exception as e:
+except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+    finally:
+        # Clean up connection pool
+        if 'async_engine' in globals():
+            await async_engine.dispose()
 
 import pandas as pd
 import logging

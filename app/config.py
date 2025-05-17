@@ -29,8 +29,7 @@ S3_CONFIG = {
     "r2_bucket_name": "iconluxurygroup",
     "r2_custom_domain": "https://iconluxury.group",
 }
-# Database credentials
-MSSQLS_PWD =  'Ftu5675FDG54hjhiuu$'
+
 
 # Existing imports and conn_str
 BASE_CONFIG_URL = "https://iconluxury.group/static_settings/"
@@ -38,13 +37,3 @@ BASE_CONFIG_URL = "https://iconluxury.group/static_settings/"
 GROK_API_KEY = os.getenv('GROK_API_KEY', 'xai-ucA8EcERzruUwHAa1duxYallTxycDumI5n3eVY7EJqhZVD0ywiiza3zEmRB4Tw7eNC5k0VuXVndYOUj9')
 GROK_ENDPOINT = os.getenv('GROK_ENDPOINT', 'https://api.x.ai/v1/chat/completions')
 
-# Database connection string
-pwd_str = f"Pwd={MSSQLS_PWD};"
-conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;{pwd_str}"
-# Database connection strings
-from urllib.parse import quote_plus
-from sqlalchemy import create_engine
-from sqlalchemy.ext.asyncio import create_async_engine
-encoded_conn_str = quote_plus(conn_str)
-async_engine = create_async_engine(f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}", echo=True)
-engine = create_engine(f"mssql+pyodbc:///?odbc_connect={conn_str}")
