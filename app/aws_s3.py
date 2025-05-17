@@ -10,11 +10,7 @@ import os
 import urllib.parse
 import mimetypes
 from logging_config import setup_job_logger
-from aioodbc import connect
-from aioodbc import Connection
-from aioodbc import Cursor
-from aioodbc import get_session
-from config import S3_CONFIG
+import aioodbc 
 # Import database configuration
 from config import VERSION
 from database_config import async_engine, engine
