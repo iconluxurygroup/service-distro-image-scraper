@@ -618,16 +618,12 @@ async def generate_download_file(
                 return {"error": "Failed to retrieve email address", "log_filename": log_filename}
             subject_line = f"{original_filename} Job Notification - No Images"
             await send_message_email(
-                to_emails=send_to_email_addr,
-                subject=subject_line,
-                message=(
-                    f"No valid images were found for FileID {file_id} after filtering.\n"
-                    f"An empty Excel file has been generated.\n"
-                    f"Download URL: {public_url}\n"
-                    f"Diagnostics: {file_count} files, {record_count} records, {result_count} image results."
-                ),
-                logger=logger
-            )
+            to_emails=send_to_email_addr,
+            subject=subject_line,
+            message=f"Excel file generation for FileID {file_id} completed successfully.",
+            file_url=public_url,
+            logger=logger
+        )
             
             logger.info(f"Completed ID {file_id} with no images")
             return {"message": "No valid images found, empty Excel file generated", "public_url": public_url, "log_filename": log_filename}
