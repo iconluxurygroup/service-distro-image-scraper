@@ -398,6 +398,24 @@ async def process_restart_batch(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Disposed database engines")
+import asyncio
+import logging
+import os
+import datetime
+from typing import Optional, Dict
+from db_utils import get_send_to_email, get_images_excel_db, update_file_location_complete, update_file_generate_complete
+from image_utils import download_all_images
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from utils import create_temp_dirs, cleanup_temp_dirs
+from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space
+import psutil
+from email_utils import send_message_email
+import httpx
+import aiofiles
+from database_config import async_engine, engine
+from sqlalchemy.sql import text
+import pandas as pd
 
 async def generate_download_file(
     file_id: int,
@@ -449,6 +467,7 @@ async def generate_download_file(
         if not os.path.exists(local_filename):
             logger.error(f"Template file not found at {local_filename}")
             return {"error": f"Failed to download template file", "log_filename": log_filename}
+        logger.debug(f"Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
 
         has_valid_images = not selected_images_df.empty and any(pd.notna(row['ImageUrl']) and row['ImageUrl'] for _, row in selected_images_df.iterrows())
         
@@ -485,6 +504,7 @@ async def generate_download_file(
         if not os.path.exists(local_filename):
             logger.error(f"Excel file not found at {local_filename}")
             return {"error": f"Excel file not found", "log_filename": log_filename}
+        logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
 
         public_url = await upload_file_to_space(
             file_src=local_filename,
@@ -497,6 +517,7 @@ async def generate_download_file(
         if not public_url:
             logger.error(f"Upload failed for ID {file_id}")
             return {"error": "Failed to upload processed file", "log_filename": log_filename}
+        logger.info(f"File uploaded to R2, public_url: {public_url}")
 
         await update_file_location_complete(str(file_id), public_url, logger=logger)
         await update_file_generate_complete(str(file_id), logger=logger)
@@ -509,8 +530,10 @@ async def generate_download_file(
         subject_line = f"{original_filename} Job Notification{' - No Images' if not has_valid_images else ''}"
         message = (
             f"Excel file generation for FileID {file_id} {'completed successfully' if has_valid_images else 'completed with no valid images'}.\n"
-            f"Download URL: {public_url}"
+            f"Download URL: {public_url}\n"
+            f"Log file: {log_filename}"
         )
+        logger.debug(f"Sending email with public_url: {public_url}")
         await send_message_email(
             to_emails=send_to_email_addr,
             subject=subject_line,
