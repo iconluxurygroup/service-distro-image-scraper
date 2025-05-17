@@ -28,6 +28,7 @@ import aiofiles
 import aiohttp
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import urlparse
+
 from url_extract import extract_thumbnail_url
 import re
 from PIL import Image as IMG2
@@ -38,7 +39,6 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-import tldextract
 from aiohttp_retry import RetryClient, ExponentialRetry
 from aiohttp import ClientTimeout
 
