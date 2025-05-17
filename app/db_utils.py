@@ -716,61 +716,53 @@ async def update_search_sort_order(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None,
-    brand_aliases: Optional[List[str]] = None
+    brand_aliases: Optional[List[str]] = None,
+    use_async: bool = True
 ) -> Optional[List[Dict]]:
     logger = logger or default_logger
     try:
         file_id = int(file_id)
         entry_id = int(entry_id)
-        logger.info(f"🔄 Starting SortOrder update for FileID: {file_id}, EntryID: {entry_id}")
-        
-        async with async_engine.begin() as conn:
-            await conn.execute(
-                text("""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = NULL
-                    WHERE EntryID = :entry_id
-                """),
+        logger.info(f"Starting SortOrder update for FileID: {file_id}, EntryID: {entry_id}")
+
+        # Select engine based on async/sync
+        engine_ctx = async_engine.begin() if use_async else engine.begin()
+        execute_func = (lambda query, params: conn.execute(query, params)) if use_async else (lambda query, params: conn.execute(query, params))
+
+        async with engine_ctx as conn:
+            # Reset SortOrder
+            await execute_func(
+                text("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID = :entry_id"),
                 {"entry_id": entry_id}
             )
             logger.debug(f"Reset SortOrder to NULL for EntryID {entry_id}")
 
+            # Fetch attributes if needed
             if not all([brand, model]):
-                query_attrs = text("""
-                    SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = :file_id AND EntryID = :entry_id
-                """)
-                logger.debug(f"Executing query: {query_attrs} with FileID: {file_id}, EntryID: {entry_id}")
-                result = (await conn.execute(query_attrs, {"file_id": file_id, "entry_id": entry_id})).fetchone()
+                result = await execute_func(
+                    text("""
+                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
+                        FROM utb_ImageScraperRecords
+                        WHERE FileID = :file_id AND EntryID = :entry_id
+                    """),
+                    {"file_id": file_id, "entry_id": entry_id}
+                )
+                result = (await result.fetchone()) if use_async else result.fetchone()
                 if result:
                     brand, model, color, category = result
-                    logger.info(f"Fetched attributes - Brand: {brand}, Model: {model}, Color: {color}, Category: {category}")
+                    logger.info(f"Fetched attributes - Brand: {brand}, Model: {model}")
                 else:
-                    logger.warning(f"No attributes found for FileID: {file_id}, EntryID: {entry_id}")
-                    brand = brand or ''
-                    model = model or ''
-                    color = color or ''
-                    category = category or ''
+                    brand, model, color, category = brand or '', model or '', color or '', category or ''
 
+            # Fetch results
             query = text("""
-                SELECT 
-                    t.ResultID, 
-                    t.EntryID,
-                    ISNULL(CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0) AS match_score,
-                    t.SortOrder,
-                    t.ImageDesc, 
-                    t.ImageSource, 
-                    t.ImageUrl,
-                    r.ProductBrand, 
-                    r.ProductModel
+                SELECT t.ResultID, t.EntryID, ...
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                 WHERE r.FileID = :file_id AND t.EntryID = :entry_id
             """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id}, EntryID: {entry_id}")
-            df = await conn.execute(query, {"file_id": file_id, "entry_id": entry_id})
-            df = pd.DataFrame(df.fetchall(), columns=df.keys())
+            df = await conn.execute(query, {"file_id": file_id, "entry_id": entry_id}) if use_async else pd.read_sql_query(query, conn, params={"file_id": file_id, "entry_id": entry_id})
+            df = pd.DataFrame(df.fetchall(), columns=df.keys()) if use_async else df
             if df.empty:
                 logger.warning(f"No eligible data found for FileID: {file_id}, EntryID: {entry_id}")
                 return []
