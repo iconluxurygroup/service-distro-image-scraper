@@ -15,10 +15,11 @@ from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
 from workflow import generate_download_file, process_restart_batch, batch_vision_reason
-from db_utils import (
+from database import (
     update_log_url_in_db,
     get_send_to_email,
     fetch_last_valid_entry,
+    update_initial_sort_order,
     update_sort_order,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
@@ -27,7 +28,9 @@ from db_utils import (
     update_file_generate_complete,
     update_file_location_complete,
 )
+from database_config import conn_str  # Import conn_str from database_config
 from config import VERSION
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)
@@ -53,6 +56,62 @@ class JobStatusResponse(BaseModel):
     public_url: str | None = Field(None, description="S3 URL of the generated Excel file, if available")
     log_url: str | None = Field(None, description="S3 URL of the job log file, if available")
     timestamp: str = Field(..., description="ISO timestamp of the response")
+
+async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
+    """Upload log file to S3 with retry logic and deduplication."""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        before_sleep=lambda retry_state: logger.info(
+            f"Retrying log upload for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
+        )
+    )
+    async def try_upload():
+        if not os.path.exists(log_filename):
+            logger.warning(f"Log file {log_filename} does not exist, skipping upload")
+            return None
+
+        file_hash = hashlib.md5(open(log_filename, "rb").read()).hexdigest()
+        current_time = time.time()
+        key = (log_filename, file_id)
+
+        if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
+            logger.info(f"Skipping redundant upload for {log_filename}")
+            return LAST_UPLOAD[key]["url"]
+
+        try:
+            upload_result = upload_file_to_space(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id}.log",
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            upload_url = await upload_result if asyncio.iscoroutine(upload_result) else upload_result
+            await update_log_url_in_db(file_id, upload_url, logger)
+            LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
+            logger.info(f"Log uploaded to: {upload_url}")
+            return upload_url
+        except Exception as e:
+            logger.warning(f"Async upload failed for FileID {file_id}: {e}")
+            upload_url = upload_file_to_space_sync(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id}.log",
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+            LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
+            logger.info(f"Sync log uploaded to: {upload_url}")
+            return upload_url
+
+    try:
+        return await try_upload()
+    except Exception as e:
+        logger.error(f"Failed to upload log for FileID {file_id} after retries: {e}", exc_info=True)
+        return None
 
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     """
@@ -101,44 +160,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
             "debug_info": debug_info
         }
     finally:
-        if os.path.exists(log_file):
-            file_hash = hashlib.md5(open(log_file, "rb").read()).hexdigest()
-            current_time = time.time()
-            key = (log_file, file_id_str)
-            
-            if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
-                logger.info(f"Skipping redundant upload for {log_file}")
-                debug_info["log_url"] = LAST_UPLOAD[key]["url"]
-            else:
-                try:
-                    upload_result = upload_file_to_space(
-                        file_src=log_file,
-                        save_as=f"job_logs/job_{file_id_str}.log",
-                        is_public=True,
-                        logger=logger,
-                        file_id=file_id_str
-                    )
-                    upload_url = await upload_result if asyncio.iscoroutine(upload_result) else upload_result
-                    await update_log_url_in_db(file_id_str, upload_url, logger)
-                    logger.info(f"Log uploaded to: {upload_url}")
-                    debug_info["log_url"] = upload_url
-                    LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
-                except Exception as upload_error:
-                    logger.warning(f"Async upload failed for FileID {file_id_str}: {upload_error}")
-                    upload_url = upload_file_to_space_sync(
-                        file_src=log_file,
-                        save_as=f"job_logs/job_{file_id_str}.log",
-                        is_public=True,
-                        logger=logger,
-                        file_id=file_id_str
-                    )
-                    await update_log_url_in_db(file_id_str, upload_url, logger)
-                    logger.info(f"Log uploaded to: {upload_url}")
-                    debug_info["log_url"] = upload_url
-                    LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
-        else:
-            logger.warning(f"Log file {log_file} does not exist, skipping upload")
-            debug_info["log_url"] = None
+        debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
 
 async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str):
     """
@@ -244,7 +266,7 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
             return
         await asyncio.sleep(60)
 
-@router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
+@router.post("/generate-download-fileaminen/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
     """
     Queue the generation of an Excel file with embedded images for a given file_id.
@@ -254,7 +276,7 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
     
     try:
         # Validate file_id
-        with pyodbc.connect(conn_str, timeout=10) as conn:
+        with pyodbc.connect(conn_str, timeout=10) as conn:  # Use conn_str from database_config
             cursor = conn.cursor()
             cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
             result = cursor.fetchone()
@@ -315,6 +337,44 @@ async def api_get_job_status(file_id: str):
         timestamp=job_status["timestamp"]
     )
 
+@router.get("/sort-by-search/{file_id}", tags=["Sorting"])
+async def api_match_and_search_sort(file_id: str):
+    """Run sort order update based on match_score and search-based priority."""
+    result = await run_job_with_logging(update_sort_order, file_id)
+    if result["status_code"] != 200:
+        raise HTTPException(status_code=result["status_code"], detail=result["message"])
+    return result
+
+@router.get("/update-sort-order-per-entry/{file_id}", tags=["Sorting"])
+async def api_update_sort_order_per_entry(
+    file_id: str,
+    background_tasks: BackgroundTasks,
+    limit: Optional[int] = Query(None, description="Maximum number of entries to process")
+):
+    """Run per-entry SortOrder update for a given file_id in the background."""
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Queueing per-entry SortOrder update for FileID: {file_id}, limit: {limit}")
+
+    try:
+        # Initialize job status
+        JOB_STATUS[file_id] = {
+            "status": "queued",
+            "message": "Per-entry sort order update queued",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+        # Queue the job
+        background_tasks.add_task(run_per_entry_sort_job, file_id, limit, logger, log_filename)
+
+        return {
+            "status_code": 200,
+            "message": f"Per-entry SortOrder update queued for FileID: {file_id}",
+            "data": None
+        }
+    except Exception as e:
+        logger.error(f"Error queuing per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error queuing SortOrder update for FileID {file_id}: {str(e)}")
+
 async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: logging.Logger, log_filename: str):
     """Run per-entry sort order update as a background task."""
     try:
@@ -325,7 +385,7 @@ async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: log
         }
 
         # Validate file_id
-        with pyodbc.connect(conn_str, timeout=10) as conn:
+        with pyodbc.connect(conn_str, timeout=10) as conn:  # Use conn_str from database_config
             cursor = conn.cursor()
             cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
             if not cursor.fetchone():
@@ -366,49 +426,14 @@ async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: log
             "timestamp": datetime.datetime.now().isoformat()
         }
         return {"status_code": 500, "message": JOB_STATUS[file_id]["message"], "data": None}
-@router.get("/sort-by-search/{file_id}", tags=["Sorting"])
-async def api_match_and_search_sort(file_id: str):
-    """Run sort order update based on match_score and search-based priority."""
-    result = await run_job_with_logging(update_sort_order, file_id)
+
+@router.get("/initial-sort/{file_id}", tags=["Sorting"])
+async def api_initial_sort(file_id: str):
+    """Run initial sort order update."""
+    result = await run_job_with_logging(update_initial_sort_order, file_id)
     if result["status_code"] != 200:
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
     return result
-@router.get("/update-sort-order-per-entry/{file_id}", tags=["Sorting"])
-async def api_update_sort_order_per_entry(
-    file_id: str,
-    background_tasks: BackgroundTasks,
-    limit: Optional[int] = Query(None, description="Maximum number of entries to process")
-):
-    """Run per-entry SortOrder update for a given file_id in the background."""
-    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    logger.info(f"Queueing per-entry SortOrder update for FileID: {file_id}, limit: {limit}")
-
-    try:
-        # Initialize job status
-        JOB_STATUS[file_id] = {
-            "status": "queued",
-            "message": "Per-entry sort order update queued",
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-
-        # Queue the job
-        background_tasks.add_task(run_per_entry_sort_job, file_id, limit, logger, log_filename)
-
-        return {
-            "status_code": 200,
-            "message": f"Per-entry SortOrder update queued for FileID: {file_id}",
-            "data": None
-        }
-    except Exception as e:
-        logger.error(f"Error queuing per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error queuing SortOrder update for FileID {file_id}: {str(e)}")
-# @router.get("/initial-sort/{file_id}", tags=["Sorting"])
-# async def api_initial_sort(file_id: str):
-#     """Run initial sort order update."""
-#     result = await run_job_with_logging(update_initial_sort_order, file_id)
-#     if result["status_code"] != 200:
-#         raise HTTPException(status_code=result["status_code"], detail=result["message"])
-#     return result
 
 @router.get("/no-image-sort/{file_id}", tags=["Sorting"])
 async def api_no_image_sort(file_id: str):
