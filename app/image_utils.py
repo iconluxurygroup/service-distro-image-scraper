@@ -130,6 +130,8 @@ async def download_image(
             async with session.get(encoded_url, timeout=timeout, headers=headers) as response:
                 if response.status != 200:
                     logger.warning(f"Attempt {attempt} - HTTP error for image {encoded_url}: {response.status} {response.reason}")
+                    if response.status == 404:
+                        return False
                     continue
                 async with aiofiles.open(filename, 'wb') as f:
                     await f.write(await response.read())
@@ -182,7 +184,7 @@ async def download_all_images(
                 logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
                 failed_downloads.append((main_url, excel_row_id))
                 if not main_url and not thumb_url:
-                    logger.critical(f"No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID 315.")
+                    logger.critical(f"No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID {image.get('FileID', 'unknown')}.")
 
     batches = [image_list[i:i + batch_size] for i in range(0, len(image_list), batch_size)]
     for batch_idx, batch in enumerate(batches, 1):
