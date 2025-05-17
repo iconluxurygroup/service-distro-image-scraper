@@ -73,6 +73,9 @@ def encode_url(url: str) -> str:
 
 async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bool:
     try:
+        if not re.match(r'^https?://', url):
+            logger.warning(f"Invalid URL format: {url}")
+            return False
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124',
             'Accept': 'image/*,*/*;q=0.8',
@@ -82,12 +85,23 @@ async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging
             if response.status == 200:
                 logger.debug(f"URL {url} is accessible")
                 return True
+            elif response.status == 404:
+                logger.warning(f"URL {url} is permanently unavailable (404)")
+                return False
             logger.warning(f"URL {url} returned status {response.status}")
             return False
     except aiohttp.ClientError as e:
         logger.warning(f"URL {url} is not accessible: {e}")
         return False
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientResponseError, asyncio.TimeoutError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying download for URL {retry_state.kwargs['url']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def download_image(
     url: str,
     filename: str,
@@ -121,27 +135,21 @@ async def download_image(
                     await f.write(await response.read())
                 logger.debug(f"Attempt {attempt} - Successfully downloaded {encoded_url} to {filename}")
                 return True
-        except aiohttp.ClientError as e:
-            logger.error(f"Attempt {attempt} - HTTP error for image {encoded_url}: {str(e)}")
-            continue
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                logger.error(f"Attempt {attempt} - Permanent failure for {url}: 404 Not Found")
+                return False
+            logger.error(f"Attempt {attempt} - HTTP error for image {url}: {str(e)}")
+            raise
         except asyncio.TimeoutError:
-            logger.error(f"Attempt {attempt} - Timeout downloading image {encoded_url}")
-            continue
+            logger.error(f"Attempt {attempt} - Timeout downloading image {url}")
+            raise
         except Exception as e:
-            logger.error(f"Attempt {attempt} - Error downloading image {encoded_url}: {str(e)}", exc_info=True)
+            logger.error(f"Attempt {attempt} - Error downloading image {url}: {str(e)}", exc_info=True)
             continue
     logger.error(f"All {max_clean_attempts} attempts failed for URL {url}")
     return False
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=lambda retry_state: retry_state.kwargs.get('logger', default_logger).info(
-        f"Retrying download_all_images for {len(retry_state.args[0])} images "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
 async def download_all_images(
     image_list: List[Dict],
     temp_dir: str,
@@ -166,13 +174,10 @@ async def download_all_images(
 
         async with aiohttp.ClientSession() as session:
             success = await download_image(main_url, filename, session, logger)
-            if not success:
-                if thumb_url:
-                    logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
-                    success = await download_image(thumb_url, filename, session, logger)
-                else:
-                    logger.warning(f"No thumbnail URL available for ExcelRowID {excel_row_id}")
-
+            if not success and thumb_url:
+                logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
+                success = await download_image(thumb_url, filename, session, logger)
+            
             if not success:
                 logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
                 failed_downloads.append((main_url, excel_row_id))
