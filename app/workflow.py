@@ -162,7 +162,6 @@ def process_entry_search(args):
     try:
         mem_info = process.memory_info()
         logger.debug(f"Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
-        # Create a new event loop for the thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -255,28 +254,26 @@ async def process_restart_batch(
 
         logger.info(f"Detected {CPU_CORES} physical CPU cores, setting max_workers={MAX_WORKERS}")
 
-        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id_db_int,))
-            if cursor.fetchone()[0] == 0:
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": file_id_db_int}
+            )
+            if result.fetchone()[0] == 0:
                 logger.error(f"FileID {file_id_db} does not exist")
-                cursor.close()
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
-            cursor.close()
 
         if entry_id is None:
             entry_id = await fetch_last_valid_entry(str(file_id_db_int), logger)
             if entry_id is not None:
-                with pyodbc.connect(conn_str) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID > ?",
-                        (file_id_db_int, entry_id)
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(
+                        text("SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = :file_id AND EntryID > :entry_id"),
+                        {"file_id": file_id_db_int, "entry_id": entry_id}
                     )
-                    next_entry = cursor.fetchone()
+                    next_entry = result.fetchone()
                     entry_id = next_entry[0] if next_entry and next_entry[0] else None
                     logger.info(f"Resuming from EntryID: {entry_id}")
-                    cursor.close()
 
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
@@ -299,18 +296,18 @@ async def process_restart_batch(
             logger.error(f"No healthy endpoint")
             return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
-        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
-            cursor = conn.cursor()
-            query = """
+        async with async_engine.connect() as conn:
+            query = text("""
                 SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory 
                 FROM utb_ImageScraperRecords 
-                WHERE FileID = ? AND (? IS NULL OR EntryID >= ?) 
+                WHERE FileID = :file_id AND (:entry_id IS NULL OR EntryID >= :entry_id) 
                 ORDER BY EntryID
-            """
-            cursor.execute(query, (file_id_db_int, entry_id, entry_id))
-            entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
+            """)
+            result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
+            entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
             logger.info(f"Found {len(entries)} entries")
-            cursor.close()
+            result.close()
+
         if not entries:
             logger.warning(f"No entries found")
             return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
@@ -388,27 +385,26 @@ async def process_restart_batch(
                 logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
                 log_memory_usage()
 
-        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT COUNT(DISTINCT t.EntryID), 
-                       SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                       SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ?
-                """,
-                (file_id_db_int,)
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT COUNT(DISTINCT t.EntryID), 
+                           SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                           SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = :file_id
+                """),
+                {"file_id": file_id_db_int}
             )
-            total_entries, positive_entries, null_entries = cursor.fetchone()
+            total_entries, positive_entries, null_entries = result.fetchone()
             logger.info(
                 f"Verification: {total_entries} total entries, "
                 f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
             )
             if null_entries > 0:
                 logger.warning(f"Found {null_entries} entries with NULL SortOrder")
-            cursor.close()
+            result.close()
 
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
@@ -453,15 +449,17 @@ async def generate_download_file(
 
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            if not result:
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": file_id}
+            )
+            row = result.fetchone()
+            result.close()
+            if not row:
                 logger.error(f"No file found for ID {file_id}")
                 return {"error": f"No file found for ID {file_id}", "log_filename": log_filename}
-            original_filename = result[0]
+            original_filename = row[0]
 
         logger.info(f"Fetching images for ID: {file_id}")
         mem_info = process.memory_info()
@@ -481,18 +479,27 @@ async def generate_download_file(
         
         if selected_images_df.empty:
             logger.warning(f"No images found for ID {file_id}. Creating empty Excel file.")
-            with pyodbc.connect(conn_str, timeout=30) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
-                file_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = ?", (file_id,))
-                record_count = cursor.fetchone()[0]
-                cursor.execute(
-                    "SELECT COUNT(*) FROM utb_ImageScraperResult r INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID WHERE s.FileID = ? AND r.SortOrder >= 0",
-                    (file_id,)
+            async with async_engine.connect() as conn:
+                result = await conn.execute(
+                    text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                    {"file_id": file_id}
                 )
-                result_count = cursor.fetchone()[0]
-                cursor.close()
+                file_count = result.fetchone()[0]
+                result = await conn.execute(
+                    text("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = :file_id"),
+                    {"file_id": file_id}
+                )
+                record_count = result.fetchone()[0]
+                result = await conn.execute(
+                    text("""
+                        SELECT COUNT(*) FROM utb_ImageScraperResult r 
+                        INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID 
+                        WHERE s.FileID = :file_id AND r.SortOrder >= 0
+                    """),
+                    {"file_id": file_id}
+                )
+                result_count = result.fetchone()[0]
+                result.close()
                 logger.info(f"Diagnostics: Files={file_count}, Records={record_count}, Results={result_count}")
             
             template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
@@ -727,209 +734,6 @@ async def generate_download_file(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Disposed database engines")
-
-async def batch_vision_reason(
-    file_id: str,
-    entry_ids: Optional[List[int]] = None,
-    step: int = 0,
-    limit: int = 5000,
-    concurrency: int = 10,
-    logger: Optional[logging.Logger] = None
-) -> None:
-    logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
-    process = psutil.Process()
-    try:
-        file_id = int(file_id)
-        logger.info(f"Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
-        mem_info = process.memory_info()
-        logger.debug(f"Memory before processing: RSS={mem_info.rss / 1024**2:.2f} MB")
-
-        df = await fetch_missing_images(file_id, limit, True, logger)
-        if df.empty:
-            logger.warning(f"No missing images found for FileID: {file_id}")
-            return
-
-        if entry_ids is not None:
-            df = df[df['EntryID'].isin(entry_ids)]
-            if df.empty:
-                logger.warning(f"No missing images found for specified EntryIDs: {entry_ids}")
-                return
-
-        columns_to_drop = ['Step1', 'Step2', 'Step3', 'Step4', 'CreateTime_1', 'CreateTime_2']
-        df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
-        logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
-        entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
-
-        valid_updates = []
-        semaphore = asyncio.Semaphore(concurrency)
-        async def process_with_semaphore(entry_id, df_subset):
-            async with semaphore:
-                return await process_entry_wrapper(file_id, entry_id, df_subset, logger)
-
-        tasks = [
-            process_with_semaphore(entry_id, df[df['EntryID'] == entry_id])
-            for entry_id in entry_ids_to_process
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for entry_id, updates in zip(entry_ids_to_process, results):
-            if isinstance(updates, Exception):
-                logger.error(f"Error processing EntryID {entry_id}: {updates}", exc_info=True)
-                continue
-            if not updates:
-                logger.warning(f"No valid updates for EntryID: {entry_id}")
-                continue
-            valid_updates.extend(updates)
-            logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
-
-        if valid_updates:
-            with pyodbc.connect(conn_str, timeout=30) as conn:
-                cursor = conn.cursor()
-                cursor.executemany(
-                    "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?",
-                    valid_updates
-                )
-                conn.commit()
-                cursor.close()
-                logger.info(f"Updated {len(valid_updates)} records: {[update[3] for update in valid_updates]}")
-
-        for entry_id in entry_ids_to_process:
-            with pyodbc.connect(conn_str, timeout=30) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = ? AND EntryID = ?
-                    """,
-                    (file_id, entry_id)
-                )
-                result = cursor.fetchone()
-                cursor.close()
-                product_brand = product_model = product_color = product_category = ''
-                if result:
-                    product_brand, product_model, product_color, product_category = result
-                else:
-                    logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
-
-            await update_search_sort_order(
-                file_id=str(file_id),
-                entry_id=str(entry_id),
-                brand=product_brand,
-                model=product_model,
-                color=product_color,
-                category=product_category,
-                logger=logger
-            )
-            logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
-
-        mem_info = process.memory_info()
-        logger.debug(f"Memory before JSON export: RSS={mem_info.rss / 1024**2:.2f} MB")
-        json_url = await export_dai_json(file_id, entry_ids, logger)
-        if json_url:
-            logger.info(f"DAI JSON exported to {json_url}")
-            await update_log_url_in_db(file_id, json_url, logger)
-        else:
-            logger.warning(f"Failed to export DAI JSON for FileID: {file_id}")
-
-        mem_info = process.memory_info()
-        logger.debug(f"Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
-
-    except Exception as e:
-        logger.error(f"Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
-        raise
-    finally:
-        await async_engine.dispose()
-        engine.dispose()
-        logger.info(f"Disposed database engines")
-
-async def process_entry_wrapper(
-    file_id: int,
-    entry_id: int,
-    entry_df: pd.DataFrame,
-    logger: logging.Logger,
-    max_retries: int = 3
-) -> List[Tuple[str, bool, str, int]]:
-    process = psutil.Process()
-    attempt = 1
-    while attempt <= max_retries:
-        logger.info(f"Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
-        try:
-            mem_info = process.memory_info()
-            logger.debug(f"Memory before processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
-            
-            if not all(pd.notna(entry_df.get('ResultID', pd.Series([])))):
-                logger.error(f"Invalid ResultID in entry_df for EntryID {entry_id}")
-                return []
-
-            updates = await process_entry(file_id, entry_id, entry_df, logger)
-            if not updates:
-                logger.warning(f"No updates returned for EntryID {entry_id} on attempt {attempt}")
-                attempt += 1
-                await asyncio.sleep(2)
-                continue
-
-            valid_updates = []
-            for update in updates:
-                if not isinstance(update, (list, tuple)) or len(update) != 4:
-                    logger.error(f"Invalid update tuple for EntryID {entry_id}: {update}")
-                    continue
-                
-                ai_json, image_is_fashion, ai_caption, result_id = update
-                if not isinstance(ai_json, str):
-                    logger.error(f"Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
-                    ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}})
-                
-                if is_valid_ai_result(ai_json, ai_caption or "", logger):
-                    valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
-                else:
-                    logger.warning(f"Invalid AI result for ResultID {result_id} on attempt {attempt}")
-
-            if valid_updates:
-                logger.info(f"Valid updates for EntryID {entry_id}: {len(valid_updates)}")
-                mem_info = process.memory_info()
-                logger.debug(f"Memory after processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
-                return valid_updates
-            else:
-                logger.warning(f"No valid updates for EntryID {entry_id} on attempt {attempt}")
-                attempt += 1
-                await asyncio.sleep(2)
-        
-        except Exception as e:
-            logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
-            attempt += 1
-            await asyncio.sleep(2)
-    
-    logger.error(f"Failed to process EntryID {entry_id} after {max_retries} attempts")
-    return [
-        (
-            json.dumps({"scores": {"sentiment": 0.0, "relevance": 0.0}, "category": "unknown", "error": "Processing failed"}),
-            False,
-            "Failed to generate caption",
-            int(row.get('ResultID', 0))
-        ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
-    ]
-
-def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
-    process = psutil.Process()
-    try:
-        if not ai_caption or ai_caption.strip() == "":
-            logger.warning(f"Invalid AI result: AiCaption is empty")
-            return False
-        
-        parsed_json = json.loads(ai_json)
-        if not isinstance(parsed_json, dict):
-            logger.warning(f"Invalid AI result: AiJson is not a dictionary")
-            return False
-        
-        if "scores" not in parsed_json or not parsed_json["scores"]:
-            logger.warning(f"Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
-            return False
-        
-        return True
-    except json.JSONDecodeError as e:
-        logger.warning(f"Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
-        return False
 
 async def detect_job_failure(log_filename: str, logger: logging.Logger) -> bool:
     try:
