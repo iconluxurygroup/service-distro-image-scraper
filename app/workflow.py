@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import datetime
+import hashlib
+import time
 from typing import Optional, Dict, List
 from fastapi import BackgroundTasks
 from db_utils import (
@@ -27,6 +29,7 @@ import aiofiles
 from database_config import async_engine, engine
 from sqlalchemy.sql import text
 import pandas as pd
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -34,6 +37,51 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
+
+async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        before_sleep=lambda retry_state: logger.info(
+            f"Retrying log upload for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
+        )
+    )
+    async def try_upload():
+        if not os.path.exists(log_filename):
+            logger.warning(f"Log file {log_filename} does not exist, skipping upload")
+            return None
+
+        file_hash = hashlib.md5(open(log_filename, "rb").read()).hexdigest()
+        current_time = time.time()
+        key = (log_filename, file_id)
+
+        LAST_UPLOAD = {}  # Local cache for deduplication
+        if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
+            logger.info(f"Skipping redundant upload for {log_filename}")
+            return LAST_UPLOAD[key]["url"]
+
+        try:
+            upload_url = await upload_file_to_space(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id}.log",
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+            LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
+            logger.info(f"Log uploaded to R2: {upload_url}")
+            return upload_url
+        except Exception as e:
+            logger.error(f"Failed to upload log for FileID {file_id}: {e}", exc_info=True)
+            raise
+
+    try:
+        return await try_upload()
+    except Exception as e:
+        logger.error(f"Failed to upload log for FileID {file_id} after retries: {e}", exc_info=True)
+        return None
 
 async def async_process_entry_search(
     search_string: str,
@@ -285,6 +333,7 @@ async def process_restart_batch(
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
+        log_public_url = await upload_log_file(str(file_id_db), log_filename, logger)
         return {
             "message": "Search processing completed",
             "file_id": str(file_id_db),
@@ -292,12 +341,13 @@ async def process_restart_batch(
             "total_entries": str(len(entries)),
             "failed_entries": str(failed_entries),
             "log_filename": log_filename,
-            "log_public_url": "",
+            "log_public_url": log_public_url or "",
             "last_entry_id": str(last_entry_id_processed)
         }
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
-        return {"error": str(e), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+        log_public_url = await upload_log_file(str(file_id_db), log_filename, logger)
+        return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
         await async_engine.dispose()
         engine.dispose()
@@ -421,6 +471,8 @@ async def generate_download_file(
         await update_file_location_complete(str(file_id), public_url, logger=logger)
         await update_file_generate_complete(str(file_id), logger=logger)
 
+        log_public_url = await upload_log_file(str(file_id), log_filename, logger)
+
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
             logger.error(f"No email address for ID {file_id}")
@@ -466,6 +518,7 @@ async def generate_download_file(
         }
     except Exception as e:
         logger.error(f"Error for ID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(str(file_id), log_filename, logger)
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if send_to_email_addr:
             error_message = f"Excel file generation for FileID {file_id} failed.\nError: {str(e)}\nLog file: {log_filename}"
