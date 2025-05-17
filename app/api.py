@@ -1005,188 +1005,76 @@ async def run_job_with_logging(job_func, file_id, **kwargs) -> dict:
             logger.warning(f"Log file {log_file} does not exist, skipping upload")
             debug_info["log_url"] = None
 
-@router.post("/generate-download-file/{file_id}", tags=["Export"])
-async def api_generate_download_file(
-    background_tasks: BackgroundTasks,
-    file_id: str
-):
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Received request to generate download file for ID: {file_id}")
-    debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
-
+@router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
+async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
+    """
+    Queue the generation of an Excel file with embedded images for a given file_id.
+    """
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Received request to generate download file for FileID: {file_id}")
+    
     try:
-        process = psutil.Process()
-        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
-        logger.debug(f"Memory before job: RSS={debug_info['memory_usage']['before']:.2f} MB")
-
-        # Query database for EntryID 69801 state
-        with pyodbc.connect(conn_str) as conn:
+        # Validate file_id
+        with pyodbc.connect(conn_str, timeout=10) as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT r.AiJson, r.AiCaption, r.SortOrder
-                FROM utb_ImageScraperResult r
-                INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID
-                WHERE r.EntryID = ? AND s.FileID = ?
-            """, (69801, file_id))
+            cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
             result = cursor.fetchone()
-            if result:
-                debug_info["database_state"]["entry_69801"] = {
-                    "AiJson": result[0],
-                    "AiCaption": result[1],
-                    "SortOrder": result[2]
-                }
-            else:
-                debug_info["database_state"]["entry_69801"] = "Not found for ID"
-
-        background_tasks.add_task(run_job_with_logging, generate_download_file, file_id)
-        background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-
-        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
-        logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
-
-        # Check if entry_69801 is a dictionary before accessing AiJson
-        entry_69801 = debug_info["database_state"].get("entry_69801", "Not found")
-        is_error = isinstance(entry_69801, dict) and "Processing failed" in entry_69801.get("AiJson", "")
-
-        return {
-            "status": "success",
-            "status_code": 202,
-            "message": f"Download file generation queued for ID: {file_id}",
-            "data": {
-                "validated_response": {
-                    "status": "error" if is_error else "unknown",
-                    "status_code": 500 if is_error else 200,
-                    "message": "Image processing failed due to worker timeout or resource exhaustion" if is_error else "No error detected",
-                    "data": {
-                        "original_response": {
-                            "scores": {"sentiment": 0.0, "relevance": 0.0},
-                            "category": "unknown",
-                            "error": "Processing failed",
-                            "caption": "Failed to generate caption"
-                        } if is_error else {},
-                        "entry_id": 69801,
-                        "file_id": file_id,
-                        "result_id": None
-                    },
-                    "retry_flag": is_error,
-                    "timestamp": "2025-05-17T00:36:00-04:00"
-                },
-                "debug_info": {
-                    "memory_usage": {
-                        "before": debug_info["memory_usage"]["before"],
-                        "after": debug_info["memory_usage"]["after"]
-                    },
-                    "log_file": log_filename,
-                    "database_state": debug_info["database_state"]
-                },
-                "job_result": None
-            },
-            "timestamp": timestamp
+            if not result:
+                logger.error(f"Invalid FileID: {file_id}")
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+        
+        # Initialize job status
+        JOB_STATUS[file_id] = {
+            "status": "queued",
+            "message": "Job queued for processing",
+            "timestamp": datetime.datetime.now().isoformat()
         }
+        
+        # Queue the job as a background task
+        background_tasks.add_task(run_generate_download_file, file_id, logger, log_filename)
+        
+        # Send email notification to confirm job queuing
+        send_to_email = await get_send_to_email(int(file_id), logger=logger)
+        if send_to_email:
+            await send_message_email(
+                to_emails=send_to_email,
+                subject=f"Job Queued for FileID: {file_id}",
+                message=f"Excel file generation for FileID {file_id} has been queued.",
+                logger=logger
+            )
+        
+        return JobStatusResponse(
+            status="queued",
+            message=f"Download file generation queued for FileID: {file_id}",
+            timestamp=datetime.datetime.now().isoformat()
+        )
+    except pyodbc.Error as e:
+        logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error queuing download file for ID {file_id}: {e}", exc_info=True)
-        debug_info["error_traceback"] = traceback.format_exc()
-        return {
-            "status": "error",
-            "status_code": 500,
-            "message": f"Error queuing download file for ID: {file_id}: {str(e)}",
-            "data": {
-                "validated_response": {
-                    "status": "error",
-                    "status_code": 500,
-                    "message": "Image processing failed due to worker timeout or resource exhaustion",
-                    "data": {
-                        "original_response": {
-                            "scores": {"sentiment": 0.0, "relevance": 0.0},
-                            "category": "unknown",
-                            "error": "Processing failed",
-                            "caption": "Failed to generate caption"
-                        },
-                        "entry_id": 69801,
-                        "file_id": file_id,
-                        "result_id": None
-                    },
-                    "retry_flag": True,
-                    "timestamp": "2025-05-17T00:36:00-04:00"
-                },
-                "debug_info": {
-                    "memory_usage": {
-                        "before": debug_info["memory_usage"].get("before", 0),
-                        "after": debug_info["memory_usage"].get("after", 0)
-                    },
-                    "log_file": log_filename,
-                    "database_state": debug_info["database_state"],
-                    "error_traceback": debug_info["error_traceback"]
-                },
-                "job_result": None
-            },
-            "timestamp": timestamp
-        }
+        logger.error(f"Error queuing download file for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error queuing job: {str(e)}")
 
-@router.get("/fetch-missing-images/{file_id}", tags=["Database"])
-async def fetch_missing_images_endpoint(file_id: str, limit: int = Query(1000), ai_analysis_only: bool = Query(True)):
-    """Fetch missing images."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Fetching missing images for FileID: {file_id}, limit: {limit}, ai_analysis_only: {ai_analysis_only}")
-    try:
-        result = await fetch_missing_images(file_id, limit, ai_analysis_only, logger)
-        if result.empty:
-            return {"status_code": 200, "message": f"No missing images found for FileID: {file_id}", "data": []}
-        return {"status_code": 200, "message": f"Fetched missing images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
-    except Exception as e:
-        logger.error(f"Error fetching missing images for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error fetching missing images for FileID {file_id}: {str(e)}")
-
-@router.get("/get-images-excel-db/{file_id}", tags=["Database"])
-async def get_images_excel_db_endpoint(file_id: str):
-    """Get images from Excel DB."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Fetching Excel images for FileID: {file_id}")
-    try:
-        result = await get_images_excel_db(file_id, logger)
-        if result.empty:
-            return {"status_code": 200, "message": f"No images found for Excel export for FileID: {file_id}", "data": []}
-        return {"status_code": 200, "message": f"Fetched Excel images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
-    except Exception as e:
-        logger.error(f"Error fetching Excel images for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error fetching Excel images for FileID {file_id}: {str(e)}")
-
-@router.get("/get-send-to-email/{file_id}", tags=["Database"])
-async def get_send_to_email_endpoint(file_id: str):
-    """Get email address for a file."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Retrieving email for FileID: {file_id}")
-    try:
-        result = await get_send_to_email(int(file_id), logger)
-        return {"status_code": 200, "message": f"Retrieved email successfully for FileID: {file_id}", "data": result}
-    except Exception as e:
-        logger.error(f"Error retrieving email for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error retrieving email for FileID {file_id}: {str(e)}")
-
-@router.post("/update-file-generate-complete/{file_id}", tags=["Database"])
-async def update_file_generate_complete_endpoint(file_id: str):
-    """Update file generation completion status."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Updating file generate complete for FileID: {file_id}")
-    try:
-        await update_file_generate_complete(file_id, logger)
-        return {"status_code": 200, "message": f"Updated file generate complete successfully for FileID: {file_id}", "data": None}
-    except Exception as e:
-        logger.error(f"Error updating file generate complete for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error updating file generate complete for FileID {file_id}: {str(e)}")
-
-@router.post("/update-file-location-complete/{file_id}", tags=["Database"])
-async def update_file_location_complete_endpoint(file_id: str, file_location: str):
-    """Update file location completion status."""
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Updating file location complete for FileID: {file_id}, file_location: {file_location}")
-    try:
-        await update_file_location_complete(file_id, file_location, logger)
-        return {"status_code": 200, "message": f"Updated file location successfully for FileID: {file_id}", "data": None}
-    except Exception as e:
-        logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
+@router.get("/job-status/{file_id}", tags=["Export"], response_model=JobStatusResponse)
+async def api_get_job_status(file_id: str):
+    """
+    Retrieve the status of a job for a given file_id.
+    """
+    logger, _ = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Checking job status for FileID: {file_id}")
+    
+    job_status = JOB_STATUS.get(file_id)
+    if not job_status:
+        logger.warning(f"No job found for FileID: {file_id}")
+        raise HTTPException(status_code=404, detail=f"No job found for FileID: {file_id}")
+    
+    return JobStatusResponse(
+        status=job_status["status"],
+        message=job_status["message"],
+        public_url=job_status.get("public_url"),
+        log_url=job_status.get("log_url"),
+        timestamp=job_status["timestamp"]
+    )
 
 # Include the router in the FastAPI app
 app.include_router(router, prefix="/api/v3")
