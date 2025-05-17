@@ -1,6 +1,4 @@
 import logging
-import pandas as pd
-import re
 import asyncio
 import json
 from typing import Optional, List, Dict
@@ -10,19 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from database_config import conn_str, async_engine
 from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
 import psutil
-
 import pyodbc
-
-
-import logging
-import pandas as pd
-from typing import Optional
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
-from common import clean_string
-import psutil
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -39,10 +25,9 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
         return False
     return True
 
-
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),  # Fixed typo: wait -> wait_exponential
+    wait=wait_exponential(multiplier=2, min=2, max=10),
     retry=retry_if_exception_type(SQLAlchemyError),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
@@ -50,29 +35,52 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
     )
 )
 async def insert_search_results(
-    df: pd.DataFrame,
+    results: List[Dict],
     logger: Optional[logging.Logger] = None,
     file_id: str = None
 ) -> bool:
     logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
 
-    if df.empty:
-        logger.warning(f"Worker PID {process.pid}: Empty DataFrame provided for insert_search_results")
+    if not results:
+        logger.warning(f"Worker PID {process.pid}: Empty results provided for insert_search_results")
         return False
 
     required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
-    if not all(col in df.columns for col in required_columns):
-        missing_cols = set(required_columns) - set(df.columns)
-        logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
-        return False
+    for res in results:
+        if not all(col in res for col in required_columns):
+            missing_cols = set(required_columns) - set(res.keys())
+            logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
+            return False
 
     try:
         # Validate and cast EntryID to integer
-        df = df.copy()  # Avoid modifying the original DataFrame
-        df['EntryID'] = pd.to_numeric(df['EntryID'], errors='coerce').astype('Int64')
-        if df['EntryID'].isna().any():
-            logger.error(f"Worker PID {process.pid}: Invalid EntryID values in DataFrame: {df[df['EntryID'].isna()]}")
+        parameters = []
+        for res in results:
+            try:
+                entry_id = int(res["EntryID"])
+            except (ValueError, TypeError):
+                logger.error(f"Worker PID {process.pid}: Invalid EntryID value: {res.get('EntryID')}")
+                return False
+
+            # Filter irrelevant URLs based on category
+            category = res.get("ProductCategory", "")
+            image_url = str(res.get("ImageUrl", "")) if res.get("ImageUrl") else ""
+            if category.lower() == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
+                logger.debug(f"Filtered out irrelevant URL: {image_url}")
+                continue
+
+            parameters.append({
+                "entry_id": entry_id,
+                "image_url": image_url,
+                "image_desc": str(res.get("ImageDesc", "")) if res.get("ImageDesc") else "",
+                "image_source": str(res.get("ImageSource", "")) if res.get("ImageSource") else "",
+                "image_url_thumbnail": str(res.get("ImageUrlThumbnail", "")) if res.get("ImageUrlThumbnail") else ""
+            })
+
+        logger.debug(f"Worker PID {process.pid}: Inserting {len(parameters)} rows into utb_ImageScraperResult")
+        if not parameters:
+            logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id}")
             return False
 
         async with async_engine.connect() as conn:
@@ -83,44 +91,12 @@ async def insert_search_results(
             except Exception as e:
                 logger.warning(f"Worker PID {process.pid}: Failed to clear connection state: {e}")
 
-            # Filter irrelevant URLs based on category (e.g., exclude appliance parts for footwear)
-            def is_relevant_url(url: str, category: str) -> bool:
-                if category and category.lower() == "footwear" and any(keyword in url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
-                    logger.debug(f"Filtered out irrelevant URL: {url}")
-                    return False
-                return True
-
-            parameters = [
-                (
-                    int(row["EntryID"]),  # Ensure integer
-                    str(row["ImageUrl"]) if pd.notna(row["ImageUrl"]) else "",
-                    str(row["ImageDesc"]) if pd.notna(row["ImageDesc"]) else "",
-                    str(row["ImageSource"]) if pd.notna(row["ImageSource"]) else "",
-                    str(row["ImageUrlThumbnail"]) if pd.notna(row["ImageUrlThumbnail"]) else ""
-                )
-                for _, row in df.iterrows()
-                if is_relevant_url(row["ImageUrl"], row.get("ProductCategory", ""))
-            ]
-            logger.debug(f"Worker PID {process.pid}: Inserting {len(parameters)} rows into utb_ImageScraperResult")
-            if not parameters:
-                logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id}")
-                return False
-
-            result = await conn.execute(
+            await conn.execute(
                 text("""
                     INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
                     VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
                 """),
-                [
-                    {
-                        "entry_id": param[0],
-                        "image_url": param[1],
-                        "image_desc": param[2],
-                        "image_source": param[3],
-                        "image_url_thumbnail": param[4]
-                    }
-                    for param in parameters
-                ]
+                parameters
             )
             await conn.commit()
             logger.info(f"Worker PID {process.pid}: Successfully inserted {len(parameters)} rows for FileID {file_id}")
@@ -131,7 +107,6 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
-
 
 @retry(
     stop=stop_after_attempt(3),
@@ -156,7 +131,6 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
-        # Fetch results from utb_ImageScraperResult
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT ResultID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
@@ -172,16 +146,13 @@ async def update_search_sort_order(
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
             return False
 
-        # Convert rows to list of dictionaries
         results = [dict(zip(columns, row)) for row in rows]
         logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
-        # Clean and prepare data
         brand_clean = clean_string(brand).lower() if brand else ""
-        model_clean = normalize_model(model) if model else ""
+        model_clean = validate_model(model) if model else ""
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
-        # Generate aliases with fallback for common cases
         brand_aliases = []
         if brand and brand_rules and "brand_rules" in brand_rules:
             for rule in brand_rules["brand_rules"]:
@@ -196,7 +167,6 @@ async def update_search_sort_order(
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
-        # Calculate priorities
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
@@ -207,22 +177,12 @@ async def update_search_sort_order(
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
-            # Assign priority (1 = best, 4 = worst)
-            if model_matched and brand_matched:
-                res["priority"] = 1
-            elif model_matched:
-                res["priority"] = 2
-            elif brand_matched:
-                res["priority"] = 3
-            else:
-                res["priority"] = 4
+            res["priority"] = calculate_priority(model_matched, brand_matched)
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
-        # Sort results by priority
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Update SortOrder in database
         async with async_engine.connect() as conn:
             for index, res in enumerate(sorted_results, 1):
                 try:
@@ -236,7 +196,7 @@ async def update_search_sort_order(
                     )
                     logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {index} for ResultID {res['ResultID']}")
                 except SQLAlchemyError as e:
-                    logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, Entryişim_id {entry_id}: {e}")
+                    logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, EntryID {entry_id}: {e}")
                     return False
             await conn.commit()
             logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(sorted_results)} rows for EntryID {entry_id}")
@@ -312,7 +272,6 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
         
         logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
         
-        # Detailed verification with actual SortOrder values
         async with async_engine.connect() as conn:
             verification = {}
             queries = [
@@ -333,7 +292,6 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
                 verification[key] = result.scalar()
                 result.close()
             
-            # Log actual SortOrder values
             query = text("""
                 SELECT t.EntryID, t.SortOrder, t.ImageUrl
                 FROM utb_ImageScraperResult t
@@ -375,7 +333,6 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
         
         async with async_engine.begin() as conn:
-            # Check if any results need processing
             result = await conn.execute(
                 text("""
                     SELECT COUNT(*) 
