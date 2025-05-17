@@ -797,7 +797,7 @@ async def api_process_ai_images(
             "timestamp": timestamp
         }
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter,
 from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 import logging
@@ -813,7 +813,15 @@ from workflow import generate_download_file
 from database import update_log_url_in_db
 from config import conn_str
 
-router = APIRouter()
+# Global job status store (in-memory for simplicity; use Redis in production)
+JOB_STATUS = {}
+
+class JobStatusResponse(BaseModel):
+    status: str
+    message: str
+    public_url: Optional[str] = None
+    log_url: Optional[str] = None
+    timestamp: str
 
 # Global debouncing cache
 LAST_UPLOAD = {}
