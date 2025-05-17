@@ -8,7 +8,21 @@ from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from database_config import conn_str, async_engine
 from vision_utils import fetch_missing_images  # Import from vision_utils
+import logging
+import pandas as pd
+import pyodbc
+import asyncio
+from typing import Optional, List, Dict
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str, async_engine
+from vision_utils import fetch_missing_images
 
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -341,21 +355,7 @@ async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-import logging
-import pandas as pd
-import pyodbc
-import asyncio
-from typing import Optional, List, Dict
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from database_config import conn_str, async_engine
-from vision_utils import fetch_missing_images
 
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
