@@ -157,41 +157,6 @@ def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
         logger.error(f"Worker PID {process.pid}: Failed to insert search results: {e}", exc_info=True)
         return False
 
-async def monitor_and_resubmit_failed_jobs(file_id: int, logger: logging.Logger):
-    """Monitor job logs for failures and resubmit if necessary."""
-    log_filename = f"job_logs/job_{file_id}.log"
-    max_attempts = 3
-    attempt = 1
-
-    while attempt <= max_attempts:
-        if os.path.exists(log_filename):
-            with open(log_filename, 'r') as f:
-                log_content = f.read()
-                if "WORKER TIMEOUT" in log_content or "SIGKILL" in log_content:
-                    logger.warning(f"Worker PID {psutil.Process().pid}: Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
-                    last_entry_id = await get_last_entry_id(str(file_id), logger)
-                    logger.info(f"Worker PID {psutil.Process().pid}: Resubmitting job for FileID: {file_id} starting from EntryID: {last_entry_id}")
-                    result = await process_restart_batch(
-                        file_id_db=file_id,
-                        entry_id=last_entry_id,
-                        use_all_variations=False,
-                        logger=logger
-                    )
-                    if "error" not in result:
-                        logger.info(f"Worker PID {psutil.Process().pid}: Resubmission successful for FileID: {file_id}")
-                        return
-                    else:
-                        logger.error(f"Worker PID {psutil.Process().pid}: Resubmission failed for FileID: {file_id}: {result['error']}")
-                    attempt += 1
-                    await asyncio.sleep(60)  # Wait before retrying
-                else:
-                    logger.info(f"Worker PID {psutil.Process().pid}: No failure detected in logs for FileID: {file_id}")
-                    return
-        else:
-            logger.warning(f"Worker PID {psutil.Process().pid}: Log file {log_filename} does not exist for FileID: {file_id}")
-            return
-
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -477,8 +442,6 @@ async def process_restart_batch(
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
-
-# Rest of the functions remain unchanged
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
@@ -618,97 +581,6 @@ async def generate_download_file(
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         logger.info(f"Worker PID {process.pid}: 🧹 Cleaned up temporary directories for FileID {file_id}")
 
-async def process_entry_wrapper(
-    file_id: int,
-    entry_id: int,
-    entry_df: pd.DataFrame,
-    logger: logging.Logger,
-    max_retries: int = 3
-) -> List[Tuple[str, bool, str, int]]:
-    """Wrapper for process_entry with retry logic."""
-    process = psutil.Process()
-    attempt = 1
-    while attempt <= max_retries:
-        logger.info(f"Worker PID {process.pid}: Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
-        try:
-            mem_info = process.memory_info()
-            logger.debug(f"Worker PID {process.pid}: Memory before processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
-            
-            # Validate ResultID
-            if not all(pd.notna(entry_df.get('ResultID', pd.Series([])))):
-                logger.error(f"Worker PID {process.pid}: Invalid ResultID in entry_df for EntryID {entry_id}")
-                return []
-
-            updates = await process_entry(file_id, entry_id, entry_df, logger)
-            if not updates:
-                logger.warning(f"Worker PID {process.pid}: No updates returned for EntryID {entry_id} on attempt {attempt}")
-                attempt += 1
-                await asyncio.sleep(2)
-                continue
-
-            valid_updates = []
-            for update in updates:
-                if not isinstance(update, (list, tuple)) or len(update) != 4:
-                    logger.error(f"Worker PID {process.pid}: Invalid update tuple for EntryID {entry_id}: {update}")
-                    continue
-                
-                ai_json, image_is_fashion, ai_caption, result_id = update
-                if not isinstance(ai_json, str):
-                    logger.error(f"Worker PID {process.pid}: Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
-                    ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}})
-                
-                if is_valid_ai_result(ai_json, ai_caption or "", logger):
-                    valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
-                else:
-                    logger.warning(f"Worker PID {process.pid}: Invalid AI result for ResultID {result_id} on attempt {attempt}")
-
-            if valid_updates:
-                logger.info(f"Worker PID {process.pid}: Valid updates for EntryID {entry_id}: {len(valid_updates)}")
-                mem_info = process.memory_info()
-                logger.debug(f"Worker PID {process.pid}: Memory after processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
-                return valid_updates
-            else:
-                logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID {entry_id} on attempt {attempt}")
-                attempt += 1
-                await asyncio.sleep(2)
-        
-        except Exception as e:
-            logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
-            attempt += 1
-            await asyncio.sleep(2)
-    
-    logger.error(f"Worker PID {process.pid}: Failed to process EntryID {entry_id} after {max_retries} attempts")
-    return [
-        (
-            json.dumps({"scores": {"sentiment": 0.0, "relevance": 0.0}, "category": "unknown", "error": "Processing failed"}),
-            False,
-            "Failed to generate caption",
-            int(row.get('ResultID', 0))
-        ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
-    ]
-
-def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
-    """Validate AI result: ai_json must be valid JSON with scores, ai_caption must be non-empty."""
-    process = psutil.Process()
-    try:
-        if not ai_caption or ai_caption.strip() == "":
-            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiCaption is empty")
-            return False
-        
-        parsed_json = json.loads(ai_json)
-        if not isinstance(parsed_json, dict):
-            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not a dictionary")
-            return False
-        
-        if "scores" not in parsed_json or not parsed_json["scores"]:
-            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
-            return False
-        
-        return True
-    except json.JSONDecodeError as e:
-        logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
-        return False
-
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
@@ -829,11 +701,93 @@ async def batch_vision_reason(
         logger.error(f"Worker PID {process.pid}: 🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
         raise
 
-def run_async_in_thread(coro):
-    """Run an async coroutine in a new event loop within a thread."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+async def process_entry_wrapper(
+    file_id: int,
+    entry_id: int,
+    entry_df: pd.DataFrame,
+    logger: logging.Logger,
+    max_retries: int = 3
+) -> List[Tuple[str, bool, str, int]]:
+    """Wrapper for process_entry with retry logic."""
+    process = psutil.Process()
+    attempt = 1
+    while attempt <= max_retries:
+        logger.info(f"Worker PID {process.pid}: Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
+        try:
+            mem_info = process.memory_info()
+            logger.debug(f"Worker PID {process.pid}: Memory before processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+            
+            # Validate ResultID
+            if not all(pd.notna(entry_df.get('ResultID', pd.Series([])))):
+                logger.error(f"Worker PID {process.pid}: Invalid ResultID in entry_df for EntryID {entry_id}")
+                return []
+
+            updates = await process_entry(file_id, entry_id, entry_df, logger)
+            if not updates:
+                logger.warning(f"Worker PID {process.pid}: No updates returned for EntryID {entry_id} on attempt {attempt}")
+                attempt += 1
+                await asyncio.sleep(2)
+                continue
+
+            valid_updates = []
+            for update in updates:
+                if not isinstance(update, (list, tuple)) or len(update) != 4:
+                    logger.error(f"Worker PID {process.pid}: Invalid update tuple for EntryID {entry_id}: {update}")
+                    continue
+                
+                ai_json, image_is_fashion, ai_caption, result_id = update
+                if not isinstance(ai_json, str):
+                    logger.error(f"Worker PID {process.pid}: Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
+                    ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}})
+                
+                if is_valid_ai_result(ai_json, ai_caption or "", logger):
+                    valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
+                else:
+                    logger.warning(f"Worker PID {process.pid}: Invalid AI result for ResultID {result_id} on attempt {attempt}")
+
+            if valid_updates:
+                logger.info(f"Worker PID {process.pid}: Valid updates for EntryID {entry_id}: {len(valid_updates)}")
+                mem_info = process.memory_info()
+                logger.debug(f"Worker PID {process.pid}: Memory after processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+                return valid_updates
+            else:
+                logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID {entry_id} on attempt {attempt}")
+                attempt += 1
+                await asyncio.sleep(2)
+        
+        except Exception as e:
+            logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
+            attempt += 1
+            await asyncio.sleep(2)
+    
+    logger.error(f"Worker PID {process.pid}: Failed to process EntryID {entry_id} after {max_retries} attempts")
+    return [
+        (
+            json.dumps({"scores": {"sentiment": 0.0, "relevance": 0.0}, "category": "unknown", "error": "Processing failed"}),
+            False,
+            "Failed to generate caption",
+            int(row.get('ResultID', 0))
+        ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
+    ]
+
+def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
+    """Validate AI result: ai_json must be valid JSON with scores, ai_caption must be non-empty."""
+    process = psutil.Process()
     try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+        if not ai_caption or ai_caption.strip() == "":
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiCaption is empty")
+            return False
+        
+        parsed_json = json.loads(ai_json)
+        if not isinstance(parsed_json, dict):
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not a dictionary")
+            return False
+        
+        if "scores" not in parsed_json or not parsed_json["scores"]:
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
+            return False
+        
+        return True
+    except json.JSONDecodeError as e:
+        logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
+        return False
