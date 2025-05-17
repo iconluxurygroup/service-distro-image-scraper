@@ -316,6 +316,57 @@ async def api_get_job_status(file_id: str):
         timestamp=job_status["timestamp"]
     )
 
+async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: logging.Logger, log_filename: str):
+    """Run per-entry sort order update as a background task."""
+    try:
+        JOB_STATUS[file_id] = {
+            "status": "running",
+            "message": "Per-entry sort order update is running",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+        # Validate file_id
+        with pyodbc.connect(conn_str, timeout=10) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
+            if not cursor.fetchone():
+                raise ValueError(f"FileID {file_id} not found")
+
+        result = await update_sort_order_per_entry(file_id, logger=logger, limit=limit)
+        if result is None:
+            raise ValueError("update_sort_order_per_entry returned None")
+
+        log_url = await upload_log_file(file_id, log_filename, logger)
+        JOB_STATUS[file_id] = {
+            "status": "completed",
+            "message": f"Per-entry SortOrder updated successfully for FileID: {file_id}",
+            "log_url": log_url,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        logger.info(f"Completed per-entry sort order update for FileID: {file_id}")
+        return {"status_code": 200, "message": JOB_STATUS[file_id]["message"], "data": result}
+
+    except pyodbc.Error as e:
+        logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
+        log_url = await upload_log_file(file_id, log_filename, logger)
+        JOB_STATUS[file_id] = {
+            "status": "failed",
+            "message": f"Database error: {str(e)}",
+            "log_url": log_url,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        return {"status_code": 500, "message": JOB_STATUS[file_id]["message"], "data": None}
+
+    except Exception as e:
+        logger.error(f"Error in per-entry sort order update for FileID {file_id}: {e}", exc_info=True)
+        log_url = await upload_log_file(file_id, log_filename, logger)
+        JOB_STATUS[file_id] = {
+            "status": "failed",
+            "message": f"Error: {str(e)}",
+            "log_url": log_url,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        return {"status_code": 500, "message": JOB_STATUS[file_id]["message"], "data": None}
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     """Run sort order update based on match_score and search-based priority."""
