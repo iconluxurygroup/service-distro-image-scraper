@@ -100,7 +100,7 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Updating SortOrder for FileID: {file_id}, EntryID: {entry_id}")
         async with async_engine.connect() as conn:
             query = text("""
-                SELECT t.ResultID, t.EntryID, t.match_score, t.ImageDesc, t.ImageSource, t.ImageUrl,
+                SELECT t.ResultID, t.EntryID, t.ImageDesc, t.ImageSource, t.ImageUrl,
                        r.ProductBrand, r.ProductModel, t.AiJson
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
@@ -124,8 +124,11 @@ async def update_search_sort_order(
         
         try:
             df = pd.DataFrame(rows, columns=columns)
-        except ValueError as e:
-            logger.error(f"Worker PID {process.pid}: DataFrame creation failed for EntryID {entry_id}: {e}")
+            df['match_score'] = df['AiJson'].apply(
+                lambda x: float(json.loads(x)['match_score']) if x and json.loads(x).get('match_score') else 0.0
+            )
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.error(f"Worker PID {process.pid}: DataFrame creation or JSON parsing failed for EntryID {entry_id}: {e}")
             async with async_engine.connect() as conn:
                 await conn.execute(
                     text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id"),
@@ -211,7 +214,7 @@ def sync_update_search_sort_order(
                     brand, model, color, category = row
                     logger.debug(f"Fetched attributes - Brand: {brand}, Model: {model}")
                 else:
-                    logger.warning(f"No attributes found for FileID: {file_id}, EntryID: {entry_id}")
+                    logger.warning(f"No attributes found for FileID: {file_id}, EntryID {entry_id}")
                     brand, model, color, category = brand or '', model or '', color or '', category or ''
 
             cursor.execute(
@@ -485,7 +488,6 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
         
         async with async_engine.begin() as conn:
-            # Delete placeholder entries
             result = await conn.execute(
                 text("""
                     DELETE FROM utb_ImageScraperResult
@@ -501,7 +503,6 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             rows_deleted = result.rowcount
             logger.info(f"Deleted {rows_deleted} placeholder entries for FileID: {file_id}")
 
-            # Set NULL SortOrder to -2
             result = await conn.execute(
                 text("""
                     UPDATE utb_ImageScraperResult
