@@ -1,7 +1,7 @@
 import os
 import logging
 from typing import Optional, Dict
-from urllib.parse import quote_plus
+
 VERSION="3.4.21"
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"
