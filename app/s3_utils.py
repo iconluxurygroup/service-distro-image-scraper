@@ -3,6 +3,8 @@ import os
 import asyncio
 import urllib.parse
 import mimetypes
+import secrets
+import datetime
 from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.exc import SQLAlchemyError
@@ -10,7 +12,7 @@ import aiobotocore.session
 from aiobotocore.config import AioConfig
 from config import S3_CONFIG
 from sqlalchemy.sql import text
-from database_config import async_engine, conn_str
+from database_config import async_engine
 import pyodbc
 
 default_logger = logging.getLogger(__name__)
@@ -54,6 +56,19 @@ def double_encode_plus(filename, logger=None):
     second_pass = urllib.parse.quote(first_pass)
     logger.debug(f"Double-encoded filename: {second_pass}")
     return second_pass
+
+def generate_unique_filename(original_filename, logger=None):
+    logger = logger or default_logger
+    # Generate 8-letter random alphanumeric code
+    code = secrets.token_hex(4).lower()[:8]  # 4 bytes = 8 hex chars
+    # Get timestamp in YYYYMMDDHHMMSS format
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    # Get file extension
+    _, ext = os.path.splitext(original_filename)
+    # Create new filename: code_timestamp.ext
+    new_filename = f"{code}_{timestamp}{ext}"
+    logger.debug(f"Generated unique filename: {new_filename} from {original_filename}")
+    return new_filename
 
 @retry(
     stop=stop_after_attempt(3),
@@ -120,24 +135,11 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         logger.error(f"Local file does not exist: {file_src}")
         raise FileNotFoundError(f"Local file does not exist: {file_src}")
 
+    # Handle Excel files: generate unique filename and set save_as
     if file_src.endswith('.xlsx'):
-        save_as = f"excel_files/{file_id}/{os.path.basename(file_src)}"
+        unique_filename = generate_unique_filename(os.path.basename(file_src), logger)
+        save_as = f"excel_files/{file_id}/{unique_filename}"
         logger.info(f"Excel file detected. Setting save_as to: {save_as}")
-
-    # Check for existing file URL in FileLocationURLComplete
-    try:
-        async with async_engine.connect() as conn:
-            result = await conn.execute(
-                text("SELECT FileLocationURLComplete FROM utb_ImageScraperFiles WHERE ID = :file_id"),
-                {"file_id": file_id}
-            )
-            existing_url = result.fetchone()
-            if existing_url and existing_url[0]:
-                logger.info(f"Excel file already uploaded for FileID {file_id}: {existing_url[0]}")
-                # Optionally overwrite: continue with upload to ensure latest URL
-                logger.debug(f"Proceeding with upload to update FileLocationURLComplete with latest URL")
-    except SQLAlchemyError as e:
-        logger.error(f"Database error checking FileLocationURLComplete for FileID {file_id}: {e}", exc_info=True)
 
     content_type, _ = mimetypes.guess_type(file_src)
     if not content_type:
@@ -179,10 +181,11 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
     if is_public and result_urls.get('r2'):
         if file_id:
             try:
-                # Update FileLocationURLComplete
+                # Update FileLocationURLComplete with the latest URL
                 await update_file_location_complete_async(file_id, result_urls['r2'], logger)
                 # Mark file generation complete
                 await update_file_generate_complete(file_id, logger)
+                logger.info(f"Successfully updated FileLocationURLComplete and marked generation complete for FileID: {file_id}")
                 return result_urls['r2']
             except Exception as e:
                 logger.error(f"Failed to update database for FileID {file_id}: {e}", exc_info=True)
