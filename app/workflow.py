@@ -437,10 +437,8 @@ async def generate_download_file(
             logger.info(f"Selected {len(selected_image_list)} valid images")
 
             failed_downloads = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
-            failed_downloads = [(url, int(row_id)) for url, row_id in failed_downloads]
-
-            header_index = 5
-            await process_images_and_anchor(local_filename, temp_images_dir, selected_image_list, "A", header_index, logger)
+\
+            await process_images_and_anchor(local_filename, temp_images_dir, selected_image_list, logger)
 
             successful_entries = len(entries) - len(failed_downloads)
             failed_entries = len(failed_downloads)
