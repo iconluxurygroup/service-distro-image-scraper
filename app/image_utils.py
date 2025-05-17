@@ -4,13 +4,70 @@ import logging
 import aiohttp
 import aiofiles
 from typing import List, Dict, Tuple, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs, urlencode
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import re
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+def clean_url(url: str) -> str:
+    """Clean URLs by fixing common issues like backslashes or double-encoding."""
+    # Replace backslashes with forward slashes or remove them
+    url = re.sub(r'\\+', '/', url)
+    # Remove erroneous %5C or literal backslashes in query strings
+    url = url.replace('%5C', '')
+    # Decode any double-encoded % signs (e.g., %25 -> %)
+    try:
+        while '%25' in url:
+            url = url.replace('%25', '%')
+    except Exception as e:
+        default_logger.warning(f"Error decoding URL {url}: {e}")
+    return url
+
+def encode_url(url: str) -> str:
+    """Encode a URL, preserving scheme, netloc, and reserved characters where appropriate."""
+    parsed = urlparse(url)
+    # Clean the URL first
+    cleaned_url = clean_url(url)
+    parsed = urlparse(cleaned_url)
+    
+    # Encode path and query separately
+    path = quote(parsed.path, safe='/')
+    if parsed.query:
+        # Parse query string into key-value pairs
+        query_dict = parse_qs(parsed.query)
+        # Encode each value
+        encoded_query = urlencode(
+            {k: [quote(v, safe='') for v in vs] for k, vs in query_dict.items()},
+            doseq=True
+        )
+    else:
+        encoded_query = ''
+    
+    # Reconstruct URL
+    encoded_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+    if encoded_query:
+        encoded_url += f"?{encoded_query}"
+    if parsed.fragment:
+        encoded_url += f"#{quote(parsed.fragment)}"
+    
+    return encoded_url
+
+async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bool:
+    """Validate if a URL is accessible with a HEAD request."""
+    try:
+        async with session.head(url, timeout=5) as response:
+            if response.status == 200:
+                logger.debug(f"URL {url} is accessible")
+                return True
+            logger.warning(f"URL {url} returned status {response.status}")
+            return False
+    except aiohttp.ClientError as e:
+        logger.warning(f"URL {url} is not accessible: {e}")
+        return False
 
 async def download_image(
     url: str,
@@ -20,9 +77,22 @@ async def download_image(
     timeout: int = 30
 ) -> bool:
     try:
-        encoded_url = quote(url, safe=':/?=&')
-        logger.debug(f"Downloading image from {encoded_url} to {filename}")
-        async with session.get(encoded_url, timeout=timeout) as response:
+        # Clean and encode the URL
+        cleaned_url = clean_url(url)
+        encoded_url = encode_url(cleaned_url)
+        logger.debug(f"Raw URL: {url}")
+        logger.debug(f"Cleaned URL: {cleaned_url}")
+        logger.debug(f"Encoded URL: {encoded_url}")
+
+        # Validate URL accessibility
+        if not await validate_url(encoded_url, session, logger):
+            logger.warning(f"Skipping download for inaccessible URL: {encoded_url}")
+            return False
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        async with session.get(encoded_url, timeout=timeout, headers=headers) as response:
             if response.status != 200:
                 logger.warning(f"⚠️ HTTP error for image {encoded_url}: {response.status} {response.reason}")
                 return False
