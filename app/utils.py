@@ -16,8 +16,7 @@ from common import (
     filter_model_results,
     calculate_priority
 )
-import pyodbc
-from database_config import conn_str  # Import conn_str
+from database_config import conn_str
 from search_utils import update_search_sort_order, insert_search_results
 from endpoint_utils import get_endpoint, sync_get_endpoint
 from image_utils import download_all_images
@@ -64,9 +63,11 @@ def check_endpoint_health(endpoint: str, timeout: int = 5, logger: Optional[logg
     try:
         response = httpx.get(health_url, timeout=timeout)
         response.raise_for_status()
-        return "Google is reachable" in response.json().get("status", "")
+        status = response.json().get("status", "")
+        logger.debug(f"Health check for {endpoint}: Status={status}, Headers={response.headers}")
+        return "Google is reachable" in status
     except httpx.RequestException as e:
-        logger.warning(f"Endpoint {endpoint} health check failed: {e}")
+        logger.warning(f"Endpoint {endpoint} health check failed: {e}, Headers={getattr(e.response, 'headers', 'N/A')}")
         return False
 
 def get_healthy_endpoint(endpoints: List[str], logger: Optional[logging.Logger] = None) -> Optional[str]:
@@ -121,6 +122,7 @@ async def process_search_row_gcloud(
             try:
                 logger.info(f"Worker PID {process.pid}: Attempt {attempt}: Fetching {search_url} via {fetch_endpoint} with region {region}")
                 async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                    logger.debug(f"Worker PID {process.pid}: GCloud response status: {response.status}, Headers: {response.headers}")
                     response.raise_for_status()
                     result = await response.json()
                     result_data = result.get("result")
@@ -142,6 +144,14 @@ async def process_search_row_gcloud(
     logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     return pd.DataFrame()
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, httpx.HTTPStatusError, TimeoutError, json.JSONDecodeError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Worker PID {psutil.Process().pid}: Retrying process_search_row for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def process_search_row(
     search_string: str,
     endpoint: str,
@@ -168,115 +178,67 @@ async def process_search_row(
         logger.info(f"Worker PID {process.pid}: {attempt_type} attempt {attempt_num} (Total attempts: {total_attempts[0]}/{max_retries}) for EntryID {entry_id}")
         return True
 
-    try:
-        if search_type == "retry_with_alternative":
-            delimiters = r'[\s\-_,]+'
-            words = re.split(delimiters, search_string.strip())
-            for i in range(len(words), 0, -1):
-                partial_search = ' '.join(words[:i])
-                query = partial_search
-                if brand:
-                    query += f" {brand}"
-                if category:
-                    query += f" {category}"
-                search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=isch"
-                fetch_endpoint = f"{endpoint}/fetch"
-                attempt_num = 1
-                while attempt_num <= 3:
-                    if not await log_retry_status("Primary", attempt_num):
-                        return pd.DataFrame()
-                    mem_info = process.memory_info()
-                    logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+    query = search_string
+    if brand:
+        query += f" {brand}"
+    if category:
+        query += f" {category}"
+    search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=isch"
+    fetch_endpoint = f"{endpoint}/fetch"
+
+    attempt_num = 1
+    while attempt_num <= 3:
+        if not await log_retry_status("Primary", attempt_num):
+            break
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+        try:
+            logger.info(f"Worker PID {process.pid}: Fetching {search_url} via {fetch_endpoint}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                    logger.debug(f"Worker PID {process.pid}: Response status: {response.status}, Headers: {response.headers}")
+                    if response.status in (429, 503):
+                        logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
+                        raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
+                    response.raise_for_status()
                     try:
-                        logger.info(f"Worker PID {process.pid}: Fetching URLs via {fetch_endpoint} with query: {query}")
-                        async with aiohttp.ClientSession() as session:
-                            async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
-                                response.raise_for_status()
-                                result = await response.json()
-                                result_data = result.get("result")
-                                if result_data:
-                                    results_html_bytes = result_data if isinstance(result_data, bytes) else result_data.encode("utf-8")
-                                    df = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
-                                    mem_info = process.memory_info()
-                                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                                    if not df.empty:
-                                        irrelevant_keywords = ['wallpaper', 'furniture', 'decor', 'stock photo', 'pistol', 'mattress', 'trunk', 'clutch', 'solenoid', 'card', 'pokemon']
-                                        df = df[df['ImageDesc'].str.lower().str.contains('scotch|soda|sneaker|shoe|hoodie|shirt|jacket|pants|apparel|clothing', na=False) &
-                                               ~df['ImageDesc'].str.lower().str.contains('|'.join(irrelevant_keywords), na=False)]
-                                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(df)} rows for EntryID {entry_id}")
-                                        return df
-                                logger.warning(f"Worker PID {process.pid}: No results for query: {query}, moving to next attempt or split")
-                                break
-                    except (aiohttp.ClientError, json.JSONDecodeError) as e:
-                        logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {fetch_endpoint} with query '{query}': {e}")
-                        attempt_num += 1
-                        if attempt_num > 3:
-                            break
-                if total_attempts[0] < max_retries:
-                    gcloud_df = await process_search_row_gcloud(partial_search, entry_id, logger, max_retries - total_attempts[0], total_attempts)
-                    if not gcloud_df.empty:
-                        logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_df)} images using query: {partial_search}")
-                        return gcloud_df
-                    logger.warning(f"Worker PID {process.pid}: GCloud fallback failed for query: {partial_search}, trying next split")
-            logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id} after all splits and retries")
-            return pd.DataFrame()
-        else:
-            query = search_string
-            if brand:
-                query += f" {brand}"
-            if category:
-                query += f" {category}"
-            search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=isch"
-            attempt_num = 1
-            while attempt_num <= 3:
-                if not await log_retry_status("Primary", attempt_num):
-                    return pd.DataFrame()
-                mem_info = process.memory_info()
-                logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                try:
-                    logger.info(f"Worker PID {process.pid}: Searching {search_url}")
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(search_url, timeout=60) as response:
-                            response.raise_for_status()
-                            try:
-                                result = await response.json()
-                                result_data = result.get("body")
-                            except json.JSONDecodeError as e:
-                                logger.error(f"Worker PID {process.pid}: JSON decode error for {search_url}: {e}")
-                                raise ValueError("Invalid JSON response")
-                            if not result_data:
-                                logger.warning(f"Worker PID {process.pid}: No body in response for {search_url}")
-                                raise ValueError("Empty response body")
-                            unpacked_html = unpack_content(result_data, logger)
-                            if not unpacked_html or len(unpacked_html) < 100:
-                                logger.warning(f"Worker PID {process.pid}: Invalid HTML for {search_url}")
-                                raise ValueError("Invalid HTML content")
-                            df = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
-                            mem_info = process.memory_info()
-                            logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                            if not df.empty:
-                                irrelevant_keywords = ['wallpaper', 'furniture', 'decor', 'stock photo', 'pistol', 'mattress', 'trunk', 'clutch', 'solenoid', 'card', 'pokemon']
-                                df = df[df['ImageDesc'].str.lower().str.contains('scotch|soda|sneaker|shoe|hoodie|shirt|jacket|pants|apparel|clothing', na=False) &
-                                       ~df['ImageDesc'].str.lower().str.contains('|'.join(irrelevant_keywords), na=False)]
-                                logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(df)} rows for EntryID {entry_id}")
-                                return df
-                            logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id}")
-                            return df
-                except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {search_url}: {e}")
-                    attempt_num += 1
-                    if attempt_num > 3:
-                        break
-            if total_attempts[0] < max_retries:
-                gcloud_df = await process_search_row_gcloud(search_string, entry_id, logger, max_retries - total_attempts[0], total_attempts)
-                if not gcloud_df.empty:
-                    logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_df)} images")
-                    return gcloud_df
-                logger.error(f"Worker PID {process.pid}: GCloud fallback also failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
-            return pd.DataFrame()
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Unexpected error processing EntryID {entry_id} after {total_attempts[0]} attempts: {e}", exc_info=True)
-        return pd.DataFrame()
+                        result = await response.json()
+                        result_data = result.get("result")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Worker PID {process.pid}: JSON decode error for {search_url}: {e}")
+                        raise
+                    if not result_data:
+                        logger.warning(f"Worker PID {process.pid}: No result data in response for {search_url}")
+                        raise ValueError("Empty response result")
+                    unpacked_html = unpack_content(result_data, logger)
+                    if not unpacked_html or len(unpacked_html) < 100:
+                        logger.warning(f"Worker PID {process.pid}: Invalid HTML for {search_url}")
+                        raise ValueError("Invalid HTML content")
+                    df = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
+                    mem_info = process.memory_info()
+                    logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+                    if not df.empty:
+                        irrelevant_keywords = ['wallpaper', 'furniture', 'decor', 'stock photo', 'pistol', 'mattress', 'trunk', 'clutch', 'solenoid', 'card', 'pokemon']
+                        df = df[df['ImageDesc'].str.lower().str.contains('scotch|soda|sneaker|shoe|hoodie|shirt|jacket|pants|apparel|clothing', na=False) &
+                               ~df['ImageDesc'].str.lower().str.contains('|'.join(irrelevant_keywords), na=False)]
+                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(df)} rows for EntryID {entry_id}")
+                        return df
+                    logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id}")
+                    return df
+        except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {fetch_endpoint}: {e}")
+            attempt_num += 1
+            if attempt_num > 3:
+                break
+
+    if total_attempts[0] < max_retries:
+        gcloud_df = await process_search_row_gcloud(search_string, entry_id, logger, max_retries - total_attempts[0], total_attempts)
+        if not gcloud_df.empty:
+            logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_df)} images")
+            return gcloud_df
+        logger.error(f"Worker PID {process.pid}: GCloud fallback also failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
+    
+    return pd.DataFrame()
 
 def generate_search_variations(
     search_string: str,
@@ -312,7 +274,7 @@ def generate_search_variations(
             delimiter_variations.append(search_string.replace(delim, ' '))
             delimiter_variations.append(search_string.replace(delim, '-'))
             delimiter_variations.append(search_string.replace(delim, '_'))
-    variations["delimiter_variations"] = delimiter_variations
+    variations["delimiter_variations"] = list(set(delimiter_variations))
     
     variations["color_delimiter"].append(search_string)
     
@@ -426,24 +388,16 @@ async def search_variation(
             "variation": variation,
             "result": pd.DataFrame([{
                 "EntryID": entry_id,
-                "ImageUrl": "placeholder://no-results",
+                "ImageUrl": "placeholder://error",
                 "ImageDesc": f"Error for {variation}: {str(e)}",
                 "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://no-results"
+                "ImageUrlThumbnail": "placeholder://error"
             }]),
             "status": "failed",
             "result_count": 1,
             "error": str(e)
         }
 
-import logging
-import pandas as pd
-import pyodbc
-from typing import Optional, Dict
-from common import clean_string, generate_aliases, generate_brand_aliases
-from database_config import conn_str
-from icon_image_lib.google_parser import process_search_result
-\
 async def process_single_all(
     entry_id: int,
     search_string: str,
@@ -557,24 +511,20 @@ async def process_single_all(
                 return False
             logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
             
-            # Update sort order only if non-placeholder results exist
-            if not deduplicated_df['ImageUrl'].str.contains('placeholder://', na=False).all():
-                update_result = await update_search_sort_order(
-                    file_id=str(file_id_db),
-                    entry_id=str(entry_id),
-                    brand=result_brand,
-                    model=result_model,
-                    color=result_color,
-                    category=result_category,
-                    logger=logger,
-                    brand_rules=brand_rules
-                )
-                if update_result is None:
-                    logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
-                    return False
-                logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
-            else:
-                logger.info(f"Worker PID {process.pid}: Skipping sort order update for EntryID {entry_id} due to all placeholder results")
+            update_result = await update_search_sort_order(
+                file_id=str(file_id_db),
+                entry_id=str(entry_id),
+                brand=result_brand,
+                model=result_model,
+                color=result_color,
+                category=result_category,
+                logger=logger,
+                brand_rules=brand_rules
+            )
+            if update_result is None:
+                logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
+                return False
+            logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
 
             try:
                 with pyodbc.connect(conn_str, autocommit=False) as conn:
@@ -595,6 +545,12 @@ async def process_single_all(
                     logger.info(f"Worker PID {process.pid}: Verification: Found {count} rows with positive SortOrder, {null_count} rows with NULL SortOrder for EntryID {entry_id}")
                     if null_count > 0:
                         logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder after update for EntryID {entry_id}")
+                        cursor.execute(
+                            "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND SortOrder IS NULL",
+                            (entry_id,)
+                        )
+                        conn.commit()
+                        logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder rows to -2 for EntryID {entry_id}")
                     if total_count == 0:
                         logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
             except pyodbc.Error as e:
@@ -621,15 +577,11 @@ async def process_single_all(
             with pyodbc.connect(conn_str, autocommit=False) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = 1
-                    WHERE EntryID = ? AND ImageUrl = ?
-                    """,
+                    "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND ImageUrl = ?",
                     (entry_id, "placeholder://no-results")
                 )
                 conn.commit()
-                logger.info(f"Worker PID {process.pid}: Fallback applied: Set SortOrder=1 for placeholder row for EntryID {entry_id}")
+                logger.info(f"Worker PID {process.pid}: Set SortOrder=-2 for placeholder row for EntryID {entry_id}")
             return True
         else:
             logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}")
@@ -684,8 +636,7 @@ async def process_single_row(
     }
     required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-    # Fetch attributes if not provided
-    if not all([brand, model, color, category]):
+    if not brand or not model or not color or not category:
         try:
             with pyodbc.connect(conn_str, autocommit=False) as conn:
                 cursor = conn.cursor()
@@ -695,14 +646,16 @@ async def process_single_row(
                 )
                 result = cursor.fetchone()
                 if result:
-                    result_brand, result_model, result_color, result_category = result
+                    result_brand = result_brand or result[0]
+                    result_model = result_model or result[1]
+                    result_color = result_color or result[2]
+                    result_category = result_category or result[3]
                     logger.info(f"Worker PID {process.pid}: Fetched attributes for EntryID {entry_id}: Brand={result_brand}, Model={result_model}, Color={result_color}, Category={result_category}")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No attributes found for FileID {file_id_db}, EntryID {entry_id}")
         except pyodbc.Error as e:
             logger.error(f"Worker PID {process.pid}: Failed to fetch attributes for EntryID {entry_id}: {e}", exc_info=True)
 
-    # Generate variations
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory before generating variations: RSS={mem_info.rss / 1024**2:.2f} MB")
     variations = generate_search_variations(search_string, result_brand, result_model, brand_rules, logger)
@@ -711,7 +664,6 @@ async def process_single_row(
         logger.error(f"Worker PID {process.pid}: No healthy endpoint available for EntryID {entry_id}")
         return False
 
-    # Process search variations
     for search_type in search_types:
         if search_type not in variations:
             logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found in variations for EntryID {entry_id}")
@@ -728,7 +680,6 @@ async def process_single_row(
             all_results.extend([res["result"] for res in successful_results])
             break
 
-    # Insert results
     if all_results:
         try:
             mem_info = process.memory_info()
@@ -743,32 +694,27 @@ async def process_single_row(
                 return False
             deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
             logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows")
-            insert_success = await insert_search_results(deduplicated_df, logger=logger)
+            insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
             if not insert_success:
                 logger.error(f"Worker PID {process.pid}: Failed to insert deduplicated results for EntryID {entry_id}")
                 return False
             logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
             
-            # Update sort order only if non-placeholder results exist
-            if not deduplicated_df['ImageUrl'].str.contains('placeholder://', na=False).all():
-                update_result = await update_search_sort_order(
-                    file_id=str(file_id_db),
-                    entry_id=str(entry_id),
-                    brand=result_brand,
-                    model=result_model,
-                    color=result_color,
-                    category=result_category,
-                    logger=logger,
-                    brand_rules=brand_rules
-                )
-                if update_result is None:
-                    logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
-                    return False
-                logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
-            else:
-                logger.info(f"Worker PID {process.pid}: Skipping sort order update for EntryID {entry_id} due to all placeholder results")
+            update_result = await update_search_sort_order(
+                file_id=str(file_id_db),
+                entry_id=str(entry_id),
+                brand=result_brand,
+                model=result_model,
+                color=result_color,
+                category=result_category,
+                logger=logger,
+                brand_rules=brand_rules
+            )
+            if update_result is None:
+                logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
+                return False
+            logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
 
-            # Optimized verification
             with pyodbc.connect(conn_str, autocommit=False) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -787,6 +733,12 @@ async def process_single_row(
                 logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
                 if null_count > 0:
                     logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                    cursor.execute(
+                        "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND SortOrder IS NULL",
+                        (entry_id,)
+                    )
+                    conn.commit()
+                    logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder rows to -2 for EntryID {entry_id}")
                 if total_count == 0:
                     logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
                     return False
@@ -799,7 +751,6 @@ async def process_single_row(
             logger.error(f"Worker PID {process.pid}: Error during database update for EntryID {entry_id}: {e}", exc_info=True)
             return False
 
-    # Handle no results
     logger.info(f"Worker PID {process.pid}: No results to insert for EntryID {entry_id}")
     placeholder_df = pd.DataFrame([{
         "EntryID": entry_id,
@@ -809,21 +760,17 @@ async def process_single_row(
         "ImageUrlThumbnail": "placeholder://no-results"
     }])
     try:
-        insert_success = await insert_search_results(placeholder_df, logger=logger)
+        insert_success = await insert_search_results(placeholder_df, logger=logger, file_id=str(file_id_db))
         if insert_success:
             logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
             with pyodbc.connect(conn_str, autocommit=False) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = 1
-                    WHERE EntryID = ? AND ImageUrl = ?
-                    """,
+                    "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND ImageUrl = ?",
                     (entry_id, "placeholder://no-results")
                 )
                 conn.commit()
-                logger.info(f"Worker PID {process.pid}: Set SortOrder=1 for placeholder row for EntryID {entry_id}")
+                logger.info(f"Worker PID {process.pid}: Set SortOrder=-2 for placeholder row for EntryID {entry_id}")
             return True
         else:
             logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}")
