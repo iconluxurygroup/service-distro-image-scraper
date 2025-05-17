@@ -268,6 +268,35 @@ async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logg
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(pyodbc.Error),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying get_send_to_email for FileID {retry_state.kwargs['file_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT UserEmail FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            if result and result[0]:
+                logger.info(f"Retrieved email for FileID {file_id}: {result[0]}")
+                return result[0]
+            logger.warning(f"No email found for FileID {file_id}")
+            return "nik@accessx.com"
+    except pyodbc.Error as e:
+        logger.error(f"Database error fetching email for FileID {file_id}: {e}", exc_info=True)
+        return "nik@accessx.com"
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        return "nik@accessx.com"
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(SQLAlchemyError),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying export_dai_json for FileID {retry_state.kwargs['file_id']} "
