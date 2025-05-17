@@ -46,6 +46,53 @@ from database_config import conn_str, async_engine, engine
 from sqlalchemy.sql import text
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import logging
+import asyncio
+import os
+import pandas as pd
+import time
+import pyodbc
+import httpx
+import json
+import aiofiles
+import datetime
+from typing import Optional, Dict, List, Tuple
+from db_utils import (
+    sync_get_endpoint,
+    update_search_sort_order,
+    get_send_to_email,
+    insert_search_results,
+    get_images_excel_db,
+    fetch_missing_images,
+    update_file_location_complete,
+    update_file_generate_complete,
+    export_dai_json,
+    update_log_url_in_db,
+    fetch_last_valid_entry,
+)
+from image_utils import download_all_images
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from common import fetch_brand_rules
+from utils import (
+    create_temp_dirs,
+    cleanup_temp_dirs,
+    process_and_tag_results,
+    generate_search_variations,
+    process_search_row_gcloud
+)
+from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space
+import psutil
+from email_utils import send_message_email
+from image_reason import process_entry
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import aiohttp
+from database_config import conn_str, async_engine, engine
+from sqlalchemy.sql import text
+
+BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
 @retry(
     stop=stop_after_attempt(3),
@@ -68,27 +115,47 @@ async def async_process_entry_search(
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory before task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
     
-    result = await process_and_tag_results(
-        search_string=search_string,
-        brand=brand,
-        model=search_string,
-        endpoint=endpoint,
-        entry_id=entry_id,
-        logger=logger,
-        use_all_variations=use_all_variations,
-        file_id_db=file_id_db
+    # Generate search variations
+    variations = generate_search_variations(search_string, brand, use_all_variations=use_all_variations)
+    logger.debug(f"Worker PID {process.pid}: Generated {len(variations)} search variations for EntryID {entry_id}")
+    
+    # Process all variations in parallel
+    async def process_variation(variation: str) -> List[pd.DataFrame]:
+        return await process_and_tag_results(
+            search_string=variation,
+            brand=brand,
+            model=search_string,
+            endpoint=endpoint,
+            entry_id=entry_id,
+            logger=logger,
+            use_all_variations=False,  # Avoid recursive variation generation
+            file_id_db=file_id_db
+        )
+    
+    # Run all variations concurrently
+    results = await asyncio.gather(
+        *(process_variation(variation) for variation in variations),
+        return_exceptions=True
     )
     
-    for df in result:
+    # Flatten and filter results
+    combined_results = []
+    for idx, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error(f"Worker PID {process.pid}: Error processing variation {variations[idx]} for EntryID {entry_id}: {result}")
+            continue
+        if result:
+            combined_results.extend(result)
+    
+    # Validate EntryID consistency
+    for df in combined_results:
         if 'EntryID' in df.columns and not df['EntryID'].eq(entry_id).all():
             logger.error(f"Worker PID {process.pid}: EntryID mismatch in DataFrame for EntryID {entry_id}: {df['EntryID'].tolist()}")
             raise ValueError(f"EntryID mismatch in DataFrame for EntryID {entry_id}")
     
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
-    return result
-
-    
+    return combined_results
 
 def process_entry_search(args):
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
@@ -97,10 +164,10 @@ def process_entry_search(args):
     handler = logging.FileHandler(f"job_logs/worker_{entry_id}.log")
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
-    process = psutil.Process()  # Define process here
+    process = psutil.Process()
     try:
-        mem_info = process.memory_info()  # Use process instead of psutil.Process()
-        logger.debug(f"Worker PID {process.pid}: Memory: RSS={mem_info.rss / 1024**2:.2f} MB")  # Fixed
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -120,7 +187,7 @@ def process_entry_search(args):
         finally:
             loop.close()
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Task failed for EntryID {entry_id}: {e}", exc_info=True)  # Fixed
+        logger.error(f"Worker PID {process.pid}: Task failed for EntryID {entry_id}: {e}", exc_info=True)
         return None
     finally:
         logger.removeHandler(handler)
