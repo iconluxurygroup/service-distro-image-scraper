@@ -394,7 +394,7 @@ async def process_restart_batch(
                 f"Last EntryID: {last_entry_id_processed}\n"
                 f"Log file: {log_filename}"
             )
-            await send_message_email(to_emails, subject=subject, message= message, logger=logger)
+            await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
         return {
             "message": "Search processing completed",
@@ -414,6 +414,7 @@ async def process_restart_batch(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Disposed database engines")
+
 
 async def generate_download_file(
     file_id: int,
