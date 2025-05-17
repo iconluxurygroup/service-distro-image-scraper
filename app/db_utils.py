@@ -826,7 +826,7 @@ async def update_search_sort_order(
             for rule in brand_rules.get("brand_rules", []):
                 if any(clean_string(name).lower() == brand_clean for name in rule.get("names", [])):
                     domain_hierarchy.extend(rule.get("domain_hierarchy", []))
-            break
+                    break
             match_rows = df[df['priority'].isin([1, 2, 3])]
             if not match_rows.empty:
                 match_df = match_rows.sort_values(['priority', 'match_score'], ascending=[True, False])
