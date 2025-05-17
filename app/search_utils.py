@@ -4,7 +4,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
-from common import clean_string
+from common import clean_string, generate_aliases, normalize_model
 import psutil
 import pyodbc
 
