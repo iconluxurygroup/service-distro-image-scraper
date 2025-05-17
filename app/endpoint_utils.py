@@ -2,6 +2,7 @@ import logging
 import httpx
 from typing import Optional
 import psutil
+import asyncio  
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)

@@ -4,7 +4,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 import logging
 import os
-import aioodbc
 from config import DB_PASSWORD, SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, GOOGLE_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, REGION, S3_CONFIG
 from typing import Optional, Dict
 logger = logging.getLogger(__name__)

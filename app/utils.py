@@ -3,7 +3,6 @@ import asyncio
 import os
 import pandas as pd
 import time
-import pyodbc
 from typing import List, Dict, Optional, Tuple, Any
 from common import (
     clean_string,
@@ -36,7 +35,8 @@ import urllib.parse
 from requests.exceptions import RequestException
 from icon_image_lib.google_parser import process_search_result
 import psutil
-from workflow import batch_vision_reason  # Import batch_vision_reason
+from ai_utils import batch_vision_reason  # Import batch_vision_reason from ai_utils
+
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
