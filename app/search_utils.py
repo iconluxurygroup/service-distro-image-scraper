@@ -2,13 +2,13 @@ import logging
 import pandas as pd
 import re
 import asyncio
-import pyodbc
 from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import conn_str, async_engine
 from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
+import pyodbc
 import psutil
 
 default_logger = logging.getLogger(__name__)
@@ -46,10 +46,13 @@ async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logge
             missing_cols = set(required_columns) - set(df.columns)
             logger.error(f"Missing required columns: {missing_cols}")
             return False
+        original_len = len(df)
         df = df[df['ImageUrlThumbnail'].apply(lambda x: validate_thumbnail_url(x, logger)) & 
                 ~df['ImageUrl'].str.contains('placeholder://', na=False)]
+        logger.debugನ
+
         if df.empty:
-            logger.warning(f"No rows with valid thumbnail URLs after filtering")
+            logger.warning(f"No rows with valid thumbnail URLs after filtering {original_len} rows")
             return False
         async with async_engine.connect() as conn:
             for _, row in df.iterrows():
@@ -67,8 +70,8 @@ async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logge
                     }
                 )
             await conn.commit()
-            logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult for FileID {file_id}")
-            return True
+        logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult for FileID {file_id}")
+        return True
     except Exception as e:
         logger.error(f"Unexpected error during insertion for FileID {file_id or 'unknown'}: {e}", exc_info=True)
         return False
@@ -97,10 +100,11 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Updating SortOrder for FileID: {file_id}, EntryID: {entry_id}")
         async with async_engine.connect() as conn:
             query = text("""
-                SELECT ResultID, EntryID, match_score, ImageDesc, ImageSource, ImageUrl,
-                       ProductBrand, ProductModel, AiJson
-                FROM utb_ImageScraperResult
-                WHERE EntryID = :entry_id AND FileID = :file_id
+                SELECT t.ResultID, t.EntryID, t.match_score, t.ImageDesc, t.ImageSource, t.ImageUrl,
+                       r.ProductBrand, r.ProductModel, t.AiJson
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE t.EntryID = :entry_id AND r.FileID = :file_id
             """)
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
@@ -193,7 +197,7 @@ def sync_update_search_sort_order(
                     r.ProductModel,
                     t.AiJson
                 FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = t.EntryID
                 WHERE r.FileID = ? AND t.EntryID = ?
                 """,
                 (file_id, entry_id)
@@ -525,7 +529,7 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
                     model_aliases = list(set(model_aliases))
                     logger.debug(f"Model aliases for EntryID {entry_id}, Model '{model}': {model_aliases}")
 
-                    updates = await sync_update_search_sort_order(
+                    updates = sync_update_search_sort_order(
                         file_id=str(file_id),
                         entry_id=str(entry_id),
                         brand=brand,
