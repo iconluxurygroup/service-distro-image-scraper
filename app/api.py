@@ -811,13 +811,15 @@ from config import conn_str
 
 # Global job status store (in-memory for simplicity; use Redis in production)
 JOB_STATUS = {}
+from pydantic import BaseModel, Field
+from datetime import datetime
 
 class JobStatusResponse(BaseModel):
-    status: str
-    message: str
-    public_url: Optional[str] = None
-    log_url: Optional[str] = None
-    timestamp: str
+    status: str = Field(..., description="Job status (e.g., queued, running, completed, failed)")
+    message: str = Field(..., description="Descriptive message about the job status")
+    public_url: str | None = Field(None, description="S3 URL of the generated Excel file, if available")
+    log_url: str | None = Field(None, description="S3 URL of the job log file, if available")
+    timestamp: str = Field(..., description="ISO timestamp of the response")
 
 # Global debouncing cache
 LAST_UPLOAD = {}
