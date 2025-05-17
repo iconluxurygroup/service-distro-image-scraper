@@ -4,8 +4,7 @@ import logging
 import aiohttp
 import aiofiles
 from typing import List, Dict, Tuple, Optional
-from urllib.parse import quote, urlparse, parse_qs, urlencode
-from url_encode_decode import double_encode_plus, decode_url
+from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url   
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import re
@@ -30,8 +29,6 @@ def clean_url(url: str, attempt: int = 1) -> str:
             return cleaned_url
         elif attempt == 2:
             url = re.sub(r'\\+|%5[Cc]|%2[Ff]', '', url)
-            while '%25' in url:
-                url = url.replace('%25', '%')
             parsed = urlparse(url)
             path = parsed.path
             cleaned_url = f"{parsed.scheme}://{parsed.netloc}{path}"
@@ -49,28 +46,6 @@ def clean_url(url: str, attempt: int = 1) -> str:
         return url
     except Exception as e:
         default_logger.warning(f"Error cleaning URL {url} on attempt {attempt}: {e}")
-        return url
-
-def encode_url(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-        path = parsed.path
-        if parsed.query:
-            query_dict = parse_qs(parsed.query)
-            encoded_query = urlencode(
-                {k: [quote(v, safe=':') for v in vs] for k, vs in query_dict.items()},
-                doseq=True
-            )
-        else:
-            encoded_query = ''
-        encoded_url = f"{parsed.scheme}://{parsed.netloc}{path}"
-        if encoded_query:
-            encoded_url += f"?{encoded_query}"
-        if parsed.fragment:
-            encoded_url += f"#{quote(parsed.fragment)}"
-        return encoded_url
-    except Exception as e:
-        default_logger.warning(f"Error encoding URL {url}: {e}")
         return url
 
 async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bool:
@@ -104,7 +79,6 @@ async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging
         f"Retrying download for URL {retry_state.kwargs['url']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-
 async def download_image(
     url: str,
     filename: str,
@@ -113,7 +87,7 @@ async def download_image(
     timeout: int = 30,
     max_clean_attempts: int = 3
 ) -> bool:
-    extracted_url = extract_thumbnail_url(url, logger)
+    extracted_url = extract submer_url(url, logger)
     logger.debug(f"Extracted URL: {extracted_url}")
     for attempt in range(1, max_clean_attempts + 1):
         try:
