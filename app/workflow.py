@@ -253,8 +253,8 @@ async def process_restart_batch(
             query = """
                 SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory 
                 FROM utb_ImageScraperRecords 
-                WHERE FileID = ? AND (:entry_id IS NULL OR EntryID >= :entry_id) 
-                ORDER BY EntryID
+             WHERE FileID = ? AND (? IS NULL OR EntryID >= ?) 
+        ORDER BY ENTRYID
             """
             cursor.execute(query, (file_id_db_int, entry_id))
             entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
