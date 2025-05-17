@@ -31,7 +31,7 @@ import mimetypes
 from database_config import async_engine, engine
 from sqlalchemy.sql import text
 import pandas as pd
-from aws_s3 import upload_file_to_space
+
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -415,7 +415,7 @@ async def generate_download_file(
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     process = psutil.Process()
     temp_images_dir, temp_excel_dir = None, None
-
+    from aws_s3 import upload_file_to_space
     try:
         file_id = int(file_id)
         async with async_engine.connect() as conn:
