@@ -6,7 +6,6 @@ from typing import Optional, List, Tuple
 from vision_utils import fetch_missing_images
 from image_reason import process_entry
 from search_utils import update_search_sort_order
-from workflow import update_log_url_in_db
 #, export_dai_json
 from database_config import conn_str, async_engine
 from logging_config import setup_job_logger
