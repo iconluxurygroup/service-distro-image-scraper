@@ -133,23 +133,25 @@ def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logger] = N
         logger.error(f"Database error: {e}", exc_info=True)
         return False
 
+        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        return None
+
 async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
     logger = logger or default_logger
     try:
         file_id = int(file_id)
         logger.info(f"🔄 Starting batch SortOrder update for FileID: {file_id}")
         
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                    SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
+                    FROM utb_ImageScraperRecords 
+                    WHERE FileID = ?
                 """
-                SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
-                FROM utb_ImageScraperRecords 
-                WHERE FileID = ?
-                """, 
-                (file_id,)
-            )
-            entries = cursor.fetchall()
+                logger.debug(f"Executing query: {query} with FileID: {file_id}")
+                await cursor.execute(query, (file_id,))
+                entries = await cursor.fetchall()
         
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id}")
@@ -184,38 +186,35 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
         
         logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
         
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query_positive = """
+                    SELECT COUNT(DISTINCT t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.SortOrder > 0
                 """
-                SELECT COUNT(DISTINCT t.EntryID)
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ? AND t.SortOrder > 0
-                """,
-                (file_id,)
-            )
-            positive_entries = cursor.fetchone()[0]
-            cursor.execute(
+                logger.debug(f"Executing query: {query_positive} with FileID: {file_id}")
+                await cursor.execute(query_positive, (file_id,))
+                positive_entries = (await cursor.fetchone())[0]
+                
+                query_zero = """
+                    SELECT COUNT(DISTINCT t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.SortOrder = 0
                 """
-                SELECT COUNT(DISTINCT t.EntryID)
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ? AND t.SortOrder = 0
-                """,
-                (file_id,)
-            )
-            brand_match_entries = cursor.fetchone()[0]
-            cursor.execute(
+                await cursor.execute(query_zero, (file_id,))
+                brand_match_entries = (await cursor.fetchone())[0]
+                
+                query_negative = """
+                    SELECT COUNT(DISTINCT t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.SortOrder < 0
                 """
-                SELECT COUNT(DISTINCT t.EntryID)
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ? AND t.SortOrder < 0
-                """,
-                (file_id,)
-            )
-            no_match_entries = cursor.fetchone()[0]
+                await cursor.execute(query_negative, (file_id,))
+                no_match_entries = (await cursor.fetchone())[0]
             
             logger.info(f"Verification for FileID {file_id}: "
                        f"{positive_entries} entries with model matches, "
@@ -258,52 +257,49 @@ async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] =
     logger = logger or default_logger
     try:
         file_id = int(file_id)
-        with engine.connect() as conn:
+        async with async_engine.connect() as conn:
             query = text("""
                 SELECT EntryID, ProductModel AS SearchString, 'model_only' AS SearchType, FileID
                 FROM utb_ImageScraperRecords 
                 WHERE FileID = :file_id AND Step1 IS NULL
                 ORDER BY EntryID, SearchType
             """)
-            df = pd.read_sql_query(query, conn, params={"file_id": file_id})
+            logger.debug(f"Executing query: {query} with FileID: {file_id}")
+            df = await conn.execute(query, {"file_id": file_id})
+            df = pd.DataFrame(df.fetchall(), columns=df.keys())
             if not df.empty and (df["FileID"] != file_id).any():
                 logger.error(f"Found rows with incorrect FileID for {file_id}")
                 df = df[df["FileID"] == file_id]
             logger.info(f"Got {len(df)} search records for FileID: {file_id}")
             return df[["EntryID", "SearchString", "SearchType"]]
     except Exception as e:
-        logger.error(f"Error getting records for FileID {file_id}: {e}")
+        logger.error(f"Error getting records for FileID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
-    
  
-def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[int]:
-    """Retrieve the last valid EntryID processed for a given FileID."""
+async def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[int]:
     logger = logger or default_logger
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                    SELECT MAX(t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.SortOrder IS NOT NULL
                 """
-                SELECT MAX(t.EntryID)
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ? AND t.SortOrder IS NOT NULL
-                """,
-                (file_id,)
-            )
-            result = cursor.fetchone()
-            if result and result[0]:
-                logger.info(f"Last valid EntryID for FileID {file_id}: {result[0]}")
-                return result[0]
-            logger.info(f"No valid EntryIDs found for FileID {file_id}")
-            return None
-    except pyodbc.Error as e:
-        logger.error(f"Database error fetching last valid EntryID for FileID {file_id}: {e}")
+                logger.debug(f"Executing query: {query} with FileID: {file_id}")
+                await cursor.execute(query, (file_id,))
+                result = await cursor.fetchone()
+                if result and result[0]:
+                    logger.info(f"Last valid EntryID for FileID {file_id}: {result[0]}")
+                    return result[0]
+                logger.info(f"No valid EntryIDs found for FileID {file_id}")
+                return None
+    except Exception as e:
+        logger.error(f"Error fetching last valid EntryID for FileID {file_id}: {e}", exc_info=True)
         return None
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        return None   
+
 import logging
 import pandas as pd
 import json
@@ -324,7 +320,6 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # Other functions (unchanged) are omitted for brevity
-
 def sync_update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -335,7 +330,6 @@ def sync_update_search_sort_order(
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None
 ) -> Optional[bool]:
-    """Synchronously update the sort order for search results using SQLAlchemy."""
     from utils import normalize_model, generate_aliases, clean_string
     logger = logger or default_logger
     try:
@@ -344,23 +338,20 @@ def sync_update_search_sort_order(
         logger.info(f"🔄 Starting SortOrder update for FileID: {file_id}, EntryID: {entry_id}")
 
         with engine.begin() as conn:
-            # Reset SortOrder to NULL
             conn.execute(
                 text("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID = :entry_id"),
                 {"entry_id": entry_id}
             )
             logger.debug(f"Reset SortOrder to NULL for EntryID {entry_id}")
 
-            # Fetch attributes if not provided
             if not all([brand, model]):
-                result = conn.execute(
-                    text("""
-                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                        FROM utb_ImageScraperRecords
-                        WHERE FileID = :file_id AND EntryID = :entry_id
-                    """),
-                    {"file_id": file_id, "entry_id": entry_id}
-                ).fetchone()
+                query_attrs = text("""
+                    SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
+                    FROM utb_ImageScraperRecords
+                    WHERE FileID = :file_id AND EntryID = :entry_id
+                """)
+                logger.debug(f"Executing query: {query_attrs} with FileID: {file_id}, EntryID: {entry_id}")
+                result = conn.execute(query_attrs, {"file_id": file_id, "entry_id": entry_id}).fetchone()
                 if result:
                     brand, model, color, category = result
                     logger.info(f"Fetched attributes - Brand: {brand}, Model: {model}, Color: {color}, Category: {category}")
@@ -371,7 +362,6 @@ def sync_update_search_sort_order(
                     color = color or ''
                     category = category or ''
 
-            # Fetch results with JSON validation
             query = text("""
                 SELECT 
                     t.ResultID, 
@@ -392,7 +382,9 @@ def sync_update_search_sort_order(
                 INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                 WHERE r.FileID = :file_id AND t.EntryID = :entry_id
             """)
+            logger.debug(f"Executing query: {query} with FileID: {file_id}, EntryID: {entry_id}")
             df = pd.read_sql_query(query, conn, params={"file_id": file_id, "entry_id": entry_id})
+            # ... (rest of the function unchanged)
             if df.empty:
                 logger.warning(f"No eligible data found for FileID: {file_id}, EntryID: {entry_id}")
                 return False
@@ -573,38 +565,37 @@ def sync_update_search_sort_order(
         logger.error(f"Unexpected error updating SortOrder for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
 import datetime
-
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
-    """Export AiJson and AiCaption data to per-entry JSON files and upload to S3."""
     try:
         json_urls = []
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            query = """
-                SELECT t.ResultID, t.EntryID, t.AiJson, t.AiCaption, t.ImageIsFashion
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ? AND t.AiJson IS NOT NULL AND t.AiCaption IS NOT NULL
-            """
-            params = [file_id]
-            if entry_ids:
-                query += " AND t.EntryID IN ({})".format(','.join('?' * len(entry_ids)))
-                params.extend(entry_ids)
-            
-            cursor.execute(query, params)
-            entry_results = {}
-            for row in cursor.fetchall():
-                entry_id = row[1]
-                result = {
-                    "ResultID": row[0],
-                    "EntryID": row[1],
-                    "AiJson": json.loads(row[2]) if row[2] else {},
-                    "AiCaption": row[3],
-                    "ImageIsFashion": bool(row[4])
-                }
-                if entry_id not in entry_results:
-                    entry_results[entry_id] = []
-                entry_results[entry_id].append(result)
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                    SELECT t.ResultID, t.EntryID, t.AiJson, t.AiCaption, t.ImageIsFashion
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.AiJson IS NOT NULL AND t.AiCaption IS NOT NULL
+                """
+                params = [file_id]
+                if entry_ids:
+                    query += " AND t.EntryID IN ({})".format(','.join('?' * len(entry_ids)))
+                    params.extend(entry_ids)
+                
+                logger.debug(f"Executing query: {query} with params: {params}")
+                await cursor.execute(query, params)
+                entry_results = {}
+                for row in await cursor.fetchall():
+                    entry_id = row[1]
+                    result = {
+                        "ResultID": row[0],
+                        "EntryID": row[1],
+                        "AiJson": json.loads(row[2]) if row[2] else {},
+                        "AiCaption": row[3],
+                        "ImageIsFashion": bool(row[4])
+                    }
+                    if entry_id not in entry_results:
+                        entry_results[entry_id] = []
+                    entry_results[entry_id].append(result)
 
         if not entry_results:
             logger.warning(f"No valid AI results to export for FileID {file_id}")
@@ -626,7 +617,7 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
 
             s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
             public_url = await upload_file_to_space(
-                local_json_path, s3_key, public=True, logger=logger, file_id=file_id
+                local_json_path, s3_key, is_public=True, logger=logger, file_id=file_id
             )
             
             if public_url:
@@ -643,19 +634,16 @@ async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: 
     except Exception as e:
         logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
         return ""
-
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
     try:
         file_id = int(file_id)
         logger.info(f"Starting fetch_missing_images for FileID {file_id}, ai_analysis_only={ai_analysis_only}, limit={limit}")
 
-        # Retry logic for connection
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Use synchronous engine for pandas compatibility
-                with engine.connect() as conn:
+                async with async_engine.connect() as conn:
                     if ai_analysis_only:
                         query = text("""
                             SELECT t.ResultID, t.EntryID, t.ImageUrl, t.ImageUrlThumbnail,
@@ -682,7 +670,9 @@ async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only
                         """)
                         params = {"file_id": file_id, "limit": limit}
 
-                    df = pd.read_sql_query(query, conn, params=params)
+                    logger.debug(f"Attempt {attempt + 1}: Executing query: {query} with params: {params}")
+                    df = await conn.execute(query, params)
+                    df = pd.DataFrame(df.fetchall(), columns=df.keys())
 
                     logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
                     if not df.empty:
@@ -692,7 +682,7 @@ async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only
             except SQLAlchemyError as e:
                 logger.error(f"Database error on attempt {attempt + 1}/{max_retries} for FileID {file_id}: {e}")
                 if attempt < max_retries - 1:
-                    delay = 5 * (2 ** attempt)  # Exponential backoff: 5s, 10s, 20s
+                    delay = 5 * (2 ** attempt)
                     logger.info(f"Retrying after {delay} seconds...")
                     await asyncio.sleep(delay)
                 else:
@@ -705,8 +695,6 @@ async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only
     except Exception as e:
         logger.error(f"Unexpected error fetching missing images for FileID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
-
-# Other functions (unchanged) are omitted for brevity
 
 async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None) -> None:
     logger = logger or default_logger
