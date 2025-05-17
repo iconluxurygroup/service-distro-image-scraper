@@ -3,7 +3,6 @@
 
 from db_utils import (
     get_endpoint,
-    insert_search_results,
     update_sort_order,
     update_log_url_in_db,
     get_records_to_search,
@@ -29,7 +28,6 @@ from db_utils import (
 # Expose functions for use in other modules
 __all__ = [
     'get_endpoint',
-    'insert_search_results',
     'update_sort_order',
     'update_log_url_in_db',
     'get_records_to_search',
