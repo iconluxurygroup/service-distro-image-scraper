@@ -4,6 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 import logging
 import os
+import aioodbc
 from config import DB_PASSWORD
 logger = logging.getLogger(__name__)
 
