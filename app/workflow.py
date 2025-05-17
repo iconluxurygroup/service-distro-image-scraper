@@ -505,6 +505,7 @@ async def generate_download_file(
             return {"error": f"Excel file not found", "log_filename": log_filename}
         logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
 
+        logger.debug(f"Uploading Excel file to R2: {processed_file_name}")
         public_url = await upload_file_to_space(
             file_src=local_filename,
             save_as=processed_file_name,
@@ -532,7 +533,7 @@ async def generate_download_file(
             f"Download URL: {public_url}\n"
             f"Log file: {log_filename}"
         )
-        logger.debug(f"Scheduling email with public_url: {public_url}")
+        logger.debug(f"Scheduling email to {send_to_email_addr} with public_url: {public_url}, message: {message}")
         background_tasks.add_task(
             send_message_email,
             to_emails=send_to_email_addr,
@@ -551,11 +552,13 @@ async def generate_download_file(
         logger.error(f"Error for ID {file_id}: {e}", exc_info=True)
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if send_to_email_addr:
+            error_message = f"Excel file generation for FileID {file_id} failed.\nError: {str(e)}\nLog file: {log_filename}"
+            logger.debug(f"Scheduling error email to {send_to_email_addr} with message: {error_message}")
             background_tasks.add_task(
                 send_message_email,
                 to_emails=send_to_email_addr,
                 subject=f"Error: Job Failed for FileID {file_id}",
-                message=f"Excel file generation for FileID {file_id} failed.\nError: {str(e)}\nLog file: {log_filename}",
+                message=error_message,
                 logger=logger
             )
         return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename}
