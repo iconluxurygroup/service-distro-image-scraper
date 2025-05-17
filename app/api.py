@@ -19,7 +19,6 @@ from database import (
     update_log_url_in_db,
     get_send_to_email,
     fetch_last_valid_entry,
-    update_initial_sort_order,
     update_sort_order,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
@@ -403,13 +402,13 @@ async def api_update_sort_order_per_entry(
     except Exception as e:
         logger.error(f"Error queuing per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error queuing SortOrder update for FileID {file_id}: {str(e)}")
-@router.get("/initial-sort/{file_id}", tags=["Sorting"])
-async def api_initial_sort(file_id: str):
-    """Run initial sort order update."""
-    result = await run_job_with_logging(update_initial_sort_order, file_id)
-    if result["status_code"] != 200:
-        raise HTTPException(status_code=result["status_code"], detail=result["message"])
-    return result
+# @router.get("/initial-sort/{file_id}", tags=["Sorting"])
+# async def api_initial_sort(file_id: str):
+#     """Run initial sort order update."""
+#     result = await run_job_with_logging(update_initial_sort_order, file_id)
+#     if result["status_code"] != 200:
+#         raise HTTPException(status_code=result["status_code"], detail=result["message"])
+#     return result
 
 @router.get("/no-image-sort/{file_id}", tags=["Sorting"])
 async def api_no_image_sort(file_id: str):
