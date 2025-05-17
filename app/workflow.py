@@ -442,6 +442,23 @@ async def process_restart_batch(
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
+import pandas as pd
+import logging
+import os
+import asyncio
+import httpx
+import aiofiles
+import datetime
+from typing import Optional, Dict, List
+from database import get_images_excel_db
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from image_utils import download_all_images
+from common import create_temp_dirs, cleanup_temp_dirs
+from aws_s3 import upload_file_to_space
+from email_utils import send_email
+from config import conn_str
+import pyodbc
+
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
@@ -467,11 +484,36 @@ async def generate_download_file(
         logger.info(f"Worker PID {process.pid}: 🕵️ Fetching images for FileID: {file_id}")
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory before fetching images: RSS={mem_info.rss / 1024**2:.2f} MB")
+        
         selected_images_df = await get_images_excel_db(str(file_id), logger=logger)
+        logger.info(f"Fetched DataFrame for FileID {file_id}, shape: {selected_images_df.shape}, columns: {list(selected_images_df.columns)}")
+        
+        # Validate DataFrame
+        expected_columns = [
+            "ExcelRowID",
+            "ImageUrl",
+            "ImageUrlThumbnail",
+            "Brand",
+            "Style",
+            "Color",
+            "Category"
+        ]
         if selected_images_df.empty:
-            logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for FileID {file_id}")
+            logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for FileID {file_id}. Check database records.")
             return {"error": f"No images found for FileID {file_id}", "log_filename": log_filename}
-
+        
+        if list(selected_images_df.columns) != expected_columns:
+            logger.error(f"Invalid columns in DataFrame for FileID {file_id}. Got: {list(selected_images_df.columns)}, Expected: {expected_columns}")
+            return {"error": f"Invalid DataFrame columns: {list(selected_images_df.columns)}", "log_filename": log_filename}
+        
+        if selected_images_df.shape[1] != 7:
+            logger.error(f"Invalid DataFrame shape for FileID {file_id}: got {selected_images_df.shape}, expected (N, 7)")
+            return {"error": f"Invalid DataFrame shape: {selected_images_df.shape}", "log_filename": log_filename}
+        
+        # Log sample data
+        logger.debug(f"Sample DataFrame rows: {selected_images_df.head(2).to_dict(orient='records')}")
+        
+        # Filter valid rows
         selected_image_list = [
             {
                 'ExcelRowID': row['ExcelRowID'],
@@ -483,10 +525,16 @@ async def generate_download_file(
                 'Category': row.get('Category', '')
             }
             for _, row in selected_images_df.iterrows()
-            if row['ImageUrl'] or row['ImageUrlThumbnail']
+            if pd.notna(row['ImageUrl']) or pd.notna(row['ImageUrlThumbnail'])
         ]
-        logger.debug(f"Worker PID {process.pid}: 📋 Selected {len(selected_image_list)} images: {selected_image_list[:2]}")
-
+        logger.info(f"Worker PID {process.pid}: 📋 Selected {len(selected_image_list)} valid images after filtering")
+        
+        if not selected_image_list:
+            logger.warning(f"Worker PID {process.pid}: ⚠️ No valid images after filtering for FileID {file_id}")
+            return {"error": "No valid images after filtering", "log_filename": log_filename}
+        
+        logger.debug(f"Selected image list sample: {selected_image_list[:2]}")
+        
         template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
         header_index = 5
         base_name, extension = os.path.splitext(original_filename)
@@ -552,9 +600,12 @@ async def generate_download_file(
             logger.error(f"Worker PID {process.pid}: ❌ Upload failed for FileID {file_id}")
             return {"error": "Failed to upload processed file", "log_filename": log_filename}
 
+        # Update database
+        from database import update_file_location_complete, update_file_generate_complete
         await update_file_location_complete(str(file_id), public_url, logger=logger)
         await update_file_generate_complete(str(file_id), logger=logger)
 
+        # Send email notification
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
             logger.error(f"Worker PID {process.pid}: ❌ No email address for FileID {file_id}")
