@@ -3,8 +3,7 @@ import logging
 import os
 import datetime
 from typing import Optional, Dict
-from fastapi import APIRouter, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import BackgroundTasks
 from db_utils import get_send_to_email, get_images_excel_db, update_file_location_complete, update_file_generate_complete, update_log_url_in_db
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
