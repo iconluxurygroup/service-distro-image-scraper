@@ -16,7 +16,7 @@ from common import (
     filter_model_results,
     calculate_priority
 )
-from db_utils import get_endpoint, sync_get_endpoint, sync_update_search_sort_order
+from db_utils import get_endpoint, sync_get_endpoint
 from image_utils import download_all_images
 from excel_utils import write_excel_image
 from email_utils import send_email, send_message_email

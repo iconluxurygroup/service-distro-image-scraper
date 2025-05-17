@@ -17,7 +17,7 @@ from db_utils import (
     fetch_missing_images,
     update_search_sort_order, update_log_url_in_db,
     get_send_to_email, update_file_generate_complete, update_file_location_complete,
-    sync_update_search_sort_order, get_records_to_search
+get_records_to_search
 )
 from config import BASE_CONFIG_URL
 from common import clean_string, generate_aliases, generate_brand_aliases, load_config, CONFIG_FILES
