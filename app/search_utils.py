@@ -49,7 +49,7 @@ async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logge
         original_len = len(df)
         df = df[df['ImageUrlThumbnail'].apply(lambda x: validate_thumbnail_url(x, logger)) & 
                 ~df['ImageUrl'].str.contains('placeholder://', na=False)]
-        logger.debugನ
+        logger.debug(f"Filtered DataFrame from {original_len} to {len(df)} rows based on thumbnail URL validation")
 
         if df.empty:
             logger.warning(f"No rows with valid thumbnail URLs after filtering {original_len} rows")
