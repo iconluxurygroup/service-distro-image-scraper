@@ -23,6 +23,7 @@ from database import (
     update_sort_order,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
+    fetch_missing_images,
     get_images_excel_db,
     update_file_generate_complete,
     update_file_location_complete,

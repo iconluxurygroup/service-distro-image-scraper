@@ -14,7 +14,7 @@ from typing import Optional, List, Tuple, Dict, Set
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from image_vision import detect_objects_with_computer_vision_async, analyze_image_with_gemini_async
 from db_utils import (
-
+    fetch_missing_images,
     update_search_sort_order, insert_search_results, update_log_url_in_db,
     get_send_to_email, update_file_generate_complete, update_file_location_complete,
     sync_update_search_sort_order, get_records_to_search

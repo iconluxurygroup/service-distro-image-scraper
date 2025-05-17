@@ -18,8 +18,10 @@ from db_utils import (
     update_search_sort_order,
     get_send_to_email,
     get_images_excel_db,
+    fetch_missing_images,
     update_file_location_complete,
     update_file_generate_complete,
+    export_dai_json,
     update_log_url_in_db,
     fetch_last_valid_entry,
 )
@@ -625,205 +627,205 @@ async def generate_download_file(
         engine.dispose()
         logger.info(f"Worker PID {process.pid}: Disposed database engines")
 
-# async def batch_vision_reason(
-#     file_id: str,
-#     entry_ids: Optional[List[int]] = None,
-#     step: int = 0,
-#     limit: int = 5000,
-#     concurrency: int = 10,
-#     logger: Optional[logging.Logger] = None
-# ) -> None:
-#     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
-#     process = psutil.Process()
-#     try:
-#         file_id = int(file_id)
-#         logger.info(f"Worker PID {process.pid}: Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
-#         mem_info = process.memory_info()
-#         logger.debug(f"Worker PID {process.pid}: Memory before processing: RSS={mem_info.rss / 1024**2:.2f} MB")
+async def batch_vision_reason(
+    file_id: str,
+    entry_ids: Optional[List[int]] = None,
+    step: int = 0,
+    limit: int = 5000,
+    concurrency: int = 10,
+    logger: Optional[logging.Logger] = None
+) -> None:
+    logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
+    process = psutil.Process()
+    try:
+        file_id = int(file_id)
+        logger.info(f"Worker PID {process.pid}: Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before processing: RSS={mem_info.rss / 1024**2:.2f} MB")
 
-#         #df = await fetch_missing_images(file_id, limit, True, logger)
-#         if df.empty:
-#             logger.warning(f"Worker PID {process.pid}: No missing images found for FileID: {file_id}")
-#             return
+        df = await fetch_missing_images(file_id, limit, True, logger)
+        if df.empty:
+            logger.warning(f"Worker PID {process.pid}: No missing images found for FileID: {file_id}")
+            return
 
-#         if entry_ids is not None:
-#             df = df[df['EntryID'].isin(entry_ids)]
-#             if df.empty:
-#                 logger.warning(f"Worker PID {process.pid}: No missing images found for specified EntryIDs: {entry_ids}")
-#                 return
+        if entry_ids is not None:
+            df = df[df['EntryID'].isin(entry_ids)]
+            if df.empty:
+                logger.warning(f"Worker PID {process.pid}: No missing images found for specified EntryIDs: {entry_ids}")
+                return
 
-#         columns_to_drop = ['Step1', 'Step2', 'Step3', 'Step4', 'CreateTime_1', 'CreateTime_2']
-#         df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
-#         logger.info(f"Worker PID {process.pid}: Retrieved {len(df)} image rows for FileID: {file_id}")
-#         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
+        columns_to_drop = ['Step1', 'Step2', 'Step3', 'Step4', 'CreateTime_1', 'CreateTime_2']
+        df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
+        logger.info(f"Worker PID {process.pid}: Retrieved {len(df)} image rows for FileID: {file_id}")
+        entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
-#         valid_updates = []
-#         semaphore = asyncio.Semaphore(concurrency)
-#         async def process_with_semaphore(entry_id, df_subset):
-#             async with semaphore:
-#                 return await process_entry_wrapper(file_id, entry_id, df_subset, logger)
+        valid_updates = []
+        semaphore = asyncio.Semaphore(concurrency)
+        async def process_with_semaphore(entry_id, df_subset):
+            async with semaphore:
+                return await process_entry_wrapper(file_id, entry_id, df_subset, logger)
 
-#         tasks = [
-#             process_with_semaphore(entry_id, df[df['EntryID'] == entry_id])
-#             for entry_id in entry_ids_to_process
-#         ]
-#         results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [
+            process_with_semaphore(entry_id, df[df['EntryID'] == entry_id])
+            for entry_id in entry_ids_to_process
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
-#         for entry_id, updates in zip(entry_ids_to_process, results):
-#             if isinstance(updates, Exception):
-#                 logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {updates}", exc_info=True)
-#                 continue
-#             if not updates:
-#                 logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID: {entry_id}")
-#                 continue
-#             valid_updates.extend(updates)
-#             logger.info(f"Worker PID {process.pid}: Collected {len(updates)} updates for EntryID: {entry_id}")
+        for entry_id, updates in zip(entry_ids_to_process, results):
+            if isinstance(updates, Exception):
+                logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {updates}", exc_info=True)
+                continue
+            if not updates:
+                logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID: {entry_id}")
+                continue
+            valid_updates.extend(updates)
+            logger.info(f"Worker PID {process.pid}: Collected {len(updates)} updates for EntryID: {entry_id}")
 
-#         if valid_updates:
-#             with pyodbc.connect(conn_str, timeout=30) as conn:
-#                 cursor = conn.cursor()
-#                 cursor.executemany(
-#                     "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?",
-#                     valid_updates
-#                 )
-#                 conn.commit()
-#                 cursor.close()
-#                 logger.info(f"Worker PID {process.pid}: Updated {len(valid_updates)} records: {[update[3] for update in valid_updates]}")
+        if valid_updates:
+            with pyodbc.connect(conn_str, timeout=30) as conn:
+                cursor = conn.cursor()
+                cursor.executemany(
+                    "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?",
+                    valid_updates
+                )
+                conn.commit()
+                cursor.close()
+                logger.info(f"Worker PID {process.pid}: Updated {len(valid_updates)} records: {[update[3] for update in valid_updates]}")
 
-#         for entry_id in entry_ids_to_process:
-#             with pyodbc.connect(conn_str, timeout=30) as conn:
-#                 cursor = conn.cursor()
-#                 cursor.execute(
-#                     """
-#                     SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-#                     FROM utb_ImageScraperRecords
-#                     WHERE FileID = ? AND EntryID = ?
-#                     """,
-#                     (file_id, entry_id)
-#                 )
-#                 result = cursor.fetchone()
-#                 cursor.close()
-#                 product_brand = product_model = product_color = product_category = ''
-#                 if result:
-#                     product_brand, product_model, product_color, product_category = result
-#                 else:
-#                     logger.warning(f"Worker PID {process.pid}: No attributes for FileID: {file_id}, EntryID: {entry_id}")
+        for entry_id in entry_ids_to_process:
+            with pyodbc.connect(conn_str, timeout=30) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
+                    FROM utb_ImageScraperRecords
+                    WHERE FileID = ? AND EntryID = ?
+                    """,
+                    (file_id, entry_id)
+                )
+                result = cursor.fetchone()
+                cursor.close()
+                product_brand = product_model = product_color = product_category = ''
+                if result:
+                    product_brand, product_model, product_color, product_category = result
+                else:
+                    logger.warning(f"Worker PID {process.pid}: No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
-#             await update_search_sort_order(
-#                 file_id=str(file_id),
-#                 entry_id=str(entry_id),
-#                 brand=product_brand,
-#                 model=product_model,
-#                 color=product_color,
-#                 category=product_category,
-#                 logger=logger
-#             )
-#             logger.info(f"Worker PID {process.pid}: Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
+            await update_search_sort_order(
+                file_id=str(file_id),
+                entry_id=str(entry_id),
+                brand=product_brand,
+                model=product_model,
+                color=product_color,
+                category=product_category,
+                logger=logger
+            )
+            logger.info(f"Worker PID {process.pid}: Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
 
-#         mem_info = process.memory_info()
-#         logger.debug(f"Worker PID {process.pid}: Memory before JSON export: RSS={mem_info.rss / 1024**2:.2f} MB")
-#         json_url = await export_dai_json(file_id, entry_ids, logger)
-#         if json_url:
-#             logger.info(f"Worker PID {process.pid}: DAI JSON exported to {json_url}")
-#             await update_log_url_in_db(file_id, json_url, logger)
-#         else:
-#             logger.warning(f"Worker PID {process.pid}: Failed to export DAI JSON for FileID: {file_id}")
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before JSON export: RSS={mem_info.rss / 1024**2:.2f} MB")
+        json_url = await export_dai_json(file_id, entry_ids, logger)
+        if json_url:
+            logger.info(f"Worker PID {process.pid}: DAI JSON exported to {json_url}")
+            await update_log_url_in_db(file_id, json_url, logger)
+        else:
+            logger.warning(f"Worker PID {process.pid}: Failed to export DAI JSON for FileID: {file_id}")
 
-#         mem_info = process.memory_info()
-#         logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
 
-#     except Exception as e:
-#         logger.error(f"Worker PID {process.pid}: Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
-#         raise
-#     finally:
-#         await async_engine.dispose()
-#         engine.dispose()
-#         logger.info(f"Worker PID {process.pid}: Disposed database engines")
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
+        raise
+    finally:
+        await async_engine.dispose()
+        engine.dispose()
+        logger.info(f"Worker PID {process.pid}: Disposed database engines")
 
-# async def process_entry_wrapper(
-#     file_id: int,
-#     entry_id: int,
-#     entry_df: pd.DataFrame,
-#     logger: logging.Logger,
-#     max_retries: int = 3
-# ) -> List[Tuple[str, bool, str, int]]:
-#     process = psutil.Process()
-#     attempt = 1
-#     while attempt <= max_retries:
-#         logger.info(f"Worker PID {process.pid}: Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
-#         try:
-#             mem_info = process.memory_info()
-#             logger.debug(f"Worker PID {process.pid}: Memory before processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+async def process_entry_wrapper(
+    file_id: int,
+    entry_id: int,
+    entry_df: pd.DataFrame,
+    logger: logging.Logger,
+    max_retries: int = 3
+) -> List[Tuple[str, bool, str, int]]:
+    process = psutil.Process()
+    attempt = 1
+    while attempt <= max_retries:
+        logger.info(f"Worker PID {process.pid}: Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
+        try:
+            mem_info = process.memory_info()
+            logger.debug(f"Worker PID {process.pid}: Memory before processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
             
-#             if not all(pd.notna(entry_df.get('ResultID', pd.Series([])))):
-#                 logger.error(f"Worker PID {process.pid}: Invalid ResultID in entry_df for EntryID {entry_id}")
-#                 return []
+            if not all(pd.notna(entry_df.get('ResultID', pd.Series([])))):
+                logger.error(f"Worker PID {process.pid}: Invalid ResultID in entry_df for EntryID {entry_id}")
+                return []
 
-#             updates = await process_entry(file_id, entry_id, entry_df, logger)
-#             if not updates:
-#                 logger.warning(f"Worker PID {process.pid}: No updates returned for EntryID {entry_id} on attempt {attempt}")
-#                 attempt += 1
-#                 await asyncio.sleep(2)
-#                 continue
+            updates = await process_entry(file_id, entry_id, entry_df, logger)
+            if not updates:
+                logger.warning(f"Worker PID {process.pid}: No updates returned for EntryID {entry_id} on attempt {attempt}")
+                attempt += 1
+                await asyncio.sleep(2)
+                continue
 
-#             valid_updates = []
-#             for update in updates:
-#                 if not isinstance(update, (list, tuple)) or len(update) != 4:
-#                     logger.error(f"Worker PID {process.pid}: Invalid update tuple for EntryID {entry_id}: {update}")
-#                     continue
+            valid_updates = []
+            for update in updates:
+                if not isinstance(update, (list, tuple)) or len(update) != 4:
+                    logger.error(f"Worker PID {process.pid}: Invalid update tuple for EntryID {entry_id}: {update}")
+                    continue
                 
-#                 ai_json, image_is_fashion, ai_caption, result_id = update
-#                 if not isinstance(ai_json, str):
-#                     logger.error(f"Worker PID {process.pid}: Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
-#                     ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}})
+                ai_json, image_is_fashion, ai_caption, result_id = update
+                if not isinstance(ai_json, str):
+                    logger.error(f"Worker PID {process.pid}: Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
+                    ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}})
                 
-#                 if is_valid_ai_result(ai_json, ai_caption or "", logger):
-#                     valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
-#                 else:
-#                     logger.warning(f"Worker PID {process.pid}: Invalid AI result for ResultID {result_id} on attempt {attempt}")
+                if is_valid_ai_result(ai_json, ai_caption or "", logger):
+                    valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
+                else:
+                    logger.warning(f"Worker PID {process.pid}: Invalid AI result for ResultID {result_id} on attempt {attempt}")
 
-#             if valid_updates:
-#                 logger.info(f"Worker PID {process.pid}: Valid updates for EntryID {entry_id}: {len(valid_updates)}")
-#                 mem_info = process.memory_info()
-#                 logger.debug(f"Worker PID {process.pid}: Memory after processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
-#                 return valid_updates
-#             else:
-#                 logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID {entry_id} on attempt {attempt}")
-#                 attempt += 1
-#                 await asyncio.sleep(2)
+            if valid_updates:
+                logger.info(f"Worker PID {process.pid}: Valid updates for EntryID {entry_id}: {len(valid_updates)}")
+                mem_info = process.memory_info()
+                logger.debug(f"Worker PID {process.pid}: Memory after processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+                return valid_updates
+            else:
+                logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID {entry_id} on attempt {attempt}")
+                attempt += 1
+                await asyncio.sleep(2)
         
-#         except Exception as e:
-#             logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
-#             attempt += 1
-#             await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
+            attempt += 1
+            await asyncio.sleep(2)
     
-#     logger.error(f"Worker PID {process.pid}: Failed to process EntryID {entry_id} after {max_retries} attempts")
-#     return [
-#         (
-#             json.dumps({"scores": {"sentiment": 0.0, "relevance": 0.0}, "category": "unknown", "error": "Processing failed"}),
-#             False,
-#             "Failed to generate caption",
-#             int(row.get('ResultID', 0))
-#         ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
-#     ]
+    logger.error(f"Worker PID {process.pid}: Failed to process EntryID {entry_id} after {max_retries} attempts")
+    return [
+        (
+            json.dumps({"scores": {"sentiment": 0.0, "relevance": 0.0}, "category": "unknown", "error": "Processing failed"}),
+            False,
+            "Failed to generate caption",
+            int(row.get('ResultID', 0))
+        ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
+    ]
 
-# def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
-#     process = psutil.Process()
-#     try:
-#         if not ai_caption or ai_caption.strip() == "":
-#             logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiCaption is empty")
-#             return False
+def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
+    process = psutil.Process()
+    try:
+        if not ai_caption or ai_caption.strip() == "":
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiCaption is empty")
+            return False
         
-#         parsed_json = json.loads(ai_json)
-#         if not isinstance(parsed_json, dict):
-#             logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not a dictionary")
-#             return False
+        parsed_json = json.loads(ai_json)
+        if not isinstance(parsed_json, dict):
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not a dictionary")
+            return False
         
-#         if "scores" not in parsed_json or not parsed_json["scores"]:
-#             logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
-#             return False
+        if "scores" not in parsed_json or not parsed_json["scores"]:
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
+            return False
         
-#         return True
-#     except json.JSONDecodeError as e:
-#         logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
-#         return False
+        return True
+    except json.JSONDecodeError as e:
+        logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
+        return False

@@ -8,6 +8,7 @@ import re
 import pyodbc
 import aioodbc
 import asyncio
+import datetime
 from typing import Optional, List, Dict, Any
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError, DBAPIError
@@ -21,6 +22,7 @@ default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
 async def get_endpoint(logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     try:
@@ -52,6 +54,7 @@ def sync_get_endpoint(logger: Optional[logging.Logger] = None) -> Optional[str]:
     except pyodbc.Error as e:
         logger.error(f"Database error getting endpoint: {e}")
         return None
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -61,57 +64,6 @@ def sync_get_endpoint(logger: Optional[logging.Logger] = None) -> Optional[str]:
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
-    logger = logger or logging.getLogger(__name__)
-    required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
-    
-    if df.empty:
-        logger.info("No rows to insert: DataFrame is empty")
-        return False
-
-    if not all(col in df.columns for col in required_columns):
-        missing_cols = [col for col in required_columns if col not in df.columns]
-        logger.error(f"Missing columns: {missing_cols}")
-        return False
-
-    try:
-        df = df[required_columns].copy()
-        df['EntryID'] = pd.to_numeric(df['EntryID'], errors='coerce').astype('Int64')
-        df[['ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']] = df[
-            ['ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']
-        ].fillna('').astype(str)
-        
-        if df['EntryID'].isnull().any():
-            logger.error(f"Invalid EntryID values: {df[df['EntryID'].isnull()]['EntryID'].tolist()}")
-            return False
-
-        with engine.connect() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO utb_ImageScraperResult (
-                        EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
-                    ) VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
-                """),
-                [
-                    {
-                        "entry_id": row['EntryID'],
-                        "image_url": row['ImageUrl'],
-                        "image_desc": row['ImageDesc'],
-                        "image_source": row['ImageSource'],
-                        "image_url_thumbnail": row['ImageUrlThumbnail']
-                    }
-                    for _, row in df.iterrows()
-                ]
-            )
-            conn.commit()
-            logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult")
-            return True
-    except (SQLAlchemyError, DBAPIError) as e:
-        logger.error(f"Database error inserting search results: {e}", exc_info=True)
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error inserting search results: {e}", exc_info=True)
-        return False
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -161,7 +113,8 @@ async def update_search_sort_order(
                             t.ImageSource, 
                             t.ImageUrl,
                             r.ProductBrand, 
-                            r.ProductModel
+                            r.ProductModel,
+                            t.AiJson
                         FROM utb_ImageScraperResult t
                         INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
                         WHERE r.FileID = :file_id AND t.EntryID = :entry_id
@@ -173,6 +126,11 @@ async def update_search_sort_order(
                 if df.empty:
                     logger.warning(f"No data found for FileID: {file_id}, EntryID: {entry_id}")
                     return []
+
+                invalid_json_rows = df[df['AiJson'].notnull() & (df['AiJson'].str.strip() != '') & (df['match_score'] == 0)]
+                for _, row in invalid_json_rows.iterrows():
+                    logger.warning(f"Invalid JSON in ResultID {row['ResultID']}: AiJson={row['AiJson'][:100]}...")
+                    df.loc[df['ResultID'] == row['ResultID'], 'match_score'] = 0
 
                 if brand_aliases is None:
                     brand_aliases_dict = {
@@ -286,6 +244,507 @@ async def update_search_sort_order(
             )
             await conn.commit()
             logger.debug(f"Applied fallback: Set NULL SortOrder to -2 for EntryID {entry_id}")
+
+async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
+        
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                    SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
+                    FROM utb_ImageScraperRecords 
+                    WHERE FileID = ?
+                """
+                logger.debug(f"Executing query: {query} with FileID: {file_id}")
+                await cursor.execute(query, (file_id,))
+                entries = await cursor.fetchall()
+        
+        if not entries:
+            logger.warning(f"No entries found for FileID: {file_id}")
+            return []
+            
+        results = []
+        success_count = 0
+        failure_count = 0
+        
+        for entry in entries:
+            entry_id, brand, model, color, category = entry
+            try:
+                entry_results = await update_search_sort_order(
+                    file_id=str(file_id),
+                    entry_id=str(entry_id),
+                    brand=brand,
+                    model=model,
+                    color=color,
+                    category=category,
+                    logger=logger
+                )
+                
+                if entry_results:
+                    results.extend(entry_results)
+                    success_count += 1
+                else:
+                    failure_count += 1
+                    logger.warning(f"No results for EntryID {entry_id}")
+            except Exception as e:
+                failure_count += 1
+                logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
+        
+        logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
+        
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query_positive = """
+                    SELECT COUNT(DISTINCT t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.SortOrder > 0
+                """
+                logger.debug(f"Executing query: {query_positive} with FileID: {file_id}")
+                await cursor.execute(query_positive, (file_id,))
+                positive_entries = (await cursor.fetchone())[0]
+                
+                query_zero = """
+                    SELECT COUNT(DISTINCT t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.SortOrder = 0
+                """
+                await cursor.execute(query_zero, (file_id,))
+                brand_match_entries = (await cursor.fetchone())[0]
+                
+                query_negative = """
+                    SELECT COUNT(DISTINCT t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.SortOrder < 0
+                """
+                await cursor.execute(query_negative, (file_id,))
+                no_match_entries = (await cursor.fetchone())[0]
+            
+            logger.info(f"Verification for FileID {file_id}: "
+                       f"{positive_entries} entries with model matches, "
+                       f"{brand_match_entries} entries with brand matches only, "
+                       f"{no_match_entries} entries with no matches")
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        return None
+
+async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
+        
+        async with async_engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                    DELETE FROM utb_ImageScraperResult
+                    WHERE EntryID IN (
+                        SELECT r.EntryID
+                        FROM utb_ImageScraperRecords r
+                        WHERE r.FileID = :file_id
+                        AND utb_ImageScraperResult.ImageUrl = 'placeholder://no-results'
+                    )
+                """),
+                {"file_id": file_id}
+            )
+            rows_affected = result.rowcount
+            logger.info(f"Deleted {rows_affected} placeholder entries for FileID: {file_id}")
+            
+            return {"file_id": file_id, "rows_affected": rows_affected}
+    
+    except ValueError as ve:
+        logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
+        return None
+    except Exception as e:
+        logger.error(f"Error updating entries for FileID: {file_id}, error: {str(e)}")
+        return None
+
+async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
+        
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                    SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
+                    FROM utb_ImageScraperRecords 
+                    WHERE FileID = ?
+                """
+                logger.debug(f"Executing query: {query} with FileID: {file_id}")
+                await cursor.execute(query, (file_id,))
+                entries = await cursor.fetchall()
+                
+                if not entries:
+                    logger.warning(f"No entries found for FileID: {file_id}")
+                    return {
+                        "FileID": file_id,
+                        "TotalEntries": 0,
+                        "SuccessfulEntries": 0,
+                        "FailedEntries": 0,
+                        "BrandMismatchEntries": 0,
+                        "ModelMismatchEntries": 0,
+                        "UnexpectedSortOrderEntries": 0,
+                        "EntryResults": [],
+                        "Verification": {
+                            "PositiveSortOrderEntries": 0,
+                            "BrandMatchEntries": 0,
+                            "NoMatchEntries": 0,
+                            "NullSortOrderEntries": 0,
+                            "UnexpectedSortOrderEntries": 0
+                        }
+                    }
+                
+                entry_results = []
+                success_count = 0
+                failure_count = 0
+                brand_mismatch_count = 0
+                model_mismatch_count = 0
+                unexpected_sort_order_count = 0
+                
+                for entry in entries:
+                    entry_id, brand, model, color, category = entry
+                    entry_result = {
+                        "EntryID": entry_id,
+                        "ProductModel": model,
+                        "ProductBrand": brand,
+                        "Status": "Success",
+                        "Details": {},
+                        "Error": None,
+                        "BrandMatches": [],
+                        "ModelMatches": []
+                    }
+                    try:
+                        brand_aliases_dict = {
+                            "Scotch & Soda": [
+                                "Scotch and Soda", "Scotch Soda", "Scotch&Soda", "ScotchAndSoda", "Scotch"
+                            ],
+                            "Adidas": ["Adidas AG", "Adidas Originals", "Addidas", "Adiddas"],
+                            "BAPE": ["A Bathing Ape", "BATHING APE", "Bape Japan", "ABathingApe", "Bape"]
+                        }
+                        brand_aliases = await generate_brand_aliases(brand or '', brand_aliases_dict)
+                        logger.debug(f"Brand aliases for EntryID {entry_id}, Brand '{brand}': {brand_aliases}")
+                        
+                        model_aliases = generate_aliases(model) if model else []
+                        if model and '_' in model:
+                            model_base = model.split('_')[0]
+                            model_aliases.append(model_base)
+                            model_aliases = list(set(model_aliases))
+                        logger.debug(f"Model aliases for EntryID {entry_id}, Model '{model}': {model_aliases}")
+                        
+                        updates = await update_search_sort_order(
+                            file_id=str(file_id),
+                            entry_id=str(entry_id),
+                            brand=brand,
+                            model=model,
+                            color=color,
+                            category=category,
+                            logger=logger,
+                            brand_rules=None,
+                            brand_aliases=brand_aliases
+                        )
+                        
+                        if updates is not None:
+                            positive_count = sum(1 for r in updates if r['SortOrder'] is not None and r['SortOrder'] > 0)
+                            zero_count = sum(1 for r in updates if r['SortOrder'] == 0)
+                            negative_count = sum(1 for r in updates if r['SortOrder'] is not None and r['SortOrder'] < 0)
+                            null_count = sum(1 for r in updates if r['SortOrder'] is None)
+                            unexpected_count = sum(1 for r in updates if r['SortOrder'] == -1)
+                            
+                            brand_matches = []
+                            model_matches = []
+                            for result in updates:
+                                image_desc = clean_string(result.get('ImageDesc', ''), preserve_url=False)
+                                image_source = clean_string(result.get('ImageSource', ''), preserve_url=True)
+                                image_url = clean_string(result.get('ImageUrl', ''), preserve_url=True)
+                                
+                                matched_brand_aliases = [
+                                    alias for alias in brand_aliases
+                                    if (alias.lower() in image_desc.lower() or
+                                        alias.lower() in image_source.lower() or
+                                        alias.lower() in image_url.lower() or
+                                        re.search(rf'{re.escape(alias)}', image_desc, re.IGNORECASE) or
+                                        re.search(rf'{re.escape(alias)}', image_source, re.IGNORECASE) or
+                                        re.search(rf'{re.escape(alias)}', image_url, re.IGNORECASE))
+                                ]
+                                if matched_brand_aliases:
+                                    brand_matches.append({
+                                        "ResultID": result['ResultID'],
+                                        "SortOrder": result['SortOrder'],
+                                        "MatchedAliases": matched_brand_aliases,
+                                        "ImageUrl": result.get('ImageUrl', ''),
+                                        "ImageDesc": image_desc,
+                                        "ImageSource": image_source
+                                    })
+                                
+                                matched_model_aliases = [
+                                    alias for alias in model_aliases
+                                    if (alias.lower() in image_desc.lower() or
+                                        alias.lower() in image_source.lower() or
+                                        alias.lower() in image_url.lower() or
+                                        re.search(rf'\b{re.escape(alias)}\b', image_desc, re.IGNORECASE) or
+                                        re.search(rf'\b{re.escape(alias)}\b', image_source, re.IGNORECASE) or
+                                        re.search(rf'\b{re.escape(alias)}\b', image_url, re.IGNORECASE))
+                                ]
+                                if matched_model_aliases:
+                                    model_matches.append({
+                                        "ResultID": result['ResultID'],
+                                        "SortOrder": result['SortOrder'],
+                                        "MatchedAliases": matched_model_aliases,
+                                        "ImageUrl": result.get('ImageUrl', ''),
+                                        "ImageDesc": image_desc,
+                                        "ImageSource": image_source
+                                    })
+                                
+                                if result['SortOrder'] == -1:
+                                    logger.warning(
+                                        f"Unexpected SortOrder=-1 for ResultID {result['ResultID']}, "
+                                        f"EntryID {entry_id}, Model '{model}', Brand '{brand}', "
+                                        f"ImageDesc: {image_desc}, ImageSource: {image_source}, ImageUrl: {image_url}"
+                                    )
+                                    unexpected_count += 1
+                            
+                            if unexpected_count > 0:
+                                async with aioodbc.connect(dsn=conn_str) as conn:
+                                    async with conn.cursor() as cursor:
+                                        brand_pattern = '|'.join(re.escape(alias.lower()) for alias in brand_aliases)
+                                        model_pattern = '|'.join(re.escape(alias.lower()) for alias in model_aliases)
+                                        await cursor.execute(
+                                            """
+                                            UPDATE utb_ImageScraperResult
+                                            SET SortOrder = CASE
+                                                WHEN (
+                                                    LOWER(ImageDesc) LIKE '%' + ? + '%' OR
+                                                    LOWER(ImageSource) LIKE '%' + ? + '%' OR
+                                                    LOWER(ImageUrl) LIKE '%' + ? + '%' OR
+                                                    LOWER(ImageDesc) LIKE '%' + ? + '%' OR
+                                                    LOWER(ImageSource) LIKE '%' + ? + '%' OR
+                                                    LOWER(ImageUrl) LIKE '%' + ? + '%' OR
+                                                    LOWER(ImageDesc) REGEXP ? OR
+                                                    LOWER(ImageSource) REGEXP ? OR
+                                                    LOWER(ImageUrl) REGEXP ? OR
+                                                    LOWER(ImageDesc) REGEXP ? OR
+                                                    LOWER(ImageSource) REGEXP ? OR
+                                                    LOWER(ImageUrl) REGEXP ?
+                                                ) THEN (
+                                                    SELECT COALESCE(MAX(SortOrder), 0) + 1 
+                                                    FROM utb_ImageScraperResult 
+                                                    WHERE EntryID = ? AND SortOrder > 0
+                                                )
+                                                ELSE -2
+                                            END
+                                            WHERE EntryID = ? AND SortOrder = -1
+                                            """,
+                                            (
+                                                brand, brand, brand,
+                                                model, model, model,
+                                                brand_pattern, brand_pattern, brand_pattern,
+                                                model_pattern, model_pattern, model_pattern,
+                                                entry_id, entry_id
+                                            )
+                                        )
+                                        corrected_count = cursor.rowcount
+                                        if corrected_count > 0:
+                                            logger.info(f"Corrected {corrected_count} SortOrder=-1 entries for EntryID {entry_id} to positive or -2")
+                                        unexpected_count -= corrected_count
+                                        unexpected_sort_order_count += unexpected_count
+                            
+                            if unexpected_count > 0:
+                                async with aioodbc.connect(dsn=conn_str) as conn:
+                                    async with conn.cursor() as cursor:
+                                        await cursor.execute(
+                                            """
+                                            UPDATE utb_ImageScraperResult
+                                            SET SortOrder = -2
+                                            WHERE EntryID = ? AND SortOrder = -1
+                                            """,
+                                            (entry_id,)
+                                        )
+                                        fallback_count = cursor.rowcount
+                                        if fallback_count > 0:
+                                            logger.info(f"Fallback corrected {fallback_count} SortOrder=-1 entries to -2 for EntryID {entry_id}")
+                                        unexpected_count -= fallback_count
+                                        unexpected_sort_order_count += unexpected_count
+                            
+                            async with aioodbc.connect(dsn=conn_str) as conn:
+                                async with conn.cursor() as cursor:
+                                    await cursor.execute(
+                                        """
+                                        SELECT ResultID, ImageDesc, ImageSource, ImageUrl
+                                        FROM utb_ImageScraperResult
+                                        WHERE EntryID = ? AND SortOrder = -1
+                                        """,
+                                        (entry_id,)
+                                    )
+                                    remaining_minus_one = await cursor.fetchall()
+                                    for res in remaining_minus_one:
+                                        result_id, image_desc, image_source, image_url = res
+                                        logger.warning(
+                                            f"Remaining SortOrder=-1 for ResultID {result_id}, EntryID {entry_id}, "
+                                            f"Model '{model}', Brand '{brand}', "
+                                            f"ImageDesc: {image_desc}, ImageSource: {image_source}, ImageUrl: {image_url}"
+                                        )
+                                        unexpected_count += 1
+                                        unexpected_sort_order_count += 1
+                            
+                            entry_result["Details"] = {
+                                "UpdatedRows": len(updates),
+                                "PositiveSortOrder": positive_count,
+                                "ZeroSortOrder": zero_count,
+                                "NegativeSortOrder": negative_count,
+                                "NullSortOrder": null_count,
+                                "UnexpectedSortOrder": unexpected_count
+                            }
+                            entry_result["BrandMatches"] = brand_matches
+                            entry_result["ModelMatches"] = model_matches
+                            
+                            if not brand_matches and brand:
+                                logger.warning(
+                                    f"No brand aliases matched for EntryID {entry_id}, Brand '{brand}', "
+                                    f"URLs checked: {[r.get('ImageUrl', '') for r in updates]}, "
+                                    f"Descriptions checked: {[r.get('ImageDesc', '') for r in updates]}, "
+                                    f"Sources checked: {[r.get('ImageSource', '') for r in updates]}"
+                                )
+                                brand_mismatch_count += 1
+                            if not model_matches and model:
+                                logger.warning(
+                                    f"No model aliases matched for EntryID {entry_id}, Model '{model}', "
+                                    f"URLs checked: {[r.get('ImageUrl', '') for r in updates]}, "
+                                    f"Descriptions checked: {[r.get('ImageDesc', '') for r in updates]}, "
+                                    f"Sources checked: {[r.get('ImageSource', '') for r in updates]}"
+                                )
+                                model_mismatch_count += 1
+                            
+                            success_count += 1
+                        else:
+                            failure_count += 1
+                            entry_result["Status"] = "Failed"
+                            entry_result["Error"] = "update_search_sort_order returned None"
+                            logger.warning(f"No results for EntryID {entry_id}: update_search_sort_order returned None")
+                        
+                        entry_results.append(entry_result)
+                
+                async with aioodbc.connect(dsn=conn_str) as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(
+                            """
+                            SELECT COUNT(DISTINCT t.EntryID)
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                            WHERE r.FileID = ? AND t.SortOrder > 0
+                            """,
+                            (file_id,)
+                        )
+                        positive_entries = (await cursor.fetchone())[0]
+                        await cursor.execute(
+                            """
+                            SELECT COUNT(DISTINCT t.EntryID)
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                            WHERE r.FileID = ? AND t.SortOrder = 0
+                            """,
+                            (file_id,)
+                        )
+                        brand_match_entries = (await cursor.fetchone())[0]
+                        await cursor.execute(
+                            """
+                            SELECT COUNT(DISTINCT t.EntryID)
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                            WHERE r.FileID = ? AND t.SortOrder < 0
+                            """,
+                            (file_id,)
+                        )
+                        no_match_entries = (await cursor.fetchone())[0]
+                        await cursor.execute(
+                            """
+                            SELECT COUNT(DISTINCT t.EntryID)
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                            WHERE r.FileID = ? AND t.SortOrder IS NULL
+                            """,
+                            (file_id,)
+                        )
+                        null_entries = (await cursor.fetchone())[0]
+                        await cursor.execute(
+                            """
+                            SELECT COUNT(DISTINCT t.EntryID)
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                            WHERE r.FileID = ? AND t.SortOrder = -1
+                            """,
+                            (file_id,)
+                        )
+                        unexpected_entries = (await cursor.fetchone())[0]
+                
+                logger.info(
+                    f"Verification for FileID {file_id}: "
+                    f"{positive_entries} entries with model or brand matches, "
+                    f"{brand_match_entries} entries with legacy brand matches (SortOrder=0), "
+                    f"{no_match_entries} entries with no matches, "
+                    f"{null_entries} entries with NULL SortOrder, "
+                    f"{unexpected_entries} entries with unexpected SortOrder=-1"
+                )
+                if brand_mismatch_count > 0:
+                    logger.warning(f"{brand_mismatch_count} entries had no brand alias matches")
+                if model_mismatch_count > 0:
+                    logger.warning(f"{model_mismatch_count} entries had no model alias matches")
+                if unexpected_entries > 0:
+                    logger.warning(f"{unexpected_entries} entries retained SortOrder=-1")
+                
+                return {
+                    "FileID": file_id,
+                    "TotalEntries": len(entries),
+                    "SuccessfulEntries": success_count,
+                    "FailedEntries": failure_count,
+                    "BrandMismatchEntries": brand_mismatch_count,
+                    "ModelMismatchEntries": model_mismatch_count,
+                    "UnexpectedSortOrderEntries": unexpected_entries,
+                    "EntryResults": entry_results,
+                    "Verification": {
+                        "PositiveSortOrderEntries": positive_entries,
+                        "BrandMatchEntries": brand_match_entries,
+                        "NoMatchEntries": no_match_entries,
+                        "NullSortOrderEntries": null_entries,
+                        "UnexpectedSortOrderEntries": unexpected_entries
+                    }
+                }
+            
+    except Exception as e:
+        logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        return None
+
+async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        async with async_engine.connect() as conn:
+            query = text("""
+                SELECT EntryID, ProductModel AS SearchString, 'model_only' AS SearchType, FileID
+                FROM utb_ImageScraperRecords 
+                WHERE FileID = :file_id AND Step1 IS NULL
+                ORDER BY EntryID, SearchType
+            """)
+            logger.debug(f"Executing query: {query} with FileID: {file_id}")
+            result = await conn.execute(query, {"file_id": file_id})
+            df = pd.DataFrame(await result.fetchall(), columns=result.keys())
+            result.close()
+            if not df.empty and (df["FileID"] != file_id).any():
+                logger.error(f"Found rows with incorrect FileID for {file_id}")
+                df = df[df["FileID"] == file_id]
+            logger.info(f"Got {len(df)} search records for FileID: {file_id}")
+            return df[["EntryID", "SearchString", "SearchType"]]
+    except Exception as e:
+        logger.error(f"Error getting records for FileID {file_id}: {e}", exc_info=True)
+        return pd.DataFrame()
 
 async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
@@ -436,3 +895,177 @@ async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = Non
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         return "nik@accessx.com"
+
+async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logging.Logger] = None) -> bool:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                IF NOT EXISTS (
+                    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_NAME = 'utb_ImageScraperFiles' 
+                    AND COLUMN_NAME = 'LogFileUrl'
+                )
+                BEGIN
+                    ALTER TABLE utb_ImageScraperFiles 
+                    ADD LogFileUrl NVARCHAR(MAX)
+                END
+            """)
+            cursor.execute("UPDATE utb_ImageScraperFiles SET LogFileUrl = ? WHERE ID = ?", (log_url, file_id))
+            conn.commit()
+            cursor.close()
+            logger.info(f"Updated log URL '{log_url}' for FileID {file_id}")
+            return True
+    except pyodbc.Error as e:
+        logger.error(f"Database error updating log URL for FileID {file_id}: {e}", exc_info=True)
+        return False
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        return False
+
+async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting fetch_missing_images for FileID {file_id}, ai_analysis_only={ai_analysis_only}, limit={limit}")
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with async_engine.connect() as conn:
+                    if ai_analysis_only:
+                        query = text("""
+                            SELECT t.ResultID, t.EntryID, t.ImageUrl, t.ImageUrlThumbnail,
+                                   r.ProductBrand, r.ProductCategory, r.ProductColor
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                            WHERE r.FileID = :file_id
+                            AND (t.AiJson IS NULL OR t.AiJson = '' OR ISJSON(t.AiJson) = 0)
+                            AND t.ImageUrl IS NOT NULL AND t.ImageUrl <> ''
+                            AND t.SortOrder > 0
+                            ORDER BY t.ResultID
+                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
+                        """)
+                        params = {"file_id": file_id, "limit": limit}
+                    else:
+                        query = text("""
+                            SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
+                                   t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
+                            FROM utb_ImageScraperRecords r
+                            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID AND t.SortOrder >= 0
+                            WHERE r.FileID = :file_id AND t.ResultID IS NULL
+                            ORDER BY r.EntryID
+                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
+                        """)
+                        params = {"file_id": file_id, "limit": limit}
+
+                    logger.debug(f"Attempt {attempt + 1}: Executing query: {query} with params: {params}")
+                    result = await conn.execute(query, params)
+                    df = pd.DataFrame(await result.fetchall(), columns=result.keys())
+                    result.close()
+
+                    logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
+                    if not df.empty:
+                        logger.debug(f"Sample results: {df.head(2).to_dict()}")
+                    return df
+
+            except SQLAlchemyError as e:
+                logger.error(f"Database error on attempt {attempt + 1}/{max_retries} for FileID {file_id}: {e}")
+                if attempt < max_retries - 1:
+                    delay = 5 * (2 ** attempt)
+                    logger.info(f"Retrying after {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Max retries reached for FileID {file_id}")
+                    raise
+
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Unexpected error fetching missing images for FileID {file_id}: {e}", exc_info=True)
+        return pd.DataFrame()
+
+async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
+    try:
+        json_urls = []
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                    SELECT t.ResultID, t.EntryID, t.AiJson, t.AiCaption, t.ImageIsFashion
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = ? AND t.AiJson IS NOT NULL AND t.AiCaption IS NOT NULL
+                """
+                params = [file_id]
+                if entry_ids:
+                    query += " AND t.EntryID IN ({})".format(','.join('?' * len(entry_ids)))
+                    params.extend(entry_ids)
+                
+                logger.debug(f"Executing query: {query} with params: {params}")
+                await cursor.execute(query, params)
+                entry_results = {}
+                for row in await cursor.fetchall():
+                    entry_id = row[1]
+                    result = {
+                        "ResultID": row[0],
+                        "EntryID": row[1],
+                        "AiJson": json.loads(row[2]) if row[2] else {},
+                        "AiCaption": row[3],
+                        "ImageIsFashion": bool(row[4])
+                    }
+                    if entry_id not in entry_results:
+                        entry_results[entry_id] = []
+                    entry_results[entry_id].append(result)
+
+        if not entry_results:
+            logger.warning(f"No valid AI results to export for FileID {file_id}")
+            return ""
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        temp_json_dir = f"temp_json_{file_id}"
+        os.makedirs(temp_json_dir, exist_ok=True)
+
+        for entry_id, results in entry_results.items():
+            json_filename = f"result_{entry_id}_{timestamp}.json"
+            local_json_path = os.path.join(temp_json_dir, json_filename)
+
+            async with aiofiles.open(local_json_path, 'w') as f:
+                await f.write(json.dumps(results, indent=2))
+            
+            logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
+            logger.debug(f"JSON content sample for EntryID {entry_id}: {json.dumps(results[:2], indent=2)}")
+
+            s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
+            public_url = await upload_file_to_space(
+                local_json_path, s3_key, is_public=True, logger=logger, file_id=file_id
+            )
+            
+            if public_url:
+                logger.info(f"Exported JSON for EntryID {entry_id} to {public_url}")
+                json_urls.append(public_url)
+            else:
+                logger.error(f"Failed to upload JSON for EntryID {entry_id}")
+            
+            os.remove(local_json_path)
+
+        os.rmdir(temp_json_dir)
+        return json_urls[0] if json_urls else ""
+
+    except Exception as e:
+        logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
+        return ""
+
+async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None) -> None:
+    logger = logger or default_logger
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE utb_Endpoints SET EndpointIsBlocked = 1 WHERE EndpointURL = ?", (endpoint,))
+            conn.commit()
+            cursor.close()
+            logger.info(f"Marked endpoint as blocked: {endpoint}")
+    except pyodbc.Error as e:
+        logger.error(f"Error marking endpoint as blocked: {e}")
