@@ -12,7 +12,7 @@ import hashlib
 import time
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
-from image_utils import generate_download_file, process_restart_batch, upload_log_file
+from image_utils import process_restart_batch, upload_log_file
 from search_utils import update_sort_order, update_sort_no_image_entry
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images
