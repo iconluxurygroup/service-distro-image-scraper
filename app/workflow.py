@@ -9,7 +9,6 @@ import time
 import hashlib
 import psutil
 import httpx
-from typing import Optional, List, Dict
 from fastapi import BackgroundTasks
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError

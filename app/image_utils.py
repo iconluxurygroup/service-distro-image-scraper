@@ -3,7 +3,7 @@ import asyncio
 import logging
 import aiohttp
 import aiofiles
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from urllib.parse import quote
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
