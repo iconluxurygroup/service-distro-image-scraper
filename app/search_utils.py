@@ -36,6 +36,70 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+import logging
+import psutil
+from typing import Optional, List, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import async_engine
+import urllib.parse
+import re
+
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.DEBUG)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()]
+    )
+
+def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
+    logger = logger or default_logger
+    if not url or url == '' or 'placeholder' in str(url).lower():
+        logger.debug(f"Invalid thumbnail URL: {url}")
+        return False
+    if not str(url).startswith(('http://', 'https://')):
+        logger.debug(f"Non-HTTP thumbnail URL: {url}")
+        return False
+    return True
+
+def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
+    if not value:
+        return ""
+    # Basic string cleaning: remove backslashes and encoded backslashes
+    cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
+    # Remove control characters and excessive whitespace
+    cleaned = re.sub(r'[\x00-\x1F\x7F]+', '', cleaned).strip()
+    if is_url:
+        # Decode URL-encoded characters (e.g., %20 to space)
+        cleaned = urllib.parse.unquote(cleaned)
+        # Normalize URL path to avoid double slashes
+        try:
+            parsed = urllib.parse.urlparse(cleaned)
+            if not parsed.scheme or not parsed.netloc:
+                return ""  # Invalid URL
+            path = re.sub(r'/+', '/', parsed.path)
+            cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
+            if parsed.query:
+                cleaned += f"?{parsed.query}"
+            if parsed.fragment:
+                cleaned += f"#{parsed.fragment}"
+        except ValueError:
+            logger.debug(f"Invalid URL format: {cleaned}")
+            return ""
+    return cleaned
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type(SQLAlchemyError),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
@@ -48,6 +112,7 @@ async def insert_search_results(
         logger.warning(f"Worker PID {process.pid}: Empty results provided for insert_search_results")
         return False
 
+    # Validate required columns
     required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
     for res in results:
         if not all(col in res for col in required_columns):
@@ -55,51 +120,117 @@ async def insert_search_results(
             logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
             return False
 
+    # Deduplicate based on EntryID and ImageUrl
+    seen = set()
+    deduped_results = []
+    for res in results:
+        image_url = clean_url_string(res.get("ImageUrl", ""), is_url=True)
+        key = (res["EntryID"], image_url)
+        if key not in seen:
+            seen.add(key)
+            deduped_results.append(res)
+    logger.info(f"Worker PID {process.pid}: Deduplicated from {len(results)} to {len(deduped_results)} rows")
+
+    # Prepare parameters with cleaned data
+    parameters = []
+    for res in deduped_results:
+        try:
+            entry_id = int(res["EntryID"])
+        except (ValueError, TypeError):
+            logger.error(f"Worker PID {process.pid}: Invalid EntryID value: {res.get('EntryID')}")
+            continue
+
+        category = res.get("ProductCategory", "").lower()
+        image_url = clean_url_string(res.get("ImageUrl", ""), is_url=True)
+        image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""), is_url=True)
+        image_desc = clean_url_string(res.get("ImageDesc", ""), is_url=False)
+        image_source = clean_url_string(res.get("ImageSource", ""), is_url=True)
+
+        # Validate URLs
+        if image_url and not validate_thumbnail_url(image_url, logger):
+            logger.debug(f"Worker PID {process.pid}: Invalid ImageUrl skipped: {image_url}")
+            continue
+        if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
+            image_url_thumbnail = ""
+
+        # Filter irrelevant URLs for footwear
+        if category == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
+            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
+            continue
+
+        param = {
+            "entry_id": entry_id,
+            "image_url": image_url or None,
+            "image_desc": image_desc or None,
+            "image_source": image_source or None,
+            "image_url_thumbnail": image_url_thumbnail or None
+        }
+        parameters.append(param)
+        logger.debug(f"Worker PID {process.pid}: Prepared row for EntryID {entry_id}: {param}")
+
+    if not parameters:
+        logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id}")
+        return False
+
     try:
-        parameters = []
-        for res in results:
-            try:
-                entry_id = int(res["EntryID"])
-            except (ValueError, TypeError):
-                logger.error(f"Worker PID {process.pid}: Invalid EntryID value: {res.get('EntryID')}")
-                return False
+        async with async_engine.begin() as conn:
+            inserted_count = 0
+            updated_count = 0
+            for param in parameters:
+                try:
+                    # Try updating existing row
+                    update_query = text("""
+                        UPDATE utb_ImageScraperResult
+                        SET ImageDesc = :image_desc,
+                            ImageSource = :image_source,
+                            ImageUrlThumbnail = :image_url_thumbnail,
+                            CreateTime = CURRENT_TIMESTAMP
+                        WHERE EntryID = :entry_id AND ImageUrl = :image_url
+                    """)
+                    result = await conn.execute(
+                        update_query,
+                        {
+                            "entry_id": param["entry_id"],
+                            "image_url": param["image_url"],
+                            "image_desc": param["image_desc"],
+                            "image_source": param["image_source"],
+                            "image_url_thumbnail": param["image_url_thumbnail"]
+                        }
+                    )
+                    updated_count += result.rowcount
 
-            category = res.get("ProductCategory", "")
-            image_url = str(res.get("ImageUrl", "")) if res.get("ImageUrl") else ""
-            if category.lower() == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
-                logger.debug(f"Filtered out irrelevant URL: {image_url}")
-                continue
+                    if result.rowcount == 0:
+                        # Insert new row if no update occurred
+                        insert_query = text("""
+                            INSERT INTO utb_ImageScraperResult
+                            (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+                            SELECT :entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, CURRENT_TIMESTAMP
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM utb_ImageScraperResult
+                                WHERE EntryID = :entry_id AND ImageUrl = :image_url
+                            )
+                        """)
+                        result = await conn.execute(
+                            insert_query,
+                            {
+                                "entry_id": param["entry_id"],
+                                "image_url": param["image_url"],
+                                "image_desc": param["image_desc"],
+                                "image_source": param["image_source"],
+                                "image_url_thumbnail": param["image_url_thumbnail"]
+                            }
+                        )
+                        inserted_count += result.rowcount
+                except SQLAlchemyError as e:
+                    logger.error(f"Worker PID {process.pid}: Failed to process EntryID {param['entry_id']}: {e}")
+                    logger.debug(f"Row data: {param}")
+                    continue
 
-            parameters.append({
-                "entry_id": entry_id,
-                "image_url": image_url,
-                "image_desc": str(res.get("ImageDesc", "")) if res.get("ImageDesc") else "",
-                "image_source": str(res.get("ImageSource", "")) if res.get("ImageSource") else "",
-                "image_url_thumbnail": str(res.get("ImageUrlThumbnail", "")) if res.get("ImageUrlThumbnail") else ""
-            })
+            logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(parameters)} rows for FileID {file_id}")
+            if inserted_count == 0 and updated_count == 0:
+                logger.warning(f"Worker PID {process.pid}: No rows inserted or updated for FileID {file_id}; likely all rows are duplicates")
+            return inserted_count > 0 or updated_count > 0
 
-        logger.debug(f"Worker PID {process.pid}: Inserting {len(parameters)} rows into utb_ImageScraperResult")
-        if not parameters:
-            logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id}")
-            return False
-
-        async with async_engine.connect() as conn:
-            try:
-                await conn.execute(text("SELECT 1"))
-                await conn.commit()
-            except Exception as e:
-                logger.warning(f"Worker PID {process.pid}: Failed to clear connection state: {e}")
-
-            await conn.execute(
-                text("""
-                    INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
-                    VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
-                """),
-                parameters
-            )
-            await conn.commit()
-            logger.info(f"Worker PID {process.pid}: Successfully inserted {len(parameters)} rows for FileID {file_id}")
-            return True
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
