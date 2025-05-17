@@ -1,51 +1,3 @@
-
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import logging
-import asyncio
-import os
-import pandas as pd
-import time
-import pyodbc
-import httpx
-import json
-import aiofiles
-import datetime
-from typing import Optional, Dict, List, Tuple
-from db_utils import (
-    sync_get_endpoint,
-    update_search_sort_order,
-    get_send_to_email,
-    insert_search_results,
-    get_images_excel_db,
-    fetch_missing_images,
-    update_file_location_complete,
-    update_file_generate_complete,
-    export_dai_json,
-    update_log_url_in_db,
-    fetch_last_valid_entry,
-)
-from image_utils import download_all_images
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from common import fetch_brand_rules
-from utils import (
-    create_temp_dirs,
-    cleanup_temp_dirs,
-    process_and_tag_results,
-    generate_search_variations,
-    process_search_row_gcloud
-)
-from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space
-import psutil
-from email_utils import send_message_email
-from image_reason import process_entry
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import aiohttp
-from database_config import conn_str, async_engine, engine
-from sqlalchemy.sql import text
-
-BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -107,7 +59,7 @@ async def async_process_entry_search(
     brand: str,
     endpoint: str,
     entry_id: int,
-    use_all_variations: bool,
+    use_all_variations: bool,  # Kept for compatibility, not used in generate_search_variations
     file_id_db: int,
     logger: logging.Logger
 ) -> List[pd.DataFrame]:
@@ -115,26 +67,62 @@ async def async_process_entry_search(
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory before task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
     
+    # Fetch brand rules
+    brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
+    if not brand_rules:
+        logger.warning(f"Worker PID {process.pid}: No brand rules fetched for EntryID {entry_id}")
+        brand_rules = {}
+    
     # Generate search variations
-    variations = generate_search_variations(search_string, brand, use_all_variations=use_all_variations)
-    logger.debug(f"Worker PID {process.pid}: Generated {len(variations)} search variations for EntryID {entry_id}")
+    try:
+        variations_dict = generate_search_variations(
+            search_string=search_string,
+            brand=brand,
+            model=search_string,
+            brand_rules=brand_rules,
+            logger=logger
+        )
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Failed to generate variations for EntryID {entry_id}: {e}")
+        raise ValueError(f"Failed to generate search variations: {e}")
+    
+    # Flatten variations into a unique list
+    variations = []
+    for category, var_list in variations_dict.items():
+        variations.extend(var_list)
+    variations = list(dict.fromkeys(variations))  # Remove duplicates while preserving order
+    logger.debug(f"Worker PID {process.pid}: Generated {len(variations)} unique search variations for EntryID {entry_id}: {variations}")
+    
+    if not variations:
+        logger.warning(f"Worker PID {process.pid}: No variations generated for EntryID {entry_id}")
+        return []
     
     # Process all variations in parallel
     async def process_variation(variation: str) -> List[pd.DataFrame]:
-        return await process_and_tag_results(
-            search_string=variation,
-            brand=brand,
-            model=search_string,
-            endpoint=endpoint,
-            entry_id=entry_id,
-            logger=logger,
-            use_all_variations=False,  # Avoid recursive variation generation
-            file_id_db=file_id_db
-        )
+        try:
+            result = await process_and_tag_results(
+                search_string=variation,
+                brand=brand,
+                model=search_string,
+                endpoint=endpoint,
+                entry_id=entry_id,
+                logger=logger,
+                use_all_variations=False,  # Prevent recursive variation generation
+                file_id_db=file_id_db
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Worker PID {process.pid}: Error processing variation '{variation}' for EntryID {entry_id}: {e}")
+            return []
     
-    # Run all variations concurrently
+    # Run all variations concurrently with a semaphore
+    semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent requests
+    async def process_with_semaphore(variation: str) -> List[pd.DataFrame]:
+        async with semaphore:
+            return await process_variation(variation)
+    
     results = await asyncio.gather(
-        *(process_variation(variation) for variation in variations),
+        *(process_with_semaphore(variation) for variation in variations),
         return_exceptions=True
     )
     
@@ -146,6 +134,9 @@ async def async_process_entry_search(
             continue
         if result:
             combined_results.extend(result)
+    
+    if not combined_results:
+        logger.warning(f"Worker PID {process.pid}: No valid results for EntryID {entry_id} after processing {len(variations)} variations")
     
     # Validate EntryID consistency
     for df in combined_results:
@@ -192,7 +183,6 @@ def process_entry_search(args):
     finally:
         logger.removeHandler(handler)
         handler.close()
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
