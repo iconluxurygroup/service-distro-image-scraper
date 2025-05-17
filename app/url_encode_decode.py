@@ -32,33 +32,34 @@ def decode_url(url: str, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     logger.debug(f"Decoding URL: {url}")
     try:
-        # Treat as raw text and remove backslashes with proper escaping
-        cleaned = url
-        # Replace specific Google thumbnail patterns
-        cleaned = re.sub(r'q\\=tbn', 'q=tbn', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'\\&s', '&s', cleaned, flags=re.IGNORECASE)
-        # Remove any remaining backslashes
-        cleaned = re.sub(r'\\+', '', cleaned)
-        # Remove encoded backslashes
-        cleaned = re.sub(r'%25{0,2}5[Cc]', '', cleaned)
-        # Unquote to handle percent-encoding
-        decoded = urllib.parse.unquote(cleaned)
-        # Parse and normalize query parameters
-        parsed = urllib.parse.urlparse(decoded)
-        query_dict = urllib.parse.parse_qs(parsed.query)
-        query = urllib.parse.urlencode(query_dict, doseq=True) if query_dict else ''
-        # Reconstruct URL
-        final_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if query:
-            final_url += f"?{query}"
-        if parsed.fragment:
-            final_url += f"#{urllib.parse.quote(parsed.fragment, safe='')}"
+        # Check for Google thumbnail URL
+        if 'tbn' in url.lower() or 'tbn%3A' in url:
+            logger.debug("Detected Google thumbnail URL")
+            # Remove backslashes and encoded backslashes
+            cleaned = re.sub(r'\\+', '', url)
+            cleaned = re.sub(r'%25{0,2}5[Cc]', '', cleaned)
+            # Extract thumbnail ID (between 'tbn:' or 'tbn' and '&s' or end)
+            tbn_match = re.search(r'tbn[:%3A]([A-Za-z0-9_-]+)(?:\\&s|&s|$)', cleaned)
+            if tbn_match:
+                thumbnail_id = tbn_match.group(1)
+                # Rebuild using template
+                decoded = f"https://encrypted-tbn0.gstatic.com/images?q=tbn:{thumbnail_id}&s"
+                logger.debug(f"Rebuilt Google thumbnail URL: {decoded}")
+            else:
+                logger.warning("Failed to extract thumbnail ID, falling back to generic decoding")
+                decoded = urllib.parse.unquote(cleaned)
+        else:
+            # Generic URL handling
+            cleaned = re.sub(r'\\+', '', url)
+            cleaned = re.sub(r'%25{0,2}5[Cc]', '', cleaned)
+            decoded = urllib.parse.unquote(cleaned)
         # Validate URL
+        parsed = urllib.parse.urlparse(decoded)
         if not parsed.scheme or not parsed.netloc:
-            logger.warning(f"Invalid URL structure after decoding: {final_url}")
+            logger.warning(f"Invalid URL structure after decoding: {decoded}")
             return url
-        logger.debug(f"Decoded URL: {final_url}")
-        return final_url
+        logger.debug(f"Decoded URL: {decoded}")
+        return decoded
     except Exception as e:
         logger.error(f"Error decoding URL {url}: {e}", exc_info=True)
         return url
