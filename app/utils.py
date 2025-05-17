@@ -16,6 +16,9 @@ from common import (
     filter_model_results,
     calculate_priority
 )
+import pyodbc
+from database_config import conn_str  # Import conn_str
+
 from db_utils import get_endpoint, sync_get_endpoint
 from image_utils import download_all_images
 from excel_utils import write_excel_image
