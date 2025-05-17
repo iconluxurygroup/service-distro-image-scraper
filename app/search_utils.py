@@ -17,43 +17,6 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
-    logger = logger or default_logger
-    if not url or url == '' or 'placeholder' in str(url).lower():
-        logger.debug(f"Invalid thumbnail URL: {url}")
-        return False
-    if not str(url).startswith(('http://', 'https://')):
-        logger.debug(f"Non-HTTP thumbnail URL: {url}")
-        return False
-    return True
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-import logging
-import psutil
-from typing import Optional, List, Dict
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
-import urllib.parse
-import re
-
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.DEBUG)
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler()]
-    )
 
 def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
     logger = logger or default_logger
