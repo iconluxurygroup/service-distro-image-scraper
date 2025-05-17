@@ -7,7 +7,7 @@ import re
 import pyodbc
 import aioodbc
 import asyncio
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -276,54 +276,11 @@ async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] =
         return pd.DataFrame()
     
  
-async def get_last_entry_id(file_id: str, logger: logging.Logger) -> Optional[int]:
-    """Retrieve the last processed EntryID for a given FileID from the job_progress table."""
+def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[int]:
+    """Retrieve the last valid EntryID processed for a given FileID."""
+    logger = logger or default_logger
     try:
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT last_entry_id FROM job_progress WHERE file_id = ?",
-                (file_id,)
-            )
-            result = cursor.fetchone()
-            if result and result[0]:
-                logger.info(f"Retrieved last EntryID {result[0]} from job_progress for FileID {file_id}")
-                return result[0]
-            logger.info(f"No last EntryID found in job_progress for FileID {file_id}")
-            return None
-    except pyodbc.Error as e:
-        logger.error(f"Error retrieving last EntryID for FileID {file_id}: {e}")
-        return None
-
-def parse_log_for_last_entry_id(log_file: str, logger: logging.Logger) -> Optional[int]:
-    """Parse the log file to find the last EntryID mentioned in a 'Processed EntryID' log entry."""
-    try:
-        if not os.path.exists(log_file):
-            logger.error(f"Log file {log_file} does not exist")
-            return None
-
-        last_entry_id = None
-        with open(log_file, 'r') as f:
-            for line in f:
-                # Look for log entries like: [INFO] Processed EntryID {entry_id} with {n} images
-                match = re.search(r"Processed EntryID (\d+)", line)
-                if match:
-                    entry_id = int(match.group(1))
-                    last_entry_id = entry_id
-                    logger.debug(f"Found EntryID {entry_id} in log")
-        
-        if last_entry_id:
-            logger.info(f"Last EntryID found in log: {last_entry_id}")
-        else:
-            logger.info("No EntryID found in log")
-        return last_entry_id
-    except Exception as e:
-        logger.error(f"Error parsing log file {log_file}: {e}")
-        return None
-
-def get_last_processed_entry_id_from_db(file_id: str, logger: logging.Logger) -> Optional[int]:
-    """Query the database to find the last EntryID with results for the given FileID."""
-    try:
+        file_id = int(file_id)
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -331,81 +288,22 @@ def get_last_processed_entry_id_from_db(file_id: str, logger: logging.Logger) ->
                 SELECT MAX(t.EntryID)
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = ? AND t.CreateTime IS NOT NULL
+                WHERE r.FileID = ? AND t.SortOrder IS NOT NULL
                 """,
                 (file_id,)
             )
             result = cursor.fetchone()
             if result and result[0]:
-                logger.info(f"Last processed EntryID from database: {result[0]}")
+                logger.info(f"Last valid EntryID for FileID {file_id}: {result[0]}")
                 return result[0]
-            logger.info(f"No processed EntryIDs found in database for FileID {file_id}")
+            logger.info(f"No valid EntryIDs found for FileID {file_id}")
             return None
     except pyodbc.Error as e:
-        logger.error(f"Error querying last processed EntryID for FileID {file_id}: {e}")
+        logger.error(f"Database error fetching last valid EntryID for FileID {file_id}: {e}")
         return None
-
-def find_last_entry_id(file_id: str, log_file: str, logger: logging.Logger) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Determine the last EntryID processed and the recommended EntryID to resume processing.
-    Returns (last_entry_id, resume_entry_id).
-    """
-    # Step 1: Try to get the last EntryID from the job_progress table
-    import asyncio
-    last_entry_id = asyncio.run(get_last_entry_id(file_id, logger))
-    
-    # Step 2: If not found in job_progress, parse the log file
-    if last_entry_id is None:
-        last_entry_id = parse_log_for_last_entry_id(log_file, logger)
-    
-    # Step 3: Verify with the database
-    if last_entry_id is None:
-        last_entry_id = get_last_processed_entry_id_from_db(file_id, logger)
-    
-    # Step 4: Determine the resume EntryID
-    resume_entry_id = None
-    if last_entry_id is not None:
-        # Check if the last EntryID was successfully processed
-        try:
-            with pyodbc.connect(conn_str) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM utb_ImageScraperResult
-                    WHERE EntryID = ? AND SortOrder IS NOT NULL
-                    """,
-                    (last_entry_id,)
-                )
-                result_count = cursor.fetchone()[0]
-                if result_count > 0:
-                    # Last EntryID was successfully processed, resume from the next EntryID
-                    cursor.execute(
-                        """
-                        SELECT MIN(EntryID)
-                        FROM utb_ImageScraperRecords
-                        WHERE FileID = ? AND EntryID > ?
-                        """,
-                        (file_id, last_entry_id)
-                    )
-                    next_entry = cursor.fetchone()
-                    resume_entry_id = next_entry[0] if next_entry and next_entry[0] else None
-                    logger.info(f"Last EntryID {last_entry_id} was processed; resuming from EntryID {resume_entry_id}")
-                else:
-                    # Last EntryID was not fully processed, resume from it
-                    resume_entry_id = last_entry_id
-                    logger.info(f"Last EntryID {last_entry_id} was not fully processed; resuming from it")
-        except pyodbc.Error as e:
-            logger.error(f"Error verifying last EntryID {last_entry_id}: {e}")
-            resume_entry_id = last_entry_id  # Fallback to retrying the last EntryID
-    
-    # Step 5: Fallback if no EntryID is found
-    if last_entry_id is None:
-        logger.warning("Could not determine last EntryID; assuming 69797 from log snippet")
-        last_entry_id = 69797
-        resume_entry_id = 69798  # Assume the next EntryID to be safe
-    
-    return last_entry_id, resume_entry_id   
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        return None   
 import logging
 import pandas as pd
 import json
