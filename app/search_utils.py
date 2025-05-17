@@ -11,7 +11,7 @@ from database_config import conn_str, async_engine
 from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
 import psutil
 
-
+import pyodbc
 
 
 import logging
