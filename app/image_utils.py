@@ -18,9 +18,9 @@ def clean_url(url: str, attempt: int = 1) -> str:
     try:
         # Attempt 1: Basic cleaning (remove backslashes, fix %2f in path)
         if attempt == 1:
-            url = re.sub(r'\\+|%5[Cc]', '', url)  # Remove \ and %5C/%5c
+            url = re.sub(r'\\+|%5[Cc]', '', url)
             parsed = urlparse(url)
-            path = parsed.path.replace('%2F', '/').replace('%2f', '/')  # Decode %2f to /
+            path = parsed.path.replace('%2F', '/').replace('%2f', '/')
             cleaned_url = f"{parsed.scheme}://{parsed.netloc}{path}"
             if parsed.query:
                 query = parsed.query.replace('%5C', '').replace('%5c', '')
@@ -45,7 +45,7 @@ def clean_url(url: str, attempt: int = 1) -> str:
 
         # Attempt 3: Minimal cleaning, only remove invalid characters
         elif attempt == 3:
-            url = re.sub(r'[\x00-\x1F\x7F]', '', url)  # Remove control characters
+            url = re.sub(r'[\x00-\x1F\x7F]', '', url)
             parsed = urlparse(url)
             return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" + \
                    (f"?{parsed.query}" if parsed.query else "") + \
@@ -189,6 +189,8 @@ async def download_all_images(
             if not success:
                 logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
                 failed_downloads.append((main_url, excel_row_id))
+                if not main_url and not thumb_url:
+                    logger.critical(f"No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID 315.")
 
     batches = [image_list[i:i + batch_size] for i in range(0, len(image_list), batch_size)]
     for batch_idx, batch in enumerate(batches, 1):
