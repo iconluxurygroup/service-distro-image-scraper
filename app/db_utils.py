@@ -1,35 +1,17 @@
-import asyncio
 import logging
-import os
-import datetime
-import hashlib
-import time
-from typing import Optional, Dict, List
-from fastapi import BackgroundTasks
-from db_utils import (
-    get_send_to_email,
-    get_images_excel_db,
-    update_file_location_complete,
-    update_file_generate_complete,
-    fetch_last_valid_entry,
-    update_log_url_in_db,
-)
-from search_utils import update_search_sort_order, insert_search_results
-from image_utils import download_all_images
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from common import fetch_brand_rules
-from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
-from endpoint_utils import sync_get_endpoint
-from logging_config import setup_job_logger
-from s3_utils import upload_file_to_space
-import psutil
-from email_utils import send_message_email
-import httpx
-import aiofiles
-from database_config import async_engine, engine
-from sqlalchemy.sql import text
 import pandas as pd
+import pyodbc
+import asyncio
+import json
+import datetime
+import os
+import aiofiles
+from typing import Optional, List, Dict
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str, async_engine
+from s3_utils import upload_file_to_space
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
