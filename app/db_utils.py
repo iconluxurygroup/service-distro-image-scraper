@@ -276,8 +276,10 @@ async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] =
         logger.error(f"Error getting records for FileID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
  
+
 async def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[int]:
-    logger = logger or default_logger
+    """Retrieve the last valid EntryID processed for a given FileID."""
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         async with aioodbc.connect(dsn=conn_str) as conn:
@@ -299,7 +301,6 @@ async def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] 
     except Exception as e:
         logger.error(f"Error fetching last valid EntryID for FileID {file_id}: {e}", exc_info=True)
         return None
-
 import logging
 import pandas as pd
 import json
