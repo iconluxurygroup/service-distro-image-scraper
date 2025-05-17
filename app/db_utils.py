@@ -21,7 +21,37 @@ default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+async def get_endpoint(logger: Optional[logging.Logger] = None) -> str:
+    logger = logger or default_logger
+    try:
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT TOP 1 EndpointURL FROM utb_Endpoints WHERE EndpointIsBlocked = 0 ORDER BY NEWID()")
+                result = await cursor.fetchone()
+                endpoint = result[0] if result else "No EndpointURL"
+                logger.info(f"Retrieved endpoint: {endpoint}")
+                return endpoint
+    except Exception as e:
+        logger.error(f"Database error getting endpoint: {e}")
+        return "No EndpointURL"
 
+def sync_get_endpoint(logger: Optional[logging.Logger] = None) -> Optional[str]:
+    logger = logger or default_logger
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT TOP 1 EndpointURL FROM utb_Endpoints WHERE EndpointIsBlocked = 0 ORDER BY NEWID()")
+            result = cursor.fetchone()
+            endpoint = result[0] if result else None
+            cursor.close()
+            if endpoint:
+                logger.info(f"Retrieved endpoint: {endpoint}")
+            else:
+                logger.error("No endpoint found")
+            return endpoint
+    except pyodbc.Error as e:
+        logger.error(f"Database error getting endpoint: {e}")
+        return None
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
