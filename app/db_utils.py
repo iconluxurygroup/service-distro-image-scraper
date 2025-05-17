@@ -1564,36 +1564,6 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
     except Exception as e:
             logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
             return None
-import logging
-import pandas as pd
-import aioodbc
-from typing import Optional
-from config import conn_str
-import logging
-import logging
-import pandas as pd
-import aioodbc
-from typing import Optional
-import logging
-import pandas as pd
-import aioodbc
-import pyodbc
-from typing import Optional
-from config import conn_str
-
-import logging
-import pandas as pd
-import aioodbc
-import pyodbc
-from typing import Optional
-from config import conn_str
-
-import logging
-import pandas as pd
-import pyodbc
-from typing import Optional
-from config import conn_str
-
 def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or logging.getLogger(__name__)
     try:
@@ -1663,6 +1633,10 @@ def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -
     except Exception as e:
         logger.error(f"Unexpected error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
         return pd.DataFrame(columns=["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"])
+
+
+
+        
 async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     try:
