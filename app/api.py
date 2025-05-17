@@ -20,7 +20,7 @@ from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
     fetch_last_valid_entry,
-    update_initial_sort_order,
+#    update_initial_sort_order,
     get_images_excel_db,
     update_file_generate_complete,
     update_file_location_complete,
