@@ -442,38 +442,6 @@ async def process_restart_batch(
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
-import pandas as pd
-import logging
-import os
-import asyncio
-import httpx
-import aiofiles
-import datetime
-from typing import Optional, Dict, List
-from database import get_images_excel_db
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from image_utils import download_all_images
-from common import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-from email_utils import send_email
-from config import conn_str
-import pyodbc
-import pandas as pd
-import logging
-import os
-import asyncio
-import httpx
-import aiofiles
-import datetime
-from typing import Optional, Dict, List
-from database import get_images_excel_db
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from image_utils import download_all_images
-from common import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-from email_utils import send_email
-from config import conn_str
-import pyodbc
 
 async def generate_download_file(
     file_id: int,
