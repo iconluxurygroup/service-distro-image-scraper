@@ -269,9 +269,12 @@ async def process_restart_batch(
         failed_entries = 0
         last_entry_id_processed = entry_id or 0
         api_to_db_mapping = {
-            'image_url': 'ImageUrl', 'thumbnail_url': 'ImageUrlThumbnail', 'url': 'ImageUrl',
-            'thumb': 'ImageUrlIn [13]: # This line is in the original code but not executed here
-            'image': 'ImageUrl', 'thumbnail': 'ImageUrlThumbnail'
+            'image_url': 'ImageUrl',
+            'thumbnail_url': 'ImageUrlThumbnail',
+            'url': 'ImageUrl',
+            'thumb': 'ImageUrlThumbnail',  # Corrected invalid line
+            'image': 'ImageUrl',
+            'thumbnail': 'ImageUrlThumbnail'
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
@@ -327,9 +330,6 @@ async def process_restart_batch(
                         logger.error(f"SortOrder update failed for EntryID {entry_id}")
                         return entry_id, False
 
-                    # Removed erroneous increment of successful_entries here
-                    # Moved to outer scope to avoid UnboundLocalError
-                    last_entry_id_processed = entry_id
                     return entry_id, True
                 except Exception as e:
                     logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
@@ -416,8 +416,6 @@ async def process_restart_batch(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Disposed database engines")
-
-
 
 async def generate_download_file(
     file_id: int,
