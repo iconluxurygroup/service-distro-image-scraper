@@ -436,6 +436,15 @@ async def search_variation(
             "error": str(e)
         }
 
+import logging
+import pandas as pd
+import pyodbc
+from typing import Optional, Dict
+from common import clean_string, generate_aliases, generate_brand_aliases
+from database_config import conn_str
+from icon_image_lib.google_parser import process_search_result
+from db_utils import insert_search_results, update_search_sort_order  # Import insert_search_results
+
 async def process_single_all(
     entry_id: int,
     search_string: str,
@@ -449,7 +458,7 @@ async def process_single_all(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
     
     try:
@@ -506,7 +515,6 @@ async def process_single_all(
     logger.debug(f"Worker PID {process.pid}: Memory before generating variations: RSS={mem_info.rss / 1024**2:.2f} MB")
     variations = generate_search_variations(search_string, result_brand, result_model, brand_rules, logger)
     
-    endpoint = sync_get_endpoint(logger=logger)
     if not endpoint:
         logger.error(f"Worker PID {process.pid}: No healthy endpoint available for EntryID {entry_id}")
         return False
@@ -544,19 +552,31 @@ async def process_single_all(
                 return False
             deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
             logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
-            insert_success = insert_search_results(deduplicated_df, logger=logger)
+            insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
             if not insert_success:
                 logger.error(f"Worker PID {process.pid}: Failed to insert deduplicated results for EntryID {entry_id}")
                 return False
             logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
             
-            update_result = sync_update_search_sort_order(
-                str(file_id_db), str(entry_id), result_brand, result_model, result_color, result_category, logger, brand_rules=brand_rules
-            )
-            if update_result is None:
-                logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
-                return False
-            logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id} with Brand: {result_brand}, Model: {result_model}, Color: {result_color}, Category: {result_category}")
+            # Update sort order only if non-placeholder results exist
+            if not deduplicated_df['ImageUrl'].str.contains('placeholder://', na=False).all():
+                update_result = await update_search_sort_order(
+                    file_id=str(file_id_db),
+                    entry_id=str(entry_id),
+                    brand=result_brand,
+                    model=result_model,
+                    color=result_color,
+                    category=result_category,
+                    logger=logger,
+                    brand_rules=brand_rules
+                )
+                if update_result is None:
+                    logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
+                    return False
+                logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
+            else:
+                logger.info(f"Worker PID {process.pid}: Skipping sort order update for EntryID {entry_id} due to all placeholder results")
+
             try:
                 with pyodbc.connect(conn_str, autocommit=False) as conn:
                     cursor = conn.cursor()
@@ -575,7 +595,7 @@ async def process_single_all(
                     null_count = cursor.fetchone()[0]
                     logger.info(f"Worker PID {process.pid}: Verification: Found {count} rows with positive SortOrder, {null_count} rows with NULL SortOrder for EntryID {entry_id}")
                     if null_count > 0:
-                        logger.error(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder after update for EntryID {entry_id}")
+                        logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder after update for EntryID {entry_id}")
                     if total_count == 0:
                         logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
             except pyodbc.Error as e:
@@ -596,7 +616,7 @@ async def process_single_all(
         "ImageUrlThumbnail": "placeholder://no-results"
     }])
     try:
-        insert_success = insert_search_results(placeholder_df, logger=logger)
+        insert_success = await insert_search_results(placeholder_df, logger=logger, file_id=str(file_id_db))
         if insert_success:
             logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
             with pyodbc.connect(conn_str, autocommit=False) as conn:
@@ -618,7 +638,6 @@ async def process_single_all(
     except pyodbc.Error as e:
         logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
-
 import logging
 import pandas as pd
 import pyodbc
