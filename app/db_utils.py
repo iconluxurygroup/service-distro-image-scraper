@@ -1564,53 +1564,68 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
     except Exception as e:
             logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
             return None
+import pandas as pd
+import pyodbc
+import logging
+from typing import Optional
+from config import conn_str
+
 def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    """
+    Fetch images for Excel export from the database for a given file_id.
+    Returns a DataFrame with columns: ExcelRowID, ImageUrl, ImageUrlThumbnail, Brand, Style, Color, Category.
+    """
     logger = logger or logging.getLogger(__name__)
+    expected_columns = ["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"]
+    
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
+        with pyodbc.connect(conn_str, timeout=10) as conn:
             cursor = conn.cursor()
             query = """
                 SELECT 
-                    s.ExcelRowID, 
-                    r.ImageUrl, 
-                    r.ImageUrlThumbnail, 
-                    s.ProductBrand AS Brand, 
-                    s.ProductModel AS Style, 
-                    s.ProductColor AS Color, 
-                    s.ProductCategory AS Category
+                    s.ExcelRowID,
+                    ISNULL(r.ImageUrl, '') AS ImageUrl,
+                    ISNULL(r.ImageUrlThumbnail, '') AS ImageUrlThumbnail,
+                    ISNULL(s.ProductBrand, '') AS Brand,
+                    ISNULL(s.ProductModel, '') AS Style,
+                    ISNULL(s.ProductColor, '') AS Color,
+                    ISNULL(s.ProductCategory, '') AS Category
                 FROM utb_ImageScraperFiles f
                 INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
                 LEFT JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
                     AND r.SortOrder >= 0
+                    AND r.ImageUrl IS NOT NULL AND r.ImageUrl <> ''
                 WHERE f.ID = ?
                 ORDER BY s.ExcelRowID
             """
             logger.debug(f"Executing query: {query} with ID: {file_id}")
             cursor.execute(query, (file_id,))
-            rows = cursor.fetchall()
+            
+            # Validate columns
             columns = [desc[0] for desc in cursor.description]
+            if columns != expected_columns:
+                logger.error(f"Invalid columns returned for ID {file_id}. Got: {columns}, Expected: {expected_columns}")
+                return pd.DataFrame(columns=expected_columns)
+            
+            # Fetch rows
+            rows = cursor.fetchall()
             logger.debug(f"Query result: rows={len(rows)}, columns={columns}")
             if rows:
                 logger.debug(f"Sample row: {rows[0]}")
                 logger.debug(f"Row length: {len(rows[0])}, Expected: {len(columns)}")
             
-            # Validate result
-            expected_columns = ["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"]
-            if not columns or columns != expected_columns:
-                logger.error(f"Invalid columns returned for ID {file_id}. Got: {columns}, Expected: {expected_columns}")
-                return pd.DataFrame(columns=expected_columns)
-            
             # Validate row structure
+            valid_rows = []
             for i, row in enumerate(rows):
                 if len(row) != len(columns):
-                    logger.error(f"Row {i} has incorrect number of columns: got {len(row)}, expected {len(columns)}")
-                    return pd.DataFrame(columns=expected_columns)
+                    logger.error(f"Row {i} has incorrect number of columns: got {len(row)}, expected {len(columns)}, row: {row}")
+                    continue
+                valid_rows.append([str(val) if val is not None else '' for val in row])
             
-            df = pd.DataFrame(rows, columns=columns)
-            logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
-            if df.empty:
-                logger.warning(f"No data returned for ID {file_id}. Check utb_ImageScraperFiles and utb_ImageScraperRecords.")
+            if not valid_rows:
+                logger.warning(f"No valid rows returned for ID {file_id}. Check database records.")
+                # Diagnostic queries
                 cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
                 file_count = cursor.fetchone()[0]
                 cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = ?", (file_id,))
@@ -1621,19 +1636,31 @@ def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -
                 )
                 result_count = cursor.fetchone()[0]
                 logger.debug(f"Diagnostic counts: utb_ImageScraperFiles={file_count}, utb_ImageScraperRecords={record_count}, utb_ImageScraperResult={result_count}")
+                return pd.DataFrame(columns=expected_columns)
+            
+            # Create DataFrame
+            df = pd.DataFrame(valid_rows, columns=columns)
+            logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
+            
+            # Filter out rows with missing ImageUrl
+            df = df[df['ImageUrl'].notnull() & (df['ImageUrl'] != '')]
+            logger.debug(f"Filtered to {len(df)} rows with non-empty ImageUrl")
+            
+            if df.empty:
+                logger.warning(f"No valid images found for ID {file_id} after filtering")
             else:
                 logger.debug(f"Sample rows: {df.head(2).to_dict(orient='records')}")
+            
             return df
     except pyodbc.Error as e:
         logger.error(f"Database error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame(columns=["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"])
+        return pd.DataFrame(columns=expected_columns)
     except ValueError as e:
         logger.error(f"ValueError in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame(columns=["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"])
+        return pd.DataFrame(columns=expected_columns)
     except Exception as e:
         logger.error(f"Unexpected error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame(columns=["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"])
-
+        return pd.DataFrame(columns=expected_columns)
 
 
         
