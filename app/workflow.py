@@ -256,11 +256,10 @@ async def process_restart_batch(
              WHERE FileID = ? AND (? IS NULL OR EntryID >= ?) 
         ORDER BY ENTRYID
             """
-            cursor.execute(query, (file_id_db_int, entry_id))
+            cursor.execute(query, (file_id_db_int, entry_id, entry_id))
             entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
             logger.info(f"Worker PID {process.pid}: Found {len(entries)} entries")
             cursor.close()
-
         if not entries:
             logger.warning(f"Worker PID {process.pid}: No entries found")
             return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
