@@ -1582,6 +1582,11 @@ import logging
 import pandas as pd
 import aioodbc
 from typing import Optional
+import logging
+import pandas as pd
+import aioodbc
+import pyodbc
+from typing import Optional
 from config import conn_str
 
 async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
@@ -1591,16 +1596,6 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
         async with aioodbc.connect(dsn=conn_str) as conn:
             async with conn.cursor() as cursor:
                 query = """
-                    WITH RankedResults AS (
-                        SELECT 
-                            EntryID, 
-                            ImageUrl, 
-                            ImageUrlThumbnail, 
-                            SortOrder,
-                            ROW_NUMBER() OVER (PARTITION BY EntryID ORDER BY SortOrder DESC) AS rn
-                        FROM utb_ImageScraperResult
-                        WHERE SortOrder IS NOT NULL AND SortOrder >= 0
-                    )
                     SELECT 
                         s.ExcelRowID, 
                         r.ImageUrl, 
@@ -1611,7 +1606,8 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                         s.ProductCategory AS Category
                     FROM utb_ImageScraperFiles f
                     INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
-                    LEFT JOIN RankedResults r ON r.EntryID = s.EntryID AND r.rn = 1
+                    LEFT JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
+                        AND r.SortOrder = (SELECT MAX(SortOrder) FROM utb_ImageScraperResult r2 WHERE r2.EntryID = r.EntryID AND r2.SortOrder >= 0)
                     WHERE f.ID = ?
                     ORDER BY s.ExcelRowID
                 """
@@ -1619,6 +1615,16 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                 await cursor.execute(query, (file_id,))
                 rows = await cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
+                logger.debug(f"Query result: rows={len(rows)}, columns={columns}")
+                if rows:
+                    logger.debug(f"Sample row: {rows[0]}")
+                
+                # Validate result
+                expected_columns = ["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"]
+                if not columns or columns != expected_columns:
+                    logger.error(f"Invalid columns returned for ID {file_id}. Got: {columns}, Expected: {expected_columns}")
+                    return pd.DataFrame(columns=expected_columns)
+                
                 df = pd.DataFrame(rows, columns=columns)
                 logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
                 if df.empty:
@@ -1636,12 +1642,12 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                 else:
                     logger.debug(f"Sample rows: {df.head(2).to_dict(orient='records')}")
                 return df
-    except (aioodbc.OperationalError, aioodbc.ProgrammingError) as e:
+    except pyodbc.Error as e:
         logger.error(f"Database error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"])
     except ValueError as e:
-        logger.error(f"Invalid ID format: {e}", exc_info=True)
-        return pd.DataFrame()
+        logger.error(f"ValueError in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
+        return pd.DataFrame(columns=["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"])
 async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     try:
