@@ -25,6 +25,8 @@ from db_utils import (
     update_file_generate_complete,
     update_file_location_complete,
 )
+
+from workflow import upload_file_to_space
 from database_config import conn_str, async_engine
 from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
