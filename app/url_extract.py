@@ -14,10 +14,11 @@ def extract_thumbnail_url(url: str, logger: Optional[logging.Logger] = None) -> 
         # Detect Google thumbnail URL
         if 'tbn' in url.lower():
             logger.debug("Detected Google thumbnail URL")
-            # Extract thumbnail ID (after 'tbn' or 'tbn:' or 'q\=tbn', before '&s', '\&s', or end)
-            tbn_match = re.search(r'(?:tbn[:%3A]?|q\\=tbn)([A-Za-z0-9_-]+)(?:[\\&]?s|$)', url, re.IGNORECASE)
+            # Extract thumbnail ID (43 chars after 'q\=tbn', 'tbn:', or 'tbn')
+            tbn_match = re.search(r'(?:q[\\=]+tbn|tbn[:%3A]?)([A-Za-z0-9_-]{43})(?:[\\&]?s|$)', url, re.IGNORECASE)
             if tbn_match:
                 thumbnail_id = tbn_match.group(1)
+                logger.debug(f"Extracted thumbnail ID: {thumbnail_id} (length: {len(thumbnail_id)})")
                 # Rebuild using template
                 rebuilt_url = f"https://encrypted-tbn0.gstatic.com/images?q=tbn:{thumbnail_id}&s"
                 logger.debug(f"Rebuilt thumbnail URL: {rebuilt_url}")
