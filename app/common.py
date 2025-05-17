@@ -1,20 +1,154 @@
 import logging
 import re
+import unicodedata
+import requests
+import httpx
+import aiohttp
+import asyncio
+from typing import List, Optional, Dict, Any, Tuple
 from fuzzywuzzy import fuzz
-from typing import List, Optional, Dict, Tuple,Any
+from functools import lru_cache
+from config import BASE_CONFIG_URL
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
+CONFIG_FILES = {
+    "category_hierarchy": "category_hierarchy.json",
+    "category_mapping": "category_mapping.json",
+    "fashion_labels": "fashion_labels.json",
+    "non_fashion_labels": "non_fashion_labels.json"
+}
+
+async def create_temp_dirs(file_id: int, logger: Optional[logging.Logger] = None) -> Tuple[str, str]:
+    logger = logger or default_logger
+    temp_images_dir = f"temp_images_{file_id}"
+    temp_excel_dir = f"temp_excel_{file_id}"
+    
+    os.makedirs(temp_images_dir, exist_ok=True)
+    os.makedirs(temp_excel_dir, exist_ok=True)
+    
+    logger.debug(f"Created temp directories: {temp_images_dir}, {temp_excel_dir}")
+    return temp_images_dir, temp_excel_dir
+
+async def cleanup_temp_dirs(dirs: List[str], logger: Optional[logging.Logger] = None) -> None:
+    logger = logger or default_logger
+    for dir_path in dirs:
+        if os.path.exists(dir_path):
+            try:
+                shutil.rmtree(dir_path)
+                logger.debug(f"Removed temp directory: {dir_path}")
+            except Exception as e:
+                logger.error(f"Failed to remove temp directory {dir_path}: {e}", exc_info=True)
+
+@lru_cache(maxsize=32)
+def sync_load_config(file_key: str, url: str, config_name: str, expect_list: bool = False) -> Any:
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        config = response.json()
+        if expect_list and not isinstance(config, list):
+            raise ValueError(f"{config_name} must be a list")
+        return config
+    except Exception as e:
+        raise e
+
+async def load_config(
+    file_key: str,
+    fallback: Any,
+    logger: Optional[logging.Logger] = None,
+    config_name: str = "",
+    expect_list: bool = False,
+    retries: int = 3,
+    backoff_factor: float = 2.0
+) -> Any:
+    logger = logger or default_logger
+    url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
+    
+    try:
+        config = sync_load_config(file_key, url, config_name, expect_list)
+        logger.info(f"Loaded {config_name} from cache for {url}")
+        return config
+    except Exception:
+        logger.debug(f"Cache miss for {config_name}, attempting async load")
+
+    for attempt in range(1, retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    response.raise_for_status()
+                    config = await response.json()
+                    if expect_list and not isinstance(config, list):
+                        raise ValueError(f"{config_name} must be a list")
+                    logger.info(f"Loaded {config_name} from {url} on attempt {attempt}")
+                    sync_load_config.cache_clear()
+                    sync_load_config(file_key, url, config_name, expect_list)
+                    return config
+        except (aiohttp.ClientError, ValueError, asyncio.TimeoutError) as e:
+            logger.warning(f"Failed to load {config_name} from {url} (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(backoff_factor * attempt)
+            else:
+                logger.info(f"Exhausted retries for {config_name}, using fallback")
+                return fallback
+    logger.error(f"Critical failure loading {config_name} from {url}, using fallback")
+    return fallback
+
+def clean_string(s: str, preserve_url: bool = False) -> str:
+    if not isinstance(s, str):
+        return ''
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+    s = s.replace('\\u0026', '&')
+    if preserve_url:
+        s = re.sub(r'\s+', ' ', s.strip().lower())
+    else:
+        s = re.sub(r'[^a-z0-9\s&]', '', s.strip().lower())
+        s = re.sub(r'\s+', ' ', s)
+    return s
+
+def generate_aliases(model: Any) -> List[str]:
+    if not isinstance(model, str):
+        model = str(model)
+    if not model or model.strip() == '':
+        return []
+    
+    aliases = {model, model.lower(), model.upper()}
+    separators = ['_', '-', ' ', '/', '.']
+    base_model = model
+    
+    for sep in separators:
+        base_model = base_model.replace(sep, '')
+        aliases.add(base_model)
+    
+    for sep in separators:
+        if 's69' in base_model.lower():
+            idx = base_model.lower().index('s69')
+            alias_with_sep = base_model[:idx] + sep + base_model[idx:]
+            aliases.add(alias_with_sep)
+            aliases.add(alias_with_sep.lower())
+            aliases.add(alias_with_sep.upper())
+    
+    digits_only = re.sub(r'[^0-9]', '', base_model)
+    if digits_only and digits_only.isdigit():
+        aliases.add(digits_only)
+    
+    for sep in separators:
+        if sep in model:
+            base = model.split(sep)[0]
+            aliases.add(base)
+            break
+    
+    return [a for a in aliases if a and len(a) >= len(model) - 3]
+
 async def fetch_brand_rules(
-    url: str = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json",
+    url: str = BRAND_RULES_URL,
     max_attempts: int = 3,
     timeout: int = 10,
     logger: Optional[logging.Logger] = None
 ) -> Optional[Dict]:
-    # Imported from your common.py; included here for filter_model_results dependency
     logger = logger or default_logger
     async with httpx.AsyncClient() as client:
         for attempt in range(max_attempts):
@@ -55,57 +189,49 @@ async def fetch_brand_rules(
                     logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
                     return {"brand_rules": []}
 
-def clean_string(s: str, preserve_url: bool = False) -> str:
-    # Imported from your common.py; included for dependencies
-    if not isinstance(s, str):
-        return ''
-    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
-    s = s.replace('\\u0026', '&')
-    if preserve_url:
-        s = re.sub(r'\s+', ' ', s.strip().lower())
-    else:
-        s = re.sub(r'[^a-z0-9\s&]', '', s.strip().lower())
-        s = re.sub(r'\s+', ' ', s)
-    return s
-
-def generate_aliases(model: Any) -> List[str]:
-    # Imported from your common.py; included for dependencies
+def normalize_model(model: Any) -> str:
     if not isinstance(model, str):
-        model = str(model)
-    if not model or model.strip() == '':
+        return str(model).strip().lower()
+    return model.strip().lower()
+
+async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
+    brand_clean = clean_string(brand).lower()
+    if not brand_clean:
         return []
-    
-    aliases = {model, model.lower(), model.upper()}
-    separators = ['_', '-', ' ', '/', '.']
-    base_model = model
-    
-    for sep in separators:
-        base_model = base_model.replace(sep, '')
-        aliases.add(base_model)
-    
-    for sep in separators:
-        if 's69' in base_model.lower():
-            idx = base_model.lower().index('s69')
-            alias_with_sep = base_model[:idx] + sep + base_model[idx:]
-            aliases.add(alias_with_sep)
-            aliases.add(alias_with_sep.lower())
-            aliases.add(alias_with_sep.upper())
-    
-    digits_only = re.sub(r'[^0-9]', '', base_model)
-    if digits_only and digits_only.isdigit():
-        aliases.add(digits_only)
-    
-    for sep in separators:
-        if sep in model:
-            base = model.split(sep)[0]
-            aliases.add(base)
-            break
-    
-    return [a for a in aliases if a and len(a) >= len(model) - 3]
+
+    aliases = [brand_clean]
+    for key, alias_list in predefined_aliases.items():
+        if clean_string(key).lower() == brand_clean:
+            aliases.extend(clean_string(alias).lower() for alias in alias_list)
+
+    base_brand = brand_clean.replace('&', 'and').replace('  ', ' ')
+    variations = [
+        base_brand.replace(' ', ''),
+        base_brand.replace(' ', '-'),
+        re.sub(r'[^a-z0-9]', '', base_brand),
+    ]
+
+    words = base_brand.split()
+    if len(words) > 1:
+        abbreviation = ''.join(word[0] for word in words if word)
+        if len(abbreviation) >= 4:
+            variations.append(abbreviation)
+        variations.append(words[0])
+        variations.append(words[-1])
+
+    aliases.extend(variations)
+    seen = set()
+    filtered_aliases = []
+    for alias in aliases:
+        alias_lower = alias.lower()
+        if len(alias_lower) >= 4 and alias_lower not in ["sas", "soda"] and alias_lower not in seen:
+            seen.add(alias_lower)
+            filtered_aliases.append(alias_lower)
+
+    return filtered_aliases
 
 def validate_model(row: Dict, expected_models: List[str], result_id: str, logger: Optional[logging.Logger] = None) -> bool:
-    # Imported from your common.py; included for dependencies
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     input_model = clean_string(row.get('ProductModel', ''))
     if not input_model:
         logger.warning(f"ResultID {result_id}: No ProductModel provided in row")
@@ -147,7 +273,7 @@ def validate_brand(
     domain_hierarchy: Optional[List[str]] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     if domain_hierarchy is not None and not isinstance(domain_hierarchy, (list, tuple)):
         logger.error(f"Invalid domain_hierarchy type: {type(domain_hierarchy)}. Expected list or None.")
         raise TypeError("domain_hierarchy must be a list or None")
