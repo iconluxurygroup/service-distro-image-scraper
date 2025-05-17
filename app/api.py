@@ -12,11 +12,10 @@ import hashlib
 import time
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
-from workflow import upload_file_to_space
+from image_scraper import upload_file_to_space, generate_download_file, process_restart_batch
 from search_utils import update_sort_order, update_sort_no_image_entry
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images
-from workflow import generate_download_file, process_restart_batch
 from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
@@ -48,8 +47,8 @@ LAST_UPLOAD = {}
 class JobStatusResponse(BaseModel):
     status: str = Field(..., description="Job status (e.g., queued, running, completed, failed)")
     message: str = Field(..., description="Descriptive message about the job status")
-    public_url: Optional[str] = Field(None, description="S3 URL of the generated Excel file, if available")
-    log_url: Optional[str] = Field(None, description="S3 URL of the job log file, if available")
+    public_url: Optional[str] = Field(None, description="R2 URL of the generated Excel file, if available")
+    log_url: Optional[str] = Field(None, description="R2 URL of the job log file, if available")
     timestamp: str = Field(..., description="ISO timestamp of the response")
 
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
@@ -84,7 +83,7 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
             )
             await update_log_url_in_db(file_id, upload_url, logger)
             LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
-            logger.info(f"Log uploaded to: {upload_url}")
+            logger.info(f"Log uploaded to R2: {upload_url}")
             return upload_url
         except Exception as e:
             logger.error(f"Failed to upload log for FileID {file_id}: {e}", exc_info=True)
