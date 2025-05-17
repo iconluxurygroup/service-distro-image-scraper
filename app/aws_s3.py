@@ -160,10 +160,10 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
     if logger == default_logger and file_id:
         logger, _ = setup_job_logger(job_id=file_id, console_output=True)
         logger.info(f"Setup logger for upload_file_to_space, FileID: {file_id}")
-
     if public is not None:
-        is_public = public  # Map public to is_public
+        is_public = public
         logger.warning("Use of 'public' parameter is deprecated; use 'is_public' instead")
+    # ...
 
     result_urls = {}
 
