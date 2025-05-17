@@ -7,7 +7,6 @@ from typing import Optional
 import aiobotocore.session
 from aiobotocore.config import AioConfig
 from config import S3_CONFIG
-from db_utils import update_log_url_in_db
 from sqlalchemy.sql import text
 from database_config import async_engine
 
