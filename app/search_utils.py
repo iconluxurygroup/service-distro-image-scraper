@@ -175,8 +175,10 @@ async def update_search_sort_order(
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
-            # Simplified calculate_priority call
-            res["priority"] = calculate_priority(model_matched, brand_matched)
+            # Pass all required arguments to calculate_priority
+            res["priority"] = calculate_priority(
+                model_matched, brand_matched, model_clean, model_aliases, brand_clean, brand_aliases
+            )
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
         sorted_results = sorted(results, key=lambda x: x["priority"])
