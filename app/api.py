@@ -384,8 +384,7 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         return {"error": str(e), "log_filename": log_filename}
     finally:
         log_memory_usage()
-
-async process_restart_batch(
+async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False,
@@ -598,7 +597,13 @@ async process_restart_batch(
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
-        log_public_url = await upload_log_file(str(file_id_db), log_filename, logger)
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id_db}.log",
+            is_public=True,
+            logger=logger,
+            file_id=str(file_id_db)
+        )
         return {
             "message": "Search processing completed",
             "file_id": str(file_id_db),
@@ -612,7 +617,13 @@ async process_restart_batch(
         }
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(str(file_id_db), log_filename, logger)
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id_db}.log",
+            is_public=True,
+            logger=logger,
+            file_id=str(file_id_db)
+        )
         return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
         await async_engine.dispose()
@@ -708,6 +719,45 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         }
     finally:
         debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
+
+async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
+    try:
+        JOB_STATUS[file_id] = {
+            "status": "running",
+            "message": "Job is running",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+        result = await generate_download_file(int(file_id), background_tasks, logger=logger)
+        
+        if "error" in result:
+            JOB_STATUS[file_id] = {
+                "status": "failed",
+                "message": f"Error: {result['error']}",
+                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            logger.error(f"Job failed for FileID {file_id}: {result['error']}")
+            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+        else:
+            JOB_STATUS[file_id] = {
+                "status": "completed",
+                "message": "Job completed successfully",
+                "public_url": result.get("public_url"),
+                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            logger.info(f"Job completed for FileID {file_id}")
+    except Exception as e:
+        logger.error(f"Unexpected error in job for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        JOB_STATUS[file_id] = {
+            "status": "failed",
+            "message": f"Unexpected error: {str(e)}",
+            "log_url": log_public_url or None,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
     @retry(
