@@ -1,21 +1,9 @@
 import logging
 import pandas as pd
-import re
-import asyncio
-import json
-from typing import Optional, List, Dict
+import aioodbc
+from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from database_config import conn_str, async_engine
-from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
-import pyodbc
-import psutil
-
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+from database_config import conn_str
 
 def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
     logger = logger or logging.getLogger(__name__)
@@ -30,7 +18,7 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
+    retry=retry_if_exception_type(pyodbc.Error),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -42,36 +30,46 @@ async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logge
         if df.empty:
             logger.warning("Empty DataFrame provided for insertion")
             return False
+
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
         if not all(col in df.columns for col in required_columns):
             missing_cols = set(required_columns) - set(df.columns)
             logger.error(f"Missing required columns: {missing_cols}")
             return False
+
+        # Filter rows with invalid thumbnail URLs or placeholders
         original_len = len(df)
         df = df[df['ImageUrlThumbnail'].apply(lambda x: validate_thumbnail_url(x, logger)) & 
                 ~df['ImageUrl'].str.contains('placeholder://', na=False)]
-        logger.debug(f"Filtered to {len(df)} rows with valid thumbnail URLs from {original_len} rows")
         if df.empty:
             logger.warning(f"No rows with valid thumbnail URLs after filtering {original_len} rows")
             return False
-        async with async_engine.connect() as conn:
-            for _, row in df.iterrows():
-                await conn.execute(
-                    text("""
-                        INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
-                        VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
-                    """),
-                    {
-                        "entry_id": row['EntryID'],
-                        "image_url": row['ImageUrl'],
-                        "image_desc": row['ImageDesc'],
-                        "image_source": row['ImageSource'],
-                        "image_url_thumbnail": row['ImageUrlThumbnail']
-                    }
-                )
-            await conn.commit()
-        logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult for FileID {file_id}")
-        return True
+        logger.debug(f"Filtered to {len(df)} rows with valid thumbnail URLs from {original_len}")
+
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                insert_query = """
+                    INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
+                    VALUES (?, ?, ?, ?, ?)
+                """
+                for _, row in df.iterrows():
+                    await cursor.execute(
+                        insert_query,
+                        (
+                            row['EntryID'],
+                            row['ImageUrl'],
+                            row['ImageDesc'],
+                            row['ImageSource'],
+                            row['ImageUrlThumbnail']
+                        )
+                    )
+                await conn.commit()
+                logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult for FileID {file_id}")
+                return True
+
+    except pyodbc.Error as e:
+        logger.error(f"Database error during insertion for FileID {file_id or 'unknown'}: {e}", exc_info=True)
+        raise
     except Exception as e:
         logger.error(f"Unexpected error during insertion for FileID {file_id or 'unknown'}: {e}", exc_info=True)
         return False
