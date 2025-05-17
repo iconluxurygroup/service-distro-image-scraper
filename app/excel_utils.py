@@ -27,6 +27,9 @@ async def verify_png_image_single(image_path: str, logger: Optional[logging.Logg
         async with aiofiles.open(image_path, 'rb') as f:
             img_data = await f.read()
         img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
+        if img is None:
+            logger.error(f"❌ Failed to open image: {image_path}")
+            return False
         await asyncio.to_thread(img.verify)
         logger.info(f"✅ Image verified successfully: {image_path}")
 
@@ -44,6 +47,9 @@ async def verify_png_image_single(image_path: str, logger: Optional[logging.Logg
         async with aiofiles.open(image_path, 'rb') as f:
             img_data = await f.read()
         img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
+        if img is None:
+            logger.error(f"❌ Failed to open image after resize: {image_path}")
+            return False
         await asyncio.to_thread(img.verify)
         logger.info(f"✅ Post-resize verification successful: {image_path}")
         return True
@@ -58,6 +64,9 @@ async def resize_image(image_path: str, logger: Optional[logging.Logger] = None)
         async with aiofiles.open(image_path, 'rb') as f:
             img_data = await f.read()
         img = await asyncio.to_thread(IMG2.open, BytesIO(img_data))
+        if img is None:
+            logger.error(f"❌ Failed to open image: {image_path}")
+            return False
         MAXSIZE = 130
 
         if img.mode == 'RGBA':
@@ -70,6 +79,8 @@ async def resize_image(image_path: str, logger: Optional[logging.Logger] = None)
             img = await asyncio.to_thread(img.convert, 'RGB')
 
         def get_background_color(img):
+            if img is None:
+                return None
             width, height = img.size
             pixels = np.array(img)
             top = pixels[0, :]
@@ -247,21 +258,18 @@ async def highlight_cell(
             logger.error(f"❌ Invalid cell reference format: {cell_reference}")
             raise ValueError(f"Invalid cell reference format: {cell_reference}")
 
-        if cell_reference not in ws:
-            logger.warning(f"Cell {cell_reference} not in worksheet, extending dimensions")
-            max_row = max(ws.max_row, row_num)
-            max_col = max(ws.max_column, ord(col_letter.upper()) - ord('A') + 1)
-            for r in range(ws.max_row + 1, max_row + 1):
-                for c in range(1, max_col + 1):
+        # Extend worksheet dimensions if necessary
+        if row_num > ws.max_row:
+            for r in range(ws.max_row + 1, row_num + 1):
+                for c in range(1, ws.max_column + 1):
+                    ws[f"{get_column_letter(c)}{r}"] = ""
+        if ord(col_letter.upper()) - ord('A') + 1 > ws.max_column:
+            for c in range(ws.max_column + 1, ord(col_letter.upper()) - ord('A') + 2):
+                for r in range(1, ws.max_row + 1):
                     ws[f"{get_column_letter(c)}{r}"] = ""
 
         logger.debug(f"🖌️ Applying yellow fill to cell {cell_reference}")
-        await asyncio.to_thread(
-            setattr,
-            ws[cell_reference],
-            'fill',
-            PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-        )
+        ws[cell_reference].fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
         logger.debug(f"💾 Saving workbook to {excel_file}")
         await asyncio.to_thread(wb.save, excel_file)
