@@ -12,7 +12,7 @@ import mimetypes
 from logging_config import setup_job_logger
 import aioodbc 
 # Import database configuration
-from config import VERSION
+from config import VERSION,S3_CONFIG
 from database_config import async_engine, engine
 # Initialize default logger
 default_logger = logging.getLogger(__name__)
