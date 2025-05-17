@@ -10,7 +10,7 @@ import os
 import urllib.parse
 import mimetypes
 from logging_config import setup_job_logger
-from config import S3_CONFIG
+from config import S3_CONFIG,conn_str,async_engine,engine
 # Import database configuration
 from config import VERSION
 # Initialize default logger
