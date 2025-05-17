@@ -1,33 +1,44 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
-from pydantic import BaseModel, Field
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import asyncio
 import os
-import json
-import traceback
-import psutil
-import pyodbc
-import datetime
-import hashlib
+import pandas as pd
 import time
-from typing import Optional, List, Dict, Any, Callable
-from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space, upload_file_to_space_sync
-from email_utils import send_message_email
-from vision_utils import fetch_missing_images  # New module
-from workflow import generate_download_file, process_restart_batch, batch_vision_reason
+import pyodbc
+import httpx
+import json
+import aiofiles
+import datetime
+from typing import Optional, Dict, List, Tuple
+from search_utils import update_search_sort_order, insert_search_results
 from db_utils import (
-    update_log_url_in_db,
     get_send_to_email,
-    fetch_last_valid_entry,
-    update_initial_sort_order,
-    update_sort_order,
-    update_sort_no_image_entry,
-    update_sort_order_per_entry,
     get_images_excel_db,
-    update_file_generate_complete,
     update_file_location_complete,
+    update_file_generate_complete,
+    export_dai_json,
+    update_log_url_in_db,
+    fetch_last_valid_entry,
 )
+from vision_utils import fetch_missing_images  # New module
+from endpoint_utils import sync_get_endpoint
+from image_utils import download_all_images
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from common import fetch_brand_rules
+from utils import (
+    create_temp_dirs,
+    cleanup_temp_dirs,
+    process_and_tag_results,
+    generate_search_variations,
+    process_search_row_gcloud
+)
+from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space
+import psutil
+from email_utils import send_message_email
+from image_reason import process_entry
+from tenacity import retry, stop_after_attempt, wait_exponential
 from database_config import conn_str  # Import conn_str from database_config
 from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
