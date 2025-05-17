@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
@@ -170,15 +170,17 @@ async def write_excel_image(
 
         for item in image_data:
             row_id = item['ExcelRowID']
-            if not isinstance(row_id, int):
-                logger.error(f"Invalid row_id type for {row_id}: expected int, got {type(row_id)}")
+            try:
+                row_id_int = int(row_id)  # Convert to integer
+            except (ValueError, TypeError) as e:
+                logger.error(f"Invalid row_id type for {row_id}: expected int, got {type(row_id)}, error: {e}")
                 failed_rows.append(row_id)
                 continue
-            row_number = row_id + row_offset
-            logger.debug(f"Processing row_id={row_id}, row_number={row_number}")
+            row_number = row_id_int + row_offset
+            logger.debug(f"Processing row_id={row_id_int}, row_number={row_number}")
 
-            if row_id in image_map:
-                image_file = image_map[row_id]
+            if row_id_int in image_map:
+                image_file = image_map[row_id_int]
                 image_path = os.path.join(temp_dir, image_file)
                 if await verify_png_image_single(image_path, logger=logger):
                     img = await asyncio.to_thread(Image, image_path)
@@ -187,11 +189,11 @@ async def write_excel_image(
                     await asyncio.to_thread(ws.add_image, img)
                     logger.info(f"✅ Image added at {anchor}")
                 else:
-                    failed_rows.append(row_id)
+                    failed_rows.append(row_id_int)
                     logger.warning(f"⚠️ Image verification failed for {image_file}")
             else:
-                logger.warning(f"⚠️ No image found for row {row_id}")
-                failed_rows.append(row_id)
+                logger.warning(f"⚠️ No image found for row {row_id_int}")
+                failed_rows.append(row_id_int)
 
             ws[f"B{row_number}"] = item.get('Brand', '')
             ws[f"D{row_number}"] = item.get('Style', '')
@@ -205,7 +207,7 @@ async def write_excel_image(
             if not ws[f"D{row_number}"].value:
                 logger.warning(f"⚠️ Missing Style in D{row_number}")
 
-        max_data_row = max(item['ExcelRowID'] for item in image_data) + row_offset
+        max_data_row = max(int(item['ExcelRowID']) for item in image_data) + row_offset
         if ws.max_row > max_data_row:
             logger.info(f"🗑️ Removing rows {max_data_row + 1} to {ws.max_row}")
             await asyncio.to_thread(ws.delete_rows, max_data_row + 1, ws.max_row - max_data_row)
@@ -232,9 +234,29 @@ async def highlight_cell(
         wb = await asyncio.to_thread(load_workbook, excel_file)
         ws = wb.active
 
+        # Ensure worksheet has sufficient dimensions
+        if ws.max_row < 1 or ws.max_column < 1:
+            logger.warning(f"Worksheet is empty, initializing with at least one cell")
+            ws['A1'] = ""  # Initialize cell A1
+
+        # Validate cell reference
+        try:
+            col_letter = ''.join(c for c in cell_reference if c.isalpha())
+            row_num = int(''.join(c for c in cell_reference if c.isdigit()))
+            if not col_letter or row_num < 1:
+                raise ValueError(f"Invalid cell reference format: {cell_reference}")
+        except ValueError:
+            logger.error(f"❌ Invalid cell reference format: {cell_reference}")
+            raise ValueError(f"Invalid cell reference format: {cell_reference}")
+
+        # Check if cell exists
         if cell_reference not in ws:
-            logger.error(f"❌ Invalid cell reference: {cell_reference} not in worksheet")
-            raise ValueError(f"Invalid cell reference: {cell_reference}")
+            logger.warning(f"Cell {cell_reference} not in worksheet, extending dimensions")
+            max_row = max(ws.max_row, row_num)
+            max_col = max(ws.max_column, ord(col_letter.upper()) - ord('A') + 1)
+            for r in range(ws.max_row + 1, max_row + 1):
+                for c in range(1, max_col + 1):
+                    ws[f"{get_column_letter(c)}{r}"] = ""  # Initialize cells
 
         logger.debug(f"🖌️ Applying yellow fill to cell {cell_reference}")
         await asyncio.to_thread(
@@ -269,7 +291,6 @@ async def write_failed_downloads_to_excel(
     excel_file: str,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    """Write failed downloads to an Excel file and highlight them asynchronously."""
     logger = logger or default_logger
     if failed_downloads:
         try:
@@ -277,11 +298,12 @@ async def write_failed_downloads_to_excel(
             wb = await asyncio.to_thread(load_workbook, excel_file)
             ws = wb.active
 
+            # Ensure worksheet has sufficient rows
             max_row = ws.max_row
             max_failed_row = 0
             for _, row_id in failed_downloads:
                 try:
-                    row_id_int = int(row_id)  # Ensure row_id is an integer
+                    row_id_int = int(row_id)
                     if row_id_int > max_failed_row:
                         max_failed_row = row_id_int
                 except (ValueError, TypeError) as e:
