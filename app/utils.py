@@ -5,7 +5,6 @@ import pandas as pd
 import time
 import pyodbc
 from typing import List, Dict, Optional, Tuple, Any
-from config import conn_str
 from common import (
     clean_string,
     generate_aliases,

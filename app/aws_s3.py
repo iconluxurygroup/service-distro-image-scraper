@@ -12,7 +12,8 @@ import mimetypes
 from logging_config import setup_job_logger
 from config import S3_CONFIG
 # Import database configuration
-from config import VERSION,conn_str, async_engine, engine
+from config import VERSION
+from database_config import async_engine, engine
 # Initialize default logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:

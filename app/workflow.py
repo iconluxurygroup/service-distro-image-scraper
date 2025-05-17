@@ -11,7 +11,6 @@ import json
 import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
-from config import conn_str
 from db_utils import (
     sync_get_endpoint,
     insert_search_results,
@@ -423,57 +422,7 @@ except Exception as e:
     finally:
         # Clean up connection pool
         if 'async_engine' in globals():
-            await async_engine.dispose()
 
-import pandas as pd
-import logging
-import os
-import asyncio
-import httpx
-import aiofiles
-import datetime
-from typing import Optional, Dict, List
-from database import get_images_excel_db
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from image_utils import download_all_images
-from common import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-from email_utils import send_email
-from config import conn_str
-import pyodbc
-import pandas as pd
-import logging
-import os
-import asyncio
-import httpx
-import aiofiles
-import datetime
-from typing import Optional, Dict, List
-from database import get_images_excel_db
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from image_utils import download_all_images
-from common import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-from email_utils import send_email
-from config import conn_str
-import pyodbc
-
-import pandas as pd
-import logging
-import os
-import asyncio
-import httpx
-import aiofiles
-import datetime
-from typing import Optional, Dict, List
-from database import get_images_excel_db, get_send_to_email, update_file_location_complete, update_file_generate_complete
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from image_utils import download_all_images
-from common import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
-from email_utils import send_message_email
-from config import conn_str
-import pyodbc
 
 
 async def generate_download_file(

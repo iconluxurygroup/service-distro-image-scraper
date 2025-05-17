@@ -28,7 +28,7 @@ from database import (
     update_file_generate_complete,
     update_file_location_complete,
 )
-from config import VERSION, conn_str
+from config import VERSION
 
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)

@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from config import conn_str, engine, async_engine
+
 from aws_s3 import upload_file_to_space
 from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
 
@@ -301,24 +301,6 @@ async def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] 
     except Exception as e:
         logger.error(f"Error fetching last valid EntryID for FileID {file_id}: {e}", exc_info=True)
         return None
-import logging
-import pandas as pd
-import json
-import os
-import aiofiles
-import asyncio
-from typing import Optional, List, Dict, Any
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
-from config import conn_str, engine, async_engine
-from aws_s3 import upload_file_to_space
-from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
-
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # Other functions (unchanged) are omitted for brevity
 def sync_update_search_sort_order(
@@ -708,24 +690,6 @@ async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None
     except pyodbc.Error as e:
         logger.error(f"Error marking endpoint as blocked: {e}")
 
-
-import pandas as pd
-import logging
-from typing import Optional, List, Dict, Any
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
-from config import async_engine
-
-
-
-import pandas as pd
-import logging
-from typing import Optional, List, Dict
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError, DBAPIError
-from sqlalchemy.ext.asyncio import AsyncSession
-from config import async_engine
 from common import clean_string, validate_model, validate_brand, generate_aliases, calculate_priority
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -1768,16 +1732,7 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
     except Exception as e:
             logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
             return None
-import pandas as pd
-import pyodbc
-import logging
-from typing import Optional
-from config import conn_str
-import pandas as pd
-import pyodbc
-import logging
-from typing import Optional
-from config import conn_str
+
 
 def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or logging.getLogger(__name__)
