@@ -442,7 +442,6 @@ async def process_restart_batch(
         engine.dispose()
         logger.info(f"Disposed database engines")
 
-
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
@@ -674,7 +673,7 @@ async def generate_download_file(
         if not os.path.exists(local_filename):
             logger.error(f"Excel file not found at {local_filename}")
             return {"error": f"Excel file not found", "log_filename": log_filename}
-        logger.debug(f"Excel file exists Hodges {local_filename}, size: {os.path.getsize(local_filename)} bytes")
+        logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
         logger.debug(f"Temp excel dir contents: {os.listdir(temp_excel_dir)}")
 
         mem_info = process.memory_info()
