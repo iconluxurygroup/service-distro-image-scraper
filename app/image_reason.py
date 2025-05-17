@@ -11,6 +11,7 @@ import aiohttp
 from PIL import Image
 from io import BytesIO
 from typing import Optional, List, Tuple, Dict, Set
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from image_vision import detect_objects_with_computer_vision_async, analyze_image_with_gemini_async
 from db_utils import (
     fetch_missing_images, set_sort_order_negative_four_for_zero_match,
@@ -65,7 +66,6 @@ async def initialize_configs():
 # Run initialization
 asyncio.run(initialize_configs())
 
-# ... (rest of image_reason.py remains unchanged)
 async def get_image_data_async(
     image_urls: List[str],
     session: aiohttp.ClientSession,
@@ -73,6 +73,9 @@ async def get_image_data_async(
     retries: int = 3
 ) -> Tuple[Optional[bytes], Optional[str]]:
     logger = logger or default_logger
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
     for url in image_urls:
         if not url or not isinstance(url, str) or url.strip() == "":
             logger.warning(f"Invalid URL: {url}")
@@ -81,25 +84,102 @@ async def get_image_data_async(
             logger.warning(f"Skipping invalid URL: {url}")
             continue
         decoded_url = urllib.parse.unquote(url.replace("\\u003d", "=").replace("\\u0026", "&"))
-        for attempt in range(1, retries + 1):
-            try:
-                async with session.head(decoded_url, timeout=aiohttp.ClientTimeout(total=5)) as head_response:
-                    if head_response.status in [403, 404]:
-                        logger.error(f"URL {decoded_url} returned {head_response.status}. Skipping after attempt {attempt}.")
-                        break
-                async with session.get(decoded_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                    response.raise_for_status()
-                    image_data = await response.read()
-                    logger.info(f"Downloaded image from {decoded_url} on attempt {attempt}")
-                    return image_data, decoded_url
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.error(f"Attempt {attempt} failed for {decoded_url}: {e}")
-                if attempt < retries:
-                    await asyncio.sleep(2)
-        else:
-            logger.warning(f"All {retries} attempts failed for {decoded_url}")
+        max_retries = 5 if "google" in decoded_url.lower() else retries
+
+        @retry(
+            stop=stop_after_attempt(max_retries),
+            wait=wait_fixed(2),
+            retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+            before_sleep=lambda retry_state: logger.info(f"Retrying {decoded_url} (attempt {retry_state.attempt_number}/{max_retries})")
+        )
+        async def try_download():
+            async with session.get(decoded_url, timeout=aiohttp.ClientTimeout(total=15), headers=headers) as response:
+                response.raise_for_status()
+                content = await response.read()
+                try:
+                    Image.open(BytesIO(content)).convert("RGB")
+                    return content
+                except Exception as e:
+                    logger.error(f"Invalid image content from {decoded_url}: {e}")
+                    raise ValueError("Invalid image content")
+
+        try:
+            image_data = await try_download()
+            logger.info(f"Downloaded image from {decoded_url}")
+            return image_data, decoded_url
+        except Exception as e:
+            logger.error(f"All retries failed for {decoded_url}: {e}")
+            continue
     logger.warning(f"All URLs failed: {image_urls}")
     return None, None
+
+async def generate_thumbnail(
+    image_data: Optional[bytes],
+    logger: logging.Logger = None,
+    size: Tuple[int, int] = (100, 100)
+) -> str:
+    logger = logger or default_logger
+    try:
+        if image_data:
+            image = Image.open(BytesIO(image_data)).convert("RGB")
+        else:
+            logger.warning("No image data provided; using fallback thumbnail")
+            image = Image.new("RGB", size, color=(128, 128, 128))
+        image.thumbnail(size, Image.Resampling.LANCZOS)
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        thumbnail_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        logger.info("Thumbnail generated successfully")
+        return thumbnail_base64
+    except Exception as e:
+        logger.error(f"Thumbnail generation failed: {e}")
+        image = Image.new("RGB", size, color=(128, 128, 128))
+        image.thumbnail(size, Image.Resampling.LANCZOS)
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        thumbnail_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        logger.info("Generated fallback thumbnail")
+        return thumbnail_base64
+
+async def fetch_stored_thumbnail(
+    result_id: int,
+    session: aiohttp.ClientSession,
+    logger: logging.Logger = None
+) -> Optional[str]:
+    logger = logger or default_logger
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT ImageUrlThumbnail, ThumbnailBase64 FROM utb_ImageScraperResult WHERE ResultID = ?",
+                (result_id,)
+            )
+            result = cursor.fetchone()
+            if not result:
+                logger.warning(f"No thumbnail found in database for ResultID {result_id}")
+                return None
+
+            thumbnail_url, thumbnail_base64 = result
+            if thumbnail_base64:
+                try:
+                    base64.b64decode(thumbnail_base64)
+                    logger.info(f"Using stored ThumbnailBase64 for ResultID {result_id}")
+                    return thumbnail_base64
+                except Exception as e:
+                    logger.warning(f"Invalid ThumbnailBase64 for ResultID {result_id}: {e}")
+
+            if thumbnail_url:
+                image_data, _ = await get_image_data_async([thumbnail_url], session, logger, retries=3)
+                if image_data:
+                    thumbnail_base64 = await generate_thumbnail(image_data, logger)
+                    logger.info(f"Generated thumbnail from stored ImageUrlThumbnail for ResultID {result_id}")
+                    return thumbnail_base64
+                logger.warning(f"Failed to download stored ImageUrlThumbnail {thumbnail_url} for ResultID {result_id}")
+
+            return None
+    except pyodbc.Error as e:
+        logger.error(f"Database error fetching thumbnail for ResultID {result_id}: {e}")
+        return None
 
 def is_related_to_category(detected_label: str, expected_category: str) -> bool:
     logger = default_logger
@@ -138,14 +218,16 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
             return True
 
     return False
-async def process_image(row, session: aiohttp.ClientSession, logger: logging.Logger) -> Tuple[int, str, Optional[str], int]:
-    """Process a single image row with Gemini API, ensuring valid JSON output."""
+
+async def process_image(row, session: aiohttp.ClientSession, logger: logging.Logger) -> Tuple[int, str, Optional[str], int, Optional[str]]:
+    """Process a single image row with Gemini API, ensuring valid JSON output and thumbnail."""
     result_id = row.get("ResultID")
     default_result = (
         result_id or 0,
         json.dumps({"error": "Unknown processing error", "result_id": result_id or 0, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
         "Processing failed",
-        1
+        1,
+        None
     )
 
     try:
@@ -162,64 +244,43 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             "color": str(row.get("ProductColor") or "None")
         }
 
-        async def get_image_data_async(image_urls: List[str], session: aiohttp.ClientSession) -> Tuple[Optional[bytes], Optional[str]]:
-            for url in image_urls:
-                if not url or not isinstance(url, str) or url.strip() == "":
-                    logger.warning(f"Invalid URL: {url}")
-                    continue
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                        response.raise_for_status()
-                        image_data = await response.read()
-                        logger.info(f"Downloaded image from {url}")
-                        return image_data, url
-                except Exception as e:
-                    logger.warning(f"Failed to download {url}: {e}")
-            return None, None
+        # Fetch stored thumbnail from database
+        thumbnail_base64 = await fetch_stored_thumbnail(result_id, session, logger)
 
-        image_data, downloaded_url = await get_image_data_async(image_urls, session)
+        image_data, downloaded_url = await get_image_data_async(image_urls, session, logger)
+        if not thumbnail_base64:
+            thumbnail_base64 = await generate_thumbnail(image_data, logger)
+            logger.info(f"Generated new thumbnail for ResultID {result_id}")
+
         if not image_data:
             logger.warning(f"Image download failed for ResultID {result_id}")
-            return (
-                result_id,
-                json.dumps({"error": f"Image download failed for URLs: {image_urls}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
-                "Image download failed",
-                1
-            )
+            ai_json = json.dumps({
+                "error": f"Image download failed for URLs: {image_urls}",
+                "result_id": result_id,
+                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "thumbnail": thumbnail_base64
+            })
+            return result_id, ai_json, "Image download failed", 1, thumbnail_base64
 
         base64_image = base64.b64encode(image_data).decode("utf-8")
-        from PIL import Image
-        from io import BytesIO
         Image.open(BytesIO(image_data)).convert("RGB")
 
         cv_success, cv_description, person_confidences = await detect_objects_with_computer_vision_async(base64_image, logger)
         if not cv_success or not cv_description:
             logger.warning(f"Computer vision detection failed for ResultID {result_id}: {cv_description}")
-            return (
-                result_id,
-                json.dumps({"error": cv_description or "CV detection failed", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
-                "CV detection failed",
-                1
-            )
-
-        # Check for non-fashion or multiple objects
-        def extract_labels(description):
-            cls_label = None
-            seg_label = None
-            if description.startswith("Classification:"):
-                cls_match = re.search(r"Classification: (\w+(?:\s+\w+)*) \(confidence:", description)
-                cls_label = cls_match.group(1) if cls_match else None
-            if "Segmented objects:" in description:
-                seg_match = re.search(r"(\w+(?:\s+\w+)*) \(confidence: [\d.]+, mask area:", description)
-                seg_label = seg_match.group(1) if seg_match else None
-            return cls_label, seg_label
+            ai_json = json.dumps({
+                "error": cv_description or "CV detection failed",
+                "result_id": result_id,
+                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "thumbnail": thumbnail_base64
+            })
+            return result_id, ai_json, "CV detection failed", 1, thumbnail_base64
 
         cls_label, seg_label = extract_labels(cv_description)
         detected_objects = cv_description.split("\n")[2:] if "Segmented objects:" in cv_description else []
-        fashion_labels = ["t-shirt", "shirt", "trouser", "dress", "coat", "jacket", "sweater", "sandal", "sneaker", "shoe", "bag", "hat", "scarf", "glove", "belt", "skirt", "short", "suit", "boot", "running_shoe"]
         labels = [label for label in [cls_label, seg_label] if label]
-        is_fashion = any(label.lower() in [fl.lower() for fl in fashion_labels] for label in labels if label)
-        non_fashion_labels = [label for label in labels if label and label.lower() not in [fl.lower() for fl in fashion_labels]]
+        is_fashion = any(label.lower() in [fl.lower() for fl in fashion_labels_example] for label in labels if label)
+        non_fashion_labels = [label for label in labels if label and label.lower() not in [fl.lower() for fl in fashion_labels_example]]
 
         person_detected = any(conf > 0.5 for conf in person_confidences)
         cls_conf = float(re.search(r"Classification: \w+(?:\s+\w+)* \(confidence: ([\d.]+)\)", cv_description).group(1)) if cls_label else 0.0
@@ -234,9 +295,10 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
                 "reasoning": f"Multiple non-fashion objects detected: {non_fashion_labels}.",
                 "cv_detection": cv_description,
                 "person_confidences": person_confidences,
-                "result_id": result_id
+                "result_id": result_id,
+                "thumbnail": thumbnail_base64
             })
-            return result_id, ai_json, "Non-fashion objects detected", 0
+            return result_id, ai_json, "Non-fashion objects detected", 0, thumbnail_base64
 
         if not person_detected and not is_fashion and max(cls_conf, seg_conf) < 0.2:
             logger.info(f"No fashion items or persons for ResultID {result_id}")
@@ -247,9 +309,10 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
                 "reasoning": "No person detected and low confidence in fashion detection.",
                 "cv_detection": cv_description,
                 "person_confidences": person_confidences,
-                "result_id": result_id
+                "result_id": result_id,
+                "thumbnail": thumbnail_base64
             })
-            return result_id, ai_json, "No fashion items detected", 0
+            return result_id, ai_json, "No fashion items detected", 0, thumbnail_base64
 
         gemini_result = await analyze_image_with_gemini_async(base64_image, product_details, logger=logger, cv_description=cv_description)
         logger.debug(f"Gemini raw response for ResultID {result_id}: {json.dumps(gemini_result, indent=2)}")
@@ -259,9 +322,10 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             ai_json = json.dumps({
                 "error": gemini_result.get('features', {}).get('reasoning', 'Gemini analysis failed'),
                 "result_id": result_id,
-                "scores": {"sentiment": 0.0, "relevance": 0.0}
+                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "thumbnail": thumbnail_base64
             })
-            return result_id, ai_json, "Gemini analysis failed", 1
+            return result_id, ai_json, "Gemini analysis failed", 1, thumbnail_base64
 
         features = gemini_result.get("features", {
             "description": cv_description,
@@ -291,52 +355,53 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             "reasoning": reasoning,
             "cv_detection": cv_description,
             "person_confidences": person_confidences,
-            "result_id": result_id
+            "result_id": result_id,
+            "thumbnail": thumbnail_base64
         })
-        # Validate JSON before returning
         try:
             json.loads(ai_json)
         except json.JSONDecodeError as e:
             logger.error(f"Malformed JSON for ResultID {result_id}: {e}, AiJson: {ai_json}")
-            return (
-                result_id,
-                json.dumps({"error": f"Malformed JSON: {e}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
-                "JSON generation failed",
-                1
-            )
+            ai_json = json.dumps({
+                "error": f"Malformed JSON: {e}",
+                "result_id": result_id,
+                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "thumbnail": thumbnail_base64
+            })
+            return result_id, ai_json, "JSON generation failed", 1, thumbnail_base64
 
         ai_caption = description if description.strip() else f"{product_details['brand']} {product_details['category']} item"
         is_fashion = extracted_features.get("category", "unknown").lower() != "unknown"
 
         logger.info(f"Processed ResultID {result_id} successfully")
-        return result_id, ai_json, ai_caption, 1 if is_fashion else 0
+        return result_id, ai_json, ai_caption, 1 if is_fashion else 0, thumbnail_base64
 
     except Exception as e:
         logger.error(f"Unexpected error in process_image for ResultID {result_id}: {e}", exc_info=True)
-        return (
-            result_id or 0,
-            json.dumps({"error": f"Processing error: {e}", "result_id": result_id or 0, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
-            "Processing failed",
-            1
-        )
+        thumbnail_base64 = thumbnail_base64 or await generate_thumbnail(None, logger)
+        ai_json = json.dumps({
+            "error": f"Processing error: {e}",
+            "result_id": result_id or 0,
+            "scores": {"sentiment": 0.0, "relevance": 0.0},
+            "thumbnail": thumbnail_base64
+        })
+        return result_id or 0, ai_json, "Processing failed", 1, thumbnail_base64
 
 async def process_entry(
     file_id: int,
     entry_id: int,
     entry_df: pd.DataFrame,
     logger: logging.Logger
-) -> List[Tuple[str, bool, str, int]]:
+) -> List[Tuple[str, bool, str, int, Optional[str]]]:
     """Process image entries for an EntryID, ensuring valid updates."""
     logger.info(f"Starting task for EntryID: {entry_id} with {len(entry_df)} rows for FileID: {file_id}")
     updates = []
 
     try:
-        # Validate entry_df
         if not all(col in entry_df.columns for col in ['ResultID', 'ImageUrl']):
             logger.error(f"Missing required columns in entry_df for EntryID {entry_id}: {entry_df.columns}")
             return []
 
-        # Fetch product attributes
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -352,7 +417,6 @@ async def process_entry(
             else:
                 logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
-        # Process images
         async with aiohttp.ClientSession() as session:
             tasks = [process_image(row, session, logger) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -360,11 +424,11 @@ async def process_entry(
                 if isinstance(result, Exception):
                     logger.error(f"Error in process_image: {result}")
                     continue
-                if not result or not isinstance(result, tuple) or len(result) != 4:
+                if not result or not isinstance(result, tuple) or len(result) != 5:
                     logger.error(f"Invalid result from process_image: {result}")
                     continue
-                result_id, ai_json, ai_caption, is_fashion = result
-                updates.append((ai_json, is_fashion, ai_caption, result_id))
+                result_id, ai_json, ai_caption, is_fashion, thumbnail_base64 = result
+                updates.append((ai_json, is_fashion, ai_caption, result_id, thumbnail_base64))
 
         logger.info(f"Completed task for EntryID: {entry_id} with {len(updates)} updates")
         return updates
@@ -372,3 +436,14 @@ async def process_entry(
     except Exception as e:
         logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
         return []
+
+def extract_labels(description):
+    cls_label = None
+    seg_label = None
+    if description.startswith("Classification:"):
+        cls_match = re.search(r"Classification: (\w+(?:\s+\w+)*) \(confidence:", description)
+        cls_label = cls_match.group(1) if cls_match else None
+    if "Segmented objects:" in description:
+        seg_match = re.search(r"(\w+(?:\s+\w+)*) \(confidence: [\d.]+, mask area:", description)
+        seg_label = seg_match.group(1) if seg_match else None
+    return cls_label, seg_label
