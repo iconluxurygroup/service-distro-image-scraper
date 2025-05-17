@@ -268,23 +268,20 @@ def validate_model(row, expected_models, result_id, logger=None) -> bool:
     logger.warning(f"ResultID {result_id}: Model match failed: Input model='{input_model}', Expected models={expected_models}")
     return False
 
-import re
-from typing import Dict, List
-
-def clean_string(s: str) -> str:
-    # Assuming clean_string removes unwanted characters and normalizes the string
-    return s.strip() if s else ""
 
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
+    # Convert brand to lowercase immediately after cleaning
     brand_clean = clean_string(brand).lower()
     if not brand_clean:
         return []
 
     aliases = [brand_clean]
+    # Process predefined aliases, ensuring all are lowercase
     for key, alias_list in predefined_aliases.items():
         if clean_string(key).lower() == brand_clean:
             aliases.extend(clean_string(alias).lower() for alias in alias_list)
 
+    # Normalize base_brand for variations
     base_brand = brand_clean.replace('&', 'and').replace('  ', ' ')
     variations = [
         base_brand.replace(' ', ''),
@@ -292,6 +289,7 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
         re.sub(r'[^a-z0-9]', '', base_brand),
     ]
 
+    # Generate abbreviations and word-based variations
     words = base_brand.split()
     if len(words) > 1:
         abbreviation = ''.join(word[0] for word in words if word)
@@ -301,19 +299,16 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
         variations.append(words[-1])
 
     aliases.extend(variations)
-    # Filter aliases and remove case-insensitive duplicates
+    # Filter and deduplicate aliases, ensuring lowercase output
     seen = set()
     filtered_aliases = []
     for alias in aliases:
-        if len(alias) >= 4 and alias.lower() not in ["sas", "soda"]:
-            # Use lowercase for duplicate check
-            alias_lower = alias.lower()
-            if alias_lower not in seen:
-                seen.add(alias_lower)
-                filtered_aliases.append(alias_lower)  # Ensure output is lowercase
+        alias_lower = alias.lower()  # Ensure lowercase for comparison
+        if len(alias_lower) >= 4 and alias_lower not in ["sas", "soda"] and alias_lower not in seen:
+            seen.add(alias_lower)
+            filtered_aliases.append(alias_lower)  # Append only lowercase version
 
     return filtered_aliases
-    
 def validate_brand(
     row: pd.Series,
     brand_aliases: List[str],
