@@ -1589,6 +1589,13 @@ import pyodbc
 from typing import Optional
 from config import conn_str
 
+import logging
+import pandas as pd
+import aioodbc
+import pyodbc
+from typing import Optional
+from config import conn_str
+
 async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or logging.getLogger(__name__)
     try:
@@ -1607,7 +1614,7 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                     FROM utb_ImageScraperFiles f
                     INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
                     LEFT JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
-                        AND r.SortOrder = (SELECT MAX(SortOrder) FROM utb_ImageScraperResult r2 WHERE r2.EntryID = r.EntryID AND r2.SortOrder >= 0)
+                        AND r.SortOrder >= 0
                     WHERE f.ID = ?
                     ORDER BY s.ExcelRowID
                 """
@@ -1654,6 +1661,7 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
     except ValueError as e:
         logger.error(f"ValueError in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
         return pd.DataFrame(columns=["ExcelRowID", "ImageUrl", "ImageUrlThumbnail", "Brand", "Style", "Color", "Category"])
+
 async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     try:
