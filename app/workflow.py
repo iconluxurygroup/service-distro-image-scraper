@@ -127,35 +127,31 @@ def process_entry_search(args):
         logger.removeHandler(handler)
         handler.close()
 
+from sqlalchemy.sql import text
 def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
-    """Insert search results into database with transaction isolation."""
-    process = psutil.Process()
     try:
-        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
-            cursor = conn.cursor()
-            query = """
-                INSERT INTO utb_ImageScraperResult (
-                    EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
-                ) VALUES (?, ?, ?, ?, ?)
-            """
+        with engine.connect() as conn:
             for _, row in df.iterrows():
-                cursor.execute(query, (
-                    row['EntryID'],
-                    row['ImageUrl'],
-                    row.get('ImageDesc', ''),
-                    row.get('ImageSource', ''),
-                    row.get('ImageUrlThumbnail', '')
-                ))
+                conn.execute(
+                    text("""
+                        INSERT INTO utb_ImageScraperResult (
+                            EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
+                        ) VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
+                    """),
+                    {
+                        "entry_id": row['EntryID'],
+                        "image_url": row['ImageUrl'],
+                        "image_desc": row.get('ImageDesc', ''),
+                        "image_source": row.get('ImageSource', ''),
+                        "image_url_thumbnail": row.get('ImageUrlThumbnail', '')
+                    }
+                )
             conn.commit()
-            logger.info(f"Worker PID {process.pid}: Inserted {len(df)} rows into utb_ImageScraperResult")
-            cursor.close()
+            logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult")
             return True
-    except pyodbc.Error as e:
-        logger.error(f"Worker PID {process.pid}: Failed to insert search results: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Failed to insert search results: {e}", exc_info=True)
         return False
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
 
 async def process_restart_batch(
     file_id_db: int,
