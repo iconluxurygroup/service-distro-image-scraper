@@ -380,6 +380,17 @@ async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only
     except Exception as e:
         logger.error(f"Unexpected error fetching missing images for FileID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
+import logging
+import pandas as pd
+import aioodbc
+from typing import Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str
+
+def validate_thumbnail_url(url: Optional[str]) -> bool:
+    if not url or url == '' or 'placeholder' in str(url).lower():
+        return False
+    return str(url).startswith(('http://', 'https://'))
 
 @retry(
     stop=stop_after_attempt(3),
@@ -391,10 +402,6 @@ async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only
     )
 )
 async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logger] = None, file_id: Optional[str] = None) -> bool:
-    """
-    Insert DataFrame rows into utb_ImageScraperResult table.
-    Returns True on success, False on failure.
-    """
     logger = logger or logging.getLogger(__name__)
     try:
         if df.empty:
@@ -406,6 +413,14 @@ async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logge
             missing_cols = set(required_columns) - set(df.columns)
             logger.error(f"Missing required columns: {missing_cols}")
             return False
+
+        # Filter rows with invalid thumbnail URLs or placeholders
+        original_len = len(df)
+        df = df[df['ImageUrlThumbnail'].apply(validate_thumbnail_url) & ~df['ImageUrl'].str.contains('placeholder://', na=False)]
+        if df.empty:
+            logger.warning(f"No rows with valid thumbnail URLs after filtering {original_len} rows")
+            return False
+        logger.debug(f"Filtered to {len(df)} rows with valid thumbnail URLs from {original_len}")
 
         async with aioodbc.connect(dsn=conn_str) as conn:
             async with conn.cursor() as cursor:
@@ -425,7 +440,7 @@ async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logge
                         )
                     )
                 await conn.commit()
-                logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult")
+                logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult for FileID {file_id}")
                 return True
 
     except pyodbc.Error as e:
