@@ -818,7 +818,15 @@ async def update_search_sort_order(
 
             df['new_sort_order'] = -2
             logger.debug(f"Assigned default new_sort_order: {df[['ResultID', 'new_sort_order']].to_dict(orient='records')}")
-
+            if brand_rules is None:
+                brand_rules = await fetch_brand_rules(logger=logger)
+            
+            domain_hierarchy = []
+            brand_clean = clean_string(brand).lower() if brand else ''
+            for rule in brand_rules.get("brand_rules", []):
+                if any(clean_string(name).lower() == brand_clean for name in rule.get("names", [])):
+                    domain_hierarchy.extend(rule.get("domain_hierarchy", []))
+            break
             match_rows = df[df['priority'].isin([1, 2, 3])]
             if not match_rows.empty:
                 match_df = match_rows.sort_values(['priority', 'match_score'], ascending=[True, False])
@@ -1008,15 +1016,13 @@ def sync_update_search_sort_order(
 
             # Extract brand aliases from brand_rules
             brand_aliases = []
-            if brand_rules is None:
-                brand_rules = await fetch_brand_rules(logger=logger)
-            
-            domain_hierarchy = []
-            brand_clean = clean_string(brand).lower() if brand else ''
-            for rule in brand_rules.get("brand_rules", []):
-                if any(clean_string(name).lower() == brand_clean for name in rule.get("names", [])):
-                    domain_hierarchy.extend(rule.get("domain_hierarchy", []))
-                    break
+            if brand_rules and "brand_rules" in brand_rules:
+                for rule in brand_rules["brand_rules"]:
+                    if "names" in rule:
+                        brand_clean = clean_string(brand).lower() if brand else ''
+                        if any(clean_string(name).lower() == brand_clean for name in rule["names"]):
+                            brand_aliases = [clean_string(name).lower() for name in rule["names"]]
+                            break
             if not brand_aliases:
                 # Fallback to default aliases
                 brand_aliases_dict = {
