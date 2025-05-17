@@ -54,11 +54,32 @@ def sync_get_endpoint(logger: Optional[logging.Logger] = None) -> Optional[str]:
     except pyodbc.Error as e:
         logger.error(f"Database error getting endpoint: {e}")
         return None
+import logging
+import pandas as pd
+import re
+import aioodbc
+import asyncio
+import aiofiles
+from typing import Optional, List, Dict, Any
+from sqlalchemy.exc import SQLAlchemyError, DBAPIError
+from sqlalchemy.sql import text
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str, async_engine, engine
+from common import clean_string, validate_model, validate_brand, generate_aliases, calculate_priority, generate_brand_aliases
+from aiobotocore.session import get_session
+from aiobotocore.config import AioConfig
+from config import S3_CONFIG
+import mimetypes
+import os
+import urllib.parse
+
+# Initialize mimetypes for .log files
+mimetypes.add_type('text/plain', '.log')
 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, DBAPIError, pyodbc.Error)),
+    retry=retry_if_exception_type((SQLAlchemyError, DBAPIError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -75,7 +96,7 @@ async def update_search_sort_order(
     brand_rules: Optional[Dict] = None,
     brand_aliases: Optional[List[str]] = None
 ) -> Optional[List[Dict]]:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         entry_id = int(entry_id)
@@ -92,7 +113,7 @@ async def update_search_sort_order(
                         """),
                         {"file_id": file_id, "entry_id": entry_id}
                     )
-                    row = await result.fetchone()
+                    row = result.fetchone()
                     result.close()
                     if row:
                         brand, model, color, category = row
@@ -121,7 +142,7 @@ async def update_search_sort_order(
                     """),
                     {"file_id": file_id, "entry_id": entry_id}
                 )
-                df = pd.DataFrame(await result.fetchall(), columns=result.keys())
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
                 result.close()
                 if df.empty:
                     logger.warning(f"No data found for FileID: {file_id}, EntryID: {entry_id}")
@@ -181,7 +202,7 @@ async def update_search_sort_order(
                         f"({row['ResultID']}, {row['new_sort_order']})"
                         for row in updates
                     )
-                    bulk_update_query = text(f"""
+                    bulk_update_qury = text(f"""
                         UPDATE utb_ImageScraperResult
                         SET SortOrder = v.sort_order
                         FROM (VALUES {values_clause}) AS v(result_id, sort_order)
@@ -209,7 +230,7 @@ async def update_search_sort_order(
                         "ImageSource": r[4],
                         "ImageUrl": r[5]
                     }
-                    for r in await result.fetchall()
+                    for r in result.fetchall()
                 ]
                 result.close()
 
@@ -230,7 +251,7 @@ async def update_search_sort_order(
 
                 return results
 
-    except (SQLAlchemyError, DBAPIError, pyodbc.Error) as e:
+    except (SQLAlchemyError, DBAPIError) as e:
         logger.error(f"Database error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         raise
     except Exception as e:
@@ -244,6 +265,71 @@ async def update_search_sort_order(
             )
             await conn.commit()
             logger.debug(f"Applied fallback: Set NULL SortOrder to -2 for EntryID {entry_id}")
+
+async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    logger = logger or logging.getLogger(__name__)
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting fetch_missing_images for FileID {file_id}, ai_analysis_only={ai_analysis_only}, limit={limit}")
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with async_engine.connect() as conn:
+                    if ai_analysis_only:
+                        query = text("""
+                            SELECT t.ResultID, t.EntryID, t.ImageUrl, t.ImageUrlThumbnail,
+                                   r.ProductBrand, r.ProductCategory, r.ProductColor
+                            FROM utb_ImageScraperResult t
+                            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                            WHERE r.FileID = :file_id
+                            AND (t.AiJson IS NULL OR t.AiJson = '' OR ISJSON(t.AiJson) = 0)
+                            AND t.ImageUrl IS NOT NULL AND t.ImageUrl <> ''
+                            AND t.SortOrder > 0
+                            ORDER BY t.ResultID
+                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
+                        """)
+                        params = {"file_id": file_id, "limit": limit}
+                    else:
+                        query = text("""
+                            SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
+                                   t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
+                            FROM utb_ImageScraperRecords r
+                            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID AND t.SortOrder >= 0
+                            WHERE r.FileID = :file_id AND t.ResultID IS NULL
+                            ORDER BY r.EntryID
+                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
+                        """)
+                        params = {"file_id": file_id, "limit": limit}
+
+                    logger.debug(f"Attempt {attempt + 1}: Executing query: {query} with params: {params}")
+                    result = await conn.execute(query, params)
+                    df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                    result.close()
+
+                    logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
+                    if not df.empty:
+                        logger.debug(f"Sample results: {df.head(2).to_dict()}")
+                    else:
+                        logger.info(f"No missing images found for FileID {file_id}")
+                    return df
+
+            except SQLAlchemyError as e:
+                logger.error(f"Database error on attempt {attempt + 1}/{max_retries} for FileID {file_id}: {e}")
+                if attempt < max_retries - 1:
+                    delay = 5 * (2 ** attempt)
+                    logger.info(f"Retrying after {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Max retries reached for FileID {file_id}")
+                    raise
+
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Unexpected error fetching missing images for FileID {file_id}: {e}", exc_info=True)
+        return pd.DataFrame()
 
 async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
     logger = logger or default_logger
@@ -1169,69 +1255,6 @@ async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logg
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         return False
-
-async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        logger.info(f"Starting fetch_missing_images for FileID {file_id}, ai_analysis_only={ai_analysis_only}, limit={limit}")
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                async with async_engine.connect() as conn:
-                    if ai_analysis_only:
-                        query = text("""
-                            SELECT t.ResultID, t.EntryID, t.ImageUrl, t.ImageUrlThumbnail,
-                                   r.ProductBrand, r.ProductCategory, r.ProductColor
-                            FROM utb_ImageScraperResult t
-                            INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                            WHERE r.FileID = :file_id
-                            AND (t.AiJson IS NULL OR t.AiJson = '' OR ISJSON(t.AiJson) = 0)
-                            AND t.ImageUrl IS NOT NULL AND t.ImageUrl <> ''
-                            AND t.SortOrder > 0
-                            ORDER BY t.ResultID
-                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
-                        """)
-                        params = {"file_id": file_id, "limit": limit}
-                    else:
-                        query = text("""
-                            SELECT r.EntryID, r.FileID, r.ProductBrand, r.ProductCategory, r.ProductColor,
-                                   t.ResultID, t.ImageUrl, t.ImageUrlThumbnail
-                            FROM utb_ImageScraperRecords r
-                            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID AND t.SortOrder >= 0
-                            WHERE r.FileID = :file_id AND t.ResultID IS NULL
-                            ORDER BY r.EntryID
-                            OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY
-                        """)
-                        params = {"file_id": file_id, "limit": limit}
-
-                    logger.debug(f"Attempt {attempt + 1}: Executing query: {query} with params: {params}")
-                    result = await conn.execute(query, params)
-                    df = pd.DataFrame(await result.fetchall(), columns=result.keys())
-                    result.close()
-
-                    logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
-                    if not df.empty:
-                        logger.debug(f"Sample results: {df.head(2).to_dict()}")
-                    return df
-
-            except SQLAlchemyError as e:
-                logger.error(f"Database error on attempt {attempt + 1}/{max_retries} for FileID {file_id}: {e}")
-                if attempt < max_retries - 1:
-                    delay = 5 * (2 ** attempt)
-                    logger.info(f"Retrying after {delay} seconds...")
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(f"Max retries reached for FileID {file_id}")
-                    raise
-
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        return pd.DataFrame()
-    except Exception as e:
-        logger.error(f"Unexpected error fetching missing images for FileID {file_id}: {e}", exc_info=True)
-        return pd.DataFrame()
 
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
     try:

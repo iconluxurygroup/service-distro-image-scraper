@@ -256,8 +256,8 @@ async def process_restart_batch(
             query = """
                 SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory 
                 FROM utb_ImageScraperRecords 
-             WHERE FileID = ? AND (? IS NULL OR EntryID >= ?) 
-        ORDER BY ENTRYID
+                WHERE FileID = ? AND (? IS NULL OR EntryID >= ?) 
+                ORDER BY EntryID
             """
             cursor.execute(query, (file_id_db_int, entry_id, entry_id))
             entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
@@ -361,29 +361,17 @@ async def process_restart_batch(
                 logger.warning(f"Worker PID {process.pid}: Found {null_entries} entries with NULL SortOrder")
             cursor.close()
 
-        log_public_url = ""
-        if os.path.exists(log_filename):
-            log_public_url = await upload_file_to_space(
-                file_src=log_filename,
-                save_as=f"super_scraper/logs/job_{file_id_db}.log",
-                is_public=True,
-                logger=logger,
-                file_id=file_id_db
-            )
-            if log_public_url:
-                await update_log_url_in_db(str(file_id_db), log_public_url, logger)
-            else:
-                logger.error(f"Worker PID {process.pid}: Failed to upload log file")
-
+        # Skip log upload here; let generate_download_file handle it
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
-            subject = f"Processing Completed for FileID: {file_id_db}"
+            has_failure = await detect_job_failure(log_filename, logger)
+            subject = f"Processing {'Failed' if has_failure else 'Completed'} for FileID: {file_id_db}"
             message = (
-                f"Processing for FileID {file_id_db} completed.\n"
+                f"Processing for FileID {file_id_db} {'failed' if has_failure else 'completed'}.\n"
                 f"Successful entries: {successful_entries}/{len(entries)}\n"
                 f"Failed entries: {failed_entries}\n"
                 f"Last EntryID: {last_entry_id_processed}\n"
-                f"Log URL: {log_public_url or 'Not available'}"
+                f"Log file: {log_filename}"
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
@@ -394,7 +382,7 @@ async def process_restart_batch(
             "total_entries": str(len(entries)),
             "failed_entries": str(failed_entries),
             "log_filename": log_filename,
-            "log_public_url": log_public_url,
+            "log_public_url": "",
             "last_entry_id": str(last_entry_id_processed)
         }
 
@@ -894,3 +882,17 @@ def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) ->
     except json.JSONDecodeError as e:
         logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
         return False
+async def detect_job_failure(log_filename: str, logger: logging.Logger) -> bool:
+    try:
+        async with aiofiles.open(log_filename, 'r') as f:
+            content = await f.read()
+            error_keywords = ['ERROR', 'Traceback', 'Exception', 'NameError', 'TypeError']
+            for keyword in error_keywords:
+                if keyword in content:
+                    logger.warning(f"Detected failure in log {log_filename}: {keyword} found")
+                    return True
+        logger.info(f"No failure detected in log {log_filename}")
+        return False
+    except Exception as e:
+        logger.error(f"Error reading log {log_filename}: {e}", exc_info=True)
+        return True
