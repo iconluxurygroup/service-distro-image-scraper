@@ -963,7 +963,7 @@ async def api_generate_download_file(
                         } if is_error else {},
                         "entry_id": 69801,
                         "file_id": file_id,
-                        "result_id": null
+                        "result_id": None
                     },
                     "retry_flag": is_error,
                     "timestamp": "2025-05-17T00:36:00-04:00"
@@ -976,7 +976,7 @@ async def api_generate_download_file(
                     "log_file": log_filename,
                     "database_state": debug_info["database_state"]
                 },
-                "job_result": null
+                "job_result": None
             },
             "timestamp": timestamp
         }
@@ -1001,7 +1001,7 @@ async def api_generate_download_file(
                         },
                         "entry_id": 69801,
                         "file_id": file_id,
-                        "result_id": null
+                        "result_id": None
                     },
                     "retry_flag": true,
                     "timestamp": "2025-05-17T00:36:00-04:00"
@@ -1015,7 +1015,7 @@ async def api_generate_download_file(
                     "database_state": debug_info["database_state"],
                     "error_traceback": debug_info["error_traceback"]
                 },
-                "job_result": null
+                "job_result": None
             },
             "timestamp": timestamp
         }
