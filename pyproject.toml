@@ -17,6 +17,7 @@ dependencies = [
     "numpy==2.1.1",
     "torchvision==0.21.0", 
     "requests==2.32.3",    
+    "aioodbc==0.5.0",
     "httpx==0.28.1",
     "Unidecode==1.4.0",
     "fuzzywuzzy==0.18.0",

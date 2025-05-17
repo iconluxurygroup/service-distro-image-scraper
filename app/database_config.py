@@ -4,6 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 import logging
 import os
+import aioodbc
 from config import DB_PASSWORD, SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, GOOGLE_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, REGION, S3_CONFIG
 from typing import Optional, Dict
 logger = logging.getLogger(__name__)
@@ -28,6 +29,17 @@ if not all(param in conn_str for param in required_params):
 
 encoded_conn_str = quote_plus(conn_str)
 
+async_engine = create_async_engine(
+    f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}",
+    echo=False,
+    pool_size=10,
+    max_overflow=5,
+    pool_timeout=30,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    isolation_level="READ COMMITTED"
+)
+
 engine = create_engine(
     f"mssql+pyodbc:///?odbc_connect={encoded_conn_str}",
     echo=False,
@@ -39,4 +51,5 @@ engine = create_engine(
     isolation_level="READ COMMITTED"
 )
 
+logger.info(f"Initialized async_engine with conn_str: {conn_str.split(';')[0]}...; MARS=True")
 logger.info(f"Initialized engine with conn_str: {conn_str.split(';')[0]}...; MARS=True")

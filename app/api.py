@@ -30,7 +30,7 @@ from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
+
 
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)
