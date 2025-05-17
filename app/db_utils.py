@@ -172,11 +172,20 @@ async def update_search_sort_order(
                 )
                 columns = [column[0] for column in cursor.description]
                 rows = await cursor.fetchall()
+                logger.debug(f"Raw rows: {rows[:2]}")  # Log first two rows
+                logger.debug(f"Columns: {columns}")
+                if rows and len(rows[0]) != len(columns):
+                    logger.error(f"Row length mismatch: got {len(rows[0])}, expected {len(columns)}")
+                    return []
                 df = pd.DataFrame(rows, columns=columns)
                 if df.empty:
                     logger.warning(f"No data found for FileID: {file_id}, EntryID: {entry_id}")
                     return []
-
+                rows = await cursor.fetchall()
+                if not rows:
+                    logger.warning(f"No data returned for FileID {file_id}, EntryID {entry_id}")
+                    return []
+                df = pd.DataFrame(rows, columns=columns)
                 # Skip placeholder/error results
                 df = df[~df['ImageUrl'].str.contains('placeholder://', na=False)]
                 if df.empty:
