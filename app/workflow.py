@@ -162,21 +162,25 @@ def process_entry_search(args):
     try:
         mem_info = process.memory_info()
         logger.debug(f"Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
-        # Use the existing event loop instead of creating a new one
-        loop = asyncio.get_running_loop()
-        result = loop.run_until_complete(
-            async_process_entry_search(
-                search_string=search_string,
-                brand=brand,
-                endpoint=endpoint,
-                entry_id=entry_id,
-                use_all_variations=use_all_variations,
-                file_id_db=file_id_db,
-                logger=logger
+        # Create a new event loop for the thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                async_process_entry_search(
+                    search_string=search_string,
+                    brand=brand,
+                    endpoint=endpoint,
+                    entry_id=entry_id,
+                    use_all_variations=use_all_variations,
+                    file_id_db=file_id_db,
+                    logger=logger
+                )
             )
-        )
-        logger.debug(f"Result for EntryID {entry_id}: {result}")
-        return result
+            logger.debug(f"Result for EntryID {entry_id}: {result}")
+            return result
+        finally:
+            loop.close()
     except Exception as e:
         logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
         return None
@@ -437,6 +441,7 @@ async def process_restart_batch(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Disposed database engines")
+
 
 async def generate_download_file(
     file_id: int,
