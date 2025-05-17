@@ -311,7 +311,7 @@ async def process_restart_batch(
                             continue
 
                         # Optimize deduplication
-                        deduplicated_df = combined Carrie_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
+                        deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
                         logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
 
                         # Insert results incrementally
