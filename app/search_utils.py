@@ -128,6 +128,7 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
+        # Fetch results with a dedicated connection
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
@@ -139,6 +140,7 @@ async def update_search_sort_order(
             rows = result.fetchall()
             columns = result.keys()
             result.close()
+            await conn.commit()  # Ensure connection is clean
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
@@ -175,7 +177,7 @@ async def update_search_sort_order(
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
-            # Inline priority calculation without Pandas
+            # Preserve original SortOrder logic
             if model_matched and brand_matched:
                 res["priority"] = 1
             elif model_matched:
@@ -189,6 +191,7 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
+        # Use a new connection for updates to avoid conflicts
         async with async_engine.connect() as conn:
             for index, res in enumerate(sorted_results, 1):
                 try:
@@ -241,6 +244,7 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
             result = await conn.execute(query, {"file_id": file_id})
             entries = result.fetchall()
             result.close()
+            await conn.commit()
         
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id}")
@@ -349,6 +353,8 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             )
             null_count = result.scalar()
             logger.debug(f"Worker PID {process.pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
+            result.close()
+            await conn.commit()
 
             result = await conn.execute(
                 text("""
@@ -379,6 +385,7 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             )
             rows_updated = result.rowcount
             logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
+            await conn.commit()
             
             return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
     
