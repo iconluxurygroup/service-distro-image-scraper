@@ -4,11 +4,14 @@ import asyncio
 import urllib.parse
 import mimetypes
 from typing import Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from sqlalchemy.exc import SQLAlchemyError
 import aiobotocore.session
 from aiobotocore.config import AioConfig
 from config import S3_CONFIG
 from sqlalchemy.sql import text
 from database_config import async_engine
+import pyodbc
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -52,6 +55,59 @@ def double_encode_plus(filename, logger=None):
     logger.debug(f"Double-encoded filename: {second_pass}")
     return second_pass
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(SQLAlchemyError),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying database update for FileID {retry_state.kwargs['file_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def update_file_location_complete_async(file_id: str, file_location: str, logger: Optional[logging.Logger] = None) -> None:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        async with async_engine.connect() as conn:
+            await conn.execute(
+                text("UPDATE utb_ImageScraperFiles SET FileLocationURLComplete = :url WHERE ID = :file_id"),
+                {"url": file_location, "file_id": file_id}
+            )
+            await conn.commit()
+            logger.info(f"Updated FileLocationURLComplete for FileID: {file_id} with URL: {file_location}")
+    except SQLAlchemyError as e:
+        logger.error(f"Database error in update_file_location_complete_async: {e}", exc_info=True)
+        raise
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        raise
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(pyodbc.Error),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_file_generate_complete for FileID {retry_state.kwargs['file_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def update_file_generate_complete(file_id: str, logger: Optional[logging.Logger] = None) -> None:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileCompleteTime = GETDATE() WHERE ID = ?", (file_id,))
+            conn.commit()
+            cursor.close()
+            logger.info(f"Marked file generation complete for FileID: {file_id}")
+    except pyodbc.Error as e:
+        logger.error(f"Database error in update_file_generate_complete: {e}", exc_info=True)
+        raise
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        raise
+
 async def upload_file_to_space(file_src, save_as, is_public=True, public=None, logger=None, file_id=None):
     if public is not None:
         is_public = public
@@ -68,20 +124,20 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         save_as = f"excel_files/{file_id}/{os.path.basename(file_src)}"
         logger.info(f"Excel file detected. Setting save_as to: {save_as}")
 
-    # Check for existing file URL
+    # Check for existing file URL in FileLocationURLComplete
     try:
         async with async_engine.connect() as conn:
-            column = 'UserHeaderIndex' if file_src.endswith('.xlsx') else 'LogFileUrl'
             result = await conn.execute(
-                text(f"SELECT {column} FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                text("SELECT FileLocationURLComplete FROM utb_ImageScraperFiles WHERE ID = :file_id"),
                 {"file_id": file_id}
             )
             existing_url = result.fetchone()
             if existing_url and existing_url[0]:
-                logger.info(f"{'Excel file' if file_src.endswith('.xlsx') else 'Log file'} already uploaded for FileID {file_id}: {existing_url[0]}")
-                return existing_url[0]
-    except Exception as e:
-        logger.error(f"Database error checking {column} for FileID {file_id}: {e}", exc_info=True)
+                logger.info(f"Excel file already uploaded for FileID {file_id}: {existing_url[0]}")
+                # Optionally overwrite: continue with upload to ensure latest URL
+                logger.debug(f"Proceeding with upload to update FileLocationURLComplete with latest URL")
+    except SQLAlchemyError as e:
+        logger.error(f"Database error checking FileLocationURLComplete for FileID {file_id}: {e}", exc_info=True)
 
     content_type, _ = mimetypes.guess_type(file_src)
     if not content_type:
@@ -106,6 +162,9 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                     )
                 double_encoded_key = double_encode_plus(save_as, logger=logger)
                 r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
+                if len(r2_url) > 255:
+                    logger.error(f"R2 URL length exceeds 255 characters for FileID {file_id}: {len(r2_url)}")
+                    return None
                 logger.info(f"Uploaded {file_src} to R2: {r2_url} with Content-Type: {content_type}")
                 result_urls['r2'] = r2_url
                 break
@@ -115,20 +174,20 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                 await asyncio.sleep(2 ** attempt)
                 continue
             logger.error(f"Failed to upload {file_src} to R2: {e}", exc_info=True)
-            break
+            return None
 
     if is_public and result_urls.get('r2'):
         if file_id:
             try:
-                async with async_engine.connect() as conn:
-                    column = 'UserHeaderIndex' if file_src.endswith('.xlsx') else 'LogFileUrl'
-                    await conn.execute(
-                        text(f"UPDATE utb_ImageScraperFiles SET {column} = :url WHERE ID = :file_id"),
-                        {"url": result_urls['r2'], "file_id": file_id}
-                    )
-                    await conn.commit()
-                    logger.info(f"Updated {column} in database for FileID {file_id}: {result_urls['r2']}")
+                # Update FileLocationURLComplete
+                await update_file_location_complete_async(file_id, result_urls['r2'], logger)
+                # Mark file generation complete
+                await update_file_generate_complete(file_id, logger)
+                return result_urls['r2']
             except Exception as e:
-                logger.error(f"Failed to update {column} in database for FileID {file_id}: {e}", exc_info=True)
-        return result_urls['r2']
+                logger.error(f"Failed to update database for FileID {file_id}: {e}", exc_info=True)
+                return None
+        else:
+            logger.error(f"No file_id provided for database update")
+            return result_urls['r2']
     return None
