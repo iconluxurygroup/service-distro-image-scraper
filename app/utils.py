@@ -4,6 +4,8 @@ import os
 import pandas as pd
 import time
 from typing import List, Dict, Optional, Tuple, Any
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
 from common import (
     clean_string,
     generate_aliases,
@@ -35,8 +37,7 @@ import urllib.parse
 from requests.exceptions import RequestException
 from icon_image_lib.google_parser import process_search_result
 import psutil
-from ai_utils import batch_vision_reason  # Import batch_vision_reason from ai_utils
-
+from ai_utils import batch_vision_reason
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -241,164 +242,6 @@ async def process_search_row(
     
     return pd.DataFrame()
 
-def generate_search_variations(
-    search_string: str,
-    brand: Optional[str] = None,
-    model: Optional[str] = None,
-    brand_rules: Optional[Dict] = None,
-    logger: Optional[logging.Logger] = None
-) -> Dict[str, List[str]]:
-    logger = logger or default_logger
-    process = psutil.Process()
-    variations = {
-        "default": [],
-        "delimiter_variations": [],
-        "color_delimiter": [],
-        "brand_alias": [],
-        "no_color": []
-    }
-    
-    if not search_string:
-        logger.warning(f"Worker PID {process.pid}: Empty search string provided")
-        return variations
-    
-    search_string = search_string.lower()
-    brand = clean_string(brand).lower() if brand else None
-    model = clean_string(model).lower() if model else search_string
-    
-    variations["default"].append(search_string)
-    
-    delimiters = [' ', '-', '_', '/']
-    delimiter_variations = []
-    for delim in delimiters:
-        if delim in search_string:
-            delimiter_variations.append(search_string.replace(delim, ' '))
-            delimiter_variations.append(search_string.replace(delim, '-'))
-            delimiter_variations.append(search_string.replace(delim, '_'))
-    variations["delimiter_variations"] = list(set(delimiter_variations))
-    
-    variations["color_delimiter"].append(search_string)
-    
-    if brand:
-        brand_aliases = generate_aliases(brand)
-        variations["brand_alias"] = [f"{alias} {search_string}" for alias in brand_aliases]
-    
-    no_color_string = search_string
-    if brand and brand_rules and "brand_rules" in brand_rules:
-        for rule in brand_rules["brand_rules"]:
-            if any(brand in name.lower() for name in rule.get("names", [])):
-                sku_format = rule.get("sku_format", {})
-                color_separator = sku_format.get("color_separator", "_")
-                expected_length = rule.get("expected_length", {})
-                base_length = expected_length.get("base", [6])[0]
-                with_color_length = expected_length.get("with_color", [10])[0]
-                
-                if not color_separator:
-                    logger.warning(f"Worker PID {process.pid}: Empty color_separator for brand {brand}, skipping color split")
-                    no_color_string = search_string
-                    logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: No color split, no_color='{no_color_string}'")
-                    break
-                
-                if color_separator in search_string:
-                    logger.debug(f"Worker PID {process.pid}: Applying color_separator '{color_separator}' to search_string '{search_string}'")
-                    parts = search_string.split(color_separator)
-                    base_part = parts[0]
-                    if len(base_part) == base_length and len(search_string) <= with_color_length:
-                        no_color_string = base_part
-                        logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: Extracted no_color='{no_color_string}' from '{search_string}'")
-                        break
-                elif len(search_string) == base_length:
-                    no_color_string = search_string
-                    logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: No color suffix, no_color='{no_color_string}'")
-                    break
-    
-    if no_color_string == search_string:
-        for delim in ['_', '-', ' ']:
-            if delim in search_string:
-                no_color_string = search_string.rsplit(delim, 1)[0]
-                logger.debug(f"Worker PID {process.pid}: Delimiter fallback: Extracted no_color='{no_color_string}' from '{search_string}' using delimiter '{delim}'")
-                break
-    
-    variations["no_color"].append(no_color_string if no_color_string else search_string)
-    if no_color_string != search_string:
-        logger.info(f"Worker PID {process.pid}: Generated no_color variation: '{no_color_string}' from original '{search_string}'")
-    else:
-        logger.debug(f"Worker PID {process.pid}: No color suffix detected, no_color variation same as original: '{search_string}'")
-    
-    return variations
-
-async def search_variation(
-    variation: str,
-    endpoint: str,
-    entry_id: int,
-    search_type: str,
-    brand: Optional[str] = None,
-    category: Optional[str] = None,
-    logger: Optional[logging.Logger] = None
-) -> Dict:
-    logger = logger or default_logger
-    process = psutil.Process()
-    try:
-        regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia']
-        max_attempts = 5
-        total_attempts = [0]
-
-        async def log_retry_status(attempt_type: str, attempt_num: int) -> bool:
-            total_attempts[0] += 1
-            if total_attempts[0] > max_attempts:
-                logger.error(f"Worker PID {process.pid}: Exceeded max retries ({max_attempts}) for EntryID {entry_id} after {attempt_type} attempt {attempt_num}")
-                return False
-            logger.info(f"Worker PID {process.pid}: {attempt_type} attempt {attempt_num} (Total attempts: {total_attempts[0]}/{max_attempts}) for EntryID {entry_id}")
-            return True
-
-        for region in regions:
-            if not await log_retry_status("GCloud", total_attempts[0] + 1):
-                break
-            result = await process_search_row_gcloud(variation, entry_id, logger, remaining_retries=5, total_attempts=total_attempts)
-            if not result.empty:
-                logger.info(f"Worker PID {process.pid}: GCloud attempt succeeded for EntryID {entry_id} with {len(result)} images in region {region}")
-                return {"variation": variation, "result": result, "status": "success", "result_count": len(result)}
-            logger.warning(f"Worker PID {process.pid}: GCloud attempt failed in region {region}")
-
-        for attempt in range(3):
-            if not await log_retry_status("Primary", attempt + 1):
-                break
-            result = await process_search_row(variation, endpoint, entry_id, logger, search_type, max_retries=15, brand=brand, category=category)
-            if not result.empty:
-                logger.info(f"Worker PID {process.pid}: Primary attempt succeeded for EntryID {entry_id} with {len(result)} images")
-                return {"variation": variation, "result": result, "status": "success", "result_count": len(result)}
-            logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt + 1} failed")
-
-        logger.error(f"Worker PID {process.pid}: All attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
-        return {
-            "variation": variation,
-            "result": pd.DataFrame([{
-                "EntryID": entry_id,
-                "ImageUrl": "placeholder://no-results",
-                "ImageDesc": f"No results found for {variation}",
-                "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://no-results"
-            }]),
-            "status": "failed",
-            "result_count": 1,
-            "error": "All search attempts failed"
-        }
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Error searching variation '{variation}' for EntryID {entry_id}: {e}", exc_info=True)
-        return {
-            "variation": variation,
-            "result": pd.DataFrame([{
-                "EntryID": entry_id,
-                "ImageUrl": "placeholder://error",
-                "ImageDesc": f"Error for {variation}: {str(e)}",
-                "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://error"
-            }]),
-            "status": "failed",
-            "result_count": 1,
-            "error": str(e)
-        }
-
 async def process_single_all(
     entry_id: int,
     search_string: str,
@@ -447,22 +290,26 @@ async def process_single_all(
 
     if not brand or not model or not color or not category:
         try:
-            with pyodbc.connect(conn_str, autocommit=False) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT ProductBrand, ProductModel, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID = ?",
-                    (file_id_db, entry_id)
+            async with async_engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory 
+                        FROM utb_ImageScraperRecords 
+                        WHERE FileID = :file_id AND EntryID = :entry_id
+                    """),
+                    {"file_id": file_id_db, "entry_id": entry_id}
                 )
-                result = cursor.fetchone()
-                if result:
-                    result_brand = result_brand or result[0]
-                    result_model = result_model or result[1]
-                    result_color = result_color or result[2]
-                    result_category = result_category or result[3]
+                row = result.fetchone()
+                result.close()
+                if row:
+                    result_brand = result_brand or row[0]
+                    result_model = result_model or row[1]
+                    result_color = result_color or row[2]
+                    result_category = result_category or row[3]
                     logger.info(f"Worker PID {process.pid}: Fetched attributes for EntryID {entry_id}: Brand={result_brand}, Model={result_model}, Color={result_color}, Category={result_category}")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No attributes found for FileID {file_id_db}, EntryID {entry_id}")
-        except pyodbc.Error as e:
+        except SQLAlchemyError as e:
             logger.error(f"Worker PID {process.pid}: Failed to fetch attributes for EntryID {entry_id}: {e}", exc_info=True)
 
     mem_info = process.memory_info()
@@ -544,7 +391,7 @@ async def process_single_all(
 
             try:
                 async with async_engine.connect() as conn:
-                    cursor = await conn.execute(
+                    result = await conn.execute(
                         text("""
                             SELECT 
                                 COUNT(*) AS total_count,
@@ -555,7 +402,7 @@ async def process_single_all(
                         """),
                         {"entry_id": entry_id}
                     )
-                    row = cursor.fetchone()
+                    row = result.fetchone()
                     total_count, positive_count, null_count = row
                     logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
                     if null_count > 0:
@@ -571,9 +418,13 @@ async def process_single_all(
                         return False
             except SQLAlchemyError as e:
                 logger.error(f"Worker PID {process.pid}: Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
+                return False
             mem_info = process.memory_info()
             logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
             return True
+        except SQLAlchemyError as e:
+            logger.error(f"Worker PID {process.pid}: Database error during batch update for EntryID {entry_id}: {e}", exc_info=True)
+            raise
         except Exception as e:
             logger.error(f"Worker PID {process.pid}: Error during batch database update for EntryID {entry_id}: {e}", exc_info=True)
             return False
@@ -656,22 +507,26 @@ async def process_single_row(
 
     if not brand or not model or not color or not category:
         try:
-            with pyodbc.connect(conn_str, autocommit=False) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT ProductBrand, ProductModel, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID = ?",
-                    (file_id_db, entry_id)
+            async with async_engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory 
+                        FROM utb_ImageScraperRecords 
+                        WHERE FileID = :file_id AND EntryID = :entry_id
+                    """),
+                    {"file_id": file_id_db, "entry_id": entry_id}
                 )
-                result = cursor.fetchone()
-                if result:
-                    result_brand = result_brand or result[0]
-                    result_model = result_model or result[1]
-                    result_color = result_color or result[2]
-                    result_category = result_category or result[3]
+                row = result.fetchone()
+                result.close()
+                if row:
+                    result_brand = result_brand or row[0]
+                    result_model = result_model or row[1]
+                    result_color = result_color or row[2]
+                    result_category = result_category or row[3]
                     logger.info(f"Worker PID {process.pid}: Fetched attributes for EntryID {entry_id}: Brand={result_brand}, Model={result_model}, Color={result_color}, Category={result_category}")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No attributes found for FileID {file_id_db}, EntryID {entry_id}")
-        except pyodbc.Error as e:
+        except SQLAlchemyError as e:
             logger.error(f"Worker PID {process.pid}: Failed to fetch attributes for EntryID {entry_id}: {e}", exc_info=True)
 
     mem_info = process.memory_info()
@@ -748,37 +603,44 @@ async def process_single_row(
                 return False
             logger.info(f"Worker PID {process.pid}: Completed AI analysis for EntryID {entry_id} with {len(ai_result.get('data', []))} results")
 
-            async with async_engine.connect() as conn:
-                cursor = await conn.execute(
-                    text("""
-                        SELECT 
-                            COUNT(*) AS total_count,
-                            SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                            SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                        FROM utb_ImageScraperResult 
-                        WHERE EntryID = :entry_id
-                    """),
-                    {"entry_id": entry_id}
-                )
-                row = cursor.fetchone()
-                total_count, positive_count, null_count = row
-                logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
-                if null_count > 0:
-                    logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                    await conn.execute(
-                        text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND SortOrder IS NULL"),
+            try:
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(
+                        text("""
+                            SELECT 
+                                COUNT(*) AS total_count,
+                                SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                                SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                            FROM utb_ImageScraperResult 
+                            WHERE EntryID = :entry_id
+                        """),
                         {"entry_id": entry_id}
                     )
-                    await conn.commit()
-                    logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder rows to -2 for EntryID {entry_id}")
-                if total_count == 0:
-                    logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
-                    return False
+                    row = result.fetchone()
+                    total_count, positive_count, null_count = row
+                    logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
+                    if null_count > 0:
+                        logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                        await conn.execute(
+                            text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND SortOrder IS NULL"),
+                            {"entry_id": entry_id}
+                        )
+                        await conn.commit()
+                        logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder rows to -2 for EntryID {entry_id}")
+                    if total_count == 0:
+                        logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
+                        return False
+            except SQLAlchemyError as e:
+                logger.error(f"Worker PID {process.pid}: Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
+                return False
 
             mem_info = process.memory_info()
             logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
             return True
 
+        except SQLAlchemyError as e:
+            logger.error(f"Worker PID {process.pid}: Database error during database update for EntryID {entry_id}: {e}", exc_info=True)
+            raise
         except Exception as e:
             logger.error(f"Worker PID {process.pid}: Error during database update for EntryID {entry_id}: {e}", exc_info=True)
             return False
@@ -973,6 +835,9 @@ async def process_and_tag_results(
         logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
         return all_dfs
 
+    except SQLAlchemyError as e:
+        logger.error(f"Worker PID {process.pid}: Database error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
+        raise
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
         return [pd.DataFrame([{
