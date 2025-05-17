@@ -428,7 +428,8 @@ async def generate_download_file(
                     'Brand': row.get('Brand', ''),
                     'Style': row.get('Style', ''),
                     'Color': row.get('Color', ''),
-                    'Category': row.get('Category', '')
+                    'Category': row.get('Category', ''),
+                    'FileID': file_id
                 }
                 for _, row in selected_images_df.iterrows()
                 if pd.notna(row['ImageUrl']) and row['ImageUrl']
@@ -480,7 +481,7 @@ async def generate_download_file(
 
         subject_line = f"{original_filename} Job Notification{' - No Images' if not has_valid_images else ''}"
         user_message = (
-            f"Excel file generation for FileID {file_id} {'completed successfully' if has_valid_images else 'completed with no valid images'}.\n"
+            f"Excel file generation for FileID {file_id} {'completed successfully' if successful_entries > 0 else 'completed with no valid images'}.\n"
             f"Download Excel file: {public_url}\n"
             f"Log file: {log_public_url or log_filename}"
         )
@@ -514,7 +515,7 @@ async def generate_download_file(
 
         logger.info(f"Completed ID {file_id}")
         return {
-            "message": "Processing completed successfully" if has_valid_images else "No valid images found, empty Excel file generated",
+            "message": "Processing completed successfully" if successful_entries > 0 else "No valid images found, empty Excel file generated",
             "public_url": public_url,
             "log_filename": log_filename,
             "log_public_url": log_public_url or ""
