@@ -128,9 +128,10 @@ async def update_search_sort_order(
     try:
         async with async_engine.connect() as conn:
             query = text("""
-                SELECT ResultID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
-                FROM utb_ImageScraperResult
-                WHERE EntryID = :entry_id AND FileID = :file_id
+                SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
+                FROM utb_ImageScraperResult r
+                INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
+                WHERE r.EntryID = :entry_id AND rec.FileID = :file_id
             """)
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
@@ -339,7 +340,11 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                 text("""
                     SELECT COUNT(*) 
                     FROM utb_ImageScraperResult 
-                    WHERE FileID = :file_id AND SortOrder IS NULL
+                    WHERE EntryID IN (
+                        SELECT EntryID 
+                        FROM utb_ImageScraperRecords 
+                        WHERE FileID = :file_id
+                    ) AND SortOrder IS NULL
                 """),
                 {"file_id": file_id}
             )
@@ -353,8 +358,7 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                         SELECT r.EntryID
                         FROM utb_ImageScraperRecords r
                         WHERE r.FileID = :file_id
-                        AND utb_ImageScraperResult.ImageUrl = 'placeholder://no-results'
-                    )
+                    ) AND ImageUrl = 'placeholder://no-results'
                 """),
                 {"file_id": file_id}
             )

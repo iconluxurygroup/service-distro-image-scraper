@@ -12,11 +12,11 @@ import hashlib
 import time
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
-from workflow import upload_file_to_space  # Import from image_scraper instead of aws_s3
+from workflow import upload_file_to_space 
 from search_utils import update_sort_order, update_sort_no_image_entry
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images
-from workflow import generate_download_file, process_restart_batch  # Import from image_scraper
+from workflow import generate_download_file, process_restart_batch 
 from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
