@@ -285,7 +285,7 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
     try:
         # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = await fetch_last_valid_entry(file_id, logger)
+            entry_id = fetch_last_valid_entry(file_id, logger)  # Remove await
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
 
         result = await run_job_with_logging(
