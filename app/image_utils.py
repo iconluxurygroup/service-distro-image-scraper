@@ -111,14 +111,16 @@ async def download_image(
     timeout: int = 30,
     max_clean_attempts: int = 3
 ) -> bool:
-
-    logger.debug(f"Decoded URL: {url}")
+    # Decode URL from database to fix escaped characters
+    decoded_url = decode_url(url, logger)
+    logger.debug(f"Decoded URL: {decoded_url}")
 
     for attempt in range(1, max_clean_attempts + 1):
         try:
-            cleaned_url = clean_url(url, attempt)
+            cleaned_url = clean_url(decoded_url, attempt)
             encoded_url = double_encode_plus(cleaned_url, logger)
             logger.debug(f"Attempt {attempt} - Raw URL: {url}")
+            logger.debug(f"Attempt {attempt} - Decoded URL: {decoded_url}")
             logger.debug(f"Attempt {attempt} - Cleaned URL: {cleaned_url}")
             logger.debug(f"Attempt {attempt} - Encoded URL: {encoded_url}")
 
