@@ -458,13 +458,28 @@ from aws_s3 import upload_file_to_space
 from email_utils import send_email
 from config import conn_str
 import pyodbc
+import pandas as pd
+import logging
+import os
+import asyncio
+import httpx
+import aiofiles
+import datetime
+from typing import Optional, Dict, List
+from database import get_images_excel_db
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from image_utils import download_all_images
+from common import create_temp_dirs, cleanup_temp_dirs
+from aws_s3 import upload_file_to_space
+from email_utils import send_email
+from config import conn_str
+import pyodbc
 
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
     file_id_param: Optional[int] = None
 ) -> Dict[str, str]:
-    """Generate and upload a processed Excel file with images asynchronously."""
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     process = psutil.Process()
     temp_images_dir, temp_excel_dir = None, None
@@ -477,16 +492,16 @@ async def generate_download_file(
             cursor.execute(query, (file_id,))
             result = cursor.fetchone()
             if not result:
-                logger.error(f"Worker PID {process.pid}: ❌ No file found for FileID {file_id}")
-                return {"error": f"No file found for FileID {file_id}", "log_filename": log_filename}
+                logger.error(f"Worker PID {process.pid}: ❌ No file found for ID {file_id}")
+                return {"error": f"No file found for ID {file_id}", "log_filename": log_filename}
             original_filename = result[0]
 
-        logger.info(f"Worker PID {process.pid}: 🕵️ Fetching images for FileID: {file_id}")
+        logger.info(f"Worker PID {process.pid}: 🕵️ Fetching images for ID: {file_id}")
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory before fetching images: RSS={mem_info.rss / 1024**2:.2f} MB")
         
         selected_images_df = await get_images_excel_db(str(file_id), logger=logger)
-        logger.info(f"Fetched DataFrame for FileID {file_id}, shape: {selected_images_df.shape}, columns: {list(selected_images_df.columns)}")
+        logger.info(f"Fetched DataFrame for ID {file_id}, shape: {selected_images_df.shape}, columns: {list(selected_images_df.columns)}")
         
         # Validate DataFrame
         expected_columns = [
@@ -499,15 +514,15 @@ async def generate_download_file(
             "Category"
         ]
         if selected_images_df.empty:
-            logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for FileID {file_id}. Check database records.")
-            return {"error": f"No images found for FileID {file_id}", "log_filename": log_filename}
+            logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for ID {file_id}. Check database records.")
+            return {"error": f"No images found for ID {file_id}", "log_filename": log_filename}
         
         if list(selected_images_df.columns) != expected_columns:
-            logger.error(f"Invalid columns in DataFrame for FileID {file_id}. Got: {list(selected_images_df.columns)}, Expected: {expected_columns}")
+            logger.error(f"Invalid columns in DataFrame for ID {file_id}. Got: {list(selected_images_df.columns)}, Expected: {expected_columns}")
             return {"error": f"Invalid DataFrame columns: {list(selected_images_df.columns)}", "log_filename": log_filename}
         
         if selected_images_df.shape[1] != 7:
-            logger.error(f"Invalid DataFrame shape for FileID {file_id}: got {selected_images_df.shape}, expected (N, 7)")
+            logger.error(f"Invalid DataFrame shape for ID {file_id}: got {selected_images_df.shape}, expected (N, 7)")
             return {"error": f"Invalid DataFrame shape: {selected_images_df.shape}", "log_filename": log_filename}
         
         # Log sample data
@@ -530,7 +545,7 @@ async def generate_download_file(
         logger.info(f"Worker PID {process.pid}: 📋 Selected {len(selected_image_list)} valid images after filtering")
         
         if not selected_image_list:
-            logger.warning(f"Worker PID {process.pid}: ⚠️ No valid images after filtering for FileID {file_id}")
+            logger.warning(f"Worker PID {process.pid}: ⚠️ No valid images after filtering for ID {file_id}")
             return {"error": "No valid images after filtering", "log_filename": log_filename}
         
         logger.debug(f"Selected image list sample: {selected_image_list[:2]}")
@@ -597,7 +612,7 @@ async def generate_download_file(
         )
         
         if not public_url:
-            logger.error(f"Worker PID {process.pid}: ❌ Upload failed for FileID {file_id}")
+            logger.error(f"Worker PID {process.pid}: ❌ Upload failed for ID {file_id}")
             return {"error": "Failed to upload processed file", "log_filename": log_filename}
 
         # Update database
@@ -606,9 +621,10 @@ async def generate_download_file(
         await update_file_generate_complete(str(file_id), logger=logger)
 
         # Send email notification
+        from database import get_send_to_email
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
-            logger.error(f"Worker PID {process.pid}: ❌ No email address for FileID {file_id}")
+            logger.error(f"Worker PID {process.pid}: ❌ No email address for ID {file_id}")
             return {"error": "Failed to retrieve email address", "log_filename": log_filename}
         subject_line = f"{original_filename} Job Notification"
         await send_email(
@@ -619,19 +635,18 @@ async def generate_download_file(
             logger=logger
         )
 
-        logger.info(f"Worker PID {process.pid}: 🏁 Completed FileID {file_id}")
+        logger.info(f"Worker PID {process.pid}: 🏁 Completed ID {file_id}")
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory after completion: RSS={mem_info.rss / 1024**2:.2f} MB")
         return {"message": "Processing completed successfully", "public_url": public_url, "log_filename": log_filename}
 
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: 🔴 Error for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: 🔴 Error for ID {file_id}: {e}", exc_info=True)
         return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename}
     finally:
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
-        logger.info(f"Worker PID {process.pid}: 🧹 Cleaned up temporary directories for FileID {file_id}")
-
+        logger.info(f"Worker PID {process.pid}: 🧹 Cleaned up temporary directories for ID {file_id}")
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
