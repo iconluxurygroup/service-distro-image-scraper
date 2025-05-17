@@ -6,7 +6,8 @@ from typing import Optional, List, Tuple
 from vision_utils import fetch_missing_images
 from image_reason import process_entry
 from search_utils import update_search_sort_order
-from workflow import update_log_url_in_db, export_dai_json
+from workflow import update_log_url_in_db
+#, export_dai_json
 from database_config import conn_str, async_engine
 from logging_config import setup_job_logger
 from sqlalchemy.sql import text
@@ -122,12 +123,12 @@ async def batch_vision_reason(
 
         mem_info = process.memory_info()
         logger.debug(f"Memory before JSON export: RSS={mem_info.rss / 1024**2:.2f} MB")
-        json_url = await export_dai_json(file_id, entry_ids, logger)
-        if json_url:
-            logger.info(f"DAI JSON exported to {json_url}")
-            await update_log_url_in_db(file_id, json_url, logger)
-        else:
-            logger.warning(f"Failed to export DAI JSON for FileID: {file_id}")
+        # json_url = await export_dai_json(file_id, entry_ids, logger)
+        # if json_url:
+        #     logger.info(f"DAI JSON exported to {json_url}")
+        #     await update_log_url_in_db(file_id, json_url, logger)
+        # else:
+        #     logger.warning(f"Failed to export DAI JSON for FileID: {file_id}")
 
         mem_info = process.memory_info()
         logger.debug(f"Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
