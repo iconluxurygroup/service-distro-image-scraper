@@ -44,7 +44,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-from search.modular_search import async_process_entry_search  # Import the modular search function
+from modular_search import async_process_entry_search  # Import the modular search function
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
