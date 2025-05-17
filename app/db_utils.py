@@ -707,6 +707,17 @@ async def remove_endpoint(endpoint: str, logger: Optional[logging.Logger] = None
             logger.info(f"Marked endpoint as blocked: {endpoint}")
     except pyodbc.Error as e:
         logger.error(f"Error marking endpoint as blocked: {e}")
+
+
+import pandas as pd
+import logging
+from typing import Optional, List, Dict, Any
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from config import async_engine
+from common import clean_string, validate_model, validate_brand, generate_aliases, calculate_priority
+
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -716,9 +727,183 @@ async def update_search_sort_order(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None,
-    brand_aliases: Optional[List[str]] = None,
-    use_async: bool = True
+    brand_aliases: Optional[List[str]] = None
 ) -> Optional[List[Dict]]:
+    logger = logger or logging.getLogger(__name__)
+    try:
+        file_id = int(file_id)
+        entry_id = int(entry_id)
+        logger.info(f"Starting SortOrder update for FileID: {file_id}, EntryID: {entry_id}")
+
+        async with async_engine.begin() as conn:
+            # Reset SortOrder
+            await conn.execute(
+                text("UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID = :entry_id"),
+                {"entry_id": entry_id}
+            )
+            logger.debug(f"Reset SortOrder for EntryID {entry_id}")
+
+            # Fetch attributes if not provided
+            if not all([brand, model]):
+                result = await conn.execute(
+                    text("""
+                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
+                        FROM utb_ImageScraperRecords
+                        WHERE FileID = :file_id AND EntryID = :entry_id
+                    """),
+                    {"file_id": file_id, "entry_id": entry_id}
+                )
+                row = await result.fetchone()
+                if row:
+                    brand, model, color, category = row
+                    logger.info(f"Fetched attributes - Brand: {brand}, Model: {model}")
+                else:
+                    logger.warning(f"No attributes found for FileID: {file_id}, EntryID: {entry_id}")
+                    brand, model, color, category = brand or '', model or '', color or '', category or ''
+
+            # Fetch results
+            query = text("""
+                SELECT 
+                    t.ResultID, 
+                    t.EntryID,
+                    CASE WHEN ISJSON(t.AiJson) = 1 
+                         THEN ISNULL(TRY_CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0)
+                         ELSE 0 END AS match_score,
+                    t.SortOrder,
+                    t.ImageDesc, 
+                    t.ImageSource, 
+                    t.ImageUrl,
+                    r.ProductBrand, 
+                    r.ProductModel,
+                    t.AiJson
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = :file_id AND t.EntryID = :entry_id
+            """)
+            result = await conn.execute(query, {"file_id": file_id, "entry_id": entry_id})
+            df = pd.DataFrame(result.fetchall(), columns=result.keys())
+            if df.empty:
+                logger.warning(f"No data found for FileID: {file_id}, EntryID: {entry_id}")
+                return []
+
+            logger.info(f"Fetched {len(df)} rows for EntryID {entry_id}")
+
+            # Validate JSON and log issues
+            invalid_json = df[df['AiJson'].notnull() & (df['AiJson'].str.strip() != '') & (df['match_score'] == 0)]
+            for _, row in invalid_json.iterrows():
+                logger.warning(f"Invalid JSON in ResultID {row['ResultID']}: {row['AiJson'][:100]}...")
+
+            # Generate brand aliases
+            if brand_aliases is None:
+                brand_aliases_dict = {
+                    "Scotch & Soda": ["Scotch and Soda", "Scotch Soda", "Scotch&Soda", "ScotchAndSoda", "Scotch"],
+                    "Adidas": ["Adidas AG", "Adidas Originals", "Addidas", "Adiddas"],
+                    "BAPE": ["A Bathing Ape", "BATHING APE", "Bape Japan", "ABathingApe", "Bape"]
+                }
+                brand_clean = clean_string(brand).lower() if brand else ''
+                brand_aliases = brand_aliases_dict.get(brand_clean, [brand_clean] if brand_clean else [])
+                logger.debug(f"Brand aliases: {brand_aliases}")
+
+            # Prepare model aliases
+            model_clean = clean_string(model) if model else ''
+            model_aliases = generate_aliases(model_clean) if model_clean else []
+            logger.debug(f"Model aliases: {model_aliases}")
+
+            # Clean DataFrame columns
+            required_cols = ["ImageDesc", "ImageSource", "ImageUrl", "ProductBrand", "ProductModel"]
+            for col in required_cols:
+                if col not in df.columns:
+                    logger.error(f"Missing column {col}")
+                    return []
+                df[f"{col}_clean"] = df[col].fillna('').apply(clean_string)
+
+            # Filter and prioritize results
+            df['is_model_match'] = df.apply(lambda row: validate_model(row, model_aliases, row['ResultID'], logger), axis=1)
+            df['is_brand_match'] = df.apply(lambda row: validate_brand(row, brand_aliases, row['ResultID'], None, logger), axis=1)
+            df['priority'] = df.apply(
+                lambda row: calculate_priority(
+                    row, df[df['is_model_match']], model_clean, model_aliases, brand_clean, brand_aliases, logger
+                ),
+                axis=1
+            )
+            logger.info(f"Priority distribution: {df['priority'].value_counts().to_dict()}")
+
+            # Assign SortOrder
+            df['new_sort_order'] = -2
+            match_df = df[df['priority'].isin([1, 2, 3])].sort_values(['priority', 'match_score'], ascending=[True, False])
+            if not match_df.empty:
+                valid_indices = match_df.index[match_df.apply(
+                    lambda row: row['is_model_match'] if row['priority'] in [1, 2] else row['is_brand_match'], axis=1
+                )]
+                valid_match_df = match_df.loc[valid_indices]
+                if not valid_match_df.empty:
+                    df.loc[valid_match_df.index, 'new_sort_order'] = range(1, len(valid_match_df) + 1)
+                    logger.debug(f"Assigned SortOrder for {len(valid_match_df)} matches")
+
+            # Bulk update SortOrder
+            updates = df[df['new_sort_order'] != df['SortOrder'].fillna(-999)][['ResultID', 'new_sort_order']]
+            if not updates.empty:
+                update_query = text("""
+                    UPDATE utb_ImageScraperResult 
+                    SET SortOrder = :sort_order 
+                    WHERE ResultID = :result_id
+                """)
+                for _, row in updates.iterrows():
+                    await conn.execute(
+                        update_query,
+                        {"sort_order": int(row['new_sort_order']), "result_id": int(row['ResultID'])}
+                    )
+                logger.info(f"Updated {len(updates)} rows for EntryID {entry_id}")
+
+            # Verify updates
+            verify_query = text("""
+                SELECT ResultID, EntryID, SortOrder, ImageDesc, ImageSource, ImageUrl
+                FROM utb_ImageScraperResult
+                WHERE EntryID = :entry_id
+                ORDER BY SortOrder DESC
+            """)
+            result = await conn.execute(verify_query, {"entry_id": entry_id})
+            results = [
+                {
+                    "ResultID": r[0],
+                    "EntryID": r[1],
+                    "SortOrder": r[2],
+                    "ImageDesc": r[3],
+                    "ImageSource": r[4],
+                    "ImageUrl": r[5]
+                }
+                for r in result.fetchall()
+            ]
+
+            # Log verification
+            positive_count = sum(1 for r in results if r['SortOrder'] is not None and r['SortOrder'] > 0)
+            zero_count = sum(1 for r in results if r['SortOrder'] == 0)
+            negative_count = sum(1 for r in results if r['SortOrder'] is not None and r['SortOrder'] < 0)
+            null_count = sum(1 for r in results if r['SortOrder'] is None)
+            logger.info(
+                f"Verification for EntryID {entry_id}: "
+                f"{positive_count} positive SortOrder, {zero_count} zero SortOrder, "
+                f"{negative_count} negative SortOrder, {null_count} NULL SortOrder"
+            )
+            if null_count > 0:
+                logger.warning(f"Found {null_count} rows with NULL SortOrder")
+
+            return results
+
+    except SQLAlchemyError as e:
+        logger.error(f"Database error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
+        return None
+    except ValueError as e:
+        logger.error(f"ValueError for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
+        return None
+
+
+
+
+
     logger = logger or default_logger
     try:
         file_id = int(file_id)
