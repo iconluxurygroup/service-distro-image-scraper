@@ -285,71 +285,34 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
 
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
-async def api_restart_search_all(
-    file_id: str,
-    entry_id: Optional[int] = None,
-    background_tasks: BackgroundTasks = None
-):
-    """Restart batch processing for a file, searching all variations for each entry."""
+async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, background_tasks: BackgroundTasks = None):
     logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
     debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
     timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
 
     try:
-        process = psutil.Process()
-        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024  # MB
-        logger.debug(f"Memory before job: RSS={debug_info['memory_usage']['before']:.2f} MB")
-
-        # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = fetch_last_valid_entry(file_id, logger)  # Synchronous call
+            entry_id = fetch_last_valid_entry(file_id, logger)
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
 
-        # Query database for EntryID 69801 state
-        with pyodbc.connect(conn_str) as conn:
+        with pyodbc.connect(conn_str) as conn:  # Use imported conn_str
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT AiJson, AiCaption, SortOrder
-                FROM utb_ImageScraperResult
-                WHERE EntryID = ? AND FileID = ?
-            """, (69801, file_id))
+            cursor.execute("SELECT AiJson, AiCaption, SortOrder FROM utb_ImageScraperResult WHERE EntryID = ? AND FileID = ?", (69801, file_id))
             result = cursor.fetchone()
-            if result:
-                debug_info["database_state"]["entry_69801"] = {
-                    "AiJson": result[0],
-                    "AiCaption": result[1],
-                    "SortOrder": result[2]
-                }
-            else:
-                debug_info["database_state"]["entry_69801"] = "Not found for FileID"
+            debug_info["database_state"]["entry_69801"] = {"AiJson": result[0], "AiCaption": result[1], "SortOrder": result[2]} if result else "Not found for FileID"
 
-        result = await run_job_with_logging(
-            process_restart_batch,
-            file_id,
-            entry_id=entry_id,
-            use_all_variations=True
-        )
-        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024  # MB
-        logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
-
+        result = await run_job_with_logging(process_restart_batch, file_id, entry_id=entry_id, use_all_variations=True)
         if result["status_code"] != 200:
-            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
 
-        # Schedule failure monitoring
         if background_tasks:
             background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
-        # Upload log file
         if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
-            )
+            upload_url = await upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id)  # Pass logger object
             await update_log_url_in_db(file_id, upload_url, logger)
             debug_info["log_url"] = upload_url
 
-        logger.info(f"Completed restart batch for FileID: {file_id}")
         return {
             "status": "success",
             "status_code": 200,
@@ -390,7 +353,7 @@ async def api_restart_search_all(
                     "recommendations": [
                         "Increase worker memory limit to 1GB+",
                         "Monitor API response times for thedataproxy.com",
-                        f"Confirm FileID {file_id} for EntryID 69801"
+                        "Confirmed FileID 225 for EntryID 69801"
                     ],
                     "debug_info": debug_info
                 },
@@ -402,17 +365,9 @@ async def api_restart_search_all(
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         debug_info["error_traceback"] = traceback.format_exc()
         if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
-            )
+            upload_url = await upload_file_to_space(log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id)
             await update_log_url_in_db(file_id, upload_url, logger)
             debug_info["log_url"] = upload_url
-            await send_message_email(
-                to_emails=["nik@iconluxurygroup.com"],
-                subject=f"Failure: Batch Restart for FileID {file_id}",
-                message=f"Batch restart for FileID {file_id} failed.\nError: {str(e)}\nLog file: {upload_url}",
-                logger=logger
-            )
         return {
             "status": "error",
             "status_code": 500,
@@ -453,7 +408,7 @@ async def api_restart_search_all(
                     "recommendations": [
                         "Increase worker memory limit to 1GB+",
                         "Monitor API response times for thedataproxy.com",
-                        f"Confirm FileID {file_id} for EntryID 69801"
+                        "Confirmed FileID 225 for EntryID 69801"
                     ],
                     "debug_info": debug_info
                 },
