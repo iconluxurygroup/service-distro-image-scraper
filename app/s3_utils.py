@@ -64,6 +64,10 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         logger.error(f"Local file does not exist: {file_src}")
         raise FileNotFoundError(f"Local file does not exist: {file_src}")
 
+    if file_src.endswith('.xlsx'):
+        save_as = f"excel_files/{file_id}/{os.path.basename(file_src)}"
+        logger.info(f"Excel file detected. Setting save_as to: {save_as}")
+
     try:
         async with async_engine.connect() as conn:
             result = await conn.execute(
@@ -72,7 +76,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
             )
             existing_url = result.fetchone()
             if existing_url and existing_url[0]:
-                logger.info(f"Log already uploaded for FileID {file_id}: {existing_url[0]}")
+                logger.info(f"File already uploaded for FileID {file_id}: {existing_url[0]}")
                 return existing_url[0]
     except Exception as e:
         logger.error(f"Database error checking LogFileUrl for FileID {file_id}: {e}", exc_info=True)
@@ -113,6 +117,15 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
 
     if is_public and result_urls.get('r2'):
         if file_id:
-            await update_log_url_in_db(file_id, result_urls['r2'], logger)
+            try:
+                async with async_engine.connect() as conn:
+                    await conn.execute(
+                        text("UPDATE utb_ImageScraperFiles SET LogFileUrl = :url WHERE ID = :file_id"),
+                        {"url": result_urls['r2'], "file_id": file_id}
+                    )
+                    await conn.commit()
+                    logger.info(f"Updated LogFileUrl in database for FileID {file_id}: {result_urls['r2']}")
+            except Exception as e:
+                logger.error(f"Failed to update LogFileUrl in database for FileID {file_id}: {e}", exc_info=True)
         return result_urls['r2']
     return None
