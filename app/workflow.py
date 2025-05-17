@@ -501,6 +501,7 @@ async def generate_download_file(
                 return {"error": f"Failed to download template file", "log_filename": log_filename}
             logger.debug(f"Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
             
+            import pandas as pd
             with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
                 pd.DataFrame({"Message": [f"No images found for FileID {file_id}. Check utb_ImageScraperResult for valid images."]}).to_excel(writer, sheet_name="NoImages", index=False)
             
@@ -576,6 +577,7 @@ async def generate_download_file(
                 logger.error(f"Template file not found at {local_filename}")
                 return {"error": f"Failed to download template file", "log_filename": log_filename}
             
+            import pandas as pd
             with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
                 pd.DataFrame({"Message": [f"No valid images found for FileID {file_id} after filtering."]}).to_excel(writer, sheet_name="NoImages", index=False)
             
