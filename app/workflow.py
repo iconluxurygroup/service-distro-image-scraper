@@ -16,7 +16,7 @@ from search_utils import update_search_sort_order, insert_search_results
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
-from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
+from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations
 from endpoint_utils import sync_get_endpoint
 from logging_config import setup_job_logger
 from config import S3_CONFIG
