@@ -20,7 +20,6 @@ from db_utils import (
     get_images_excel_db,
     update_file_location_complete,
     update_file_generate_complete,
-    export_dai_json,
     update_log_url_in_db,
     fetch_last_valid_entry,
 )
