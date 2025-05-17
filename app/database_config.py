@@ -1,4 +1,3 @@
-
 from urllib.parse import quote_plus
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -6,6 +5,7 @@ import logging
 import os
 from config import DB_PASSWORD, SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, GOOGLE_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, REGION, S3_CONFIG
 from typing import Optional, Dict
+
 logger = logging.getLogger(__name__)
 
 db_password = DB_PASSWORD
@@ -31,9 +31,9 @@ encoded_conn_str = quote_plus(conn_str)
 async_engine = create_async_engine(
     f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}",
     echo=False,
-    pool_size=5,  # Reduced from 10
+    pool_size=5,
     max_overflow=5,
-    pool_timeout=60,  # Increased from 30
+    pool_timeout=60,
     pool_pre_ping=True,
     pool_recycle=3600,
     isolation_level="READ COMMITTED"
@@ -42,9 +42,9 @@ async_engine = create_async_engine(
 engine = create_engine(
     f"mssql+pyodbc:///?odbc_connect={encoded_conn_str}",
     echo=False,
-    pool_size=10,
+    pool_size=5,  # Aligned with async_engine
     max_overflow=5,
-    pool_timeout=30,
+    pool_timeout=60,  # Aligned with async_engine
     pool_pre_ping=True,
     pool_recycle=3600,
     isolation_level="READ COMMITTED"

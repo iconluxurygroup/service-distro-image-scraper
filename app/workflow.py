@@ -1,14 +1,7 @@
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import logging
 import asyncio
+import logging
 import os
 import pandas as pd
-import time
-import pyodbc
-import httpx
-import json
-import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
 from search_utils import update_search_sort_order, insert_search_results
@@ -22,6 +15,7 @@ from db_utils import (
     fetch_last_valid_entry,
 )
 from vision_utils import fetch_missing_images
+import httpx, aiofiles
 from endpoint_utils import sync_get_endpoint
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
@@ -148,81 +142,8 @@ async def async_process_entry_search(
             raise ValueError(f"EntryID mismatch in DataFrame for EntryID {entry_id}")
     
     mem_info = process.memory_info()
-    logger.debug(f"Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+    logger.debug(f"Memory after task ಇದರಿಂದ EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
     return combined_results
-
-def process_entry_search(args):
-    search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
-    logger = logging.getLogger(f"worker_{entry_id}")
-    logger.setLevel(logging.DEBUG)
-    handler = logging.FileHandler(f"job_logs/worker_{entry_id}.log")
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(handler)
-    process = psutil.Process()
-    try:
-        mem_info = process.memory_info()
-        logger.debug(f"Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                async_process_entry_search(
-                    search_string=search_string,
-                    brand=brand,
-                    endpoint=endpoint,
-                    entry_id=entry_id,
-                    use_all_variations=use_all_variations,
-                    file_id_db=file_id_db,
-                    logger=logger
-                )
-            )
-            logger.debug(f"Result for EntryID {entry_id}: {result}")
-            return result
-        finally:
-            loop.close()
-    except Exception as e:
-        logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
-        return None
-    finally:
-        logger.removeHandler(handler)
-        handler.close()
-
-async def upload_file_to_space(
-    file_src: str,
-    save_as: str,
-    is_public: bool,
-    logger: logging.Logger,
-    file_id: Optional[int] = None
-) -> str:
-    process = psutil.Process()
-    try:
-        logger.info(f"Creating S3 client (sync) for {save_as}")
-        from boto3 import client
-        s3_client = client(
-            's3',
-            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-            region_name='us-east-2'
-        )
-        
-        logger.info(f"Uploading {file_src} to S3: {save_as}")
-        s3_client.upload_file(
-            Filename=file_src,
-            Bucket='iconluxurygroup',
-            Key=save_as,
-            ExtraArgs={'ACL': 'public-read'} if is_public else {}
-        )
-        
-        public_url = f"https://iconluxurygroup.s3.us-east-2.amazonaws.com/{save_as}"
-        logger.info(f"Uploaded {file_src} to S3: {public_url}")
-        
-        if file_id:
-            await update_log_url_in_db(str(file_id), public_url, logger)
-        
-        return public_url
-    except Exception as e:
-        logger.error(f"Failed to upload {file_src} to S3: {e}", exc_info=True)
-        return ""
 
 async def process_restart_batch(
     file_id_db: int,
@@ -249,10 +170,9 @@ async def process_restart_batch(
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 1
-        CPU_CORES = psutil.cpu_count(logical=False) or 4
-        MAX_WORKERS = min(CPU_CORES * 2, 8)
+        MAX_CONCURRENCY = 4  # Limit concurrent async tasks
 
-        logger.info(f"Detected {CPU_CORES} physical CPU cores, setting max_workers={MAX_WORKERS}")
+        logger.info(f"Using max_concurrency={MAX_CONCURRENCY} for async tasks")
 
         async with async_engine.connect() as conn:
             result = await conn.execute(
@@ -262,6 +182,7 @@ async def process_restart_batch(
             if result.fetchone()[0] == 0:
                 logger.error(f"FileID {file_id_db} does not exist")
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+            result.close()
 
         if entry_id is None:
             entry_id = await fetch_last_valid_entry(str(file_id_db_int), logger)
@@ -274,6 +195,7 @@ async def process_restart_batch(
                     next_entry = result.fetchone()
                     entry_id = next_entry[0] if next_entry and next_entry[0] else None
                     logger.info(f"Resuming from EntryID: {entry_id}")
+                    result.close()
 
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
@@ -288,10 +210,10 @@ async def process_restart_batch(
                     logger.info(f"Selected endpoint: {endpoint}")
                     break
                 logger.warning(f"Attempt {attempt + 1} failed")
-                time.sleep(2)
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                time.sleep(2)
+                await asyncio.sleep(2)
         if not endpoint:
             logger.error(f"No healthy endpoint")
             return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
@@ -324,66 +246,83 @@ async def process_restart_batch(
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for batch_idx, batch_entries in enumerate(entry_batches, 1):
-                logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
-                start_time = datetime.datetime.now()
+        semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+        async def process_entry(entry):
+            entry_id, search_string, brand, color, category = entry
+            async with semaphore:
+                try:
+                    logger.info(f"Processing EntryID {entry_id}")
+                    results = await async_process_entry_search(
+                        search_string=search_string,
+                        brand=brand,
+                        endpoint=endpoint,
+                        entry_id=entry_id,
+                        use_all_variations=use_all_variations,
+                        file_id_db=file_id_db,
+                        logger=logger
+                    )
+                    if not results:
+                        logger.error(f"No results for EntryID {entry_id}")
+                        return entry_id, False
 
-                tasks = [
-                    (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db)
-                    for entry_id, search_string, brand, color, category in batch_entries
-                ]
-                results = [executor.submit(process_entry_search, task) for task in tasks]
-                results = [future.result() for future in results]
+                    combined_df = pd.concat(results, ignore_index=True, copy=False)
+                    if 'EntryID' not in combined_df.columns or not combined_df['EntryID'].eq(entry_id).all():
+                        logger.error(f"EntryID mismatch for EntryID {entry_id}")
+                        return entry_id, False
 
-                for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
-                    try:
-                        if result is None or not result:
-                            logger.error(f"No results for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
+                    for api_col, db_col in api_to_db_mapping.items():
+                        if api_col in combined_df.columns and db_col not in combined_df.columns:
+                            combined_df.rename(columns={api_col: db_col}, inplace=True)
 
-                        combined_df = pd.concat(result, ignore_index=True, copy=False)
-                        if 'EntryID' not in combined_df.columns or not combined_df['EntryID'].eq(entry_id).all():
-                            logger.error(f"EntryID mismatch for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
+                    if not all(col in combined_df.columns for col in required_columns):
+                        logger.error(f"Missing columns for EntryID {entry_id}")
+                        return entry_id, False
 
-                        for api_col, db_col in api_to_db_mapping.items():
-                            if api_col in combined_df.columns and db_col not in combined_df.columns:
-                                combined_df.rename(columns={api_col: db_col}, inplace=True)
+                    deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
+                    logger.info(f"Deduplicated to {len(deduplicated_df)} rows")
+                    insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
+                    if not insert_success:
+                        logger.error(f"Failed to insert results for EntryID {entry_id}")
+                        return entry_id, False
 
-                        if not all(col in combined_df.columns for col in required_columns):
-                            logger.error(f"Missing columns for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
+                    update_result = await update_search_sort_order(
+                        str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                    )
+                    if update_result is None:
+                        logger.error(f"SortOrder update failed for EntryID {entry_id}")
+                        return entry_id, False
 
-                        deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-                        logger.info(f"Deduplicated to {len(deduplicated_df)} rows")
-                        insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
-                        if not insert_success:
-                            logger.error(f"Failed to insert results for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
+                    return entry_id, True
+                except Exception as e:
+                    logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
+                    return entry_id, False
 
-                        update_result = await update_search_sort_order(
-                            str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                        )
-                        if update_result is None:
-                            logger.error(f"SortOrder update failed for EntryID {entry_id}")
-                            failed_entries += 1
-                            continue
+        for batch_idx, batch_entries in enumerate(entry_batches, 1):
+            logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
+            start_time = datetime.datetime.now()
 
-                        successful_entries += 1
-                        last_entry_id_processed = entry_id
+            # Process entries concurrently using asyncio
+            results = await asyncio.gather(
+                *(process_entry(entry) for entry in batch_entries),
+                return_exceptions=True
+            )
 
-                    except Exception as e:
-                        logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-                        failed_entries += 1
+            for entry, result in zip(batch_entries, results):
+                entry_id = entry[0]
+                if isinstance(result, Exception):
+                    logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
+                    failed_entries += 1
+                    continue
+                entry_id_result, success = result
+                if success:
+                    successful_entries += 1
+                    last_entry_id_processed = entry_id
+                else:
+                    failed_entries += 1
 
-                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
-                log_memory_usage()
+            elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+            logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
+            log_memory_usage()
 
         async with async_engine.connect() as conn:
             result = await conn.execute(
@@ -438,6 +377,7 @@ async def process_restart_batch(
         engine.dispose()
         logger.info(f"Disposed database engines")
 
+# ... (rest of workflow.py, e.g., generate_download_file, detect_job_failure, etc., unchanged) ...
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
