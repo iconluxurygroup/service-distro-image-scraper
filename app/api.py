@@ -21,7 +21,6 @@ from db_utils import (
     get_send_to_email,
     fetch_last_valid_entry,
     update_initial_sort_order,
-    update_sort_no_image_entry,
     update_sort_order_per_entry,
     get_images_excel_db,
     update_file_generate_complete,
