@@ -64,13 +64,10 @@ def get_original_images(
     # Extract data between specific tags using LR
     start_tag = 'FINANCE",[22,1]]]]]'
     end_tag = ':[null,null,null,"glbl'
-    try:
-        matched_google_image_data = LR().get(html_content, start_tag, end_tag)
-        if not matched_google_image_data or 'Error' in matched_google_image_data:
-            logger.warning(f"No data extracted between '{start_tag}' and '{end_tag}'. HTML structure may have changed.")
-            return [], [], [], []
-    except Exception as e:
-        logger.error(f"Error in LR.get: {e}", exc_info=True)
+    matched_google_image_data = LR().get(html_content, start_tag, end_tag, logger)
+    
+    if not matched_google_image_data:
+        logger.warning(f"No data extracted between '{start_tag}' and '{end_tag}'. HTML structure may have changed.")
         return [], [], [], []
 
     # Process extracted data
