@@ -31,7 +31,7 @@ from db_utils import (
 from database_config import conn_str  # Import conn_str from database_config
 from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
+import aioodbc
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)
 
