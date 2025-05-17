@@ -1577,6 +1577,12 @@ import pandas as pd
 import aioodbc
 from typing import Optional
 from config import conn_str
+import logging
+import logging
+import pandas as pd
+import aioodbc
+from typing import Optional
+from config import conn_str
 
 async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or logging.getLogger(__name__)
@@ -1585,6 +1591,16 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
         async with aioodbc.connect(dsn=conn_str) as conn:
             async with conn.cursor() as cursor:
                 query = """
+                    WITH RankedResults AS (
+                        SELECT 
+                            EntryID, 
+                            ImageUrl, 
+                            ImageUrlThumbnail, 
+                            SortOrder,
+                            ROW_NUMBER() OVER (PARTITION BY EntryID ORDER BY SortOrder DESC) AS rn
+                        FROM utb_ImageScraperResult
+                        WHERE SortOrder IS NOT NULL AND SortOrder >= 0
+                    )
                     SELECT 
                         s.ExcelRowID, 
                         r.ImageUrl, 
@@ -1595,12 +1611,7 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                         s.ProductCategory AS Category
                     FROM utb_ImageScraperFiles f
                     INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
-                    LEFT JOIN (
-                        SELECT EntryID, ImageUrl, ImageUrlThumbnail, SortOrder
-                        FROM utb_ImageScraperResult
-                        WHERE SortOrder IS NOT NULL AND SortOrder >= 0
-                        AND ROW_NUMBER() OVER (PARTITION BY EntryID ORDER BY SortOrder DESC) = 1
-                    ) r ON r.EntryID = s.EntryID
+                    LEFT JOIN RankedResults r ON r.EntryID = s.EntryID AND r.rn = 1
                     WHERE f.ID = ?
                     ORDER BY s.ExcelRowID
                 """
@@ -1612,7 +1623,6 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                 logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
                 if df.empty:
                     logger.warning(f"No data returned for ID {file_id}. Check utb_ImageScraperFiles and utb_ImageScraperRecords.")
-                    # Log table counts for diagnostics
                     await cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
                     file_count = (await cursor.fetchone())[0]
                     await cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = ?", (file_id,))
@@ -1626,7 +1636,7 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                 else:
                     logger.debug(f"Sample rows: {df.head(2).to_dict(orient='records')}")
                 return df
-    except aioodbc.Error as e:
+    except (aioodbc.OperationalError, aioodbc.ProgrammingError) as e:
         logger.error(f"Database error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
     except ValueError as e:
