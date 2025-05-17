@@ -443,8 +443,7 @@ from typing import Optional, Dict
 from common import clean_string, generate_aliases, generate_brand_aliases
 from database_config import conn_str
 from icon_image_lib.google_parser import process_search_result
-from db_utils import insert_search_results, update_search_sort_order  # Import insert_search_results
-
+\
 async def process_single_all(
     entry_id: int,
     search_string: str,
