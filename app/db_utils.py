@@ -1619,7 +1619,14 @@ def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -
                 if len(row) != len(columns):
                     logger.error(f"Row {i} has incorrect number of columns: got {len(row)}, expected {len(columns)}, row: {row}")
                     continue
-                valid_rows.append([str(val) if val is not None else '' for val in row])
+                # Ensure ExcelRowID is integer
+                try:
+                    row = list(row)
+                    row[0] = int(row[0])  # ExcelRowID
+                    valid_rows.append(row)
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Invalid ExcelRowID in row {i}: {row[0]}, error: {e}")
+                    continue
             
             if not valid_rows:
                 logger.warning(f"No valid rows returned for ID {file_id}. Check database records.")
@@ -1636,7 +1643,7 @@ def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -
                 return pd.DataFrame(columns=expected_columns)
             
             df = pd.DataFrame(valid_rows, columns=columns)
-            # Convert ExcelRowID to integer
+            # Ensure ExcelRowID is integer
             df['ExcelRowID'] = pd.to_numeric(df['ExcelRowID'], errors='coerce').astype('Int64')
             logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
             logger.debug(f"DataFrame dtypes: {df.dtypes.to_dict()}")

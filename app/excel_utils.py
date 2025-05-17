@@ -5,7 +5,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from PIL import Image as IMG2
 from io import BytesIO
 import numpy as np
@@ -171,7 +171,7 @@ async def write_excel_image(
         for item in image_data:
             row_id = item['ExcelRowID']
             try:
-                row_id_int = int(row_id)  # Convert to integer
+                row_id_int = int(row_id)
             except (ValueError, TypeError) as e:
                 logger.error(f"Invalid row_id type for {row_id}: expected int, got {type(row_id)}, error: {e}")
                 failed_rows.append(row_id)
@@ -234,12 +234,10 @@ async def highlight_cell(
         wb = await asyncio.to_thread(load_workbook, excel_file)
         ws = wb.active
 
-        # Ensure worksheet has sufficient dimensions
         if ws.max_row < 1 or ws.max_column < 1:
             logger.warning(f"Worksheet is empty, initializing with at least one cell")
-            ws['A1'] = ""  # Initialize cell A1
+            ws['A1'] = ""
 
-        # Validate cell reference
         try:
             col_letter = ''.join(c for c in cell_reference if c.isalpha())
             row_num = int(''.join(c for c in cell_reference if c.isdigit()))
@@ -249,14 +247,13 @@ async def highlight_cell(
             logger.error(f"❌ Invalid cell reference format: {cell_reference}")
             raise ValueError(f"Invalid cell reference format: {cell_reference}")
 
-        # Check if cell exists
         if cell_reference not in ws:
             logger.warning(f"Cell {cell_reference} not in worksheet, extending dimensions")
             max_row = max(ws.max_row, row_num)
             max_col = max(ws.max_column, ord(col_letter.upper()) - ord('A') + 1)
             for r in range(ws.max_row + 1, max_row + 1):
                 for c in range(1, max_col + 1):
-                    ws[f"{get_column_letter(c)}{r}"] = ""  # Initialize cells
+                    ws[f"{get_column_letter(c)}{r}"] = ""
 
         logger.debug(f"🖌️ Applying yellow fill to cell {cell_reference}")
         await asyncio.to_thread(
@@ -287,7 +284,7 @@ async def highlight_cell(
         raise
 
 async def write_failed_downloads_to_excel(
-    failed_downloads: List[tuple],
+    failed_downloads: List[Tuple[str, int]],
     excel_file: str,
     logger: Optional[logging.Logger] = None
 ) -> bool:
@@ -296,10 +293,9 @@ async def write_failed_downloads_to_excel(
         try:
             logger.debug(f"📂 Loading workbook from {excel_file}")
             wb = await asyncio.to_thread(load_workbook, excel_file)
-            ws = wb.active
+            ws = wb.create_sheet("FailedDownloads") if "FailedDownloads" not in wb else wb["FailedDownloads"]
 
-            # Ensure worksheet has sufficient rows
-            max_row = ws.max_row
+            max_row = ws.max_row or 1
             max_failed_row = 0
             for _, row_id in failed_downloads:
                 try:
