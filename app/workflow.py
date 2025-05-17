@@ -314,8 +314,8 @@ async def process_restart_batch(
             )
             row = result.fetchone()
             total_entries = row[0] if row else 0
-            positive_entries = row[1] if row and row[1] is not None else 0
-            null_entries = row[2] if row and row[2] is not None else 0
+            positive_entries = row[1] if row and row[1] is not NULL else 0
+            null_entries = row[2] if row and row[2] is not NULL else 0
             logger.info(
                 f"Verification: {total_entries} total entries, "
                 f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
