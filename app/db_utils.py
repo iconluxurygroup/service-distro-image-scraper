@@ -19,7 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from database_config import conn_str, async_engine
 from vision_utils import fetch_missing_images
 import json, datetime, os,aiofiles
-from aws_s3 import upload_file_to_space
+
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -267,6 +267,8 @@ async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logg
     )
 )
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
+    # Defer import to avoid circular dependency
+    from aws_s3 import upload_file_to_space
     try:
         json_urls = []
         async with async_engine.connect() as conn:
