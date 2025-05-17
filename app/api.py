@@ -323,52 +323,35 @@ async def api_match_and_search_sort(file_id: str):
     if result["status_code"] != 200:
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
     return result
-
 @router.get("/update-sort-order-per-entry/{file_id}", tags=["Sorting"])
-async def api_update_sort_order_per_entry(file_id: str):
-    logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
-    
-    try:
-        result = await update_sort_order_per_entry(file_id, logger)
-        if result is None:
-            logger.error(f"Failed to update SortOrder for FileID {file_id}: update_sort_order_per_entry returned None")
-            raise HTTPException(status_code=500, detail=f"Failed to update SortOrder for FileID {file_id}")
-        
-        if os.path.exists(log_filename):
-            try:
-                upload_result = upload_file_to_space(
-                    file_src=log_filename,
-                    save_as=f"job_logs/job_{file_id}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id
-                )
-                upload_url = await upload_result if asyncio.iscoroutine(upload_result) else upload_result
-                await update_log_url_in_db(file_id, upload_url, logger)
-                logger.info(f"Log uploaded to: {upload_url}")
-            except Exception as upload_error:
-                logger.warning(f"Async upload failed for FileID {file_id}: {upload_error}")
-                upload_url = upload_file_to_space_sync(
-                    file_src=log_filename,
-                    save_as=f"job_logs/job_{file_id}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id
-                )
-                await update_log_url_in_db(file_id, upload_url, logger)
-                logger.info(f"Log uploaded to: {upload_url}")
-        
-        return {"status_code": 200, "message": f"Per-entry SortOrder updated successfully for FileID: {file_id}", "data": result}
-    except Exception as e:
-        logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error updating SortOrder for FileID {file_id}: {str(e)}")
+async def api_update_sort_order_per_entry(
+    file_id: str,
+    background_tasks: BackgroundTasks,
+    limit: Optional[int] = Query(None, description="Maximum number of entries to process")
+):
+    """Run per-entry SortOrder update for a given file_id in the background."""
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Queueing per-entry SortOrder update for FileID: {file_id}, limit: {limit}")
 
+    try:
+        # Initialize job status
+        JOB_STATUS[file_id] = {
+            "status": "queued",
+            "message": "Per-entry sort order update queued",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+        # Queue the job
+        background_tasks.add_task(run_per_entry_sort_job, file_id, limit, logger, log_filename)
+
+        return {
+            "status_code": 200,
+            "message": f"Per-entry SortOrder update queued for FileID: {file_id}",
+            "data": None
+        }
+    except Exception as e:
+        logger.error(f"Error queuing per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error queuing SortOrder update for FileID {file_id}: {str(e)}")
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
     """Run initial sort order update."""
