@@ -12,7 +12,8 @@ import hashlib
 import time
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
-from workflow import upload_file_to_space, generate_download_file, process_restart_batch
+from s3_utils import upload_file_to_space
+from workflow import generate_download_file, process_restart_batch
 from search_utils import update_sort_order, update_sort_no_image_entry
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images
@@ -20,7 +21,7 @@ from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
     fetch_last_valid_entry,
-#    update_initial_sort_order,
+    update_initial_sort_order,
     get_images_excel_db,
     update_file_generate_complete,
     update_file_location_complete,
@@ -313,3 +314,92 @@ async def api_initial_sort(file_id: str):
     if result["status_code"] != 200:
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
     return result
+
+@router.get("/no-image-sort/{file_id}", tags=["Sorting"])
+async def api_no_image_sort(file_id: str):
+    result = await run_job_with_logging(update_sort_no_image_entry, file_id)
+    if result["status_code"] != 200:
+        raise HTTPException(status_code=result["status_code"], detail=result["message"])
+    return result
+
+@router.post("/restart-job/{file_id}", tags=["Processing"])
+async def api_process_restart(file_id: str, entry_id: Optional[int] = None, background_tasks: BackgroundTasks = None):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else ""))
+    try:
+        if not entry_id:
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+        
+        result = await process_restart_batch(
+            file_id_db=int(file_id),
+            logger=logger,
+            entry_id=entry_id
+        )
+        if "error" in result:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        if background_tasks:
+            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+        
+        logger.info(f"Completed restart batch for FileID: {file_id}. Result: {result}")
+        return {"status_code": 200, "message": f"Processing restart completed for FileID: {file_id}", "data": result}
+    except Exception as e:
+        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        if os.path.exists(log_filename):
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+        raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
+
+@router.post("/restart-search-all/{file_id}", tags=["Processing"])
+async def api_restart_search_all(
+    file_id: str,
+    entry_id: Optional[int] = None,
+    background_tasks: BackgroundTasks = None
+):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
+    
+    try:
+        if not entry_id:
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+        
+        result = await run_job_with_logging(
+            process_restart_batch,
+            file_id,
+            entry_id=entry_id,
+            use_all_variations=True
+        )
+        
+        if result["status_code"] != 200:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
+            if "placeholder://error" in result["message"]:
+                logger.warning(f"Placeholder error detected; check endpoint logs for FileID {file_id}")
+                debug_info = result.get("debug_info", {})
+                endpoint_errors = debug_info.get("endpoint_errors", [])
+                for error in endpoint_errors:
+                    logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
+            raise HTTPException(status_code=result["status_code"], detail=result["message"])
+        
+        if background_tasks:
+            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+        
+        logger.info(f"Completed restart batch for FileID: {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Processing restart with all variations completed for FileID: {file_id}",
+            "data": result["data"]
+        }
+    except Exception as e:
+        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        if os.path.exists(log_filename):
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+        raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
