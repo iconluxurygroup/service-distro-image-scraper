@@ -23,7 +23,9 @@ from db_utils import (
     update_file_location_complete,
     update_file_generate_complete,
     export_dai_json,
-    update_log_url_in_db
+    update_log_url_in_db,
+    store_last_entry_id,
+    get_last_entry_id,
 )
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
@@ -52,7 +54,7 @@ SORT_ORDER_LOCK = threading.Lock()
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
+    wait=wait_exponential(multiplier=2, min=2, max=15),
     retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, pd.errors.EmptyDataError, ValueError)),
     before_sleep=lambda retry_state: logging.getLogger(f"worker_{retry_state.kwargs['entry_id']}").info(
         f"Worker PID {psutil.Process().pid}: Retrying task for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -136,7 +138,6 @@ def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
     try:
         with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
             cursor = conn.cursor()
-            # Assuming table structure; adjust columns as needed
             query = """
                 INSERT INTO utb_ImageScraperResult (
                     EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
@@ -157,16 +158,52 @@ def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
         logger.error(f"Worker PID {process.pid}: Failed to insert search results: {e}", exc_info=True)
         return False
 
+async def monitor_and_resubmit_failed_jobs(file_id: int, logger: logging.Logger):
+    """Monitor job logs for failures and resubmit if necessary."""
+    log_filename = f"job_logs/job_{file_id}.log"
+    max_attempts = 3
+    attempt = 1
+
+    while attempt <= max_attempts:
+        if os.path.exists(log_filename):
+            with open(log_filename, 'r') as f:
+                log_content = f.read()
+                if "WORKER TIMEOUT" in log_content or "SIGKILL" in log_content:
+                    logger.warning(f"Worker PID {psutil.Process().pid}: Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
+                    last_entry_id = await get_last_entry_id(str(file_id), logger)
+                    logger.info(f"Worker PID {psutil.Process().pid}: Resubmitting job for FileID: {file_id} starting from EntryID: {last_entry_id}")
+                    result = await process_restart_batch(
+                        file_id_db=file_id,
+                        entry_id=last_entry_id,
+                        use_all_variations=False,
+                        logger=logger
+                    )
+                    if "error" not in result:
+                        logger.info(f"Worker PID {psutil.Process().pid}: Resubmission successful for FileID: {file_id}")
+                        return
+                    else:
+                        logger.error(f"Worker PID {psutil.Process().pid}: Resubmission failed for FileID: {file_id}: {result['error']}")
+                    attempt += 1
+                    await asyncio.sleep(60)  # Wait before retrying
+                else:
+                    logger.info(f"Worker PID {psutil.Process().pid}: No failure detected in logs for FileID: {file_id}")
+                    return
+        else:
+            logger.warning(f"Worker PID {psutil.Process().pid}: Log file {log_filename} does not exist for FileID: {file_id}")
+            return
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
-    use_all_variations: bool = False
+    use_all_variations: bool = False,
+    logger: Optional[logging.Logger] = None
 ) -> Dict[str, str]:
     """Process a batch of entries for a file using threading and upload log file to S3."""
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
-        # Initialize logger
-        logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
+        # Initialize logger if not provided
+        if logger is None:
+            logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
         logger.setLevel(logging.DEBUG)
         process = psutil.Process()
         logger.debug(f"Worker PID {process.pid}: Logger initialized")
@@ -175,6 +212,8 @@ async def process_restart_batch(
             try:
                 mem_info = process.memory_info()
                 logger.info(f"Worker PID {process.pid}: Memory usage: RSS={mem_info.rss / 1024**2:.2f} MB")
+                if mem_info.rss / 1024**2 > 1000:  # Warn if memory exceeds 1GB
+                    logger.warning(f"Worker PID {process.pid}: High memory usage detected")
             except Exception as e:
                 logger.error(f"Worker PID {process.pid}: Memory logging failed: {e}")
 
@@ -184,8 +223,8 @@ async def process_restart_batch(
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 1  # Keep batch size small to control memory
-        CPU_CORES = psutil.cpu_count(logical=False) or 4  # Fallback to 4 if detection fails
-        MAX_WORKERS = CPU_CORES * 2  # 2 threads per physical core
+        CPU_CORES = psutil.cpu_count(logical=False) or 4
+        MAX_WORKERS = CPU_CORES * 2
 
         logger.info(f"Worker PID {process.pid}: Detected {CPU_CORES} physical CPU cores, setting max_workers={MAX_WORKERS}")
 
@@ -196,14 +235,14 @@ async def process_restart_batch(
             cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id_db_int,))
             if cursor.fetchone()[0] == 0:
                 logger.error(f"Worker PID {process.pid}: FileID {file_id_db} does not exist")
-                return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": ""}
+                return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         # Fetch brand rules
         logger.debug(f"Worker PID {process.pid}: Fetching brand rules...")
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"Worker PID {process.pid}: No brand rules fetched")
-            return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": ""}
+            return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         # Fetch endpoint
         logger.debug(f"Worker PID {process.pid}: Fetching endpoint...")
@@ -221,7 +260,7 @@ async def process_restart_batch(
                 time.sleep(2)
         if not endpoint:
             logger.error(f"Worker PID {process.pid}: No healthy endpoint")
-            return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": ""}
+            return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         # Fetch entries
         logger.debug(f"Worker PID {process.pid}: Fetching entries...")
@@ -230,23 +269,23 @@ async def process_restart_batch(
             try:
                 if entry_id:
                     cursor.execute(
-                        "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID = ?",
+                        "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID >= ? ORDER BY EntryID",
                         (file_id_db_int, entry_id)
                     )
                 else:
                     cursor.execute(
-                        "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ?",
+                        "SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory FROM utb_ImageScraperRecords WHERE FileID = ? ORDER BY EntryID",
                         (file_id_db_int,)
                     )
                 entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
                 logger.info(f"Worker PID {process.pid}: Found {len(entries)} entries")
             except pyodbc.Error as e:
                 logger.error(f"Worker PID {process.pid}: Database query failed: {e}", exc_info=True)
-                return {"error": f"Database query failed: {e}", "log_filename": log_filename, "log_public_url": ""}
+                return {"error": f"Database query failed: {e}", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         if not entries:
             logger.warning(f"Worker PID {process.pid}: No entries found")
-            return {"error": "No entries found", "log_filename": log_filename, "log_public_url": ""}
+            return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         # Create batches
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
@@ -254,6 +293,7 @@ async def process_restart_batch(
 
         successful_entries = 0
         failed_entries = 0
+        last_entry_id_processed = entry_id or 0
         api_to_db_mapping = {
             'image_url': 'ImageUrl', 'thumbnail_url': 'ImageUrlThumbnail', 'url': 'ImageUrl',
             'thumb': 'ImageUrlThumbnail', 'image': 'ImageUrl', 'thumbnail': 'ImageUrlThumbnail'
@@ -274,7 +314,7 @@ async def process_restart_batch(
 
                 # Process tasks and collect results in order
                 results = [executor.submit(process_entry_search, task) for task in tasks]
-                results = [future.result() for future in results]  # Wait for results in order
+                results = [future.result() for future in results]
 
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
                     try:
@@ -332,6 +372,9 @@ async def process_restart_batch(
 
                         logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
                         successful_entries += 1
+                        last_entry_id_processed = entry_id
+                        # Store last processed EntryID
+                        await store_last_entry_id(str(file_id_db), entry_id, logger)
 
                     except Exception as e:
                         logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {e}", exc_info=True)
@@ -383,6 +426,7 @@ async def process_restart_batch(
                 )
                 if log_public_url:
                     logger.info(f"Worker PID {process.pid}: Log file uploaded successfully. Public URL: {log_public_url}")
+                    await update_log_url_in_db(str(file_id_db), log_public_url, logger)
                 else:
                     logger.error(f"Worker PID {process.pid}: Failed to upload log file to S3")
             except Exception as e:
@@ -398,10 +442,14 @@ async def process_restart_batch(
                 f"Processing for FileID {file_id_db} has completed successfully.\n"
                 f"Successful entries: {successful_entries}/{len(entries)}\n"
                 f"Failed entries: {failed_entries}\n"
+                f"Last processed EntryID: {last_entry_id_processed}\n"
                 f"Log file: {log_filename}\n"
                 f"Log file public URL: {log_public_url if log_public_url else 'Not available'}"
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
+
+        # Schedule failure monitoring
+        asyncio.create_task(monitor_and_resubmit_failed_jobs(file_id_db, logger))
 
         return {
             "message": "Search processing completed",
@@ -410,12 +458,14 @@ async def process_restart_batch(
             "total_entries": str(len(entries)),
             "failed_entries": str(failed_entries),
             "log_filename": log_filename,
-            "log_public_url": log_public_url
+            "log_public_url": log_public_url,
+            "last_entry_id": str(last_entry_id_processed)
         }
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
-        return {"error": str(e), "log_filename": log_filename, "log_public_url": ""}
+        return {"error": str(e), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+
 
 # Rest of the functions remain unchanged
 async def generate_download_file(
