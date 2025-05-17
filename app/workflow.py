@@ -24,8 +24,7 @@ from db_utils import (
     update_file_generate_complete,
     export_dai_json,
     update_log_url_in_db,
-    store_last_entry_id,
-    get_last_entry_id,
+    fetch_last_valid_entry,
 )
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
@@ -192,6 +191,7 @@ async def monitor_and_resubmit_failed_jobs(file_id: int, logger: logging.Logger)
             logger.warning(f"Worker PID {psutil.Process().pid}: Log file {log_filename} does not exist for FileID: {file_id}")
             return
 
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -236,6 +236,22 @@ async def process_restart_batch(
             if cursor.fetchone()[0] == 0:
                 logger.error(f"Worker PID {process.pid}: FileID {file_id_db} does not exist")
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+
+        # Fetch last valid EntryID if not provided
+        if entry_id is None:
+            entry_id = await fetch_last_valid_entry(str(file_id_db_int), logger)
+            logger.info(f"Worker PID {process.pid}: Fetched last valid EntryID: {entry_id}")
+            if entry_id is not None:
+                # Resume from the next EntryID
+                with pyodbc.connect(conn_str) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = ? AND EntryID > ?",
+                        (file_id_db_int, entry_id)
+                    )
+                    next_entry = cursor.fetchone()
+                    entry_id = next_entry[0] if next_entry and next_entry[0] else None
+                    logger.info(f"Worker PID {process.pid}: Resuming from next EntryID: {entry_id}")
 
         # Fetch brand rules
         logger.debug(f"Worker PID {process.pid}: Fetching brand rules...")
@@ -373,8 +389,6 @@ async def process_restart_batch(
                         logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
                         successful_entries += 1
                         last_entry_id_processed = entry_id
-                        # Store last processed EntryID
-                        await store_last_entry_id(str(file_id_db), entry_id, logger)
 
                     except Exception as e:
                         logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {e}", exc_info=True)
@@ -447,9 +461,6 @@ async def process_restart_batch(
                 f"Log file public URL: {log_public_url if log_public_url else 'Not available'}"
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
-
-        # Schedule failure monitoring
-        asyncio.create_task(monitor_and_resubmit_failed_jobs(file_id_db, logger))
 
         return {
             "message": "Search processing completed",
