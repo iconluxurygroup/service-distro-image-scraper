@@ -61,6 +61,57 @@ def sync_get_endpoint(logger: Optional[logging.Logger] = None) -> Optional[str]:
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
+    logger = logger or logging.getLogger(__name__)
+    required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+    
+    if df.empty:
+        logger.info("No rows to insert: DataFrame is empty")
+        return False
+
+    if not all(col in df.columns for col in required_columns):
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        logger.error(f"Missing columns: {missing_cols}")
+        return False
+
+    try:
+        df = df[required_columns].copy()
+        df['EntryID'] = pd.to_numeric(df['EntryID'], errors='coerce').astype('Int64')
+        df[['ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']] = df[
+            ['ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']
+        ].fillna('').astype(str)
+        
+        if df['EntryID'].isnull().any():
+            logger.error(f"Invalid EntryID values: {df[df['EntryID'].isnull()]['EntryID'].tolist()}")
+            return False
+
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO utb_ImageScraperResult (
+                        EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
+                    ) VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
+                """),
+                [
+                    {
+                        "entry_id": row['EntryID'],
+                        "image_url": row['ImageUrl'],
+                        "image_desc": row['ImageDesc'],
+                        "image_source": row['ImageSource'],
+                        "image_url_thumbnail": row['ImageUrlThumbnail']
+                    }
+                    for _, row in df.iterrows()
+                ]
+            )
+            conn.commit()
+            logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult")
+            return True
+    except (SQLAlchemyError, DBAPIError) as e:
+        logger.error(f"Database error inserting search results: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error inserting search results: {e}", exc_info=True)
+        return False
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
