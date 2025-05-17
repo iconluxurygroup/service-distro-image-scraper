@@ -521,15 +521,15 @@ async def process_single_all(
             logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
             
             update_result = await update_search_sort_order(
-                file_id=str(file_id_db),
-                entry_id=str(entry_id),
-                brand=result_brand,
-                model=result_model,
-                color=result_color,
-                category=result_category,
-                logger=logger,
-                brand_rules=brand_rules
-            )
+            file_id=str(file_id_db),
+            entry_id=str(entry_id),
+            brand=result_brand,
+            model=result_model,
+            color=result_color,
+            category=result_category,
+            logger=logger,
+            brand_rules=brand_rules
+        )
             if update_result is None:
                 logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
                 return False
@@ -736,15 +736,15 @@ async def process_single_row(
             logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
             
             update_result = await update_search_sort_order(
-                file_id=str(file_id_db),
-                entry_id=str(entry_id),
-                brand=result_brand,
-                model=result_model,
-                color=result_color,
-                category=result_category,
-                logger=logger,
-                brand_rules=brand_rules
-            )
+            file_id=str(file_id_db),
+            entry_id=str(entry_id),
+            brand=result_brand,
+            model=result_model,
+            color=result_color,
+            category=result_category,
+            logger=logger,
+            brand_rules=brand_rules
+        )
             if update_result is None:
                 logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
                 return False
