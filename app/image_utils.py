@@ -9,7 +9,8 @@ import time
 import hashlib
 import psutil
 import httpx
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException, APIRouter, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -24,14 +25,14 @@ from db_utils import (
     update_log_url_in_db,
 )
 from search_utils import update_search_sort_order, insert_search_results
-from common import fetch_brand_rules
-from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
+from common import fetch_brand_rules, clean_string, generate_aliases, generate_brand_aliases
+from utils import create_temp_dirs, cleanup_temp_dirs
 from endpoint_utils import sync_get_endpoint
 from logging_config import setup_job_logger
 from email_utils import send_message_email
 import aiofiles
 import aiohttp
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any, Callable
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
 import re
@@ -44,7 +45,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-from modular_search import async_process_entry_search  # Import the modular search function
+from modular_search import async_process_entry_search
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -73,12 +74,13 @@ async def process_restart_batch(
             if mem_info.rss / 1024**2 > 1000:
                 logger.warning(f"High memory usage")
 
-        logger.info(f"Starting processing for FileID: {file_id_db}")
+        logger.info(f"Starting processing for FileID: {file_id_db}, Use all variations: {use_all_variations}")
         log_memory_usage()
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 1
         MAX_CONCURRENCY = 4
+        MAX_ENTRY_RETRIES = 3
 
         async with async_engine.connect() as conn:
             result = await conn.execute(
@@ -152,50 +154,67 @@ async def process_restart_batch(
         async def process_entry(entry):
             entry_id, search_string, brand, color, category = entry
             async with semaphore:
-                try:
-                    logger.info(f"Processing EntryID {entry_id}")
-                    results = await async_process_entry_search(
-                        search_string=search_string,
-                        brand=brand,
-                        endpoint=endpoint,
-                        entry_id=entry_id,
-                        use_all_variations=use_all_variations,
-                        file_id_db=file_id_db,
-                        logger=logger
-                    )
-                    if not results:
-                        logger.error(f"No results for EntryID {entry_id}")
-                        return entry_id, False
+                for attempt in range(1, MAX_ENTRY_RETRIES + 1):
+                    try:
+                        logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
+                        # Generate variations to log the count
+                        variations = generate_search_variations(
+                            search_string=search_string,
+                            brand=brand,
+                            color=color,
+                            category=category,
+                            brand_rules=brand_rules,
+                            logger=logger
+                        )
+                        total_variations = sum(len(v) for v in variations.values())
+                        logger.debug(f"Generated {total_variations} variations for EntryID {entry_id}")
 
-                    if not all(all(col in res for col in required_columns) for res in results):
-                        logger.error(f"Missing columns for EntryID {entry_id}")
-                        return entry_id, False
+                        results = await async_process_entry_search(
+                            search_string=search_string,
+                            brand=brand,
+                            endpoint=endpoint,
+                            entry_id=entry_id,
+                            use_all_variations=use_all_variations,
+                            file_id_db=file_id_db,
+                            logger=logger
+                        )
+                        if not results:
+                            logger.warning(f"No results for EntryID {entry_id} on attempt {attempt}")
+                            continue
 
-                    deduplicated_results = []
-                    seen = set()
-                    for res in results:
-                        key = (res['EntryID'], res['ImageUrl'])
-                        if key not in seen:
-                            seen.add(key)
-                            deduplicated_results.append(res)
-                    logger.info(f"Deduplicated to {len(deduplicated_results)} rows")
+                        if not all(all(col in res for col in required_columns) for res in results):
+                            logger.error(f"Missing columns for EntryID {entry_id} on attempt {attempt}")
+                            continue
 
-                    insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
-                    if not insert_success:
-                        logger.error(f"Failed to insert results for EntryID {entry_id}")
-                        return entry_id, False
+                        deduplicated_results = []
+                        seen = set()
+                        for res in results:
+                            key = (res['EntryID'], res['ImageUrl'])
+                            if key not in seen:
+                                seen.add(key)
+                                deduplicated_results.append(res)
+                        logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
-                    update_result = await update_search_sort_order(
-                        str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                    )
-                    if update_result is None or not update_result:
-                        logger.error(f"SortOrder update failed for EntryID {entry_id}")
-                        return entry_id, False
+                        insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
+                        if not insert_success:
+                            logger.error(f"Failed to insert results for EntryID {entry_id} on attempt {attempt}")
+                            continue
 
-                    return entry_id, True
-                except Exception as e:
-                    logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-                    return entry_id, False
+                        update_result = await update_search_sort_order(
+                            str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                        )
+                        if update_result is None or not update_result:
+                            logger.error(f"SortOrder update failed for EntryID {entry_id} on attempt {attempt}")
+                            continue
+
+                        return entry_id, True
+                    except Exception as e:
+                        logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
+                        if attempt < MAX_ENTRY_RETRIES:
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                return entry_id, False
 
         for batch_idx, batch_entries in enumerate(entry_batches, 1):
             logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
@@ -255,7 +274,8 @@ async def process_restart_batch(
                 f"Successful entries: {successful_entries}/{len(entries)}\n"
                 f"Failed entries: {failed_entries}\n"
                 f"Last EntryID: {last_entry_id_processed}\n"
-                f"Log file: {log_filename}"
+                f"Log file: {log_filename}\n"
+                f"Used all variations: {use_all_variations}"
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
@@ -268,7 +288,8 @@ async def process_restart_batch(
             "failed_entries": str(failed_entries),
             "log_filename": log_filename,
             "log_public_url": log_public_url or "",
-            "last_entry_id": str(last_entry_id_processed)
+            "last_entry_id": str(last_entry_id_processed),
+            "use_all_variations": str(use_all_variations)
         }
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
@@ -326,3 +347,149 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
     except Exception as e:
         logger.error(f"Failed to upload log for FileID {file_id} after retries: {e}", exc_info=True)
         return None
+
+async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger):
+    log_file = f"job_logs/job_{file_id}.log"
+    max_attempts = 3
+    attempt = 1
+
+    while attempt <= max_attempts:
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                log_content = f.read()
+                if any(err in log_content for err in ["WORKER TIMEOUT", "SIGKILL", "placeholder://error"]):
+                    logger.warning(f"Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
+                    last_entry_id = await fetch_last_valid_entry(file_id, logger)
+                    logger.info(f"Resubmitting job for FileID: {file_id} starting from EntryID: {last_entry_id or 'beginning'} with all variations")
+                    
+                    result = await process_restart_batch(
+                        file_id_db=int(file_id),
+                        logger=logger,
+                        entry_id=last_entry_id,
+                        use_all_variations=True  # Always use all variations for retries
+                    )
+                    
+                    if "error" not in result:
+                        logger.info(f"Resubmission successful for FileID: {file_id}")
+                        await send_message_email(
+                            to_emails=["nik@luxurymarket.com"],
+                            subject=f"Success: Batch Resubmission for FileID {file_id}",
+                            message=f"Resubmission succeeded for FileID {file_id} starting from EntryID {last_entry_id or 'beginning'} with all variations.\nLog: {log_file}",
+                            logger=logger
+                        )
+                        return
+                    else:
+                        logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
+                    attempt += 1
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    logger.info(f"No failure detected in logs for FileID: {file_id}")
+                    return
+        else:
+            logger.warning(f"Log file {log_file} does not exist for FileID: {file_id}")
+            return
+        await asyncio.sleep(60)
+
+router = APIRouter()
+
+class JobStatusResponse(BaseModel):
+    status: str = Field(..., description="Job status (e.g., queued, running, completed, failed)")
+    message: str = Field(..., description="Descriptive message about the job status")
+    public_url: Optional[str] = Field(None, description="R2 URL of the generated Excel file, if available")
+    log_url: Optional[str] = Field(None, description="R2 URL of the job log file, if available")
+    timestamp: str = Field(..., description="ISO timestamp of the response")
+
+@router.post("/restart-search-all/{file_id}", tags=["Processing"])
+async def api_restart_search_all(
+    file_id: str,
+    entry_id: Optional[int] = None,
+    background_tasks: BackgroundTasks = None
+):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
+    
+    try:
+        if not entry_id:
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+        
+        result = await run_job_with_logging(
+            process_restart_batch,
+            file_id,
+            entry_id=entry_id,
+            use_all_variations=True
+        )
+        
+        if result["status_code"] != 200:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
+            if "placeholder://error" in result["message"]:
+                logger.warning(f"Placeholder error detected; check endpoint logs for FileID {file_id}")
+                debug_info = result.get("debug_info", {})
+                endpoint_errors = debug_info.get("endpoint_errors", [])
+                for error in endpoint_errors:
+                    logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            raise HTTPException(status_code=result["status_code"], detail=result["message"])
+        
+        if background_tasks:
+            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+        
+        logger.info(f"Completed restart batch for FileID: {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Processing restart with all variations completed for FileID: {file_id}",
+            "data": result["data"]
+        }
+    except Exception as e:
+        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
+
+async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
+    file_id_str = str(file_id)
+    logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
+    result = None
+    debug_info = {"memory_usage": {}, "log_file": log_file, "endpoint_errors": []}
+    
+    try:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.info(f"Starting job {func_name} for FileID: {file_id}")
+        
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
+        
+        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+            result = await job_func(file_id, **kwargs)
+        else:
+            result = job_func(file_id, **kwargs)
+        
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        if debug_info["memory_usage"]["after"] > 1000:
+            logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        
+        logger.info(f"Completed job {func_name} for FileID: {file_id}")
+        return {
+            "status_code": 200,
+            "message": f"Job {func_name} completed successfully for FileID: {file_id}",
+            "data": result,
+            "debug_info": debug_info
+        }
+    except Exception as e:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        debug_info["error_traceback"] = traceback.format_exc()
+        if "placeholder://error" in str(e):
+            debug_info["endpoint_errors"].append({"error": str(e), "timestamp": datetime.datetime.now().isoformat()})
+            logger.warning(f"Detected placeholder error in job {func_name} for FileID: {file_id}")
+        return {
+            "status_code": 500,
+            "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
+            "data": None,
+            "debug_info": debug_info
+        }
+    finally:
+        debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
