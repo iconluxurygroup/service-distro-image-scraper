@@ -38,6 +38,7 @@ import aiofiles
 from database_config import conn_str, async_engine, engine
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
+import pandas as pd
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -272,7 +273,7 @@ async def process_restart_batch(
             'image_url': 'ImageUrl',
             'thumbnail_url': 'ImageUrlThumbnail',
             'url': 'ImageUrl',
-            'thumb': 'ImageUrlThumbnail',  # Corrected invalid line
+            'thumb': 'ImageUrlThumbnail',
             'image': 'ImageUrl',
             'thumbnail': 'ImageUrlThumbnail'
         }
@@ -323,12 +324,29 @@ async def process_restart_batch(
                         logger.error(f"Failed to insert results for EntryID {entry_id}")
                         return entry_id, False
 
-                    update_result = await update_search_sort_order(
-                        str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                    )
-                    if update_result is None or not update_result:
-                        logger.error(f"SortOrder update failed for EntryID {entry_id}")
+                    # Retry update_search_sort_order on failure
+                    for attempt in range(3):
+                        update_result = await update_search_sort_order(
+                            str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                        )
+                        if update_result:
+                            break
+                        logger.warning(f"SortOrder update failed for EntryID {entry_id}, attempt {attempt + 1}/3")
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"SortOrder update failed after 3 attempts for EntryID {entry_id}")
                         return entry_id, False
+
+                    # Check for NULL SortOrder rows
+                    async with async_engine.connect() as conn:
+                        result = await conn.execute(
+                            text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id AND SortOrder IS NULL"),
+                            {"entry_id": entry_id}
+                        )
+                        null_count = result.scalar()
+                        result.close()
+                        if null_count > 0:
+                            logger.warning(f"Found {null_count} rows with NULL SortOrder for EntryID {entry_id} after update")
 
                     return entry_id, True
                 except Exception as e:
@@ -501,7 +519,6 @@ async def generate_download_file(
                 return {"error": f"Failed to download template file", "log_filename": log_filename}
             logger.debug(f"Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
             
-            import pandas as pd
             with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
                 pd.DataFrame({"Message": [f"No images found for FileID {file_id}. Check utb_ImageScraperResult for valid images."]}).to_excel(writer, sheet_name="NoImages", index=False)
             
@@ -577,7 +594,6 @@ async def generate_download_file(
                 logger.error(f"Template file not found at {local_filename}")
                 return {"error": f"Failed to download template file", "log_filename": log_filename}
             
-            import pandas as pd
             with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
                 pd.DataFrame({"Message": [f"No valid images found for FileID {file_id} after filtering."]}).to_excel(writer, sheet_name="NoImages", index=False)
             
