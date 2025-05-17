@@ -33,6 +33,7 @@ dependencies = [
     "setuptools>=69.0.0",
     "gunicorn>=21.2.0",
     "waitress==3.0.2",
+    "tenacity==9.1.2",
 
     
 ]
