@@ -102,24 +102,47 @@ def clean_string(s: str, preserve_url: bool = False) -> str:
         s = re.sub(r'[^a-z0-9\s&]', '', s.strip().lower())
         s = re.sub(r'\s+', ' ', s)
     return s
-
 def generate_aliases(model: Any) -> List[str]:
-    """Generate a list of possible aliases for a model string."""
     if not isinstance(model, str):
         model = str(model)
     if not model or model.strip() == '':
         return []
+    
+    # Initialize with case variations
     aliases = {model, model.lower(), model.upper()}
-    aliases.add(model.replace("_", "-"))
-    aliases.add(model.replace("_", ""))
-    aliases.add(model.replace("_", " "))
-    aliases.add(model.replace("_", "/"))
-    aliases.add(model.replace("_", "."))
-    digits_only = re.sub(r'[_/.-]', '', model)
-    if digits_only.isdigit():
+    
+    # Define separators to handle
+    separators = ['_', '-', ' ', '/', '.']
+    base_model = model
+    
+    # Remove any existing separator to create a clean base
+    for sep in separators:
+        base_model = base_model.replace(sep, '')
+        aliases.add(base_model)
+    
+    # Add variations with different separators
+    for sep in separators:
+        # Try inserting separator before known suffixes like 's69'
+        if 's69' in base_model.lower():
+            idx = base_model.lower().index('s69')
+            alias_with_sep = base_model[:idx] + sep + base_model[idx:]
+            aliases.add(alias_with_sep)
+            aliases.add(alias_with_sep.lower())
+            aliases.add(alias_with_sep.upper())
+    
+    # Add digits-only version if applicable
+    digits_only = re.sub(r'[^0-9]', '', base_model)
+    if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
-    base = model.split('_')[0] if '_' in model else model
-    aliases.add(base)
+    
+    # Add base model without suffix if it contains a separator
+    for sep in separators:
+        if sep in model:
+            base = model.split(sep)[0]
+            aliases.add(base)
+            break
+    
+    # Filter aliases to ensure reasonable length
     return [a for a in aliases if a and len(a) >= len(model) - 3]
 
 import httpx
@@ -181,9 +204,6 @@ def normalize_model(model: Any) -> str:
     return model.strip().lower()
 
 def validate_model(row, expected_models, result_id, logger=None) -> bool:
-    """
-    Validate if the model in the row matches any expected models using exact substring matching.
-    """
     logger = logger or logging.getLogger(__name__)
     input_model = clean_string(row.get('ProductModel', ''))
     if not input_model:
@@ -196,14 +216,25 @@ def validate_model(row, expected_models, result_id, logger=None) -> bool:
         clean_string(row.get('ImageUrl', ''))
     ]
 
+    # Normalize separators in fields
+    def normalize_separators(text):
+        for sep in ['_', '-', ' ', '/', '.']:
+            text = text.replace(sep, '')
+        return text.lower()
+
+    normalized_fields = [normalize_separators(field) for field in fields]
+
     for expected_model in expected_models:
-        expected_model = clean_string(expected_model)
-        if not expected_model:
+        expected_model_clean = clean_string(expected_model)
+        if not expected_model_clean:
             continue
-        for field in fields:
+        normalized_expected = normalize_separators(expected_model_clean)
+        for field, norm_field in zip(fields, normalized_fields):
             if not field:
                 continue
-            if expected_model.lower() in field.lower():
+            # Check both exact substring and normalized match
+            if (expected_model_clean.lower() in field.lower() or
+                normalized_expected in norm_field):
                 logger.info(f"ResultID {result_id}: Model match: '{expected_model}' in field")
                 return True
 

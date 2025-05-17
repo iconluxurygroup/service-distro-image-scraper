@@ -828,7 +828,7 @@ async def update_search_sort_order(
                     if row['priority'] in [1, 2] and validate_model(row, model_aliases, result_id, logger):
                         valid_indices.append(idx)
                     elif row['priority'] == 3:
-                        brand_found = validate_brand(row, brand_aliases, result_id, domain_hierarchy, logger)
+                        brand_found = validate_brand(row, brand_aliases, result_id, None, logger)  # Pass None
                         if brand_found:
                             valid_indices.append(idx)
                         else:
@@ -837,12 +837,13 @@ async def update_search_sort_order(
                             df.at[idx, 'priority'] = 4
                     else:
                         logger.warning(f"Model validation failed for ResultID {result_id}, checking brand")
-                        brand_found = validate_brand(row, brand_aliases, result_id, domain_hierarchy, logger)
+                        brand_found = validate_brand(row, brand_aliases, result_id, None, logger)  # Pass None
                         df.at[idx, 'new_sort_order'] = -2 if not brand_found else None
                         df.at[idx, 'priority'] = 4 if not brand_found else 3
                         if brand_found:
                             valid_indices.append(idx)
-                        logger.debug(f"Downgraded ResultID {result_id} to new_sort_order={df.at[idx, 'new_sort_order']}")
+                            logger.debug(f"Downgraded ResultID {result_id} to new_sort_order={df.at[idx, 'new_sort_order']}")
+                # ... (rest unchanged)
 
                 valid_match_df = match_df.loc[valid_indices]
                 if not valid_match_df.empty:
