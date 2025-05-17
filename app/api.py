@@ -461,7 +461,7 @@ async def api_restart_search_all(
 
         # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = fetch_last_valid_entry(file_id, logger)  # Synchronous call
+            entry_id = await fetch_last_valid_entry(file_id, logger)  # Synchronous call
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
 
         # Query database for EntryID 69801 state
