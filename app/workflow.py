@@ -263,12 +263,12 @@ async def process_restart_batch(
             logger.info(f"Uploading log file {log_filename} to S3")
             try:
                 log_public_url = await upload_file_to_space(
-                    file_src=log_filename,
-                    save_as=f"super_scraper/logs/job_{file_id_db}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id_db
-                )
+    file_src=log_filename,
+    save_as=f"super_scraper/logs/job_{file_id_db}.log",
+    is_public=True,
+    logger=logger,
+    file_id=file_id_db
+)
                 if log_public_url:
                     logger.info(f"Log file uploaded successfully. Public URL: {log_public_url}")
                 else:
@@ -399,8 +399,12 @@ async def generate_download_file(
 
         # Upload to S3
         public_url = await upload_file_to_space(
-            local_filename, processed_file_name, True, logger, file_id
-        )
+    file_src=local_filename,
+    save_as=processed_file_name,
+    is_public=True,
+    logger=logger,
+    file_id=file_id
+)
         
         if not public_url:
             logger.error(f"❌ Upload failed for FileID {file_id}")

@@ -154,17 +154,15 @@ def double_encode_plus(filename, logger=None):
     second_pass = urllib.parse.quote(first_pass)
     logger.debug(f"Double-encoded filename: {second_pass}")
     return second_pass
-
 async def upload_file_to_space(file_src, save_as, is_public=True, public=None, logger=None, file_id=None):
-    logger = logger or default_logger  # Initialize first
+    logger = logger or default_logger
     if logger == default_logger and file_id:
         logger, _ = setup_job_logger(job_id=file_id, console_output=True)
         logger.info(f"Setup logger for upload_file_to_space, FileID: {file_id}")
+    logger.debug(f"Parameters: logger_type={type(logger)}, logger={logger}, file_id={file_id}")
     if public is not None:
         is_public = public
-        logger.warning("Use of 'public' parameter is deprecated; use 'is_public' instead")
-    # ...
-
+        logger.warning("The 'public' parameter is deprecated and will be removed in a future version; use 'is_public' instead")
     result_urls = {}
 
     if not os.path.exists(file_src):
