@@ -11,18 +11,18 @@ import json
 import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
-from search_utils import update_search_sort_order, insert_search_results  # New module
+from search_utils import update_search_sort_order, insert_search_results
 from db_utils import (
     get_send_to_email,
     get_images_excel_db,
-    fetch_missing_images,
     update_file_location_complete,
     update_file_generate_complete,
     export_dai_json,
     update_log_url_in_db,
     fetch_last_valid_entry,
 )
-from endpoint_utils import sync_get_endpoint  # From previous fix
+from vision_utils import fetch_missing_images  # New module
+from endpoint_utils import sync_get_endpoint
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
@@ -42,6 +42,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import aiohttp
 from database_config import conn_str, async_engine, engine
 from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
@@ -66,13 +67,11 @@ async def async_process_entry_search(
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory before task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
     
-    # Fetch brand rules
     brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
     if not brand_rules:
         logger.warning(f"Worker PID {process.pid}: No brand rules fetched for EntryID {entry_id}")
         brand_rules = {}
     
-    # Generate search variations
     try:
         variations_dict = generate_search_variations(
             search_string=search_string,
@@ -85,7 +84,6 @@ async def async_process_entry_search(
         logger.error(f"Worker PID {process.pid}: Failed to generate variations for EntryID {entry_id}: {e}")
         raise ValueError(f"Failed to generate search variations: {e}")
     
-    # Flatten variations into a unique list
     variations = []
     for category, var_list in variations_dict.items():
         variations.extend(var_list)
@@ -96,7 +94,6 @@ async def async_process_entry_search(
         logger.warning(f"Worker PID {process.pid}: No variations generated for EntryID {entry_id}")
         return []
     
-    # Process all variations in parallel
     async def process_variation(variation: str) -> List[pd.DataFrame]:
         try:
             result = await process_and_tag_results(
@@ -109,7 +106,6 @@ async def async_process_entry_search(
                 use_all_variations=False,
                 file_id_db=file_id_db
             )
-            # Validate result
             for df in result:
                 if not all(col in df.columns for col in ['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']):
                     logger.error(f"Worker PID {process.pid}: Invalid DataFrame for variation '{variation}' in EntryID {entry_id}: missing columns")
@@ -122,7 +118,6 @@ async def async_process_entry_search(
             logger.error(f"Worker PID {process.pid}: Error processing variation '{variation}' for EntryID {entry_id}: {e}")
             return []
     
-    # Run variations concurrently with a semaphore
     semaphore = asyncio.Semaphore(10)
     async def process_with_semaphore(variation: str) -> List[pd.DataFrame]:
         async with semaphore:
@@ -133,7 +128,6 @@ async def async_process_entry_search(
         return_exceptions=True
     )
     
-    # Flatten and filter results
     combined_results = []
     for idx, result in enumerate(results):
         if isinstance(result, Exception):
@@ -146,7 +140,6 @@ async def async_process_entry_search(
         logger.warning(f"Worker PID {process.pid}: No valid results for EntryID {entry_id} after processing {len(variations)} variations")
         return []
     
-    # Validate EntryID consistency
     for df in combined_results:
         if 'EntryID' in df.columns and not df['EntryID'].eq(entry_id).all():
             logger.error(f"Worker PID {process.pid}: EntryID mismatch in DataFrame for EntryID {entry_id}: {df['EntryID'].tolist()}")
@@ -201,7 +194,6 @@ async def upload_file_to_space(
 ) -> str:
     process = psutil.Process()
     try:
-        # Synchronous S3 upload
         logger.info(f"Worker PID {process.pid}: Creating S3 client (sync) for {save_as}")
         from boto3 import client
         s3_client = client(
@@ -222,7 +214,6 @@ async def upload_file_to_space(
         public_url = f"https://iconluxurygroup.s3.us-east-2.amazonaws.com/{save_as}"
         logger.info(f"Worker PID {process.pid}: Uploaded {file_src} to S3: {public_url}")
         
-        # Update log URL in database
         if file_id:
             await update_log_url_in_db(file_id, public_url, logger)
         
@@ -368,7 +359,7 @@ async def process_restart_batch(
                             continue
 
                         deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-                        insert_success = await insert_search_results(deduplicated_df, logger=logger)
+                        insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
                         if not insert_success:
                             logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
                             failed_entries += 1
@@ -415,7 +406,6 @@ async def process_restart_batch(
                 logger.warning(f"Worker PID {process.pid}: Found {null_entries} entries with NULL SortOrder")
             cursor.close()
 
-        # Skip log upload here; let generate_download_file handle it
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
             has_failure = await detect_job_failure(log_filename, logger)
@@ -733,6 +723,8 @@ async def generate_download_file(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Worker PID {process.pid}: Disposed database engines")
+
+
 
 async def batch_vision_reason(
     file_id: str,

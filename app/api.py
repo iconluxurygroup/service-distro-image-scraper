@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
+from vision_utils import fetch_missing_images  # New module
 from workflow import generate_download_file, process_restart_batch, batch_vision_reason
 from db_utils import (
     update_log_url_in_db,
@@ -23,7 +24,6 @@ from db_utils import (
     update_sort_order,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
-    fetch_missing_images,
     get_images_excel_db,
     update_file_generate_complete,
     update_file_location_complete,

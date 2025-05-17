@@ -637,13 +637,6 @@ async def process_single_all(
     except pyodbc.Error as e:
         logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
-import logging
-import pandas as pd
-import pyodbc
-from typing import Optional, Dict
-from common import clean_string, generate_aliases, generate_brand_aliases
-from database_config import conn_str  # Ensure conn_str is imported
-from icon_image_lib.google_parser import process_search_result
 
 async def process_single_row(
     entry_id: int,
