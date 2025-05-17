@@ -126,7 +126,7 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
-        # Use a separate connection for SELECT to avoid cursor conflicts
+        # Use a separate connection for SELECT
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
@@ -137,8 +137,8 @@ async def update_search_sort_order(
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
             columns = result.keys()
-            result.close()  # Explicitly close the result set
-            await conn.commit()  # Ensure no pending operations
+            result.close()
+            await conn.commit()
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
@@ -189,22 +189,23 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
         # Use a new connection for UPDATE operations
-        async with async_engine.begin() as conn:  # Use begin() for transaction
+        async with async_engine.begin() as conn:
             for index, res in enumerate(sorted_results, 1):
                 try:
+                    # Assign SortOrder = 1 to only the top result, others get 2, 3, etc.
+                    sort_order = 1 if index == 1 else index
                     await conn.execute(
                         text("""
                             UPDATE utb_ImageScraperResult
                             SET SortOrder = :sort_order
                             WHERE ResultID = :result_id AND EntryID = :entry_id
                         """),
-                        {"sort_order": index, "result_id": res["ResultID"], "entry_id": entry_id}
+                        {"sort_order": sort_order, "result_id": res["ResultID"], "entry_id": entry_id}
                     )
-                    logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {index} for ResultID {res['ResultID']}")
+                    logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {sort_order} for ResultID {res['ResultID']}")
                 except SQLAlchemyError as e:
                     logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, EntryID {entry_id}: {e}")
                     return False
-            # Commit is automatic with begin() context manager
             logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(sorted_results)} rows for EntryID {entry_id}")
 
         return True
@@ -272,56 +273,7 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
                     failure_count += 1
                     logger.warning(f"No results for EntryID {entry_id}")
             except Exception as e:
-                results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
-                failure_count += 1
-                logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-        
-        logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
-        
-        async with async_engine.connect() as conn:
-            verification = {}
-            queries = [
-                ("PositiveSortOrderEntries", "t.SortOrder > 0"),
-                ("BrandMatchEntries", "t.SortOrder = 0"),
-                ("NoMatchEntries", "t.SortOrder < 0"),
-                ("NullSortOrderEntries", "t.SortOrder IS NULL"),
-                ("UnexpectedSortOrderEntries", "t.SortOrder = -1")
-            ]
-            for key, condition in queries:
-                query = text(f"""
-                    SELECT COUNT(DISTINCT t.EntryID)
-                    FROM utb_ImageScraperResult t
-                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                    WHERE r.FileID = :file_id AND {condition}
-                """)
-                result = await conn.execute(query, {"file_id": file_id})
-                verification[key] = result.scalar()
-                result.close()
-            
-            query = text("""
-                SELECT t.EntryID, t.SortOrder, t.ImageUrl
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = :file_id
-            """)
-            result = await conn.execute(query, {"file_id": file_id})
-            sort_orders = result.fetchall()
-            logger.info(f"SortOrder values for FileID {file_id}: {[(row[0], row[1], row[2][:50]) for row in sort_orders]}")
-            
-            logger.info(f"Verification for FileID {file_id}: "
-                       f"{verification['PositiveSortOrderEntries']} entries with model matches, "
-                       f"{verification['BrandMatchEntries']} entries with brand matches only, "
-                       f"{verification['NoMatchEntries']} entries with no matches, "
-                       f"{verification['NullSortOrderEntries']} entries with NULL SortOrder, "
-                       f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder")
-        
-        return results
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        return None
+                results.append({"EntryID": entry_id, "Success": check if it already exists in R2 before downloading.
 
 @retry(
     stop=stop_after_attempt(3),
