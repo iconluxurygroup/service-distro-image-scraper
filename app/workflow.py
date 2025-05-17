@@ -6,32 +6,86 @@ import os
 import pandas as pd
 import time
 import pyodbc
-import httpx,json
+import httpx
+import json
 import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
 from config import conn_str
 from db_utils import (
-    sync_get_endpoint, insert_search_results, update_search_sort_order, get_send_to_email,
+    sync_get_endpoint,
+    insert_search_results,
+    update_search_sort_order,
+    get_send_to_email,
     sync_update_search_sort_order,
-    get_images_excel_db, fetch_missing_images, update_file_location_complete, update_file_generate_complete,
-    export_dai_json, update_log_url_in_db
+    get_images_excel_db,
+    fetch_missing_images,
+    update_file_location_complete,
+    update_file_generate_complete,
+    export_dai_json,
+    update_log_url_in_db
 )
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
-from utils import create_temp_dirs, cleanup_temp_dirs
-from utils import sync_process_and_tag_results
+from utils import (
+    create_temp_dirs,
+    cleanup_temp_dirs,
+    process_and_tag_results,
+    sync_process_and_tag_results,
+    generate_search_variations,
+    search_variation,
+    process_search_row_gcloud
+)
 from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space
 import psutil
 from email_utils import send_message_email, send_email
 from image_reason import process_entry
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import aiohttp
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, pd.errors.EmptyDataError, ValueError)),
+    before_sleep=lambda retry_state: logging.getLogger(f"worker_{retry_state.kwargs['entry_id']}").info(
+        f"Worker PID {psutil.Process().pid}: Retrying task for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def async_process_entry_search(
+    search_string: str,
+    brand: str,
+    endpoint: str,
+    entry_id: int,
+    use_all_variations: bool,
+    file_id_db: int,
+    logger: logging.Logger
+) -> List[pd.DataFrame]:
+    """Async wrapper for process_and_tag_results with retry logic."""
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    logger.debug(f"Worker PID {process.pid}: Memory before task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+    
+    result = await process_and_tag_results(
+        search_string=search_string,
+        brand=brand,
+        model=search_string,
+        endpoint=endpoint,
+        entry_id=entry_id,
+        logger=logger,
+        use_all_variations=use_all_variations,
+        file_id_db=file_id_db
+    )
+    
+    mem_info = process.memory_info()
+    logger.debug(f"Worker PID {process.pid}: Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+    return result
+
 def process_entry_search(args):
-    """Wrapper for sync_process_and_tag_results to run in a thread."""
+    """Wrapper for async_process_entry_search to run in a thread."""
     search_string, brand, endpoint, entry_id, use_all_variations, file_id_db = args
     logger = logging.getLogger(f"worker_{entry_id}")
     logger.setLevel(logging.DEBUG)
@@ -40,21 +94,28 @@ def process_entry_search(args):
     logger.addHandler(handler)
     try:
         mem_info = psutil.Process().memory_info()
-        logger.debug(f"Worker {entry_id} memory: RSS={mem_info.rss / 1024 / 1024:.2f} MB")
-        result = sync_process_and_tag_results(
-            search_string=search_string,
-            brand=brand,
-            model=search_string,
-            endpoint=endpoint,
-            entry_id=entry_id,
-            logger=logger,
-            use_all_variations=use_all_variations,
-            file_id_db=file_id_db
-        )
-        logger.debug(f"Result for EntryID {entry_id}: {result}")
-        return result
+        logger.debug(f"Worker PID {psutil.Process().pid}: Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
+        # Run async function in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                async_process_entry_search(
+                    search_string=search_string,
+                    brand=brand,
+                    endpoint=endpoint,
+                    entry_id=entry_id,
+                    use_all_variations=use_all_variations,
+                    file_id_db=file_id_db,
+                    logger=logger
+                )
+            )
+            logger.debug(f"Worker PID {psutil.Process().pid}: Result for EntryID {entry_id}: {result}")
+            return result
+        finally:
+            loop.close()
     except Exception as e:
-        logger.error(f"Task failed for EntryID {entry_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {psutil.Process().pid}: Task failed for EntryID {entry_id}: {e}", exc_info=True)
         return None
     finally:
         logger.removeHandler(handler)
@@ -71,59 +132,59 @@ async def process_restart_batch(
         # Initialize logger
         logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
         logger.setLevel(logging.DEBUG)
-        logger.debug("Logger initialized")
+        process = psutil.Process()
+        logger.debug(f"Worker PID {process.pid}: Logger initialized")
 
         def log_memory_usage():
             try:
-                process = psutil.Process()
                 mem_info = process.memory_info()
-                logger.info(f"Memory usage: RSS={mem_info.rss / 1024 / 1024:.2f} MB")
+                logger.info(f"Worker PID {process.pid}: Memory usage: RSS={mem_info.rss / 1024**2:.2f} MB")
             except Exception as e:
-                logger.error(f"Memory logging failed: {e}")
+                logger.error(f"Worker PID {process.pid}: Memory logging failed: {e}")
 
-        logger.debug(f"Input file_id_db: {file_id_db}, entry_id: {entry_id}, use_all_variations: {use_all_variations}")
-        logger.info(f"🔁 Starting processing for FileID: {file_id_db}")
+        logger.debug(f"Worker PID {process.pid}: Input file_id_db: {file_id_db}, entry_id: {entry_id}, use_all_variations: {use_all_variations}")
+        logger.info(f"Worker PID {process.pid}: 🔁 Starting processing for FileID: {file_id_db}")
         log_memory_usage()
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 1
 
         # Validate FileID
-        logger.debug("Validating FileID...")
+        logger.debug(f"Worker PID {process.pid}: Validating FileID...")
         with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id_db_int,))
             if cursor.fetchone()[0] == 0:
-                logger.error(f"FileID {file_id_db} does not exist")
+                logger.error(f"Worker PID {process.pid}: FileID {file_id_db} does not exist")
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": ""}
 
         # Fetch brand rules
-        logger.debug("Fetching brand rules...")
+        logger.debug(f"Worker PID {process.pid}: Fetching brand rules...")
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
-            logger.warning("No brand rules fetched")
+            logger.warning(f"Worker PID {process.pid}: No brand rules fetched")
             return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": ""}
 
         # Fetch endpoint
-        logger.debug("Fetching endpoint...")
+        logger.debug(f"Worker PID {process.pid}: Fetching endpoint...")
         endpoint = None
         for attempt in range(5):
             try:
                 endpoint = sync_get_endpoint(logger=logger)
                 if endpoint:
-                    logger.info(f"Selected endpoint: {endpoint}")
+                    logger.info(f"Worker PID {process.pid}: Selected endpoint: {endpoint}")
                     break
-                logger.warning(f"Attempt {attempt + 1} failed")
+                logger.warning(f"Worker PID {process.pid}: Attempt {attempt + 1} failed")
                 time.sleep(2)
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                logger.warning(f"Worker PID {process.pid}: Attempt {attempt + 1} failed: {e}")
                 time.sleep(2)
         if not endpoint:
-            logger.error("No healthy endpoint")
+            logger.error(f"Worker PID {process.pid}: No healthy endpoint")
             return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": ""}
 
         # Fetch entries
-        logger.debug("Fetching entries...")
+        logger.debug(f"Worker PID {process.pid}: Fetching entries...")
         with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
             cursor = conn.cursor()
             try:
@@ -138,18 +199,18 @@ async def process_restart_batch(
                         (file_id_db_int,)
                     )
                 entries = [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall() if row[1] is not None]
-                logger.info(f"Found {len(entries)} entries")
+                logger.info(f"Worker PID {process.pid}: Found {len(entries)} entries")
             except pyodbc.Error as e:
-                logger.error(f"Database query failed: {e}", exc_info=True)
+                logger.error(f"Worker PID {process.pid}: Database query failed: {e}", exc_info=True)
                 return {"error": f"Database query failed: {e}", "log_filename": log_filename, "log_public_url": ""}
 
         if not entries:
-            logger.warning("No entries found")
+            logger.warning(f"Worker PID {process.pid}: No entries found")
             return {"error": "No entries found", "log_filename": log_filename, "log_public_url": ""}
 
         # Create batches
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
-        logger.info(f"Created {len(entry_batches)} batches")
+        logger.info(f"Worker PID {process.pid}: Created {len(entry_batches)} batches")
 
         successful_entries = 0
         failed_entries = 0
@@ -159,74 +220,76 @@ async def process_restart_batch(
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        # Use ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        # Use ThreadPoolExecutor with reduced workers to manage memory
+        with ThreadPoolExecutor(max_workers=2) as executor:
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
-                logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
+                logger.info(f"Worker PID {process.pid}: Processing batch {batch_idx}/{len(entry_batches)}")
                 start_time = datetime.datetime.now()
 
                 tasks = [
                     (search_string, brand, endpoint, entry_id, use_all_variations, file_id_db_int)
                     for entry_id, search_string, brand, color, category in batch_entries
                 ]
-                logger.debug(f"Tasks: {tasks}")
+                logger.debug(f"Worker PID {process.pid}: Tasks: {tasks}")
 
                 results = list(executor.map(process_entry_search, tasks))
-                logger.debug(f"Batch {batch_idx} results: {results}")
+                logger.debug(f"Worker PID {process.pid}: Batch {batch_idx} results: {results}")
 
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
                     try:
                         if result is None:
-                            logger.error(f"No results for EntryID {entry_id}")
+                            logger.error(f"Worker PID {process.pid}: No results for EntryID {entry_id}")
                             failed_entries += 1
                             continue
 
                         dfs = result
                         if not dfs:
-                            logger.error(f"Empty results for EntryID {entry_id}")
+                            logger.error(f"Worker PID {process.pid}: Empty results for EntryID {entry_id}")
                             failed_entries += 1
                             continue
 
-                        combined_df = pd.concat(dfs, ignore_index=True)
-                        logger.debug(f"Combined DataFrame for EntryID {entry_id}: {combined_df.to_dict()}")
+                        # Process DataFrame incrementally to reduce memory usage
+                        combined_df = pd.concat(dfs, ignore_index=True, copy=False)
+                        logger.debug(f"Worker PID {process.pid}: Combined DataFrame for EntryID {entry_id}: {combined_df.to_dict()}")
 
                         for api_col, db_col in api_to_db_mapping.items():
                             if api_col in combined_df.columns and db_col not in combined_df.columns:
                                 combined_df.rename(columns={api_col: db_col}, inplace=True)
 
                         if not all(col in combined_df.columns for col in required_columns):
-                            logger.error(f"Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
+                            logger.error(f"Worker PID {process.pid}: Missing columns {set(required_columns) - set(combined_df.columns)} for EntryID {entry_id}")
                             failed_entries += 1
                             continue
 
-                        deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-                        logger.info(f"Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
+                        deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
+                        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
 
                         insert_success = insert_search_results(deduplicated_df, logger=logger)
                         if not insert_success:
-                            logger.error(f"Failed to insert results for EntryID {entry_id}")
+                            logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
                             failed_entries += 1
                             continue
 
-                        logger.info(f"Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
+                        logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
 
-                        update_result = update_search_sort_order(
+                        # Await the async update_search_sort_order
+                        update_result = await update_search_sort_order(
                             str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                         )
                         if update_result is None:
-                            logger.error(f"SortOrder update failed for EntryID {entry_id}")
+                            logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
                             failed_entries += 1
                             continue
 
-                        logger.info(f"Updated sort order for EntryID {entry_id}")
+                        logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
                         successful_entries += 1
 
                     except Exception as e:
-                        logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
+                        logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {e}", exc_info=True)
                         failed_entries += 1
 
                 elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
+                logger.info(f"Worker PID {process.pid}: Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
                 log_memory_usage()
 
         # Final verification
@@ -252,31 +315,31 @@ async def process_restart_batch(
                 (file_id_db_int,)
             )
             null_entries = cursor.fetchone()[0]
-            logger.info(f"Final verification: Found {positive_entries} entries with positive SortOrder, {null_entries} entries with NULL SortOrder")
+            logger.info(f"Worker PID {process.pid}: Final verification: Found {positive_entries} entries with positive SortOrder, {null_entries} entries with NULL SortOrder")
 
-        logger.info(f"Completed processing. Successful: {successful_entries}, Failed: {failed_entries}")
+        logger.info(f"Worker PID {process.pid}: Completed processing. Successful: {successful_entries}, Failed: {failed_entries}")
         log_memory_usage()
 
         # Upload log file to S3
         log_public_url = ""
         if os.path.exists(log_filename):
-            logger.info(f"Uploading log file {log_filename} to S3")
+            logger.info(f"Worker PID {process.pid}: Uploading log file {log_filename} to S3")
             try:
                 log_public_url = await upload_file_to_space(
-    file_src=log_filename,
-    save_as=f"super_scraper/logs/job_{file_id_db}.log",
-    is_public=True,
-    logger=logger,
-    file_id=file_id_db
-)
+                    file_src=log_filename,
+                    save_as=f"super_scraper/logs/job_{file_id_db}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id_db
+                )
                 if log_public_url:
-                    logger.info(f"Log file uploaded successfully. Public URL: {log_public_url}")
+                    logger.info(f"Worker PID {process.pid}: Log file uploaded successfully. Public URL: {log_public_url}")
                 else:
-                    logger.error("Failed to upload log file to S3")
+                    logger.error(f"Worker PID {process.pid}: Failed to upload log file to S3")
             except Exception as e:
-                logger.error(f"Error uploading log file to S3: {e}", exc_info=True)
+                logger.error(f"Worker PID {process.pid}: Error uploading log file to S3: {e}", exc_info=True)
         else:
-            logger.error(f"Log file {log_filename} does not exist")
+            logger.error(f"Worker PID {process.pid}: Log file {log_filename} does not exist")
 
         # Send email notification
         to_emails = await get_send_to_email(file_id_db, logger=logger)
@@ -302,7 +365,7 @@ async def process_restart_batch(
         }
 
     except Exception as e:
-        logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": ""}
 
 async def generate_download_file(
@@ -312,24 +375,27 @@ async def generate_download_file(
 ) -> Dict[str, str]:
     """Generate and upload a processed Excel file with images asynchronously."""
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
+    process = psutil.Process()
     temp_images_dir, temp_excel_dir = None, None
 
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
+        with pyodbc.connect(conn_str, timeout=30) as conn:
             query = "SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?"
             cursor = conn.cursor()
             cursor.execute(query, (file_id,))
             result = cursor.fetchone()
             if not result:
-                logger.error(f"❌ No file found for FileID {file_id}")
+                logger.error(f"Worker PID {process.pid}: ❌ No file found for FileID {file_id}")
                 return {"error": f"No file found for FileID {file_id}", "log_filename": log_filename}
             original_filename = result[0]
 
-        logger.info(f"🕵️ Fetching images for FileID: {file_id}")
+        logger.info(f"Worker PID {process.pid}: 🕵️ Fetching images for FileID: {file_id}")
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before fetching images: RSS={mem_info.rss / 1024**2:.2f} MB")
         selected_images_df = await get_images_excel_db(str(file_id), logger=logger)
         if selected_images_df.empty:
-            logger.warning(f"⚠️ No images found for FileID {file_id}")
+            logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for FileID {file_id}")
             return {"error": f"No images found for FileID {file_id}", "log_filename": log_filename}
 
         selected_image_list = [
@@ -345,7 +411,7 @@ async def generate_download_file(
             for _, row in selected_images_df.iterrows()
             if row['ImageUrl'] or row['ImageUrlThumbnail']
         ]
-        logger.debug(f"📋 Selected {len(selected_image_list)} images: {selected_image_list[:2]}")
+        logger.debug(f"Worker PID {process.pid}: 📋 Selected {len(selected_image_list)} images: {selected_image_list[:2]}")
 
         template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
         header_index = 5
@@ -353,13 +419,13 @@ async def generate_download_file(
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         unique_id = base_name[-8:] if len(base_name) >= 8 else base_name
         processed_file_name = f"super_scraper/jobs/{file_id}/{base_name}_scraper_{timestamp}_{unique_id}{extension}"
-        logger.info(f"🆔 Generated filename: {processed_file_name}")
+        logger.info(f"Worker PID {process.pid}: 🆔 Generated filename: {processed_file_name}")
 
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
         local_filename = os.path.join(temp_excel_dir, original_filename)
 
         # Download template file
-        logger.info(f"📥 Downloading template file from {template_file_path}")
+        logger.info(f"Worker PID {process.pid}: 📥 Downloading template file from {template_file_path}")
         async with httpx.AsyncClient() as client:
             response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
             response.raise_for_status()
@@ -368,46 +434,48 @@ async def generate_download_file(
         
         # Verify template file
         if not os.path.exists(local_filename):
-            logger.error(f"Template file not found at {local_filename}")
+            logger.error(f"Worker PID {process.pid}: Template file not found at {local_filename}")
             return {"error": f"Failed to download template file", "log_filename": log_filename}
-        logger.debug(f"Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
+        logger.debug(f"Worker PID {process.pid}: Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
 
         # Download images
-        logger.debug(f"Using temp_images_dir: {temp_images_dir}")
+        logger.debug(f"Worker PID {process.pid}: Using temp_images_dir: {temp_images_dir}")
         failed_img_urls = await download_all_images(selected_image_list, temp_images_dir, logger=logger)
-        logger.info(f"📥 Downloaded images, {len(failed_img_urls)} failed")
+        logger.info(f"Worker PID {process.pid}: 📥 Downloaded images, {len(failed_img_urls)} failed")
 
         # Write images to Excel
-        logger.info(f"🖼️ Writing images with row_offset={header_index}")
+        logger.info(f"Worker PID {process.pid}: 🖼️ Writing images with row_offset={header_index}")
         failed_rows = await write_excel_image(
             local_filename, temp_images_dir, selected_image_list, "A", header_index, logger
         )
 
         # Write failed downloads
         if failed_img_urls:
-            logger.info(f"📝 Writing {len(failed_img_urls)} failed downloads to Excel")
+            logger.info(f"Worker PID {process.pid}: 📝 Writing {len(failed_img_urls)} failed downloads to Excel")
             success = await write_failed_downloads_to_excel(failed_img_urls, local_filename, logger=logger)
             if not success:
-                logger.warning(f"⚠️ Failed to write some failed downloads to Excel")
+                logger.warning(f"Worker PID {process.pid}: ⚠️ Failed to write some failed downloads to Excel")
 
         # Verify Excel file
         if not os.path.exists(local_filename):
-            logger.error(f"Excel file not found at {local_filename}")
+            logger.error(f"Worker PID {process.pid}: Excel file not found at {local_filename}")
             return {"error": f"Excel file not found", "log_filename": log_filename}
-        logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
-        logger.debug(f"Temp excel dir contents: {os.listdir(temp_excel_dir)}")
+        logger.debug(f"Worker PID {process.pid}: Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
+        logger.debug(f"Worker PID {process.pid}: Temp excel dir contents: {os.listdir(temp_excel_dir)}")
 
         # Upload to S3
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before S3 upload: RSS={mem_info.rss / 1024**2:.2f} MB")
         public_url = await upload_file_to_space(
-    file_src=local_filename,
-    save_as=processed_file_name,
-    is_public=True,
-    logger=logger,
-    file_id=file_id
-)
+            file_src=local_filename,
+            save_as=processed_file_name,
+            is_public=True,
+            logger=logger,
+            file_id=file_id
+        )
         
         if not public_url:
-            logger.error(f"❌ Upload failed for FileID {file_id}")
+            logger.error(f"Worker PID {process.pid}: ❌ Upload failed for FileID {file_id}")
             return {"error": "Failed to upload processed file", "log_filename": log_filename}
 
         await update_file_location_complete(str(file_id), public_url, logger=logger)
@@ -415,7 +483,7 @@ async def generate_download_file(
 
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
-            logger.error(f"❌ No email address for FileID {file_id}")
+            logger.error(f"Worker PID {process.pid}: ❌ No email address for FileID {file_id}")
             return {"error": "Failed to retrieve email address", "log_filename": log_filename}
         subject_line = f"{original_filename} Job Notification"
         await send_email(
@@ -426,31 +494,43 @@ async def generate_download_file(
             logger=logger
         )
 
-        logger.info(f"🏁 Completed FileID {file_id}")
+        logger.info(f"Worker PID {process.pid}: 🏁 Completed FileID {file_id}")
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory after completion: RSS={mem_info.rss / 1024**2:.2f} MB")
         return {"message": "Processing completed successfully", "public_url": public_url, "log_filename": log_filename}
 
     except Exception as e:
-        logger.error(f"🔴 Error for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: 🔴 Error for FileID {file_id}: {e}", exc_info=True)
         return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename}
     finally:
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
-        logger.info(f"🧹 Cleaned up temporary directories for FileID {file_id}")
+        logger.info(f"Worker PID {process.pid}: 🧹 Cleaned up temporary directories for FileID {file_id}")
 
-async def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFrame, logger: logging.Logger, max_retries: int = 3) -> List[Tuple[str, bool, str, int]]:
+async def process_entry_wrapper(
+    file_id: int,
+    entry_id: int,
+    entry_df: pd.DataFrame,
+    logger: logging.Logger,
+    max_retries: int = 3
+) -> List[Tuple[str, bool, str, int]]:
     """Wrapper for process_entry with retry logic."""
+    process = psutil.Process()
     attempt = 1
     while attempt <= max_retries:
-        logger.info(f"Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
+        logger.info(f"Worker PID {process.pid}: Processing EntryID {entry_id}, attempt {attempt}/{max_retries}")
         try:
+            mem_info = process.memory_info()
+            logger.debug(f"Worker PID {process.pid}: Memory before processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
+            
             # Validate ResultID
             if not all(pd.notna(entry_df.get('ResultID', pd.Series([])))):
-                logger.error(f"Invalid ResultID in entry_df for EntryID {entry_id}")
+                logger.error(f"Worker PID {process.pid}: Invalid ResultID in entry_df for EntryID {entry_id}")
                 return []
 
             updates = await process_entry(file_id, entry_id, entry_df, logger)
             if not updates:
-                logger.warning(f"No updates returned for EntryID {entry_id} on attempt {attempt}")
+                logger.warning(f"Worker PID {process.pid}: No updates returned for EntryID {entry_id} on attempt {attempt}")
                 attempt += 1
                 await asyncio.sleep(2)
                 continue
@@ -458,33 +538,35 @@ async def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFr
             valid_updates = []
             for update in updates:
                 if not isinstance(update, (list, tuple)) or len(update) != 4:
-                    logger.error(f"Invalid update tuple for EntryID {entry_id}: {update}")
+                    logger.error(f"Worker PID {process.pid}: Invalid update tuple for EntryID {entry_id}: {update}")
                     continue
                 
                 ai_json, image_is_fashion, ai_caption, result_id = update
                 if not isinstance(ai_json, str):
-                    logger.error(f"Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
+                    logger.error(f"Worker PID {process.pid}: Invalid ai_json type for ResultID {result_id}: {type(ai_json).__name__}")
                     ai_json = json.dumps({"error": f"Invalid ai_json type: {type(ai_json).__name__}", "result_id": result_id, "scores": {"sentiment": 0.0, "relevance": 0.0}})
                 
                 if is_valid_ai_result(ai_json, ai_caption or "", logger):
                     valid_updates.append((ai_json, image_is_fashion, ai_caption, result_id))
                 else:
-                    logger.warning(f"Invalid AI result for ResultID {result_id} on attempt {attempt}")
+                    logger.warning(f"Worker PID {process.pid}: Invalid AI result for ResultID {result_id} on attempt {attempt}")
 
             if valid_updates:
-                logger.info(f"Valid updates for EntryID {entry_id}: {len(valid_updates)}")
+                logger.info(f"Worker PID {process.pid}: Valid updates for EntryID {entry_id}: {len(valid_updates)}")
+                mem_info = process.memory_info()
+                logger.debug(f"Worker PID {process.pid}: Memory after processing EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
                 return valid_updates
             else:
-                logger.warning(f"No valid updates for EntryID {entry_id} on attempt {attempt}")
+                logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID {entry_id} on attempt {attempt}")
                 attempt += 1
                 await asyncio.sleep(2)
         
         except Exception as e:
-            logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
+            logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
             attempt += 1
             await asyncio.sleep(2)
     
-    logger.error(f"Failed to process EntryID {entry_id} after {max_retries} attempts")
+    logger.error(f"Worker PID {process.pid}: Failed to process EntryID {entry_id} after {max_retries} attempts")
     return [
         (
             json.dumps({"scores": {"sentiment": 0.0, "relevance": 0.0}, "category": "unknown", "error": "Processing failed"}),
@@ -494,26 +576,26 @@ async def process_entry_wrapper(file_id: int, entry_id: int, entry_df: pd.DataFr
         ) for _, row in entry_df.iterrows() if pd.notna(row.get('ResultID'))
     ]
 
-
 def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) -> bool:
     """Validate AI result: ai_json must be valid JSON with scores, ai_caption must be non-empty."""
+    process = psutil.Process()
     try:
         if not ai_caption or ai_caption.strip() == "":
-            logger.warning("Invalid AI result: AiCaption is empty")
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiCaption is empty")
             return False
         
         parsed_json = json.loads(ai_json)
         if not isinstance(parsed_json, dict):
-            logger.warning("Invalid AI result: AiJson is not a dictionary")
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not a dictionary")
             return False
         
         if "scores" not in parsed_json or not parsed_json["scores"]:
-            logger.warning(f"Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
+            logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson missing or empty 'scores' field, AiJson: {ai_json}")
             return False
         
         return True
     except json.JSONDecodeError as e:
-        logger.warning(f"Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
+        logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
         return False
 
 async def batch_vision_reason(
@@ -526,50 +608,59 @@ async def batch_vision_reason(
 ) -> None:
     """Process images with AI vision, retrying until valid results, and export to JSON."""
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
+    process = psutil.Process()
     try:
         file_id = int(file_id)
-        logger.info(f"📷 Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
+        logger.info(f"Worker PID {process.pid}: 📷 Starting batch image processing for FileID: {file_id}, Step: {step}, Limit: {limit}")
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before processing: RSS={mem_info.rss / 1024**2:.2f} MB")
 
         df = await fetch_missing_images(file_id, limit, True, logger)
         if df.empty:
-            logger.warning(f"⚠️ No missing images found for FileID: {file_id}")
+            logger.warning(f"Worker PID {process.pid}: ⚠️ No missing images found for FileID: {file_id}")
             return
 
         if entry_ids is not None:
             df = df[df['EntryID'].isin(entry_ids)]
             if df.empty:
-                logger.warning(f"⚠️ No missing images found for specified EntryIDs: {entry_ids}")
+                logger.warning(f"Worker PID {process.pid}: ⚠️ No missing images found for specified EntryIDs: {entry_ids}")
                 return
 
         columns_to_drop = ['Step1', 'Step2', 'Step3', 'Step4', 'CreateTime_1', 'CreateTime_2']
-        df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
-        logger.info(f"Retrieved {len(df)} image rows for FileID: {file_id}")
+        df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
+        logger.info(f"Worker PID {process.pid}: Retrieved {len(df)} image rows for FileID: {file_id}")
         entry_ids_to_process = list(df.groupby('EntryID').groups.keys())
 
         valid_updates = []
+        # Limit concurrency to manage memory
+        semaphore = asyncio.Semaphore(concurrency)
+        async def process_with_semaphore(entry_id, df_subset):
+            async with semaphore:
+                return await process_entry_wrapper(file_id, entry_id, df_subset, logger)
+
         tasks = [
-            process_entry_wrapper(file_id, entry_id, df[df['EntryID'] == entry_id], logger)
+            process_with_semaphore(entry_id, df[df['EntryID'] == entry_id])
             for entry_id in entry_ids_to_process
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for entry_id, updates in zip(entry_ids_to_process, results):
             if isinstance(updates, Exception):
-                logger.error(f"Error processing EntryID {entry_id}: {updates}", exc_info=True)
+                logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {updates}", exc_info=True)
                 continue
             if not updates:
-                logger.warning(f"No valid updates for EntryID: {entry_id}")
+                logger.warning(f"Worker PID {process.pid}: No valid updates for EntryID: {entry_id}")
                 continue
             valid_updates.extend(updates)
-            logger.info(f"Collected {len(updates)} updates for EntryID: {entry_id}")
+            logger.info(f"Worker PID {process.pid}: Collected {len(updates)} updates for EntryID: {entry_id}")
 
         if valid_updates:
-            with pyodbc.connect(conn_str) as conn:
+            with pyodbc.connect(conn_str, timeout=30) as conn:
                 cursor = conn.cursor()
                 query = "UPDATE utb_ImageScraperResult SET AiJson = ?, ImageIsFashion = ?, AiCaption = ? WHERE ResultID = ?"
                 cursor.executemany(query, valid_updates)
                 conn.commit()
-                logger.info(f"Updated {len(valid_updates)} records: {[update[3] for update in valid_updates]}")
+                logger.info(f"Worker PID {process.pid}: Updated {len(valid_updates)} records: {[update[3] for update in valid_updates]}")
 
                 # Verify updates
                 result_ids = [update[3] for update in valid_updates]
@@ -579,10 +670,10 @@ async def batch_vision_reason(
                     result_ids
                 )
                 for row in cursor.fetchall():
-                    logger.info(f"Verified ResultID {row[0]}: AiJson = {row[1][:100]}..., AiCaption = {row[2][:100]}...")
+                    logger.info(f"Worker PID {process.pid}: Verified ResultID {row[0]}: AiJson = {row[1][:100]}..., AiCaption = {row[2][:100]}...")
 
         for entry_id in entry_ids_to_process:
-            with pyodbc.connect(conn_str) as conn:
+            with pyodbc.connect(conn_str, timeout=30) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -597,9 +688,9 @@ async def batch_vision_reason(
                 if result:
                     product_brand, product_model, product_color, product_category = result
                 else:
-                    logger.warning(f"No attributes for FileID: {file_id}, EntryID: {entry_id}")
+                    logger.warning(f"Worker PID {process.pid}: No attributes for FileID: {file_id}, EntryID: {entry_id}")
 
-            sync_update_search_sort_order(
+            await sync_update_search_sort_order(
                 file_id=str(file_id),
                 entry_id=str(entry_id),
                 brand=product_brand,
@@ -608,21 +699,27 @@ async def batch_vision_reason(
                 category=product_category,
                 logger=logger
             )
-            logger.info(f"Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
+            logger.info(f"Worker PID {process.pid}: Updated sort order for FileID: {file_id}, EntryID: {entry_id}")
 
         # Export AiJson to DAI JSON file
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before JSON export: RSS={mem_info.rss / 1024**2:.2f} MB")
         json_url = await export_dai_json(file_id, entry_ids, logger)
         if json_url:
-            logger.info(f"DAI JSON exported to {json_url}")
+            logger.info(f"Worker PID {process.pid}: DAI JSON exported to {json_url}")
             await update_log_url_in_db(file_id, json_url, logger)
         else:
-            logger.warning(f"Failed to export DAI JSON for FileID: {file_id}")
+            logger.warning(f"Worker PID {process.pid}: Failed to export DAI JSON for FileID: {file_id}")
+
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
 
     except Exception as e:
-        logger.error(f"🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: 🔴 Error in batch_vision_reason for FileID {file_id}: {e}", exc_info=True)
         raise
 
 def run_async_in_thread(coro):
+    """Run an async coroutine in a new event loop within a thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
