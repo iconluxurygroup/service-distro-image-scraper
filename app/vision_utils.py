@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
 import psutil
 from urllib.parse import quote_plus
+
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or logging.getLogger(__name__)
     try:
@@ -50,7 +51,7 @@ async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only
 
                     logger.info(f"Fetched {len(df)} images for FileID {file_id}, ai_analysis_only={ai_analysis_only}")
                     if not df.empty:
-                        logger.debug(f"Sample results: {df.head(2).to_dict()}")
+                        logger.debug(f"Sample results (first 2 rows): {df.head(2).to_dict(orient='records')}")
                     else:
                         logger.info(f"No missing images found for FileID {file_id}")
                     return df

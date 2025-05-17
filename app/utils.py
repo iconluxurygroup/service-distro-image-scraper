@@ -16,7 +16,7 @@ from common import (
     filter_model_results,
     calculate_priority
 )
-from database_config import conn_str
+from database_config import conn_str, async_engine
 from search_utils import update_search_sort_order, insert_search_results
 from endpoint_utils import get_endpoint, sync_get_endpoint
 from image_utils import download_all_images
@@ -36,6 +36,7 @@ import urllib.parse
 from requests.exceptions import RequestException
 from icon_image_lib.google_parser import process_search_result
 import psutil
+from workflow import batch_vision_reason  # Import batch_vision_reason
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -526,34 +527,49 @@ async def process_single_all(
                 return False
             logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
 
+            # Immediately run AI analysis for this entry
+            logger.info(f"Worker PID {process.pid}: Starting AI analysis for EntryID {entry_id}")
+            ai_result = await batch_vision_reason(
+                file_id=str(file_id_db),
+                entry_ids=[entry_id],
+                step=0,
+                limit=1000,
+                concurrency=10,
+                logger=logger
+            )
+            if ai_result.get("status_code") != 200:
+                logger.error(f"Worker PID {process.pid}: AI analysis failed for EntryID {entry_id}: {ai_result.get('message')}")
+                return False
+            logger.info(f"Worker PID {process.pid}: Completed AI analysis for EntryID {entry_id} with {len(ai_result.get('data', []))} results")
+
             try:
-                with pyodbc.connect(conn_str, autocommit=False) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ?", (entry_id,))
-                    total_count = cursor.fetchone()[0]
-                    logger.info(f"Worker PID {process.pid}: Verification: Found {total_count} total rows for EntryID {entry_id}")
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder > 0",
-                        (entry_id,)
+                async with async_engine.connect() as conn:
+                    cursor = await conn.execute(
+                        text("""
+                            SELECT 
+                                COUNT(*) AS total_count,
+                                SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                                SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                            FROM utb_ImageScraperResult 
+                            WHERE EntryID = :entry_id
+                        """),
+                        {"entry_id": entry_id}
                     )
-                    count = cursor.fetchone()[0]
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder IS NULL",
-                        (entry_id,)
-                    )
-                    null_count = cursor.fetchone()[0]
-                    logger.info(f"Worker PID {process.pid}: Verification: Found {count} rows with positive SortOrder, {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                    row = cursor.fetchone()
+                    total_count, positive_count, null_count = row
+                    logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
                     if null_count > 0:
-                        logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder after update for EntryID {entry_id}")
-                        cursor.execute(
-                            "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND SortOrder IS NULL",
-                            (entry_id,)
+                        logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                        await conn.execute(
+                            text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND SortOrder IS NULL"),
+                            {"entry_id": entry_id}
                         )
-                        conn.commit()
+                        await conn.commit()
                         logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder rows to -2 for EntryID {entry_id}")
                     if total_count == 0:
                         logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
-            except pyodbc.Error as e:
+                        return False
+            except SQLAlchemyError as e:
                 logger.error(f"Worker PID {process.pid}: Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
             mem_info = process.memory_info()
             logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
@@ -574,20 +590,22 @@ async def process_single_all(
         insert_success = await insert_search_results(placeholder_df, logger=logger, file_id=str(file_id_db))
         if insert_success:
             logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
-            with pyodbc.connect(conn_str, autocommit=False) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND ImageUrl = ?",
-                    (entry_id, "placeholder://no-results")
+            async with async_engine.connect() as conn:
+                await conn.execute(
+                    text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND ImageUrl = :image_url"),
+                    {"entry_id": entry_id, "image_url": "placeholder://no-results"}
                 )
-                conn.commit()
+                await conn.commit()
                 logger.info(f"Worker PID {process.pid}: Set SortOrder=-2 for placeholder row for EntryID {entry_id}")
             return True
         else:
             logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}")
             return False
-    except pyodbc.Error as e:
-        logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
+    except SQLAlchemyError as e:
+        logger.error(f"Worker PID {process.pid}: Database error inserting placeholder row for EntryID {entry_id}: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Unexpected error inserting placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
 
 async def process_single_row(
@@ -715,29 +733,43 @@ async def process_single_row(
                 return False
             logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
 
-            with pyodbc.connect(conn_str, autocommit=False) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT 
-                        COUNT(*) AS total_count,
-                        SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                        SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                    FROM utb_ImageScraperResult 
-                    WHERE EntryID = ?
-                    """,
-                    (entry_id,)
+            # Immediately run AI analysis for this entry
+            logger.info(f"Worker PID {process.pid}: Starting AI analysis for EntryID {entry_id}")
+            ai_result = await batch_vision_reason(
+                file_id=str(file_id_db),
+                entry_ids=[entry_id],
+                step=0,
+                limit=1000,
+                concurrency=10,
+                logger=logger
+            )
+            if ai_result.get("status_code") != 200:
+                logger.error(f"Worker PID {process.pid}: AI analysis failed for EntryID {entry_id}: {ai_result.get('message')}")
+                return False
+            logger.info(f"Worker PID {process.pid}: Completed AI analysis for EntryID {entry_id} with {len(ai_result.get('data', []))} results")
+
+            async with async_engine.connect() as conn:
+                cursor = await conn.execute(
+                    text("""
+                        SELECT 
+                            COUNT(*) AS total_count,
+                            SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                            SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                        FROM utb_ImageScraperResult 
+                        WHERE EntryID = :entry_id
+                    """),
+                    {"entry_id": entry_id}
                 )
                 row = cursor.fetchone()
                 total_count, positive_count, null_count = row
                 logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
                 if null_count > 0:
                     logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                    cursor.execute(
-                        "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND SortOrder IS NULL",
-                        (entry_id,)
+                    await conn.execute(
+                        text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND SortOrder IS NULL"),
+                        {"entry_id": entry_id}
                     )
-                    conn.commit()
+                    await conn.commit()
                     logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder rows to -2 for EntryID {entry_id}")
                 if total_count == 0:
                     logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
@@ -763,20 +795,22 @@ async def process_single_row(
         insert_success = await insert_search_results(placeholder_df, logger=logger, file_id=str(file_id_db))
         if insert_success:
             logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
-            with pyodbc.connect(conn_str, autocommit=False) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = ? AND ImageUrl = ?",
-                    (entry_id, "placeholder://no-results")
+            async with async_engine.connect() as conn:
+                await conn.execute(
+                    text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND ImageUrl = :image_url"),
+                    {"entry_id": entry_id, "image_url": "placeholder://no-results"}
                 )
-                conn.commit()
+                await conn.commit()
                 logger.info(f"Worker PID {process.pid}: Set SortOrder=-2 for placeholder row for EntryID {entry_id}")
             return True
         else:
             logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}")
             return False
-    except pyodbc.Error as e:
-        logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
+    except SQLAlchemyError as e:
+        logger.error(f"Worker PID {process.pid}: Database error inserting placeholder row for EntryID {entry_id}: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Unexpected error inserting placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
 
 @retry(
@@ -850,8 +884,8 @@ async def process_and_tag_results(
             }])]
 
         try:
-            with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
-                query = """
+            async with async_engine.connect() as conn:
+                query = text("""
                     SELECT 
                         r.EntryID, 
                         r.ImageUrl, 
@@ -864,13 +898,14 @@ async def process_and_tag_results(
                     FROM utb_ImageScraperResult r
                     INNER JOIN utb_ImageScraperRecords rec
                         ON r.EntryID = rec.EntryID
-                    WHERE r.EntryID = ?
-                """
+                    WHERE r.EntryID = :entry_id
+                """)
                 logger.debug(f"Worker PID {process.pid}: Executing database query for EntryID {entry_id}")
-                df = pd.read_sql(query, conn, params=(entry_id,), chunksize=1000)
-                df = pd.concat(df, ignore_index=True, copy=False)
+                result = await conn.execute(query, {"entry_id": entry_id})
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                result.close()
                 logger.debug(f"Worker PID {process.pid}: Retrieved {len(df)} rows for EntryID {entry_id}")
-        except pyodbc.Error as e:
+        except SQLAlchemyError as e:
             logger.error(f"Worker PID {process.pid}: Failed to retrieve results for EntryID {entry_id}: {e}", exc_info=True)
             return [pd.DataFrame([{
                 "EntryID": entry_id,
