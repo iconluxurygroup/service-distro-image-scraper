@@ -31,7 +31,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 
-
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)
 
@@ -44,7 +43,7 @@ if not default_logger.handlers:
 # Create APIRouter instance
 router = APIRouter()
 
-# Global job status store (in-memory for simplicity; use Redis in production)
+# Global job status store (in-memory; use Redis in production)
 JOB_STATUS = {}
 
 # Global debouncing cache for log uploads
@@ -53,8 +52,8 @@ LAST_UPLOAD = {}
 class JobStatusResponse(BaseModel):
     status: str = Field(..., description="Job status (e.g., queued, running, completed, failed)")
     message: str = Field(..., description="Descriptive message about the job status")
-    public_url: str | None = Field(None, description="S3 URL of the generated Excel file, if available")
-    log_url: str | None = Field(None, description="S3 URL of the job log file, if available")
+    public_url: Optional[str] = Field(None, description="S3 URL of the generated Excel file, if available")
+    log_url: Optional[str] = Field(None, description="S3 URL of the job log file, if available")
     timestamp: str = Field(..., description="ISO timestamp of the response")
 
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
@@ -121,7 +120,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
     result = None
-    debug_info = {"memory_usage": {}, "log_file": log_file}
+    debug_info = {"memory_usage": {}, "log_file": log_file, "endpoint_errors": []}
     
     try:
         func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
@@ -153,6 +152,9 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
         logger.debug(f"Traceback: {traceback.format_exc()}")
         debug_info["error_traceback"] = traceback.format_exc()
+        if "placeholder://error" in str(e):
+            debug_info["endpoint_errors"].append({"error": str(e), "timestamp": datetime.datetime.now().isoformat()})
+            logger.warning(f"Detected placeholder error in job {func_name} for FileID: {file_id}")
         return {
             "status_code": 500,
             "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
@@ -213,7 +215,7 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
         if os.path.exists(log_file):
             with open(log_file, 'r') as f:
                 log_content = f.read()
-                if "WORKER TIMEOUT" in log_content or "SIGKILL" in log_content:
+                if "WORKER TIMEOUT" in log_content or "SIGKILL" in log_content or "placeholder://error" in log_content:
                     logger.warning(f"Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
                     last_entry_id = await fetch_last_valid_entry(file_id, logger)
                     if last_entry_id:
@@ -272,11 +274,12 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
     logger.info(f"Received request to generate download file for FileID: {file_id}")
     
     try:
-        with pyodbc.connect(conn_str, timeout=10) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
-            result = cursor.fetchone()
-            if not result:
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if not result.fetchone():
                 logger.error(f"Invalid FileID: {file_id}")
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
         
@@ -302,7 +305,7 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
             message=f"Download file generation queued for FileID: {file_id}",
             timestamp=datetime.datetime.now().isoformat()
         )
-    except pyodbc.Error as e:
+    except SQLAlchemyError as e:
         logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
@@ -337,85 +340,6 @@ async def api_match_and_search_sort(file_id: str):
     if result["status_code"] != 200:
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
     return result
-
-@router.get("/update-sort-order-per-entry/{file_id}", tags=["Sorting"])
-async def api_update_sort_order_per_entry(
-    file_id: str,
-    background_tasks: BackgroundTasks,
-    limit: Optional[int] = Query(None, description="Maximum number of entries to process")
-):
-    """Run per-entry SortOrder update for a given file_id in the background."""
-    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    logger.info(f"Queueing per-entry SortOrder update for FileID: {file_id}, limit: {limit}")
-
-    try:
-        JOB_STATUS[file_id] = {
-            "status": "queued",
-            "message": "Per-entry sort order update queued",
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-
-        background_tasks.add_task(run_per_entry_sort_job, file_id, limit, logger, log_filename)
-
-        return {
-            "status_code": 200,
-            "message": f"Per-entry SortOrder update queued for FileID: {file_id}",
-            "data": None
-        }
-    except Exception as e:
-        logger.error(f"Error queuing per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error queuing SortOrder update for FileID {file_id}: {str(e)}")
-
-async def run_per_entry_sort_job(file_id: str, limit: Optional[int], logger: logging.Logger, log_filename: str):
-    """Run per-entry sort order update as a background task."""
-    try:
-        JOB_STATUS[file_id] = {
-            "status": "running",
-            "message": "Per-entry sort order update is running",
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-
-        with pyodbc.connect(conn_str, timeout=10) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = ?", (int(file_id),))
-            if not cursor.fetchone():
-                raise ValueError(f"FileID {file_id} not found")
-
-        result = await update_sort_order_per_entry(file_id, logger=logger)
-        if result is None:
-            raise ValueError("update_sort_order_per_entry returned None")
-
-        log_url = await upload_log_file(file_id, log_filename, logger)
-        JOB_STATUS[file_id] = {
-            "status": "completed",
-            "message": f"Per-entry SortOrder updated successfully for FileID: {file_id}",
-            "log_url": log_url,
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        logger.info(f"Completed per-entry sort order update for FileID: {file_id}")
-        return {"status_code": 200, "message": JOB_STATUS[file_id]["message"], "data": result}
-
-    except pyodbc.Error as e:
-        logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
-        log_url = await upload_log_file(file_id, log_filename, logger)
-        JOB_STATUS[file_id] = {
-            "status": "failed",
-            "message": f"Database error: {str(e)}",
-            "log_url": log_url,
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        return {"status_code": 500, "message": JOB_STATUS[file_id]["message"], "data": None}
-
-    except Exception as e:
-        logger.error(f"Error in per-entry sort order update for FileID {file_id}: {e}", exc_info=True)
-        log_url = await upload_log_file(file_id, log_filename, logger)
-        JOB_STATUS[file_id] = {
-            "status": "failed",
-            "message": f"Error: {str(e)}",
-            "log_url": log_url,
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        return {"status_code": 500, "message": JOB_STATUS[file_id]["message"], "data": None}
 
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
@@ -488,6 +412,12 @@ async def api_restart_search_all(
         
         if result["status_code"] != 200:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
+            if "placeholder://error" in result["message"]:
+                logger.warning(f"Placeholder error detected; check endpoint logs for FileID {file_id}")
+                debug_info = result.get("debug_info", {})
+                endpoint_errors = debug_info.get("endpoint_errors", [])
+                for error in endpoint_errors:
+                    logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
         
         if background_tasks:
