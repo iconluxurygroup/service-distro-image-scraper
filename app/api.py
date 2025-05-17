@@ -23,7 +23,6 @@ from database import (
     update_sort_order,
     update_sort_no_image_entry,
     update_sort_order_per_entry,
-    fetch_missing_images,
     get_images_excel_db,
     update_file_generate_complete,
     update_file_location_complete,
@@ -506,19 +505,6 @@ async def api_process_ai_images(
             )
             await update_log_url_in_db(file_id, upload_url, logger)
         raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
-
-@router.get("/fetch-missing-images/{file_id}", tags=["Database"])
-async def fetch_missing_images_endpoint(file_id: str, limit: int = Query(1000), ai_analysis_only: bool = Query(True)):
-    logger, _ = setup_job_logger(job_id=file_id)
-    logger.info(f"Fetching missing images for FileID: {file_id}, limit: {limit}, ai_analysis_only: {ai_analysis_only}")
-    try:
-        result = await fetch_missing_images(file_id, limit, ai_analysis_only, logger)
-        if result.empty:
-            return {"status_code": 200, "message": f"No missing images found for FileID: {file_id}", "data": []}
-        return {"status_code": 200, "message": f"Fetched missing images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
-    except Exception as e:
-        logger.error(f"Error fetching missing images for FileID {file_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error fetching missing images for FileID {file_id}: {str(e)}")
 
 @router.get("/get-images-excel-db/{file_id}", tags=["Database"])
 async def get_images_excel_db_endpoint(file_id: str):
