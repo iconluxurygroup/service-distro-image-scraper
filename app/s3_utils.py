@@ -68,19 +68,20 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         save_as = f"excel_files/{file_id}/{os.path.basename(file_src)}"
         logger.info(f"Excel file detected. Setting save_as to: {save_as}")
 
-    # Check for existing Excel file URL in a separate field (not LogFileUrl)
+    # Check for existing file URL
     try:
         async with async_engine.connect() as conn:
+            column = 'UserHeaderIndex' if file_src.endswith('.xlsx') else 'LogFileUrl'
             result = await conn.execute(
-                text("SELECT ExcelFileUrl FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                text(f"SELECT {column} FROM utb_ImageScraperFiles WHERE ID = :file_id"),
                 {"file_id": file_id}
             )
             existing_url = result.fetchone()
             if existing_url and existing_url[0]:
-                logger.info(f"Excel file already uploaded for FileID {file_id}: {existing_url[0]}")
+                logger.info(f"{'Excel file' if file_src.endswith('.xlsx') else 'Log file'} already uploaded for FileID {file_id}: {existing_url[0]}")
                 return existing_url[0]
     except Exception as e:
-        logger.error(f"Database error checking ExcelFileUrl for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Database error checking {column} for FileID {file_id}: {e}", exc_info=True)
 
     content_type, _ = mimetypes.guess_type(file_src)
     if not content_type:
@@ -120,8 +121,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         if file_id:
             try:
                 async with async_engine.connect() as conn:
-                    # Update ExcelFileUrl for Excel files, LogFileUrl for logs
-                    column = 'ExcelFileUrl' if file_src.endswith('.xlsx') else 'LogFileUrl'
+                    column = 'UserHeaderIndex' if file_src.endswith('.xlsx') else 'LogFileUrl'
                     await conn.execute(
                         text(f"UPDATE utb_ImageScraperFiles SET {column} = :url WHERE ID = :file_id"),
                         {"url": result_urls['r2'], "file_id": file_id}
