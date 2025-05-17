@@ -398,24 +398,6 @@ async def process_restart_batch(
         await async_engine.dispose()
         engine.dispose()
         logger.info(f"Disposed database engines")
-import asyncio
-import logging
-import os
-import datetime
-from typing import Optional, Dict
-from db_utils import get_send_to_email, get_images_excel_db, update_file_location_complete, update_file_generate_complete
-from image_utils import download_all_images
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
-from utils import create_temp_dirs, cleanup_temp_dirs
-from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space
-import psutil
-from email_utils import send_message_email
-import httpx
-import aiofiles
-from database_config import async_engine, engine
-from sqlalchemy.sql import text
-import pandas as pd
 
 async def generate_download_file(
     file_id: int,
@@ -534,7 +516,7 @@ async def generate_download_file(
             f"Download URL: {public_url}\n"
             f"Log file: {log_filename}"
         )
-        logger.debug(f"Sending email with public_url: {public_url}")
+        logger.debug(f"Scheduling email with public_url: {public_url}")
         background_tasks.add_task(
             send_message_email,
             to_emails=send_to_email_addr,
