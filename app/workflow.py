@@ -43,6 +43,7 @@ from image_reason import process_entry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import aiohttp
 from database_config import conn_str, async_engine, engine
+from sqlalchemy.sql import text
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
@@ -122,6 +123,58 @@ def process_entry_search(args):
         logger.removeHandler(handler)
         handler.close()
 
+def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
+    logger = logger or logging.getLogger(__name__)
+    required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+    
+    if df.empty:
+        logger.info("No rows to insert: DataFrame is empty")
+        return False
+
+    if not all(col in df.columns for col in required_columns):
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        logger.error(f"Missing columns: {missing_cols}")
+        return False
+
+    try:
+        df = df[required_columns].copy()
+        df['EntryID'] = pd.to_numeric(df['EntryID'], errors='coerce').astype('Int64')
+        df[['ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']] = df[
+            ['ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']
+        ].fillna('').astype(str)
+        
+        if df['EntryID'].isnull().any():
+            logger.error(f"Invalid EntryID values: {df[df['EntryID'].isnull()]['EntryID'].tolist()}")
+            return False
+
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO utb_ImageScraperResult (
+                        EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
+                    ) VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
+                """),
+                [
+                    {
+                        "entry_id": row['EntryID'],
+                        "image_url": row['ImageUrl'],
+                        "image_desc": row['ImageDesc'],
+                        "image_source": row['ImageSource'],
+                        "image_url_thumbnail": row['ImageUrlThumbnail']
+                    }
+                    for _, row in df.iterrows()
+                ]
+            )
+            conn.commit()
+            logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult")
+            return True
+    except (SQLAlchemyError, DBAPIError) as e:
+        logger.error(f"Database error inserting search results: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error inserting search results: {e}", exc_info=True)
+        return False
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -180,7 +233,18 @@ async def process_restart_batch(
             logger.warning(f"Worker PID {process.pid}: No brand rules fetched")
             return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
-        endpoint = sync_get_endpoint(logger=logger)
+        endpoint = None
+        for attempt in range(5):
+            try:
+                endpoint = sync_get_endpoint(logger=logger)
+                if endpoint:
+                    logger.info(f"Worker PID {process.pid}: Selected endpoint: {endpoint}")
+                    break
+                logger.warning(f"Worker PID {process.pid}: Attempt {attempt + 1} failed")
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"Worker PID {process.pid}: Attempt {attempt + 1} failed: {e}")
+                time.sleep(2)
         if not endpoint:
             logger.error(f"Worker PID {process.pid}: No healthy endpoint")
             return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}

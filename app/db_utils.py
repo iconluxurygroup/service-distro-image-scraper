@@ -366,14 +366,27 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
         logger.error(f"Error updating entries for FileID: {file_id}, error: {str(e)}")
         return None
 
+import logging
+import pandas as pd
+import re
+import aioodbc
+import asyncio
+from typing import Optional, List, Dict, Any
+from sqlalchemy.exc import SQLAlchemyError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str
+from common import clean_string, validate_model, validate_brand, generate_aliases, calculate_priority, generate_brand_aliases
+
 async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
-        
+
+        # Single connection for all operations
         async with aioodbc.connect(dsn=conn_str) as conn:
             async with conn.cursor() as cursor:
+                # Fetch entries
                 query = """
                     SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
                     FROM utb_ImageScraperRecords 
@@ -382,7 +395,7 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
                 logger.debug(f"Executing query: {query} with FileID: {file_id}")
                 await cursor.execute(query, (file_id,))
                 entries = await cursor.fetchall()
-                
+
                 if not entries:
                     logger.warning(f"No entries found for FileID: {file_id}")
                     return {
@@ -402,14 +415,20 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
                             "UnexpectedSortOrderEntries": 0
                         }
                     }
-                
+
                 entry_results = []
                 success_count = 0
                 failure_count = 0
                 brand_mismatch_count = 0
                 model_mismatch_count = 0
                 unexpected_sort_order_count = 0
-                
+
+                brand_aliases_dict = {
+                    "Scotch & Soda": ["Scotch and Soda", "Scotch Soda", "Scotch&Soda", "ScotchAndSoda", "Scotch"],
+                    "Adidas": ["Adidas AG", "Adidas Originals", "Addidas", "Adiddas"],
+                    "BAPE": ["A Bathing Ape", "BATHING APE", "Bape Japan", "ABathingApe", "Bape"]
+                }
+
                 for entry in entries:
                     entry_id, brand, model, color, category = entry
                     entry_result = {
@@ -422,24 +441,20 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
                         "BrandMatches": [],
                         "ModelMatches": []
                     }
+
                     try:
-                        brand_aliases_dict = {
-                            "Scotch & Soda": [
-                                "Scotch and Soda", "Scotch Soda", "Scotch&Soda", "ScotchAndSoda", "Scotch"
-                            ],
-                            "Adidas": ["Adidas AG", "Adidas Originals", "Addidas", "Adiddas"],
-                            "BAPE": ["A Bathing Ape", "BATHING APE", "Bape Japan", "ABathingApe", "Bape"]
-                        }
+                        # Generate aliases
                         brand_aliases = await generate_brand_aliases(brand or '', brand_aliases_dict)
                         logger.debug(f"Brand aliases for EntryID {entry_id}, Brand '{brand}': {brand_aliases}")
-                        
+
                         model_aliases = generate_aliases(model) if model else []
                         if model and '_' in model:
                             model_base = model.split('_')[0]
                             model_aliases.append(model_base)
-                            model_aliases = list(set(model_aliases))
+                        model_aliases = list(set(model_aliases))
                         logger.debug(f"Model aliases for EntryID {entry_id}, Model '{model}': {model_aliases}")
-                        
+
+                        # Update sort order
                         updates = await update_search_sort_order(
                             file_id=str(file_id),
                             entry_id=str(entry_id),
@@ -451,150 +466,86 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
                             brand_rules=None,
                             brand_aliases=brand_aliases
                         )
-                        
+
                         if updates is not None:
                             positive_count = sum(1 for r in updates if r['SortOrder'] is not None and r['SortOrder'] > 0)
                             zero_count = sum(1 for r in updates if r['SortOrder'] == 0)
                             negative_count = sum(1 for r in updates if r['SortOrder'] is not None and r['SortOrder'] < 0)
                             null_count = sum(1 for r in updates if r['SortOrder'] is None)
                             unexpected_count = sum(1 for r in updates if r['SortOrder'] == -1)
-                            
+
                             brand_matches = []
                             model_matches = []
                             for result in updates:
                                 image_desc = clean_string(result.get('ImageDesc', ''), preserve_url=False)
                                 image_source = clean_string(result.get('ImageSource', ''), preserve_url=True)
                                 image_url = clean_string(result.get('ImageUrl', ''), preserve_url=True)
-                                
+
+                                # Simplified alias matching with word boundaries
                                 matched_brand_aliases = [
                                     alias for alias in brand_aliases
-                                    if (alias.lower() in image_desc.lower() or
-                                        alias.lower() in image_source.lower() or
-                                        alias.lower() in image_url.lower() or
-                                        re.search(rf'{re.escape(alias)}', image_desc, re.IGNORECASE) or
-                                        re.search(rf'{re.escape(alias)}', image_source, re.IGNORECASE) or
-                                        re.search(rf'{re.escape(alias)}', image_url, re.IGNORECASE))
+                                    if re.search(rf'\b{re.escape(alias.lower())}\b', 
+                                                (image_desc + ' ' + image_source + ' ' + image_url).lower())
                                 ]
                                 if matched_brand_aliases:
                                     brand_matches.append({
                                         "ResultID": result['ResultID'],
                                         "SortOrder": result['SortOrder'],
                                         "MatchedAliases": matched_brand_aliases,
-                                        "ImageUrl": result.get('ImageUrl', ''),
+                                        "ImageUrl": image_url,
                                         "ImageDesc": image_desc,
                                         "ImageSource": image_source
                                     })
-                                
+
                                 matched_model_aliases = [
                                     alias for alias in model_aliases
-                                    if (alias.lower() in image_desc.lower() or
-                                        alias.lower() in image_source.lower() or
-                                        alias.lower() in image_url.lower() or
-                                        re.search(rf'\b{re.escape(alias)}\b', image_desc, re.IGNORECASE) or
-                                        re.search(rf'\b{re.escape(alias)}\b', image_source, re.IGNORECASE) or
-                                        re.search(rf'\b{re.escape(alias)}\b', image_url, re.IGNORECASE))
+                                    if re.search(rf'\b{re.escape(alias.lower())}\b', 
+                                                (image_desc + ' ' + image_source + ' ' + image_url).lower())
                                 ]
                                 if matched_model_aliases:
                                     model_matches.append({
                                         "ResultID": result['ResultID'],
                                         "SortOrder": result['SortOrder'],
                                         "MatchedAliases": matched_model_aliases,
-                                        "ImageUrl": result.get('ImageUrl', ''),
+                                        "ImageUrl": image_url,
                                         "ImageDesc": image_desc,
                                         "ImageSource": image_source
                                     })
-                                
+
                                 if result['SortOrder'] == -1:
                                     logger.warning(
                                         f"Unexpected SortOrder=-1 for ResultID {result['ResultID']}, "
-                                        f"EntryID {entry_id}, Model '{model}', Brand '{brand}', "
-                                        f"ImageDesc: {image_desc}, ImageSource: {image_source}, ImageUrl: {image_url}"
+                                        f"EntryID {entry_id}, Model '{model}', Brand '{brand}'"
                                     )
                                     unexpected_count += 1
-                            
+
+                            # Consolidated correction for SortOrder=-1
                             if unexpected_count > 0:
-                                async with aioodbc.connect(dsn=conn_str) as conn:
-                                    async with conn.cursor() as cursor:
-                                        brand_pattern = '|'.join(re.escape(alias.lower()) for alias in brand_aliases)
-                                        model_pattern = '|'.join(re.escape(alias.lower()) for alias in model_aliases)
-                                        await cursor.execute(
-                                            """
-                                            UPDATE utb_ImageScraperResult
-                                            SET SortOrder = CASE
-                                                WHEN (
-                                                    LOWER(ImageDesc) LIKE '%' + ? + '%' OR
-                                                    LOWER(ImageSource) LIKE '%' + ? + '%' OR
-                                                    LOWER(ImageUrl) LIKE '%' + ? + '%' OR
-                                                    LOWER(ImageDesc) LIKE '%' + ? + '%' OR
-                                                    LOWER(ImageSource) LIKE '%' + ? + '%' OR
-                                                    LOWER(ImageUrl) LIKE '%' + ? + '%' OR
-                                                    LOWER(ImageDesc) REGEXP ? OR
-                                                    LOWER(ImageSource) REGEXP ? OR
-                                                    LOWER(ImageUrl) REGEXP ? OR
-                                                    LOWER(ImageDesc) REGEXP ? OR
-                                                    LOWER(ImageSource) REGEXP ? OR
-                                                    LOWER(ImageUrl) REGEXP ?
-                                                ) THEN (
-                                                    SELECT COALESCE(MAX(SortOrder), 0) + 1 
-                                                    FROM utb_ImageScraperResult 
-                                                    WHERE EntryID = ? AND SortOrder > 0
-                                                )
-                                                ELSE -2
-                                            END
-                                            WHERE EntryID = ? AND SortOrder = -1
-                                            """,
-                                            (
-                                                brand, brand, brand,
-                                                model, model, model,
-                                                brand_pattern, brand_pattern, brand_pattern,
-                                                model_pattern, model_pattern, model_pattern,
-                                                entry_id, entry_id
-                                            )
+                                brand_pattern = '|'.join(re.escape(alias.lower()) for alias in brand_aliases)
+                                model_pattern = '|'.join(re.escape(alias.lower()) for alias in model_aliases)
+                                await cursor.execute(
+                                    """
+                                    UPDATE utb_ImageScraperResult
+                                    SET SortOrder = CASE
+                                        WHEN (
+                                            LOWER(ImageDesc) REGEXP ? OR
+                                            LOWER(ImageSource) REGEXP ? OR
+                                            LOWER(ImageUrl) REGEXP ?
+                                        ) THEN (
+                                            SELECT COALESCE(MAX(SortOrder), 0) + 1 
+                                            FROM utb_ImageScraperResult 
+                                            WHERE EntryID = ? AND SortOrder > 0
                                         )
-                                        corrected_count = cursor.rowcount
-                                        if corrected_count > 0:
-                                            logger.info(f"Corrected {corrected_count} SortOrder=-1 entries for EntryID {entry_id} to positive or -2")
-                                        unexpected_count -= corrected_count
-                                        unexpected_sort_order_count += unexpected_count
-                            
-                            if unexpected_count > 0:
-                                async with aioodbc.connect(dsn=conn_str) as conn:
-                                    async with conn.cursor() as cursor:
-                                        await cursor.execute(
-                                            """
-                                            UPDATE utb_ImageScraperResult
-                                            SET SortOrder = -2
-                                            WHERE EntryID = ? AND SortOrder = -1
-                                            """,
-                                            (entry_id,)
-                                        )
-                                        fallback_count = cursor.rowcount
-                                        if fallback_count > 0:
-                                            logger.info(f"Fallback corrected {fallback_count} SortOrder=-1 entries to -2 for EntryID {entry_id}")
-                                        unexpected_count -= fallback_count
-                                        unexpected_sort_order_count += unexpected_count
-                            
-                            async with aioodbc.connect(dsn=conn_str) as conn:
-                                async with conn.cursor() as cursor:
-                                    await cursor.execute(
-                                        """
-                                        SELECT ResultID, ImageDesc, ImageSource, ImageUrl
-                                        FROM utb_ImageScraperResult
-                                        WHERE EntryID = ? AND SortOrder = -1
-                                        """,
-                                        (entry_id,)
-                                    )
-                                    remaining_minus_one = await cursor.fetchall()
-                                    for res in remaining_minus_one:
-                                        result_id, image_desc, image_source, image_url = res
-                                        logger.warning(
-                                            f"Remaining SortOrder=-1 for ResultID {result_id}, EntryID {entry_id}, "
-                                            f"Model '{model}', Brand '{brand}', "
-                                            f"ImageDesc: {image_desc}, ImageSource: {image_source}, ImageUrl: {image_url}"
-                                        )
-                                        unexpected_count += 1
-                                        unexpected_sort_order_count += 1
-                            
+                                        ELSE -2
+                                    END
+                                    WHERE EntryID = ? AND SortOrder = -1
+                                    """,
+                                    (brand_pattern, brand_pattern, brand_pattern, entry_id, entry_id)
+                                )
+                                corrected_count = cursor.rowcount
+                                unexpected_sort_order_count += unexpected_count - corrected_count
+                                logger.info(f"Corrected {corrected_count} SortOrder=-1 entries for EntryID {entry_id}")
+
                             entry_result["Details"] = {
                                 "UpdatedRows": len(updates),
                                 "PositiveSortOrder": positive_count,
@@ -605,101 +556,66 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
                             }
                             entry_result["BrandMatches"] = brand_matches
                             entry_result["ModelMatches"] = model_matches
-                            
+
                             if not brand_matches and brand:
-                                logger.warning(
-                                    f"No brand aliases matched for EntryID {entry_id}, Brand '{brand}', "
-                                    f"URLs checked: {[r.get('ImageUrl', '') for r in updates]}, "
-                                    f"Descriptions checked: {[r.get('ImageDesc', '') for r in updates]}, "
-                                    f"Sources checked: {[r.get('ImageSource', '') for r in updates]}"
-                                )
+                                logger.warning(f"No brand aliases matched for EntryID {entry_id}, Brand '{brand}'")
                                 brand_mismatch_count += 1
                             if not model_matches and model:
-                                logger.warning(
-                                    f"No model aliases matched for EntryID {entry_id}, Model '{model}', "
-                                    f"URLs checked: {[r.get('ImageUrl', '') for r in updates]}, "
-                                    f"Descriptions checked: {[r.get('ImageDesc', '') for r in updates]}, "
-                                    f"Sources checked: {[r.get('ImageSource', '') for r in updates]}"
-                                )
+                                logger.warning(f"No model aliases matched for EntryID {entry_id}, Model '{model}'")
                                 model_mismatch_count += 1
-                            
+
                             success_count += 1
                         else:
                             failure_count += 1
                             entry_result["Status"] = "Failed"
                             entry_result["Error"] = "update_search_sort_order returned None"
-                            logger.warning(f"No results for EntryID {entry_id}: update_search_sort_order returned None")
-                        
+                            logger.warning(f"No results for EntryID {entry_id}")
+
                         entry_results.append(entry_result)
-                
-                async with aioodbc.connect(dsn=conn_str) as conn:
-                    async with conn.cursor() as cursor:
-                        await cursor.execute(
-                            """
-                            SELECT COUNT(DISTINCT t.EntryID)
-                            FROM utb_ImageScraperResult t
-                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                            WHERE r.FileID = ? AND t.SortOrder > 0
-                            """,
-                            (file_id,)
-                        )
-                        positive_entries = (await cursor.fetchone())[0]
-                        await cursor.execute(
-                            """
-                            SELECT COUNT(DISTINCT t.EntryID)
-                            FROM utb_ImageScraperResult t
-                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                            WHERE r.FileID = ? AND t.SortOrder = 0
-                            """,
-                            (file_id,)
-                        )
-                        brand_match_entries = (await cursor.fetchone())[0]
-                        await cursor.execute(
-                            """
-                            SELECT COUNT(DISTINCT t.EntryID)
-                            FROM utb_ImageScraperResult t
-                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                            WHERE r.FileID = ? AND t.SortOrder < 0
-                            """,
-                            (file_id,)
-                        )
-                        no_match_entries = (await cursor.fetchone())[0]
-                        await cursor.execute(
-                            """
-                            SELECT COUNT(DISTINCT t.EntryID)
-                            FROM utb_ImageScraperResult t
-                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                            WHERE r.FileID = ? AND t.SortOrder IS NULL
-                            """,
-                            (file_id,)
-                        )
-                        null_entries = (await cursor.fetchone())[0]
-                        await cursor.execute(
-                            """
-                            SELECT COUNT(DISTINCT t.EntryID)
-                            FROM utb_ImageScraperResult t
-                            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                            WHERE r.FileID = ? AND t.SortOrder = -1
-                            """,
-                            (file_id,)
-                        )
-                        unexpected_entries = (await cursor.fetchone())[0]
-                
+                    except Exception as e:
+                        failure_count += 1
+                        entry_result["Status"] = "Failed"
+                        entry_result["Error"] = str(e)
+                        logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
+                        entry_results.append(entry_result)
+
+                # Optimized verification
+                verification_queries = [
+                    ("PositiveSortOrderEntries", "t.SortOrder > 0"),
+                    ("BrandMatchEntries", "t.SortOrder = 0"),
+                    ("NoMatchEntries", "t.SortOrder < 0"),
+                    ("NullSortOrderEntries", "t.SortOrder IS NULL"),
+                    ("UnexpectedSortOrderEntries", "t.SortOrder = -1")
+                ]
+                verification = {}
+                for key, condition in verification_queries:
+                    await cursor.execute(
+                        """
+                        SELECT COUNT(DISTINCT t.EntryID)
+                        FROM utb_ImageScraperResult t
+                        INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                        WHERE r.FileID = ? AND {}
+                        """.format(condition),
+                        (file_id,)
+                    )
+                    verification[key] = (await cursor.fetchone())[0]
+
                 logger.info(
                     f"Verification for FileID {file_id}: "
-                    f"{positive_entries} entries with model or brand matches, "
-                    f"{brand_match_entries} entries with legacy brand matches (SortOrder=0), "
-                    f"{no_match_entries} entries with no matches, "
-                    f"{null_entries} entries with NULL SortOrder, "
-                    f"{unexpected_entries} entries with unexpected SortOrder=-1"
+                    f"{verification['PositiveSortOrderEntries']} model/brand matches, "
+                    f"{verification['BrandMatchEntries']} legacy brand matches, "
+                    f"{verification['NoMatchEntries']} no matches, "
+                    f"{verification['NullSortOrderEntries']} NULL, "
+                    f"{verification['UnexpectedSortOrderEntries']} unexpected"
                 )
+
                 if brand_mismatch_count > 0:
                     logger.warning(f"{brand_mismatch_count} entries had no brand alias matches")
                 if model_mismatch_count > 0:
                     logger.warning(f"{model_mismatch_count} entries had no model alias matches")
-                if unexpected_entries > 0:
-                    logger.warning(f"{unexpected_entries} entries retained SortOrder=-1")
-                
+                if verification['UnexpectedSortOrderEntries'] > 0:
+                    logger.warning(f"{verification['UnexpectedSortOrderEntries']} entries retained SortOrder=-1")
+
                 return {
                     "FileID": file_id,
                     "TotalEntries": len(entries),
@@ -707,20 +623,18 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
                     "FailedEntries": failure_count,
                     "BrandMismatchEntries": brand_mismatch_count,
                     "ModelMismatchEntries": model_mismatch_count,
-                    "UnexpectedSortOrderEntries": unexpected_entries,
+                    "UnexpectedSortOrderEntries": verification['UnexpectedSortOrderEntries'],
                     "EntryResults": entry_results,
-                    "Verification": {
-                        "PositiveSortOrderEntries": positive_entries,
-                        "BrandMatchEntries": brand_match_entries,
-                        "NoMatchEntries": no_match_entries,
-                        "NullSortOrderEntries": null_entries,
-                        "UnexpectedSortOrderEntries": unexpected_entries
-                    }
+                    "Verification": verification
                 }
-            
+
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        return None
     except Exception as e:
         logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
         return None
+
 
 async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
