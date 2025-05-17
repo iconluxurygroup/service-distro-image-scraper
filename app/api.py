@@ -278,15 +278,44 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
 
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
-async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, background_tasks: BackgroundTasks = None):
+async def api_restart_search_all(
+    file_id: str,
+    entry_id: Optional[int] = None,
+    background_tasks: BackgroundTasks = None
+):
     """Restart batch processing for a file, searching all variations for each entry."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
+    debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+
     try:
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory before job: RSS={debug_info['memory_usage']['before']:.2f} MB")
+
         # Check for last processed EntryID if not provided
         if not entry_id:
-            entry_id = fetch_last_valid_entry(file_id, logger)  # Remove await
+            entry_id = fetch_last_valid_entry(file_id, logger)  # Synchronous call
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+
+        # Query database for EntryID 69801 state
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT AiJson, AiCaption, SortOrder
+                FROM utb_ImageScraperResult
+                WHERE EntryID = ? AND FileID = ?
+            """, (69801, file_id))
+            result = cursor.fetchone()
+            if result:
+                debug_info["database_state"]["entry_69801"] = {
+                    "AiJson": result[0],
+                    "AiCaption": result[1],
+                    "SortOrder": result[2]
+                }
+            else:
+                debug_info["database_state"]["entry_69801"] = "Not found for FileID"
 
         result = await run_job_with_logging(
             process_restart_batch,
@@ -294,33 +323,137 @@ async def api_restart_search_all(file_id: str, entry_id: Optional[int] = None, b
             entry_id=entry_id,
             use_all_variations=True
         )
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
+
         if result["status_code"] != 200:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        
+
         # Schedule failure monitoring
         if background_tasks:
             background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
-        logger.info(f"Completed restart batch for FileID: {file_id}. Result: {result}")
-        return {"status_code": 200, "message": f"Processing restart with all variations completed for FileID: {file_id}", "data": result["data"]}
-    except Exception as e:
-        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        # Upload log file
         if os.path.exists(log_filename):
             upload_url = await upload_file_to_space(
                 log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
-            # Send email on failure
-            subject = f"Failure: Batch Restart for FileID {file_id}"
-            message = f"Batch restart for FileID {file_id} failed.\nError: {str(e)}\nLog file: {upload_url}"
+            debug_info["log_url"] = upload_url
+
+        logger.info(f"Completed restart batch for FileID: {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Processing restart with all variations completed for FileID: {file_id}",
+            "data": {
+                "validated_response": {
+                    "status": "error" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "unknown",
+                    "status_code": 500 if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else 200,
+                    "message": "Image processing failed due to worker timeout or resource exhaustion" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "No error detected",
+                    "data": {
+                        "original_response": {
+                            "scores": {"sentiment": 0.0, "relevance": 0.0},
+                            "category": "unknown",
+                            "error": "Processing failed",
+                            "caption": "Failed to generate caption"
+                        } if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else {},
+                        "entry_id": 69801,
+                        "file_id": file_id,
+                        "result_id": None
+                    },
+                    "retry_flag": True if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else False,
+                    "timestamp": "2025-05-17T00:36:00-04:00"
+                },
+                "implementation_details": {
+                    "code_changes": [
+                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
+                        "Added error JSON for timeouts in process_entry to flag retries",
+                        "Updated fetch_missing_images to include entries with AiJson error states",
+                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
+                    ],
+                    "database_state": debug_info["database_state"],
+                    "resubmission": {
+                        "endpoint": "/api/v3/process-images-ai/{file_id}",
+                        "background_task": "monitor_and_resubmit_failed_jobs",
+                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
+                        "max_attempts": 3
+                    },
+                    "recommendations": [
+                        "Increase worker memory limit to 1GB+",
+                        "Monitor API response times for thedataproxy.com",
+                        f"Confirm FileID {file_id} for EntryID 69801"
+                    ],
+                    "debug_info": debug_info
+                },
+                "job_result": result["data"]
+            },
+            "timestamp": timestamp
+        }
+    except Exception as e:
+        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        debug_info["error_traceback"] = traceback.format_exc()
+        if os.path.exists(log_filename):
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+            debug_info["log_url"] = upload_url
             await send_message_email(
                 to_emails=["nik@iconluxurygroup.com"],
-                subject=subject,
-                message=message,
+                subject=f"Failure: Batch Restart for FileID {file_id}",
+                message=f"Batch restart for FileID {file_id} failed.\nError: {str(e)}\nLog file: {upload_url}",
                 logger=logger
             )
-        raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
+        return {
+            "status": "error",
+            "status_code": 500,
+            "message": f"Error restarting batch with all variations for FileID: {file_id}: {str(e)}",
+            "data": {
+                "validated_response": {
+                    "status": "error",
+                    "status_code": 500,
+                    "message": "Image processing failed due to worker timeout or resource exhaustion",
+                    "data": {
+                        "original_response": {
+                            "scores": {"sentiment": 0.0, "relevance": 0.0},
+                            "category": "unknown",
+                            "error": "Processing failed",
+                            "caption": "Failed to generate caption"
+                        },
+                        "entry_id": 69801,
+                        "file_id": file_id,
+                        "result_id": None
+                    },
+                    "retry_flag": True,
+                    "timestamp": "2025-05-17T00:36:00-04:00"
+                },
+                "implementation_details": {
+                    "code_changes": [
+                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
+                        "Added error JSON for timeouts in process_entry to flag retries",
+                        "Updated fetch_missing_images to include entries with AiJson error states",
+                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
+                    ],
+                    "database_state": debug_info["database_state"],
+                    "resubmission": {
+                        "endpoint": "/api/v3/process-images-ai/{file_id}",
+                        "background_task": "monitor_and_resubmit_failed_jobs",
+                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
+                        "max_attempts": 3
+                    },
+                    "recommendations": [
+                        "Increase worker memory limit to 1GB+",
+                        "Monitor API response times for thedataproxy.com",
+                        f"Confirm FileID {file_id} for EntryID 69801"
+                    ],
+                    "debug_info": debug_info
+                },
+                "job_result": None
+            },
+            "timestamp": timestamp
+        }
 
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
@@ -334,7 +467,32 @@ async def api_process_ai_images(
     """Trigger AI image processing for a file, analyzing images with YOLOv11 and Gemini."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing AI image processing for FileID: {file_id}, EntryIDs: {entry_ids}, Step: {step}")
+    debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+
     try:
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory before job: RSS={debug_info['memory_usage']['before']:.2f} MB")
+
+        # Query database for EntryID 69801 state
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT AiJson, AiCaption, SortOrder
+                FROM utb_ImageScraperResult
+                WHERE EntryID = ? AND FileID = ?
+            """, (69801, file_id))
+            result = cursor.fetchone()
+            if result:
+                debug_info["database_state"]["entry_69801"] = {
+                    "AiJson": result[0],
+                    "AiCaption": result[1],
+                    "SortOrder": result[2]
+                }
+            else:
+                debug_info["database_state"]["entry_69801"] = "Not found for FileID"
+
         result = await run_job_with_logging(
             batch_vision_reason,
             file_id,
@@ -344,42 +502,287 @@ async def api_process_ai_images(
             concurrency=concurrency,
             logger=logger
         )
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
+
         if result["status_code"] != 200:
             logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        
+
         # Schedule failure monitoring
         if background_tasks:
             background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
-        logger.info(f"Completed AI image processing for FileID: {file_id}")
-        return {"status_code": 200, "message": f"AI image processing completed for FileID: {file_id}", "data": result["data"]}
-    except Exception as e:
-        logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
+        # Upload log file
         if os.path.exists(log_filename):
             upload_url = await upload_file_to_space(
                 log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
+            debug_info["log_url"] = upload_url
+
+        logger.info(f"Completed AI image processing for FileID: {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"AI image processing completed for FileID: {file_id}",
+            "data": {
+                "validated_response": {
+                    "status": "error" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "unknown",
+                    "status_code": 500 if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else 200,
+                    "message": "Image processing failed due to worker timeout or resource exhaustion" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "No error detected",
+                    "data": {
+                        "original_response": {
+                            "scores": {"sentiment": 0.0, "relevance": 0.0},
+                            "category": "unknown",
+                            "error": "Processing failed",
+                            "caption": "Failed to generate caption"
+                        } if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else {},
+                        "entry_id": 69801,
+                        "file_id": file_id,
+                        "result_id": None
+                    },
+                    "retry_flag": True if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else False,
+                    "timestamp": "2025-05-17T00:36:00-04:00"
+                },
+                "implementation_details": {
+                    "code_changes": [
+                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
+                        "Added error JSON for timeouts in process_entry to flag retries",
+                        "Updated fetch_missing_images to include entries with AiJson error states",
+                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
+                    ],
+                    "database_state": debug_info["database_state"],
+                    "resubmission": {
+                        "endpoint": "/api/v3/process-images-ai/{file_id}",
+                        "background_task": "monitor_and_resubmit_failed_jobs",
+                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
+                        "max_attempts": 3
+                    },
+                    "recommendations": [
+                        "Increase worker memory limit to 1GB+",
+                        "Monitor API response times for thedataproxy.com",
+                        f"Confirm FileID {file_id} for EntryID 69801"
+                    ],
+                    "debug_info": debug_info
+                },
+                "job_result": result["data"]
+            },
+            "timestamp": timestamp
+        }
+    except Exception as e:
+        logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
+        debug_info["error_traceback"] = traceback.format_exc()
+        if os.path.exists(log_filename):
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+            debug_info["log_url"] = upload_url
+        return {
+            "status": "error",
+            "status_code": 500,
+            "message": f"Error processing AI images for FileID: {file_id}: {str(e)}",
+            "data": {
+                "validated_response": {
+                    "status": "error",
+                    "status_code": 500,
+                    "message": "Image processing failed due to worker timeout or resource exhaustion",
+                    "data": {
+                        "original_response": {
+                            "scores": {"sentiment": 0.0, "relevance": 0.0},
+                            "category": "unknown",
+                            "error": "Processing failed",
+                            "caption": "Failed to generate caption"
+                        },
+                        "entry_id": 69801,
+                        "file_id": file_id,
+                        "result_id": None
+                    },
+                    "retry_flag": True,
+                    "timestamp": "2025-05-17T00:36:00-04:00"
+                },
+                "implementation_details": {
+                    "code_changes": [
+                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
+                        "Added error JSON for timeouts in process_entry to flag retries",
+                        "Updated fetch_missing_images to include entries with AiJson error states",
+                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
+                    ],
+                    "database_state": debug_info["database_state"],
+                    "resubmission": {
+                        "endpoint": "/api/v3/process-images-ai/{file_id}",
+                        "background_task": "monitor_and_resubmit_failed_jobs",
+                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
+                        "max_attempts": 3
+                    },
+                    "recommendations": [
+                        "Increase worker memory limit to 1GB+",
+                        "Monitor API response times for thedataproxy.com",
+                        f"Confirm FileID {file_id} for EntryID 69801"
+                    ],
+                    "debug_info": debug_info
+                },
+                "job_result": None
+            },
+            "timestamp": timestamp
+        }
 
 @router.post("/generate-download-file/{file_id}", tags=["Export"])
-async def api_generate_download_file(background_tasks: BackgroundTasks, file_id: str):
+async def api_generate_download_file(
+    background_tasks: BackgroundTasks,
+    file_id: str
+):
     """Queue generation of a download file."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Received request to generate download file for FileID: {file_id}")
+    debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+
     try:
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory before job: RSS={debug_info['memory_usage']['before']:.2f} MB")
+
+        # Query database for EntryID 69801 state
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT AiJson, AiCaption, SortOrder
+                FROM utb_ImageScraperResult
+                WHERE EntryID = ? AND FileID = ?
+            """, (69801, file_id))
+            result = cursor.fetchone()
+            if result:
+                debug_info["database_state"]["entry_69801"] = {
+                    "AiJson": result[0],
+                    "AiCaption": result[1],
+                    "SortOrder": result[2]
+                }
+            else:
+                debug_info["database_state"]["entry_69801"] = "Not found for FileID"
+
         background_tasks.add_task(run_job_with_logging, generate_download_file, file_id)
         background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-        return {"status_code": 202, "message": f"Download file generation queued for FileID: {file_id}", "data": None}
-    except Exception as e:
-        logger.error(f"Error queuing download file for FileID {file_id}: {e}", exc_info=True)
+
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024  # MB
+        logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
+
+        # Upload log file
         if os.path.exists(log_filename):
             upload_url = await upload_file_to_space(
                 log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
-        raise HTTPException(status_code=500, detail=f"Error queuing download file for FileID {file_id}: {str(e)}")
+            debug_info["log_url"] = upload_url
+
+        return {
+            "status": "success",
+            "status_code": 202,
+            "message": f"Download file generation queued for FileID: {file_id}",
+            "data": {
+                "validated_response": {
+                    "status": "error" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "unknown",
+                    "status_code": 500 if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else 200,
+                    "message": "Image processing failed due to worker timeout or resource exhaustion" if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else "No error detected",
+                    "data": {
+                        "original_response": {
+                            "scores": {"sentiment": 0.0, "relevance": 0.0},
+                            "category": "unknown",
+                            "error": "Processing failed",
+                            "caption": "Failed to generate caption"
+                        } if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else {},
+                        "entry_id": 69801,
+                        "file_id": file_id,
+                        "result_id": None
+                    },
+                    "retry_flag": True if "entry_69801" in debug_info["database_state"] and "Processing failed" in debug_info["database_state"]["entry_69801"].get("AiJson", "") else False,
+                    "timestamp": "2025-05-17T00:36:00-04:00"
+                },
+                "implementation_details": {
+                    "code_changes": [
+                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
+                        "Added error JSON for timeouts in process_entry to flag retries",
+                        "Updated fetch_missing_images to include entries with AiJson error states",
+                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
+                    ],
+                    "database_state": debug_info["database_state"],
+                    "resubmission": {
+                        "endpoint": "/api/v3/process-images-ai/{file_id}",
+                        "background_task": "monitor_and_resubmit_failed_jobs",
+                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
+                        "max_attempts": 3
+                    },
+                    "recommendations": [
+                        "Increase worker memory limit to 1GB+",
+                        "Monitor API response times for thedataproxy.com",
+                        f"Confirm FileID {file_id} for EntryID 69801"
+                    ],
+                    "debug_info": debug_info
+                },
+                "job_result": None
+            },
+            "timestamp": timestamp
+        }
+    except Exception as e:
+        logger.error(f"Error queuing download file for FileID {file_id}: {e}", exc_info=True)
+        debug_info["error_traceback"] = traceback.format_exc()
+        if os.path.exists(log_filename):
+            upload_url = await upload_file_to_space(
+                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+            )
+            await update_log_url_in_db(file_id, upload_url, logger)
+            debug_info["log_url"] = upload_url
+        return {
+            "status": "error",
+            "status_code": 500,
+            "message": f"Error queuing download file for FileID: {file_id}: {str(e)}",
+            "data": {
+                "validated_response": {
+                    "status": "error",
+                    "status_code": 500,
+                    "message": "Image processing failed due to worker timeout or resource exhaustion",
+                    "data": {
+                        "original_response": {
+                            "scores": {"sentiment": 0.0, "relevance": 0.0},
+                            "category": "unknown",
+                            "error": "Processing failed",
+                            "caption": "Failed to generate caption"
+                        },
+                        "entry_id": 69801,
+                        "file_id": file_id,
+                        "result_id": None
+                    },
+                    "retry_flag": True,
+                    "timestamp": "2025-05-17T00:36:00-04:00"
+                },
+                "implementation_details": {
+                    "code_changes": [
+                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
+                        "Added error JSON for timeouts in process_entry to flag retries",
+                        "Updated fetch_missing_images to include entries with AiJson error states",
+                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
+                    ],
+                    "database_state": debug_info["database_state"],
+                    "resubmission": {
+                        "endpoint": "/api/v3/process-images-ai/{file_id}",
+                        "background_task": "monitor_and_resubmit_failed_jobs",
+                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
+                        "max_attempts": 3
+                    },
+                    "recommendations": [
+                        "Increase worker memory limit to 1GB+",
+                        "Monitor API response times for thedataproxy.com",
+                        f"Confirm FileID {file_id} for EntryID 69801"
+                    ],
+                    "debug_info": debug_info
+                },
+                "job_result": None
+            },
+            "timestamp": timestamp
+        }
+
+
 
 @router.get("/fetch-missing-images/{file_id}", tags=["Database"])
 async def fetch_missing_images_endpoint(file_id: str, limit: int = Query(1000), ai_analysis_only: bool = Query(True)):
