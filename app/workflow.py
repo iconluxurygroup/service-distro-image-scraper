@@ -419,6 +419,7 @@ import pandas as pd
 
 async def generate_download_file(
     file_id: int,
+    background_tasks: BackgroundTasks,
     logger: Optional[logging.Logger] = None,
     file_id_param: Optional[int] = None
 ) -> Dict[str, str]:
@@ -534,7 +535,8 @@ async def generate_download_file(
             f"Log file: {log_filename}"
         )
         logger.debug(f"Sending email with public_url: {public_url}")
-        await send_message_email(
+        background_tasks.add_task(
+            send_message_email,
             to_emails=send_to_email_addr,
             subject=subject_line,
             message=message,
@@ -551,7 +553,8 @@ async def generate_download_file(
         logger.error(f"Error for ID {file_id}: {e}", exc_info=True)
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if send_to_email_addr:
-            await send_message_email(
+            background_tasks.add_task(
+                send_message_email,
                 to_emails=send_to_email_addr,
                 subject=f"Error: Job Failed for FileID {file_id}",
                 message=f"Excel file generation for FileID {file_id} failed.\nError: {str(e)}\nLog file: {log_filename}",
