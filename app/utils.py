@@ -619,6 +619,15 @@ async def process_single_all(
         logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
 
+import logging
+import pandas as pd
+import pyodbc
+from typing import Optional, Dict
+from common import clean_string, generate_aliases, generate_brand_aliases
+from database_config import conn_str  # Ensure conn_str is imported
+from icon_image_lib.google_parser import process_search_result
+from db_utils import update_search_sort_order  # Import updated function
+
 async def process_single_row(
     entry_id: int,
     search_string: str,
@@ -632,7 +641,7 @@ async def process_single_row(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
     
     try:
@@ -665,7 +674,8 @@ async def process_single_row(
     }
     required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-    if not brand or not model or not color or not category:
+    # Fetch attributes if not provided
+    if not all([brand, model, color, category]):
         try:
             with pyodbc.connect(conn_str, autocommit=False) as conn:
                 cursor = conn.cursor()
@@ -675,25 +685,23 @@ async def process_single_row(
                 )
                 result = cursor.fetchone()
                 if result:
-                    result_brand = result_brand or result[0]
-                    result_model = result_model or result[1]
-                    result_color = result_color or result[2]
-                    result_category = result_category or result[3]
+                    result_brand, result_model, result_color, result_category = result
                     logger.info(f"Worker PID {process.pid}: Fetched attributes for EntryID {entry_id}: Brand={result_brand}, Model={result_model}, Color={result_color}, Category={result_category}")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No attributes found for FileID {file_id_db}, EntryID {entry_id}")
         except pyodbc.Error as e:
             logger.error(f"Worker PID {process.pid}: Failed to fetch attributes for EntryID {entry_id}: {e}", exc_info=True)
 
+    # Generate variations
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory before generating variations: RSS={mem_info.rss / 1024**2:.2f} MB")
     variations = generate_search_variations(search_string, result_brand, result_model, brand_rules, logger)
     
-    endpoint = sync_get_endpoint(logger=logger)
     if not endpoint:
         logger.error(f"Worker PID {process.pid}: No healthy endpoint available for EntryID {entry_id}")
         return False
 
+    # Process search variations
     for search_type in search_types:
         if search_type not in variations:
             logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found in variations for EntryID {entry_id}")
@@ -710,19 +718,20 @@ async def process_single_row(
             all_results.extend([res["result"] for res in successful_results])
             break
 
+    # Insert results
     if all_results:
         try:
             mem_info = process.memory_info()
             logger.debug(f"Worker PID {process.pid}: Memory before combining results: RSS={mem_info.rss / 1024**2:.2f} MB")
             combined_df = pd.concat(all_results, ignore_index=True, copy=False)
-            logger.info(f"Worker PID {process.pid}: Combined {len(combined_df)} results for EntryID {entry_id} for batch insertion")
+            logger.info(f"Worker PID {process.pid}: Combined {len(combined_df)} results for EntryID {entry_id}")
             for api_col, db_col in api_to_db_mapping.items():
                 if api_col in combined_df.columns and db_col not in combined_df.columns:
                     combined_df.rename(columns={api_col: db_col}, inplace=True)
             if not all(col in combined_df.columns for col in required_columns):
                 logger.error(f"Worker PID {process.pid}: Missing columns {set(required_columns) - set(combined_df.columns)} in result for EntryID {entry_id}")
                 return False
-            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
+            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
             logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows")
             insert_success = insert_search_results(deduplicated_df, logger=logger)
             if not insert_success:
@@ -730,43 +739,57 @@ async def process_single_row(
                 return False
             logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
             
-            update_result = sync_update_search_sort_order(
-                str(file_id_db), str(entry_id), result_brand, result_model, result_color, result_category, logger, brand_rules=brand_rules
-            )
-            if update_result is None:
-                logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
-                return False
-            logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id} with Brand: {result_brand}, Model: {result_model}, Color: {result_color}, Category: {result_category}")
-            try:
-                with pyodbc.connect(conn_str, autocommit=False) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ?", (entry_id,))
-                    total_count = cursor.fetchone()[0]
-                    logger.info(f"Worker PID {process.pid}: Verification: Found {total_count} total rows for EntryID {entry_id}")
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder > 0",
-                        (entry_id,)
-                    )
-                    count = cursor.fetchone()[0]
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = ? AND SortOrder IS NULL",
-                        (entry_id,)
-                    )
-                    null_count = cursor.fetchone()[0]
-                    logger.info(f"Worker PID {process.pid}: Verification: Found {count} rows with positive SortOrder, {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                    if null_count > 0:
-                        logger.error(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder after update for EntryID {entry_id}")
-                    if total_count == 0:
-                        logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
-            except pyodbc.Error as e:
-                logger.error(f"Worker PID {process.pid}: Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
+            # Update sort order only if non-placeholder results exist
+            if not deduplicated_df['ImageUrl'].str.contains('placeholder://', na=False).all():
+                update_result = await update_search_sort_order(
+                    file_id=str(file_id_db),
+                    entry_id=str(entry_id),
+                    brand=result_brand,
+                    model=result_model,
+                    color=result_color,
+                    category=result_category,
+                    logger=logger,
+                    brand_rules=brand_rules
+                )
+                if update_result is None:
+                    logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
+                    return False
+                logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
+            else:
+                logger.info(f"Worker PID {process.pid}: Skipping sort order update for EntryID {entry_id} due to all placeholder results")
+
+            # Optimized verification
+            with pyodbc.connect(conn_str, autocommit=False) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT 
+                        COUNT(*) AS total_count,
+                        SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                        SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                    FROM utb_ImageScraperResult 
+                    WHERE EntryID = ?
+                    """,
+                    (entry_id,)
+                )
+                row = cursor.fetchone()
+                total_count, positive_count, null_count = row
+                logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
+                if null_count > 0:
+                    logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                if total_count == 0:
+                    logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
+                    return False
+
             mem_info = process.memory_info()
             logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
             return True
+
         except Exception as e:
-            logger.error(f"Worker PID {process.pid}: Error during batch database update for EntryID {entry_id}: {e}", exc_info=True)
+            logger.error(f"Worker PID {process.pid}: Error during database update for EntryID {entry_id}: {e}", exc_info=True)
             return False
 
+    # Handle no results
     logger.info(f"Worker PID {process.pid}: No results to insert for EntryID {entry_id}")
     placeholder_df = pd.DataFrame([{
         "EntryID": entry_id,
@@ -790,7 +813,7 @@ async def process_single_row(
                     (entry_id, "placeholder://no-results")
                 )
                 conn.commit()
-                logger.info(f"Worker PID {process.pid}: Fallback applied: Set SortOrder=1 for placeholder row for EntryID {entry_id}")
+                logger.info(f"Worker PID {process.pid}: Set SortOrder=1 for placeholder row for EntryID {entry_id}")
             return True
         else:
             logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}")
