@@ -34,7 +34,34 @@ CONFIG_FILES = {
     "fashion_labels": "fashion_labels.json",
     "non_fashion_labels": "non_fashion_labels.json"
 }
+import os
+import shutil
+import logging
+import asyncio
+from typing import Optional, List
 
+async def create_temp_dirs(file_id: int, logger: Optional[logging.Logger] = None) -> tuple[str, str]:
+    """Create temporary directories for images and Excel files."""
+    logger = logger or logging.getLogger(__name__)
+    temp_images_dir = f"temp_images_{file_id}"
+    temp_excel_dir = f"temp_excel_{file_id}"
+    
+    os.makedirs(temp_images_dir, exist_ok=True)
+    os.makedirs(temp_excel_dir, exist_ok=True)
+    
+    logger.debug(f"Created temp directories: {temp_images_dir}, {temp_excel_dir}")
+    return temp_images_dir, temp_excel_dir
+
+async def cleanup_temp_dirs(dirs: List[str], logger: Optional[logging.Logger] = None) -> None:
+    """Clean up temporary directories."""
+    logger = logger or logging.getLogger(__name__)
+    for dir_path in dirs:
+        if os.path.exists(dir_path):
+            try:
+                shutil.rmtree(dir_path)
+                logger.debug(f"Removed temp directory: {dir_path}")
+            except Exception as e:
+                logger.error(f"Failed to remove temp directory {dir_path}: {e}", exc_info=True)
 # Cache synchronous loads
 @lru_cache(maxsize=32)
 def sync_load_config(file_key: str, url: str, config_name: str, expect_list: bool = False) -> Any:
