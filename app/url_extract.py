@@ -19,7 +19,7 @@ def extract_thumbnail_url(url: str, logger: Optional[logging.Logger] = None) -> 
             if tbn_match:
                 thumbnail_id = tbn_match.group(1)
                 # Rebuild using template
-                rebuilt_url = f"https://encrypted-tbn0.gstatic.com/images?q=tbn:{thumbnail_id}"
+                rebuilt_url = f"https://encrypted-tbn0.gstatic.com/images?q=tbn:{thumbnail_id}&s"
                 logger.debug(f"Rebuilt thumbnail URL: {rebuilt_url}")
                 return rebuilt_url
             else:
