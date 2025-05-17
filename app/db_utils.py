@@ -9,13 +9,13 @@ import aioodbc
 import asyncio
 from typing import Optional, List, Dict, Any
 from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from database_config import conn_str, async_engine, engine
 from aws_s3 import upload_file_to_space
-from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
+from common import clean_string, validate_model, validate_brand, generate_aliases, calculate_priority, generate_brand_aliases
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
