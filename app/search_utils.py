@@ -1,15 +1,12 @@
 import logging
-import asyncio
-import json
 from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from database_config import conn_str, async_engine
-from common import clean_string, normalize_model, validate_model, generate_aliases, generate_brand_aliases, calculate_priority, filter_model_results
+from database_config import async_engine
+from common import clean_string
 import psutil
-import re
-import unicodedata
+import pyodbc
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -17,7 +14,7 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     if not url or url == '' or 'placeholder' in str(url).lower():
         logger.debug(f"Invalid thumbnail URL: {url}")
         return False
@@ -40,7 +37,7 @@ async def insert_search_results(
     logger: Optional[logging.Logger] = None,
     file_id: str = None
 ) -> bool:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     process = psutil.Process()
 
     if not results:
@@ -56,17 +53,6 @@ async def insert_search_results(
 
     try:
         parameters = []
-        async with async_engine.connect() as conn:
-            existing_urls = set()
-            for res in results:
-                result = await conn.execute(
-                    text("SELECT ImageUrl FROM utb_ImageScraperResult WHERE EntryID = :entry_id"),
-                    {"entry_id": res["EntryID"]}
-                )
-                existing_urls.update(row[0] for row in result.fetchall())
-                result.close()
-            await conn.commit()
-
         for res in results:
             try:
                 entry_id = int(res["EntryID"])
@@ -74,14 +60,10 @@ async def insert_search_results(
                 logger.error(f"Worker PID {process.pid}: Invalid EntryID value: {res.get('EntryID')}")
                 return False
 
-            image_url = str(res.get("ImageUrl", "")) if res.get("ImageUrl") else ""
-            if image_url in existing_urls:
-                logger.debug(f"Worker PID {process.pid}: Skipping duplicate ImageUrl: {image_url}")
-                continue
-
             category = res.get("ProductCategory", "")
+            image_url = str(res.get("ImageUrl", "")) if res.get("ImageUrl") else ""
             if category.lower() == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
-                logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
+                logger.debug(f"Filtered out irrelevant URL: {image_url}")
                 continue
 
             parameters.append({
@@ -124,7 +106,7 @@ async def insert_search_results(
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, ValueError)),
+    retry=retry_if_exception_type((pyodbc.Error, ValueError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -140,243 +122,92 @@ async def update_search_sort_order(
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None
 ) -> Optional[bool]:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     process = psutil.Process()
-
-    def normalize_text(text: str, field: str = "unknown") -> str:
-        if not text:
-            return ""
-        try:
-            text = text.replace('\\', '\\\\')
-            text = unicodedata.normalize('NFC', text.encode().decode('unicode_escape')).lower().strip()
-            return text
-        except UnicodeDecodeError as e:
-            logger.warning(f"Worker PID {process.pid}: UnicodeDecodeError in normalize_text for field '{field}': {e}, input: {text[:100]}")
-            text = unicodedata.normalize('NFC', text.encode('ascii', 'ignore').decode('ascii')).lower().strip()
-            return text
-
+    
     try:
-        file_id = int(file_id)
-        entry_id = int(entry_id)
-        logger.info(f"Worker PID {process.pid}: Starting SortOrder update for FileID: {file_id}, EntryID: {entry_id}")
-
-        # Fetch attributes if not provided
-        async with async_engine.connect() as conn:
-            if not all([brand, model]):
-                result = await conn.execute(
-                    text("""
-                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                        FROM utb_ImageScraperRecords
-                        WHERE FileID = :file_id AND EntryID = :entry_id
-                    """),
-                    {"file_id": file_id, "entry_id": entry_id}
-                )
-                row = result.fetchone()
-                result.close()
-                await conn.commit()
-                if row:
-                    brand, model, color, category = row
-                    logger.info(f"Worker PID {process.pid}: Fetched attributes - Brand: {brand}, Model: {model}, Color: {color}, Category: {category}")
-                else:
-                    logger.warning(f"Worker PID {process.pid}: No attributes found for FileID: {file_id}, EntryID: {entry_id}")
-                    brand = brand or ''
-                    model = model or ''
-                    color = color or ''
-                    category = category or ''
-
-        # Generate brand and model aliases
-        brand_clean = normalize_text(brand, "ProductBrand")
-        brand_aliases_dict = {
-            "Scotch & Soda": [
-                "Scotch and Soda", "Scotch Soda", "Scotch&Soda", "ScotchAndSoda", "Scotch"
-            ],
-            "Adidas": ["Adidas AG", "Adidas Originals", "Addidas", "Adiddas"],
-            "BAPE": ["A Bathing Ape", "BATHING APE", "Bape Japan", "ABathingApe", "Bape"]
-        }
-        brand_aliases = [normalize_text(alias, "BrandAlias") for alias in brand_aliases_dict.get(brand, [brand_clean])]
-        if not brand_aliases and brand_clean:
-            brand_aliases = [brand_clean]
-        logger.debug(f"Worker PID {process.pid}: Using brand aliases: {brand_aliases}")
-
-        model_clean = normalize_text(model, "ProductModel") if model else ''
-        model_aliases = generate_aliases(model_clean) if model_clean else []
-        logger.debug(f"Worker PID {process.pid}: Using model aliases: {model_aliases}")
-
-        # Reset SortOrder to NULL
-        async with async_engine.connect() as conn:
-            await conn.execute(
-                text("""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = NULL
-                    WHERE EntryID = :entry_id
-                """),
-                {"entry_id": entry_id}
-            )
-            await conn.commit()
-            logger.debug(f"Worker PID {process.pid}: Reset SortOrder to NULL for EntryID {entry_id}")
-
-        # Fetch results using a fresh connection
         async with async_engine.connect() as conn:
             query = text("""
-                SELECT 
-                    t.ResultID, 
-                    t.EntryID,
-                    ISNULL(CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0) AS match_score,
-                    t.SortOrder,
-                    t.ImageDesc, 
-                    t.ImageSource, 
-                    t.ImageUrl,
-                    r.ProductBrand, 
-                    r.ProductModel
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
-                WHERE r.FileID = :file_id AND t.EntryID = :entry_id
+                SELECT ResultID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
+                FROM utb_ImageScraperResult
+                WHERE EntryID = :entry_id AND FileID = :file_id
             """)
-            result = await conn.execute(query, {"file_id": file_id, "entry_id": entry_id})
+            result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
             columns = result.keys()
             result.close()
-            await conn.commit()
 
         if not rows:
-            logger.warning(f"Worker PID {process.pid}: No eligible data found for FileID: {file_id}, EntryID: {entry_id}")
+            logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
             return False
 
-        # Convert rows to list of dicts
         results = [dict(zip(columns, row)) for row in rows]
-        logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
+        logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
-        # Clean and normalize result fields
-        for res in results:
-            for col in ["ImageDesc", "ImageSource", "ImageUrl", "ProductBrand", "ProductModel"]:
-                res[f"{col}_clean"] = normalize_text(str(res.get(col, '')), col) if res.get(col) else ''
-            res["priority"] = None
-            res["new_sort_order"] = -2  # Default sort order
+        brand_clean = clean_string(brand).lower() if brand else ""
+        model_clean = normalize_model(model) if model else ""
+        logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
-        # Brand validation and ranking
-        match_results = []
-        for res in results:
-            image_desc = res["ImageDesc_clean"]
-            if not image_desc and not res["ImageSource_clean"] and not res["ImageUrl_clean"]:
-                logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Empty fields, setting SortOrder=-1")
-                res["new_sort_order"] = -1
-                continue
-
-            brand_found = False
-            for alias in brand_aliases:
-                if alias and alias in image_desc:
-                    brand_found = True
-                    res["priority"] = 3
-                    match_results.append(res)
-                    logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Matched brand alias '{alias}' in ImageDesc: {image_desc[:100]}")
+        brand_aliases = []
+        if brand and brand_rules and "brand_rules" in brand_rules:
+            for rule in brand_rules["brand_rules"]:
+                if any(brand.lower() in name.lower() for name in rule.get("names", [])):
+                    brand_aliases = rule.get("names", [])
                     break
-            if not brand_found:
-                logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: No brand match in ImageDesc: {image_desc[:100]}")
+        if not brand_aliases and brand_clean:
+            brand_aliases = [brand_clean, brand_clean.replace(" & ", " and "), brand_clean.replace(" ", "")]
+        brand_aliases = [clean_string(alias).lower() for alias in brand_aliases]
+        model_aliases = generate_aliases(model_clean) if model_clean else []
+        if model_clean and not model_aliases:
+            model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
+        logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
-        # Rank brand matches
-        if match_results:
-            def rank_key(res):
-                has_desc = 1 if res["ImageDesc_clean"] else 0
-                has_source = 1 if res["ImageSource_clean"] else 0
-                has_url = 1 if res["ImageUrl_clean"] else 0
-                return (-res["match_score"], -has_desc, -has_source, -has_url)
-            
-            match_results.sort(key=rank_key)
-            for index, res in enumerate(match_results, 1):
-                res["new_sort_order"] = index
-                logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Assigned SortOrder={index}, match_score={res['match_score']}, ImageDesc: {res['ImageDesc_clean'][:100]}")
+        for res in results:
+            image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
+            image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
+            image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
+            logger.debug(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
 
-        # Prepare bulk update
-        update_params = [
-            {"sort_order": int(res["new_sort_order"]), "result_id": int(res["ResultID"])}
-            for res in results
-        ]
+            model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
+            brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
+            logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
-        # Perform bulk update with a fresh connection
+            if model_matched and brand_matched:
+                res["priority"] = 1
+            elif model_matched:
+                res["priority"] = 2
+            elif brand_matched:
+                res["priority"] = 3
+            else:
+                res["priority"] = 4
+            logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
+
+        sorted_results = sorted(results, key=lambda x: x["priority"])
+        logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
+
         async with async_engine.connect() as conn:
-            if update_params:
+            for index, res in enumerate(sorted_results, 1):
                 try:
                     await conn.execute(
                         text("""
-                            UPDATE utb_ImageScraperResult 
-                            SET SortOrder = :sort_order 
-                            WHERE ResultID = :result_id
+                            UPDATE utb_ImageScraperResult
+                            SET SortOrder = :sort_order
+                            WHERE ResultID = :result_id AND EntryID = :entry_id
                         """),
-                        update_params
+                        {"sort_order": index, "result_id": res["ResultID"], "entry_id": entry_id}
                     )
-                    await conn.commit()
-                    logger.info(f"Worker PID {process.pid}: Successfully updated {len(update_params)} rows for EntryID {entry_id}")
+                    logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {index} for ResultID {res['ResultID']}")
                 except SQLAlchemyError as e:
-                    logger.error(f"Worker PID {process.pid}: Bulk update failed for EntryID {entry_id}: {e}")
-                    # Fallback to individual updates with delay
-                    for param in update_params:
-                        try:
-                            await conn.execute(
-                                text("""
-                                    UPDATE utb_ImageScraperResult 
-                                    SET SortOrder = :sort_order 
-                                    WHERE ResultID = :result_id
-                                """),
-                                param
-                            )
-                            await conn.commit()
-                            logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {param['sort_order']} for ResultID {param['result_id']}")
-                            await asyncio.sleep(0.1)  # Small delay to prevent connection overload
-                        except SQLAlchemyError as e:
-                            logger.error(f"Worker PID {process.pid}: Failed to update ResultID {param['result_id']}: {e}")
-                            continue
-
-        # Verify updates
-        async with async_engine.connect() as conn:
-            verify_query = text("""
-                SELECT ResultID, EntryID, SortOrder, ImageDesc, ImageSource, ImageUrl
-                FROM utb_ImageScraperResult
-                WHERE EntryID = :entry_id
-                ORDER BY SortOrder DESC
-            """)
-            result = await conn.execute(verify_query, {"entry_id": entry_id})
-            verified_results = [
-                {
-                    "ResultID": r[0],
-                    "EntryID": r[1],
-                    "SortOrder": r[2],
-                    "ImageDesc": r[3],
-                    "ImageSource": r[4],
-                    "ImageUrl": r[5]
-                }
-                for r in result.fetchall()
-            ]
-            result.close()
+                    logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, EntryID {entry_id}: {e}")
+                    return False
             await conn.commit()
+            logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(sorted_results)} rows for EntryID {entry_id}")
 
-            positive_count = sum(1 for r in verified_results if r['SortOrder'] is not None and r['SortOrder'] > 0)
-            zero_count = sum(1 for r in verified_results if r['SortOrder'] == 0)
-            negative_count = sum(1 for r in verified_results if r['SortOrder'] is not None and r['SortOrder'] < 0)
-            null_count = sum(1 for r in verified_results if r['SortOrder'] is None)
-            logger.info(
-                f"Worker PID {process.pid}: Verification for EntryID {entry_id}: "
-                f"{positive_count} rows with positive SortOrder (model or brand matches), "
-                f"{zero_count} rows with SortOrder=0 (legacy brand matches), "
-                f"{negative_count} rows with negative SortOrder, "
-                f"{null_count} rows with NULL SortOrder"
-            )
-            if null_count > 0:
-                logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                for r in verified_results:
-                    if r['SortOrder'] is None:
-                        logger.debug(f"Worker PID {process.pid}: NULL SortOrder for ResultID {r['ResultID']}, ImageDesc: {r['ImageDesc'][:100]}")
-
-            for r in verified_results[:3]:
-                logger.info(f"Worker PID {process.pid}: Sample - ResultID: {r['ResultID']}, EntryID: {r['EntryID']}, SortOrder: {r['SortOrder']}, ImageDesc: {r['ImageDesc'][:100]}")
-
-        return null_count == 0  # Return True if no NULL SortOrder values
+        return True
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        raise
-    except ValueError as e:
-        logger.error(f"Worker PID {process.pid}: ValueError in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        raise
+        return False
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
@@ -391,7 +222,7 @@ async def update_search_sort_order(
     )
 )
 async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     try:
         file_id = int(file_id)
         logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
@@ -406,7 +237,6 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
             result = await conn.execute(query, {"file_id": file_id})
             entries = result.fetchall()
             result.close()
-            await conn.commit()
         
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id}")
@@ -418,7 +248,7 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
         
         for entry in entries:
             entry_id, brand, model, color, category = entry
-            logger.debug(f"Worker PID {process.pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
+            logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
             try:
                 entry_results = await update_search_sort_order(
                     file_id=str(file_id),
@@ -499,7 +329,7 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
     )
 )
 async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     try:
         file_id = int(file_id)
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
@@ -514,9 +344,7 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                 {"file_id": file_id}
             )
             null_count = result.scalar()
-            logger.debug(f"Worker PID {process.pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
-            result.close()
-            await conn.commit()
+            logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
 
             result = await conn.execute(
                 text("""
@@ -547,7 +375,6 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             )
             rows_updated = result.rowcount
             logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
-            await conn.commit()
             
             return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
     
@@ -560,93 +387,3 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
     except Exception as e:
         logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
         return None
-
-def generate_search_variations(
-    search_string: str,
-    brand: Optional[str] = None,
-    model: Optional[str] = None,
-    brand_rules: Optional[Dict] = None,
-    logger: Optional[logging.Logger] = None
-) -> Dict[str, List[str]]:
-    logger = logger or default_logger
-    process = psutil.Process()
-    variations = {
-        "default": [],
-        "delimiter_variations": [],
-        "color_delimiter": [],
-        "brand_alias": [],
-        "no_color": []
-    }
-    
-    if not search_string:
-        logger.warning(f"Worker PID {process.pid}: Empty search string provided")
-        return variations
-    
-    search_string = search_string.lower()
-    brand = clean_string(brand).lower() if brand else None
-    model = clean_string(model).lower() if model else search_string
-    
-    variations["default"].append(search_string)
-    
-    delimiters = [' ', '-', '_', '/']
-    delimiter_variations = []
-    for delim in delimiters:
-        if delim in search_string:
-            delimiter_variations.append(search_string.replace(delim, ' '))
-            delimiter_variations.append(search_string.replace(delim, '-'))
-            delimiter_variations.append(search_string.replace(delim, '_'))
-    variations["delimiter_variations"] = list(set(delimiter_variations))
-    
-    variations["color_delimiter"].append(search_string)
-    
-    if brand:
-        brand_aliases = generate_aliases(brand)
-        variations["brand_alias"] = [f"{alias} {search_string}" for alias in brand_aliases]
-    
-    no_color_string = search_string
-    if brand and brand_rules and "brand_rules" in brand_rules:
-        for rule in brand_rules["brand_rules"]:
-            if any(brand in name.lower() for name in rule.get("names", [])):
-                sku_format = rule.get("sku_format", {})
-                color_separator = sku_format.get("color_separator", "_")
-                expected_length = rule.get("expected_length", {})
-                base_length = expected_length.get("base", [6])[0]
-                with_color_length = expected_length.get("with_color", [10])[0]
-                
-                if not color_separator:
-                    logger.warning(f"Worker PID {process.pid}: Empty color_separator for brand {brand}, skipping color split")
-                    no_color_string = search_string
-                    logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: No color split, no_color='{no_color_string}'")
-                    break
-                
-                if color_separator in search_string:
-                    logger.debug(f"Worker PID {process.pid}: Applying color_separator '{color_separator}' to search_string '{search_string}'")
-                    parts = search_string.split(color_separator)
-                    base_part = parts[0]
-                    if len(base_part) == base_length and len(search_string) <= with_color_length:
-                        no_color_string = base_part
-                        logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: Extracted no_color='{no_color_string}' from '{search_string}'")
-                        break
-                elif len(search_string) == base_length:
-                    no_color_string = search_string
-                    logger.debug(f"Worker PID {process.pid}: Brand rule applied for {brand}: No color suffix, no_color='{no_color_string}'")
-                    break
-    
-    if no_color_string == search_string:
-        for delim in ['_', '-', ' ']:
-            if delim in search_string:
-                no_color_string = search_string.rsplit(delim, 1)[0]
-                logger.debug(f"Worker PID {process.pid}: Delimiter fallback: Extracted no_color='{no_color_string}' from '{search_string}' using delimiter '{delim}'")
-                break
-    
-    variations["no_color"].append(no_color_string if no_color_string else search_string)
-    if no_color_string != search_string:
-        logger.info(f"Worker PID {process.pid}: Generated no_color variation: '{no_color_string}' from original '{search_string}'")
-    else:
-        logger.debug(f"Worker PID {process.pid}: No color suffix detected, no_color variation same as original: '{search_string}'")
-    
-    for key in variations:
-        variations[key] = list(set(v.lower() for v in variations[key]))
-    
-    logger.debug(f"Worker PID {process.pid}: Generated variations: {variations}")
-    return variations
