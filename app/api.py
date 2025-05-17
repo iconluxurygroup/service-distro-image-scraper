@@ -29,7 +29,7 @@ from email_utils import send_message_email
 from logging_config import setup_job_logger
 import traceback
 import psutil
-from config import VERSION
+from config import VERSION,conn_str,engine,async_engine 
 
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)
