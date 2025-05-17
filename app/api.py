@@ -15,7 +15,7 @@ from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images
-from workflow import generate_download_file, process_restart_batch, batch_vision_reason
+from workflow import generate_download_file, process_restart_batch
 from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
@@ -30,7 +30,7 @@ from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-
+from ai_utils import batch_vision_reason
 # Initialize FastAPI app
 app = FastAPI(title="super_scraper", version=VERSION)
 
