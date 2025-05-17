@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter,BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 from pydantic import BaseModel, Field
 import logging
 import asyncio
@@ -12,10 +12,11 @@ import hashlib
 import time
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
+from workflow import upload_file_to_space  # Import from image_scraper instead of aws_s3
 from search_utils import update_sort_order, update_sort_no_image_entry
 from email_utils import send_message_email
 from vision_utils import fetch_missing_images
-from workflow import generate_download_file, process_restart_batch
+from workflow import generate_download_file, process_restart_batch  # Import from image_scraper
 from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
@@ -25,30 +26,23 @@ from db_utils import (
     update_file_generate_complete,
     update_file_location_complete,
 )
-
-from workflow import upload_file_to_space
 from database_config import conn_str, async_engine
 from config import VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from ai_utils import batch_vision_reason
-# Initialize FastAPI app
+
 app = FastAPI(title="super_scraper", version=VERSION)
 
-# Default logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# Create APIRouter instance
 router = APIRouter()
 
-# Global job status store (in-memory; use Redis in production)
 JOB_STATUS = {}
-
-# Global debouncing cache for log uploads
 LAST_UPLOAD = {}
 
 class JobStatusResponse(BaseModel):
@@ -59,7 +53,6 @@ class JobStatusResponse(BaseModel):
     timestamp: str = Field(..., description="ISO timestamp of the response")
 
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
-    """Upload log file to S3 with retry logic and deduplication."""
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -82,31 +75,20 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
             return LAST_UPLOAD[key]["url"]
 
         try:
-            upload_result = upload_file_to_space(
+            upload_url = await upload_file_to_space(
                 file_src=log_filename,
                 save_as=f"job_logs/job_{file_id}.log",
                 is_public=True,
                 logger=logger,
                 file_id=file_id
             )
-            upload_url = await upload_result if asyncio.iscoroutine(upload_result) else upload_result
             await update_log_url_in_db(file_id, upload_url, logger)
             LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
             logger.info(f"Log uploaded to: {upload_url}")
             return upload_url
         except Exception as e:
-            logger.warning(f"Async upload failed for FileID {file_id}: {e}")
-            upload_url = upload_file_to_space_sync(
-                file_src=log_filename,
-                save_as=f"job_logs/job_{file_id}.log",
-                is_public=True,
-                logger=logger,
-                file_id=file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-            LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
-            logger.info(f"Sync log uploaded to: {upload_url}")
-            return upload_url
+            logger.error(f"Failed to upload log for FileID {file_id}: {e}", exc_info=True)
+            raise
 
     try:
         return await try_upload()
@@ -115,10 +97,6 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
         return None
 
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
-    """
-    Run a job function with logging and upload logs to storage.
-    Returns standardized response with status_code, message, and data.
-    """
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
     result = None
@@ -166,10 +144,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
     finally:
         debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
 
-async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str):
-    """
-    Wrapper to run generate_download_file in a background task, updating job status.
-    """
+async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
     try:
         JOB_STATUS[file_id] = {
             "status": "running",
@@ -177,7 +152,7 @@ async def run_generate_download_file(file_id: str, logger: logging.Logger, log_f
             "timestamp": datetime.datetime.now().isoformat()
         }
         
-        result = await generate_download_file(int(file_id), logger=logger)
+        result = await generate_download_file(int(file_id), background_tasks, logger=logger)
         
         if "error" in result:
             JOB_STATUS[file_id] = {
@@ -206,9 +181,6 @@ async def run_generate_download_file(file_id: str, logger: logging.Logger, log_f
         }
 
 async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger):
-    """
-    Monitor job logs for failures and resubmit if necessary.
-    """
     log_file = f"job_logs/job_{file_id}.log"
     max_attempts = 3
     attempt = 1
@@ -269,9 +241,6 @@ async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger)
 
 @router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
-    """
-    Queue the generation of an Excel file with embedded images for a given file_id.
-    """
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     logger.info(f"Received request to generate download file for FileID: {file_id}")
     
@@ -291,7 +260,7 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
             "timestamp": datetime.datetime.now().isoformat()
         }
         
-        background_tasks.add_task(run_generate_download_file, file_id, logger, log_filename)
+        background_tasks.add_task(run_generate_download_file, file_id, logger, log_filename, background_tasks)
         
         send_to_email = await get_send_to_email(int(file_id), logger=logger)
         if send_to_email:
@@ -316,9 +285,6 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
 
 @router.get("/job-status/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_get_job_status(file_id: str):
-    """
-    Retrieve the status of a job for a given file_id.
-    """
     logger, _ = setup_job_logger(job_id=file_id, console_output=True)
     logger.info(f"Checking job status for FileID: {file_id}")
     
@@ -337,7 +303,6 @@ async def api_get_job_status(file_id: str):
 
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
-    """Run sort order update based on match_score and search-based priority."""
     result = await run_job_with_logging(update_sort_order, file_id)
     if result["status_code"] != 200:
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
@@ -345,7 +310,6 @@ async def api_match_and_search_sort(file_id: str):
 
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
-    """Run initial sort order update."""
     result = await run_job_with_logging(update_initial_sort_order, file_id)
     if result["status_code"] != 200:
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
@@ -353,7 +317,6 @@ async def api_initial_sort(file_id: str):
 
 @router.get("/no-image-sort/{file_id}", tags=["Sorting"])
 async def api_no_image_sort(file_id: str):
-    """Remove entries with no image results for a given file ID."""
     result = await run_job_with_logging(update_sort_no_image_entry, file_id)
     if result["status_code"] != 200:
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
@@ -533,5 +496,4 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
 
-# Include the router in the FastAPI app
 app.include_router(router, prefix="/api/v3")
