@@ -53,7 +53,6 @@ BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.co
         f"Worker PID {psutil.Process().pid}: Retrying task for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -192,6 +191,45 @@ def process_entry_search(args):
     finally:
         logger.removeHandler(handler)
         handler.close()
+
+async def upload_file_to_space(
+    file_src: str,
+    save_as: str,
+    is_public: bool,
+    logger: logging.Logger,
+    file_id: Optional[int] = None
+) -> str:
+    process = psutil.Process()
+    try:
+        # Synchronous S3 upload
+        logger.info(f"Worker PID {process.pid}: Creating S3 client (sync) for {save_as}")
+        from boto3 import client
+        s3_client = client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name='us-east-2'
+        )
+        
+        logger.info(f"Worker PID {process.pid}: Uploading {file_src} to S3: {save_as}")
+        s3_client.upload_file(
+            Filename=file_src,
+            Bucket='iconluxurygroup',
+            Key=save_as,
+            ExtraArgs={'ACL': 'public-read'} if is_public else {}
+        )
+        
+        public_url = f"https://iconluxurygroup.s3.us-east-2.amazonaws.com/{save_as}"
+        logger.info(f"Worker PID {process.pid}: Uploaded {file_src} to S3: {public_url}")
+        
+        # Update log URL in database
+        if file_id:
+            await update_log_url_in_db(file_id, public_url, logger)
+        
+        return public_url
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Failed to upload {file_src} to S3: {e}", exc_info=True)
+        return ""
 
 async def process_restart_batch(
     file_id_db: int,
