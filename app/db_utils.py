@@ -1298,33 +1298,43 @@ async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = Non
         return "nik@accessx.com"
 
 async def update_log_url_in_db(file_id: str, log_url: str, logger: Optional[logging.Logger] = None) -> bool:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                IF NOT EXISTS (
-                    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
-                    WHERE TABLE_NAME = 'utb_ImageScraperFiles' 
-                    AND COLUMN_NAME = 'LogFileUrl'
+        async with aioodbc.connect(dsn=conn_str) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    IF NOT EXISTS (
+                        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS 
+                        WHERE TABLE_NAME = 'utb_ImageScraperFiles' 
+                        AND COLUMN_NAME = 'LogFileUrl'
+                    )
+                    BEGIN
+                        ALTER TABLE utb_ImageScraperFiles 
+                        ADD LogFileUrl NVARCHAR(MAX)
+                    END
+                    """
                 )
-                BEGIN
-                    ALTER TABLE utb_ImageScraperFiles 
-                    ADD LogFileUrl NVARCHAR(MAX)
-                END
-            """)
-            cursor.execute("UPDATE utb_ImageScraperFiles SET LogFileUrl = ? WHERE ID = ?", (log_url, file_id))
-            conn.commit()
-            cursor.close()
-            logger.info(f"Updated log URL '{log_url}' for FileID {file_id}")
-            return True
-    except pyodbc.Error as e:
+                await cursor.execute(
+                    "UPDATE utb_ImageScraperFiles SET LogFileUrl = ? WHERE ID = ?",
+                    (log_url, file_id)
+                )
+                await conn.commit()
+                logger.info(f"Updated log URL '{log_url}' for FileID {file_id}")
+                return True
+    except aioodbc.Error as e:
         logger.error(f"Database error updating log URL for FileID {file_id}: {e}", exc_info=True)
         return False
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         return False
+    except Exception as e:
+        logger.error(f"Unexpected error updating log URL for FileID {file_id}: {e}", exc_info=True)
+        return False
+
+# Other database functions (e.g., update_initial_sort_order, get_send_to_email) would be here
+# For brevity, only showing update_log_url_in_db
 
 async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
     try:
