@@ -11,9 +11,9 @@ import json
 import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
+from search_utils import update_search_sort_order, insert_search_results  # New module
 from db_utils import (
     get_send_to_email,
-    insert_search_results,
     get_images_excel_db,
     fetch_missing_images,
     update_file_location_complete,
@@ -21,9 +21,8 @@ from db_utils import (
     export_dai_json,
     update_log_url_in_db,
     fetch_last_valid_entry,
-    update_search_sort_order,  # Assuming this is still in db_utils
 )
-from endpoint_utils import sync_get_endpoint  # New module
+from endpoint_utils import sync_get_endpoint  # From previous fix
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
@@ -54,6 +53,7 @@ BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.co
         f"Worker PID {psutil.Process().pid}: Retrying task for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+
 async def async_process_entry_search(
     search_string: str,
     brand: str,
