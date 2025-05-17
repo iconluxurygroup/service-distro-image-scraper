@@ -4,7 +4,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
-from common import clean_string, generate_aliases, normalize_model
+from common import clean_string, normalize_model, generate_aliases
 import psutil
 import pyodbc
 
@@ -126,6 +126,7 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
+        # Use a separate connection for SELECT to avoid cursor conflicts
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
@@ -136,7 +137,8 @@ async def update_search_sort_order(
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
             columns = result.keys()
-            result.close()
+            result.close()  # Explicitly close the result set
+            await conn.commit()  # Ensure no pending operations
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
@@ -186,7 +188,8 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        async with async_engine.connect() as conn:
+        # Use a new connection for UPDATE operations
+        async with async_engine.begin() as conn:  # Use begin() for transaction
             for index, res in enumerate(sorted_results, 1):
                 try:
                     await conn.execute(
@@ -201,7 +204,7 @@ async def update_search_sort_order(
                 except SQLAlchemyError as e:
                     logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, EntryID {entry_id}: {e}")
                     return False
-            await conn.commit()
+            # Commit is automatic with begin() context manager
             logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(sorted_results)} rows for EntryID {entry_id}")
 
         return True
