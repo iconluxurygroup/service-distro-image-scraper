@@ -1031,3 +1031,190 @@ async def process_single_all(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting placeholder row for EntryID {entry_id}: {e}", exc_info=True)
         return False
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, ValueError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Worker PID {psutil.Process().pid}: Retrying process_and_tag_results for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def process_and_tag_results(
+    search_string,
+    brand,
+    model,
+    endpoint,
+    entry_id,
+    logger,
+    use_all_variations: bool = False,
+    file_id_db: int = None
+) -> List[Dict]:
+    logger = logger or default_logger
+    process = psutil.Process()
+    try:
+        logger.debug(f"Worker PID {process.pid}: Starting process_and_tag_results for EntryID {entry_id}")
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory before processing: RSS={mem_info.rss / 1024**2:.2f} MB")
+        
+        brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
+        if not brand_rules:
+            logger.warning(f"Worker PID {process.pid}: No brand rules fetched for EntryID {entry_id}")
+            brand_rules = {"brand_rules": []}
+
+        if file_id_db is None:
+            logger.error(f"Worker PID {process.pid}: FileID not provided for EntryID {entry_id}")
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://error",
+                "ImageDesc": "Error: FileID not provided",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://error",
+                "search_type": "default",
+                "priority": 4
+            }]
+
+        max_row_retries = 3
+        process_func = process_single_all if use_all_variations else process_single_row
+        logger.debug(f"Worker PID {process.pid}: Calling process_func for EntryID {entry_id}")
+        success = await process_func(
+            entry_id=entry_id,
+            search_string=search_string,
+            max_row_retries=max_row_retries,
+            file_id_db=file_id_db,
+            brand_rules=brand_rules,
+            endpoint=endpoint,
+            brand=brand,
+            model=model,
+            logger=logger
+        )
+        logger.debug(f"Worker PID {process.pid}: Process func result for EntryID {entry_id}: {success}")
+
+        if not success:
+            logger.error(f"Worker PID {process.pid}: Processing failed for EntryID {entry_id}")
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://error",
+                "ImageDesc": "Error: Processing failed",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://error",
+                "search_type": "default",
+                "priority": 4
+            }]
+
+        try:
+            async with async_engine.connect() as conn:
+                query = text("""
+                    SELECT 
+                        r.EntryID, 
+                        r.ImageUrl, 
+                        r.ImageDesc, 
+                        r.ImageSource, 
+                        r.ImageUrlThumbnail, 
+                        r.ResultID, 
+                        rec.ProductModel, 
+                        rec.ProductBrand
+                    FROM utb_ImageScraperResult r
+                    INNER JOIN utb_ImageScraperRecords rec
+                        ON r.EntryID = rec.EntryID
+                    WHERE r.EntryID = :entry_id
+                """)
+                logger.debug(f"Worker PID {process.pid}: Executing database query for EntryID {entry_id}")
+                result = await conn.execute(query, {"entry_id": entry_id})
+                rows = result.fetchall()
+                columns = result.keys()
+                results = [dict(zip(columns, row)) for row in rows]
+                result.close()
+                logger.debug(f"Worker PID {process.pid}: Retrieved {len(results)} rows for EntryID {entry_id}")
+        except SQLAlchemyError as e:
+            logger.error(f"Worker PID {process.pid}: Failed to retrieve results for EntryID {entry_id}: {e}", exc_info=True)
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://error",
+                "ImageDesc": f"Error: Database retrieval failed: {str(e)}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://error",
+                "search_type": "default",
+                "priority": 4
+            }]
+
+        all_results = []
+        if results:
+            for res in results:
+                res['search_type'] = 'default'
+                res['ImageDesc_clean'] = clean_string(res.get('ImageDesc', ''), preserve_url=False)
+                res['ImageSource_clean'] = clean_string(res.get('ImageSource', ''), preserve_url=True)
+                res['ImageUrl_clean'] = clean_string(res.get('ImageUrl', ''), preserve_url=True)
+                res['ProductBrand_clean'] = clean_string(res.get('ProductBrand', ''), preserve_url=False)
+
+            brand_aliases = []
+            for rule in brand_rules["brand_rules"]:
+                if any(brand.lower() in name.lower() for name in rule.get("names", [])):
+                    brand_aliases = rule.get("names", [])
+                    break
+            exact_results, _ = await filter_model_results(
+                results,
+                debug=False,
+                logger=logger,
+                brand_aliases=brand_aliases
+            )
+
+            def calculate_priority_list(results, exact_results, model_clean, model_aliases, brand_clean, brand_aliases):
+                exact_ids = {res['ResultID'] for res in exact_results}
+                prioritized_results = []
+                for res in results:
+                    model_matched = res['ResultID'] in exact_ids
+                    brand_matched = (
+                        any(alias.lower() in res.get('ImageDesc_clean', '').lower() for alias in brand_aliases) or
+                        any(alias.lower() in res.get('ImageSource_clean', '').lower() for alias in brand_aliases) or
+                        any(alias.lower() in res.get('ImageUrl_clean', '').lower() for alias in brand_aliases)
+                    )
+                    if model_matched and brand_matched:
+                        priority = 1
+                    elif model_matched:
+                        priority = 2
+                    elif brand_matched:
+                        priority = 3
+                    else:
+                        priority = 4
+                    res['priority'] = priority
+                    prioritized_results.append(res)
+                return prioritized_results
+
+            model_clean = normalize_model(model or search_string)
+            model_aliases = generate_aliases(model_clean)
+            brand_clean = clean_string(brand).lower() if brand else ''
+            brand_aliases = await generate_brand_aliases(brand_clean, {}) if brand else []
+            all_results = calculate_priority_list(
+                results, exact_results, model_clean, model_aliases, brand_clean, brand_aliases
+            )
+        else:
+            all_results = [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No results found for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results",
+                "search_type": "default",
+                "priority": 4
+            }]
+
+        mem_info = process.memory_info()
+        logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
+        return all_results
+
+    except SQLAlchemyError as e:
+        logger.error(f"Worker PID {process.pid}: Database error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Unexpected error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
+        return [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://error",
+            "ImageDesc": f"Error: {str(e)}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://error",
+            "search_type": "default",
+            "priority": 4
+        }]
