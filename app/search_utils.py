@@ -56,7 +56,6 @@ async def insert_search_results(
 
     try:
         parameters = []
-        # Check for duplicates
         async with async_engine.connect() as conn:
             existing_urls = set()
             for res in results:
@@ -144,12 +143,20 @@ async def update_search_sort_order(
     logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
 
-    def normalize_text(text: str) -> str:
+    def normalize_text(text: str, field: str = "unknown") -> str:
         if not text:
             return ""
-        # Decode Unicode escapes (e.g., \u0026 to &), normalize to NFC, and lowercase
-        text = unicodedata.normalize('NFC', text.encode().decode('unicode_escape')).lower().strip()
-        return text
+        try:
+            # Escape single backslashes to prevent invalid escape sequences
+            text = text.replace('\\', '\\\\')
+            # Decode Unicode escapes (e.g., \u0026 to &), normalize to NFC, and lowercase
+            text = unicodedata.normalize('NFC', text.encode().decode('unicode_escape')).lower().strip()
+            return text
+        except UnicodeDecodeError as e:
+            logger.warning(f"Worker PID {process.pid}: UnicodeDecodeError in normalize_text for field '{field}': {e}, input: {text[:100]}")
+            # Fallback: Remove invalid characters and normalize
+            text = unicodedata.normalize('NFC', text.encode('ascii', 'ignore').decode('ascii')).lower().strip()
+            return text
 
     try:
         file_id = int(file_id)
@@ -181,7 +188,7 @@ async def update_search_sort_order(
                     category = category or ''
 
         # Generate brand and model aliases
-        brand_clean = normalize_text(brand)
+        brand_clean = normalize_text(brand, "ProductBrand")
         brand_aliases_dict = {
             "Scotch & Soda": [
                 "Scotch and Soda", "Scotch Soda", "Scotch&Soda", "ScotchAndSoda", "Scotch"
@@ -189,12 +196,12 @@ async def update_search_sort_order(
             "Adidas": ["Adidas AG", "Adidas Originals", "Addidas", "Adiddas"],
             "BAPE": ["A Bathing Ape", "BATHING APE", "Bape Japan", "ABathingApe", "Bape"]
         }
-        brand_aliases = [normalize_text(alias) for alias in brand_aliases_dict.get(brand, [brand_clean])]
+        brand_aliases = [normalize_text(alias, "BrandAlias") for alias in brand_aliases_dict.get(brand, [brand_clean])]
         if not brand_aliases and brand_clean:
             brand_aliases = [brand_clean]
         logger.debug(f"Worker PID {process.pid}: Using brand aliases: {brand_aliases}")
 
-        model_clean = normalize_text(model) if model else ''
+        model_clean = normalize_text(model, "ProductModel") if model else ''
         model_aliases = generate_aliases(model_clean) if model_clean else []
         logger.debug(f"Worker PID {process.pid}: Using model aliases: {model_aliases}")
 
@@ -245,7 +252,7 @@ async def update_search_sort_order(
         # Clean and normalize result fields
         for res in results:
             for col in ["ImageDesc", "ImageSource", "ImageUrl", "ProductBrand", "ProductModel"]:
-                res[f"{col}_clean"] = normalize_text(res.get(col, '')) if res.get(col) else ''
+                res[f"{col}_clean"] = normalize_text(str(res.get(col, '')), col) if res.get(col) else ''
             res["priority"] = None
             res["new_sort_order"] = -2  # Default sort order
 
@@ -265,10 +272,10 @@ async def update_search_sort_order(
                     res["new_sort_order"] = 1  # Positive SortOrder for brand match
                     res["priority"] = 3
                     match_results.append(res)
-                    logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Matched brand alias '{alias}' in ImageDesc: {image_desc}")
+                    logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Matched brand alias '{alias}' in ImageDesc: {image_desc[:100]}")
                     break
             if not brand_found:
-                logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: No brand match in ImageDesc: {image_desc}")
+                logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: No brand match in ImageDesc: {image_desc[:100]}")
 
         # Update SortOrder
         async with async_engine.connect() as conn:
@@ -332,10 +339,10 @@ async def update_search_sort_order(
                 logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
                 for r in verified_results:
                     if r['SortOrder'] is None:
-                        logger.debug(f"Worker PID {process.pid}: NULL SortOrder for ResultID {r['ResultID']}, ImageDesc: {r['ImageDesc']}")
+                        logger.debug(f"Worker PID {process.pid}: NULL SortOrder for ResultID {r['ResultID']}, ImageDesc: {r['ImageDesc'][:100]}")
 
             for r in verified_results[:3]:
-                logger.info(f"Worker PID {process.pid}: Sample - ResultID: {r['ResultID']}, EntryID: {r['EntryID']}, SortOrder: {r['SortOrder']}, ImageDesc: {r['ImageDesc']}")
+                logger.info(f"Worker PID {process.pid}: Sample - ResultID: {r['ResultID']}, EntryID: {r['EntryID']}, SortOrder: {r['SortOrder']}, ImageDesc: {r['ImageDesc'][:100]}")
 
         return success_count > 0
 
@@ -550,7 +557,6 @@ def generate_search_variations(
         logger.warning(f"Worker PID {process.pid}: Empty search string provided")
         return variations
     
-    # Normalize all inputs to lowercase to suppress case sensitivity
     search_string = search_string.lower()
     brand = clean_string(brand).lower() if brand else None
     model = clean_string(model).lower() if model else search_string
@@ -614,7 +620,6 @@ def generate_search_variations(
     else:
         logger.debug(f"Worker PID {process.pid}: No color suffix detected, no_color variation same as original: '{search_string}'")
     
-    # Ensure all variations are lowercase and unique
     for key in variations:
         variations[key] = list(set(v.lower() for v in variations[key]))
     
