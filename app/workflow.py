@@ -724,8 +724,6 @@ async def generate_download_file(
         engine.dispose()
         logger.info(f"Worker PID {process.pid}: Disposed database engines")
 
-
-
 async def batch_vision_reason(
     file_id: str,
     entry_ids: Optional[List[int]] = None,
@@ -928,6 +926,7 @@ def is_valid_ai_result(ai_json: str, ai_caption: str, logger: logging.Logger) ->
     except json.JSONDecodeError as e:
         logger.warning(f"Worker PID {process.pid}: Invalid AI result: AiJson is not valid JSON: {e}, AiJson: {ai_json}")
         return False
+
 async def detect_job_failure(log_filename: str, logger: logging.Logger) -> bool:
     try:
         async with aiofiles.open(log_filename, 'r') as f:
