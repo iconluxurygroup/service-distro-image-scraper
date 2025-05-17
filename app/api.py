@@ -624,9 +624,6 @@ async def api_restart_search_all(
             "timestamp": timestamp
         }
 
-# Include the router in the FastAPI app
-app.include_router(router, prefix="/api/v3")
-
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
     file_id: str,
@@ -805,7 +802,6 @@ async def api_generate_download_file(
     background_tasks: BackgroundTasks,
     file_id: str
 ):
-    """Queue generation of a download file."""
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Received request to generate download file for FileID: {file_id}")
     debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
@@ -813,16 +809,17 @@ async def api_generate_download_file(
 
     try:
         process = psutil.Process()
-        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024  # MB
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
         logger.debug(f"Memory before job: RSS={debug_info['memory_usage']['before']:.2f} MB")
 
         # Query database for EntryID 69801 state
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT AiJson, AiCaption, SortOrder
-                FROM utb_ImageScraperResult
-                WHERE EntryID = ? AND FileID = ?
+                SELECT r.AiJson, r.AiCaption, r.SortOrder
+                FROM utb_ImageScraperResult r
+                INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID
+                WHERE r.EntryID = ? AND s.FileID = ?
             """, (69801, file_id))
             result = cursor.fetchone()
             if result:
@@ -837,13 +834,12 @@ async def api_generate_download_file(
         background_tasks.add_task(run_job_with_logging, generate_download_file, file_id)
         background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
-        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024  # MB
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
         logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
 
-        # Upload log file
         if os.path.exists(log_filename):
             upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+                log_filename, f"job_logs/job_{file_id}.log", is_public=True, logger=logger, file_id=file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
             debug_info["log_url"] = upload_url
@@ -901,7 +897,7 @@ async def api_generate_download_file(
         debug_info["error_traceback"] = traceback.format_exc()
         if os.path.exists(log_filename):
             upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", True, logger, file_id
+                log_filename, f"job_logs/job_{file_id}.log", is_public=True, logger=logger, file_id=file_id
             )
             await update_log_url_in_db(file_id, upload_url, logger)
             debug_info["log_url"] = upload_url
@@ -953,7 +949,6 @@ async def api_generate_download_file(
             },
             "timestamp": timestamp
         }
-
 
 
 @router.get("/fetch-missing-images/{file_id}", tags=["Database"])
