@@ -103,6 +103,7 @@ async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging
         f"Retrying download for URL {retry_state.kwargs['url']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+
 async def download_image(
     url: str,
     filename: str,
@@ -111,37 +112,29 @@ async def download_image(
     timeout: int = 30,
     max_clean_attempts: int = 3
 ) -> bool:
-    # Decode URL from database to fix escaped characters
-    decoded_url = decode_url(url, logger)
-    logger.debug(f"Decoded URL: {decoded_url}")
-
+    extracted_url = extract_thumbnail_url(url, logger)
+    logger.debug(f"Extracted URL: {extracted_url}")
     for attempt in range(1, max_clean_attempts + 1):
         try:
-            cleaned_url = clean_url(decoded_url, attempt)
-            encoded_url = double_encode_plus(cleaned_url, logger)
             logger.debug(f"Attempt {attempt} - Raw URL: {url}")
-            logger.debug(f"Attempt {attempt} - Decoded URL: {decoded_url}")
-            logger.debug(f"Attempt {attempt} - Cleaned URL: {cleaned_url}")
-            logger.debug(f"Attempt {attempt} - Encoded URL: {encoded_url}")
-
-            if not await validate_url(encoded_url, session, logger):
-                logger.warning(f"Attempt {attempt} - Skipping inaccessible URL: {encoded_url}")
+            logger.debug(f"Attempt {attempt} - Extracted URL: {extracted_url}")
+            if not await validate_url(extracted_url, session, logger):
+                logger.warning(f"Attempt {attempt} - Skipping inaccessible URL: {extracted_url}")
                 continue
-
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124',
                 'Accept': 'image/*,*/*;q=0.8',
                 'Referer': 'https://www.google.com/'
             }
-            async with session.get(encoded_url, timeout=timeout, headers=headers) as response:
+            async with session.get(extracted_url, timeout=timeout, headers=headers) as response:
                 if response.status != 200:
-                    logger.warning(f"Attempt {attempt} - HTTP error for image {encoded_url}: {response.status} {response.reason}")
+                    logger.warning(f"Attempt {attempt} - HTTP error for image {extracted_url}: {response.status} {response.reason}")
                     if response.status == 404:
                         return False
                     continue
                 async with aiofiles.open(filename, 'wb') as f:
                     await f.write(await response.read())
-                logger.debug(f"Attempt {attempt} - Successfully downloaded {encoded_url} to {filename}")
+                logger.debug(f"Attempt {attempt} - Successfully downloaded {extracted_url} to {filename}")
                 return True
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
