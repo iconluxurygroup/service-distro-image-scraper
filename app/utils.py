@@ -18,7 +18,7 @@ from common import (
 )
 import pyodbc
 from database_config import conn_str  # Import conn_str
-
+from search_utils import update_search_sort_order, insert_search_results
 from endpoint_utils import get_endpoint, sync_get_endpoint
 from image_utils import download_all_images
 from excel_utils import write_excel_image
@@ -644,7 +644,6 @@ from typing import Optional, Dict
 from common import clean_string, generate_aliases, generate_brand_aliases
 from database_config import conn_str  # Ensure conn_str is imported
 from icon_image_lib.google_parser import process_search_result
-from db_utils import update_search_sort_order  # Import updated function
 
 async def process_single_row(
     entry_id: int,
