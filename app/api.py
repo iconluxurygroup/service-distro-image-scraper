@@ -796,6 +796,7 @@ async def api_process_ai_images(
             },
             "timestamp": timestamp
         }
+
 @router.post("/generate-download-file/{file_id}", tags=["Export"])
 async def api_generate_download_file(
     background_tasks: BackgroundTasks,
@@ -818,7 +819,7 @@ async def api_generate_download_file(
                 SELECT r.AiJson, r.AiCaption, r.SortOrder
                 FROM utb_ImageScraperResult r
                 INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID
-                WHERE r.EntryID = ? AND s.FileAPEID = ?
+                WHERE r.EntryID = ? AND s.FileID = ?
             """, (69801, file_id))
             result = cursor.fetchone()
             if result:
@@ -836,12 +837,7 @@ async def api_generate_download_file(
         debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
         logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
 
-        if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", is_public=True, logger=logger, file_id=file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-            debug_info["log_url"] = upload_url
+        # Removed direct upload logic to avoid redundancy
 
         # Check if entry_69801 is a dictionary before accessing AiJson
         entry_69801 = debug_info["database_state"].get("entry_69801", "Not found")
