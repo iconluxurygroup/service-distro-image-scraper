@@ -416,7 +416,6 @@ from image_utils import download_all_images
 from excel_utils import write_excel_image
 from email_utils import send_email, send_message_email
 from file_utils import create_temp_dirs, cleanup_temp_dirs
-from aws_s3 import upload_file_to_space
 import httpx
 import aiofiles
 import aiohttp
