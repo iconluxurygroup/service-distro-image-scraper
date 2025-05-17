@@ -15,6 +15,7 @@ import pandas as pd
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
 from s3_utils import upload_file_to_space
+from ai_utils import batch_vision_reason
 from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
