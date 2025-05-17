@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from utils import generate_search_variations, process_and_tag_results
-from search_variations import generate_search_variations
+from image_utils import generate_search_variations
 from url_extract import extract_thumbnail_url
 
 class SearchClient:

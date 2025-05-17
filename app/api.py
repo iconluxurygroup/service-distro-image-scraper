@@ -139,64 +139,7 @@ async def run_generate_download_file(file_id: str, logger: logging.Logger, log_f
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger):
-    log_file = f"job_logs/job_{file_id}.log"
-    max_attempts = 3
-    attempt = 1
 
-    while attempt <= max_attempts:
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                log_content = f.read()
-                if "WORKER TIMEOUT" in log_content or "SIGKILL" in log_content or "placeholder://error" in log_content:
-                    logger.warning(f"Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
-                    last_entry_id = await fetch_last_valid_entry(file_id, logger)
-                    if last_entry_id:
-                        logger.info(f"Resubmitting job for FileID: {file_id} starting from EntryID: {last_entry_id}")
-                        result = await process_restart_batch(
-                            file_id_db=int(file_id),
-                            logger=logger,
-                            entry_id=last_entry_id,
-                            use_all_variations=False
-                        )
-                        if "error" not in result:
-                            logger.info(f"Resubmission successful for FileID: {file_id}")
-                            await send_message_email(
-                                to_emails=["nik@luxurymarket.com"],
-                                subject=f"Success: Batch Resubmission for FileID {file_id}",
-                                message=f"Resubmission succeeded for FileID {file_id} starting from EntryID {last_entry_id}.\nLog: {log_file}",
-                                logger=logger
-                            )
-                            return
-                        else:
-                            logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
-                    else:
-                        logger.warning(f"No last EntryID found for FileID: {file_id}, restarting from beginning")
-                        result = await process_restart_batch(
-                            file_id_db=int(file_id),
-                            logger=logger,
-                            entry_id=None,
-                            use_all_variations=False
-                        )
-                        if "error" not in result:
-                            logger.info(f"Resubmission successful for FileID: {file_id}")
-                            await send_message_email(
-                                to_emails=["nik@luxurymarket.com"],
-                                subject=f"Success: Batch Resubmission for FileID {file_id}",
-                                message=f"Resubmission succeeded for FileID {file_id} from beginning.\nLog: {log_file}",
-                                logger=logger
-                            )
-                            return
-                        else:
-                            logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
-                    attempt += 1
-                else:
-                    logger.info(f"No failure detected in logs for FileID: {file_id}")
-                    return
-        else:
-            logger.warning(f"Log file {log_file} does not exist for FileID: {file_id}")
-            return
-        await asyncio.sleep(60)
 
 @router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
