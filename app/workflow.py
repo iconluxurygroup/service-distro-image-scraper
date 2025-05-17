@@ -442,12 +442,11 @@ async def process_restart_batch(
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
-def generate_download_file(file_id: str, **kwargs) -> dict:
-    with pyodbc.connect(conn_str) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM utb_ImageScraperRecords WHERE file_id = ?
-        """, (file_id,))
+async def generate_download_file(
+    file_id: int,
+    logger: Optional[logging.Logger] = None,
+    file_id_param: Optional[int] = None
+) -> Dict[str, str]:
     """Generate and upload a processed Excel file with images asynchronously."""
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     process = psutil.Process()
