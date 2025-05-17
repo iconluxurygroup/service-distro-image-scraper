@@ -29,7 +29,6 @@ from config import BRAND_RULES_URL, VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from ai_utils import batch_vision_reason
 from endpoint_utils import sync_get_endpoint
 from email_utils import send_message_email
 from utils import create_temp_dirs, cleanup_temp_dirs, process_and_tag_results
@@ -38,7 +37,6 @@ from url_extract import extract_thumbnail_url
 import httpx
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -387,7 +385,7 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
     finally:
         log_memory_usage()
 
-async def process_restart_batch(
+async process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False,
@@ -710,45 +708,6 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         }
     finally:
         debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
-
-async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
-    try:
-        JOB_STATUS[file_id] = {
-            "status": "running",
-            "message": "Job is running",
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        
-        result = await generate_download_file(int(file_id), background_tasks, logger=logger)
-        
-        if "error" in result:
-            JOB_STATUS[file_id] = {
-                "status": "failed",
-                "message": f"Error: {result['error']}",
-                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
-                "timestamp": datetime.datetime.now().isoformat()
-            }
-            logger.error(f"Job failed for FileID {file_id}: {result['error']}")
-            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-        else:
-            JOB_STATUS[file_id] = {
-                "status": "completed",
-                "message": "Job completed successfully",
-                "public_url": result.get("public_url"),
-                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
-                "timestamp": datetime.datetime.now().isoformat()
-            }
-            logger.info(f"Job completed for FileID {file_id}")
-    except Exception as e:
-        logger.error(f"Unexpected error in job for FileID {file_id}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(file_id, log_filename, logger)
-        JOB_STATUS[file_id] = {
-            "status": "failed",
-            "message": f"Unexpected error: {str(e)}",
-            "log_url": log_public_url or None,
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
     @retry(
