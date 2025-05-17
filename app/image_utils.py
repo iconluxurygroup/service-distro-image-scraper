@@ -44,6 +44,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
+from search.modular_search import async_process_entry_search  # Import the modular search function
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -52,7 +53,6 @@ if not default_logger.handlers:
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
-# Original process_restart_batch (Fixed Typo)
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -272,13 +272,12 @@ async def process_restart_batch(
         }
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(str(file_id_db), log_filename, logger)  # Fixed typo
+        log_public_url = await upload_log_file(str(file_id_db), log_filename, logger)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
-# Log Upload (Included for Reference, Unchanged)
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
     @retry(
         stop=stop_after_attempt(3),
