@@ -147,7 +147,11 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        BATCH_SIZE = 1
+        BATCH_SIZE = 1  # Keep batch size small to control memory
+        CPU_CORES = psutil.cpu_count(logical=False) or 4  # Fallback to 4 if detection fails
+        MAX_WORKERS = CPU_CORES * 2  # 2 threads per physical core
+
+        logger.info(f"Worker PID {process.pid}: Detected {CPU_CORES} physical CPU cores, setting max_workers={MAX_WORKERS}")
 
         # Validate FileID
         logger.debug(f"Worker PID {process.pid}: Validating FileID...")
@@ -220,8 +224,8 @@ async def process_restart_batch(
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        # Use ThreadPoolExecutor with reduced workers to manage memory
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # Use ThreadPoolExecutor with dynamic workers
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Worker PID {process.pid}: Processing batch {batch_idx}/{len(entry_batches)}")
                 start_time = datetime.datetime.now()
@@ -367,6 +371,8 @@ async def process_restart_batch(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": ""}
+
+# Rest of the functions remain unchanged
 
 async def generate_download_file(
     file_id: int,
