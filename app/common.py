@@ -1,189 +1,20 @@
-# common.py
-# Contains shared utility functions to avoid circular imports
-
 import logging
-import pandas as pd
 import re
-import requests
-import unicodedata
-from unidecode import unidecode
 from fuzzywuzzy import fuzz
-from typing import List, Optional, Dict, Any, Tuple
-from requests.exceptions import RequestException
-import asyncio
-import os
-import requests
-import aiohttp
-import asyncio
-import logging
-from typing import Any, Optional
-from functools import lru_cache
-from config import BASE_CONFIG_URL
-
+from typing import List, Optional, Dict, Tuple
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
-# Configuration file paths
-CONFIG_FILES = {
-    "category_hierarchy": "category_hierarchy.json",
-    "category_mapping": "category_mapping.json",
-    "fashion_labels": "fashion_labels.json",
-    "non_fashion_labels": "non_fashion_labels.json"
-}
-import os
-import shutil
-import logging
-import asyncio
-from typing import Optional, List
-
-async def create_temp_dirs(file_id: int, logger: Optional[logging.Logger] = None) -> tuple[str, str]:
-    """Create temporary directories for images and Excel files."""
-    logger = logger or logging.getLogger(__name__)
-    temp_images_dir = f"temp_images_{file_id}"
-    temp_excel_dir = f"temp_excel_{file_id}"
-    
-    os.makedirs(temp_images_dir, exist_ok=True)
-    os.makedirs(temp_excel_dir, exist_ok=True)
-    
-    logger.debug(f"Created temp directories: {temp_images_dir}, {temp_excel_dir}")
-    return temp_images_dir, temp_excel_dir
-
-async def cleanup_temp_dirs(dirs: List[str], logger: Optional[logging.Logger] = None) -> None:
-    """Clean up temporary directories."""
-    logger = logger or logging.getLogger(__name__)
-    for dir_path in dirs:
-        if os.path.exists(dir_path):
-            try:
-                shutil.rmtree(dir_path)
-                logger.debug(f"Removed temp directory: {dir_path}")
-            except Exception as e:
-                logger.error(f"Failed to remove temp directory {dir_path}: {e}", exc_info=True)
-# Cache synchronous loads
-@lru_cache(maxsize=32)
-def sync_load_config(file_key: str, url: str, config_name: str, expect_list: bool = False) -> Any:
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        config = response.json()
-        if expect_list and not isinstance(config, list):
-            raise ValueError(f"{config_name} must be a list")
-        return config
-    except Exception as e:
-        raise e
-
-async def load_config(
-    file_key: str,
-    fallback: Any,
-    logger: Optional[logging.Logger] = None,
-    config_name: str = "",
-    expect_list: bool = False,
-    retries: int = 3,
-    backoff_factor: float = 2.0
-) -> Any:
-    logger = logger or logging.getLogger(__name__)
-    url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
-    
-    # Try cached synchronous load first
-    try:
-        config = sync_load_config(file_key, url, config_name, expect_list)
-        logger.info(f"Loaded {config_name} from cache for {url}")
-        return config
-    except Exception:
-        logger.debug(f"Cache miss for {config_name}, attempting async load")
-
-    # Async load with retries
-    for attempt in range(1, retries + 1):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    response.raise_for_status()
-                    config = await response.json()
-                    if expect_list and not isinstance(config, list):
-                        raise ValueError(f"{config_name} must be a list")
-                    logger.info(f"Loaded {config_name} from {url} on attempt {attempt}")
-                    sync_load_config.cache_clear()
-                    sync_load_config(file_key, url, config_name, expect_list)
-                    return config
-        except (aiohttp.ClientError, ValueError, asyncio.TimeoutError) as e:
-            logger.warning(f"Failed to load {config_name} from {url} (attempt {attempt}/{retries}): {e}")
-            if attempt < retries:
-                await asyncio.sleep(backoff_factor * attempt)
-            else:
-                logger.info(f"Exhausted retries for {config_name}, using fallback")
-                return fallback
-    logger.error(f"Critical failure loading {config_name} from {url}, using fallback")
-    return fallback
-def clean_string(s: str, preserve_url: bool = False) -> str:
-    """Clean a string, optionally preserving URL structures."""
-    if not isinstance(s, str):
-        return ''
-    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
-    s = s.replace('\\u0026', '&')
-    if preserve_url:
-        s = re.sub(r'\s+', ' ', s.strip().lower())
-    else:
-        s = re.sub(r'[^a-z0-9\s&]', '', s.strip().lower())
-        s = re.sub(r'\s+', ' ', s)
-    return s
-def generate_aliases(model: Any) -> List[str]:
-    if not isinstance(model, str):
-        model = str(model)
-    if not model or model.strip() == '':
-        return []
-    
-    # Initialize with case variations
-    aliases = {model, model.lower(), model.upper()}
-    
-    # Define separators to handle
-    separators = ['_', '-', ' ', '/', '.']
-    base_model = model
-    
-    # Remove any existing separator to create a clean base
-    for sep in separators:
-        base_model = base_model.replace(sep, '')
-        aliases.add(base_model)
-    
-    # Add variations with different separators
-    for sep in separators:
-        # Try inserting separator before known suffixes like 's69'
-        if 's69' in base_model.lower():
-            idx = base_model.lower().index('s69')
-            alias_with_sep = base_model[:idx] + sep + base_model[idx:]
-            aliases.add(alias_with_sep)
-            aliases.add(alias_with_sep.lower())
-            aliases.add(alias_with_sep.upper())
-    
-    # Add digits-only version if applicable
-    digits_only = re.sub(r'[^0-9]', '', base_model)
-    if digits_only and digits_only.isdigit():
-        aliases.add(digits_only)
-    
-    # Add base model without suffix if it contains a separator
-    for sep in separators:
-        if sep in model:
-            base = model.split(sep)[0]
-            aliases.add(base)
-            break
-    
-    # Filter aliases to ensure reasonable length
-    return [a for a in aliases if a and len(a) >= len(model) - 3]
-
-import httpx
-import logging
-import asyncio
-from typing import Optional, Dict
-
 async def fetch_brand_rules(
-    url: str = BRAND_RULES_URL,
+    url: str = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json",
     max_attempts: int = 3,
     timeout: int = 10,
     logger: Optional[logging.Logger] = None
 ) -> Optional[Dict]:
-    """Fetch brand rules from a remote URL with retry logic."""
+    # Imported from your common.py; included here for filter_model_results dependency
     logger = logger or default_logger
     async with httpx.AsyncClient() as client:
         for attempt in range(max_attempts):
@@ -224,13 +55,56 @@ async def fetch_brand_rules(
                     logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
                     return {"brand_rules": []}
 
-def normalize_model(model: Any) -> str:
-    """Normalize a model string to lowercase."""
-    if not isinstance(model, str):
-        return str(model).strip().lower()
-    return model.strip().lower()
+def clean_string(s: str, preserve_url: bool = False) -> str:
+    # Imported from your common.py; included for dependencies
+    if not isinstance(s, str):
+        return ''
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+    s = s.replace('\\u0026', '&')
+    if preserve_url:
+        s = re.sub(r'\s+', ' ', s.strip().lower())
+    else:
+        s = re.sub(r'[^a-z0-9\s&]', '', s.strip().lower())
+        s = re.sub(r'\s+', ' ', s)
+    return s
 
-def validate_model(row, expected_models, result_id, logger=None) -> bool:
+def generate_aliases(model: Any) -> List[str]:
+    # Imported from your common.py; included for dependencies
+    if not isinstance(model, str):
+        model = str(model)
+    if not model or model.strip() == '':
+        return []
+    
+    aliases = {model, model.lower(), model.upper()}
+    separators = ['_', '-', ' ', '/', '.']
+    base_model = model
+    
+    for sep in separators:
+        base_model = base_model.replace(sep, '')
+        aliases.add(base_model)
+    
+    for sep in separators:
+        if 's69' in base_model.lower():
+            idx = base_model.lower().index('s69')
+            alias_with_sep = base_model[:idx] + sep + base_model[idx:]
+            aliases.add(alias_with_sep)
+            aliases.add(alias_with_sep.lower())
+            aliases.add(alias_with_sep.upper())
+    
+    digits_only = re.sub(r'[^0-9]', '', base_model)
+    if digits_only and digits_only.isdigit():
+        aliases.add(digits_only)
+    
+    for sep in separators:
+        if sep in model:
+            base = model.split(sep)[0]
+            aliases.add(base)
+            break
+    
+    return [a for a in aliases if a and len(a) >= len(model) - 3]
+
+def validate_model(row: Dict, expected_models: List[str], result_id: str, logger: Optional[logging.Logger] = None) -> bool:
+    # Imported from your common.py; included for dependencies
     logger = logger or logging.getLogger(__name__)
     input_model = clean_string(row.get('ProductModel', ''))
     if not input_model:
@@ -243,7 +117,6 @@ def validate_model(row, expected_models, result_id, logger=None) -> bool:
         clean_string(row.get('ImageUrl', ''))
     ]
 
-    # Normalize separators in fields
     def normalize_separators(text):
         for sep in ['_', '-', ' ', '/', '.']:
             text = text.replace(sep, '')
@@ -259,7 +132,6 @@ def validate_model(row, expected_models, result_id, logger=None) -> bool:
         for field, norm_field in zip(fields, normalized_fields):
             if not field:
                 continue
-            # Check both exact substring and normalized match
             if (expected_model_clean.lower() in field.lower() or
                 normalized_expected in norm_field):
                 logger.info(f"ResultID {result_id}: Model match: '{expected_model}' in field")
@@ -268,49 +140,8 @@ def validate_model(row, expected_models, result_id, logger=None) -> bool:
     logger.warning(f"ResultID {result_id}: Model match failed: Input model='{input_model}', Expected models={expected_models}")
     return False
 
-
-async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
-    # Convert brand to lowercase immediately after cleaning
-    brand_clean = clean_string(brand).lower()
-    if not brand_clean:
-        return []
-
-    aliases = [brand_clean]
-    # Process predefined aliases, ensuring all are lowercase
-    for key, alias_list in predefined_aliases.items():
-        if clean_string(key).lower() == brand_clean:
-            aliases.extend(clean_string(alias).lower() for alias in alias_list)
-
-    # Normalize base_brand for variations
-    base_brand = brand_clean.replace('&', 'and').replace('  ', ' ')
-    variations = [
-        base_brand.replace(' ', ''),
-        base_brand.replace(' ', '-'),
-        re.sub(r'[^a-z0-9]', '', base_brand),
-    ]
-
-    # Generate abbreviations and word-based variations
-    words = base_brand.split()
-    if len(words) > 1:
-        abbreviation = ''.join(word[0] for word in words if word)
-        if len(abbreviation) >= 4:
-            variations.append(abbreviation)
-        variations.append(words[0])
-        variations.append(words[-1])
-
-    aliases.extend(variations)
-    # Filter and deduplicate aliases, ensuring lowercase output
-    seen = set()
-    filtered_aliases = []
-    for alias in aliases:
-        alias_lower = alias.lower()  # Ensure lowercase for comparison
-        if len(alias_lower) >= 4 and alias_lower not in ["sas", "soda"] and alias_lower not in seen:
-            seen.add(alias_lower)
-            filtered_aliases.append(alias_lower)  # Append only lowercase version
-
-    return filtered_aliases
 def validate_brand(
-    row: pd.Series,
+    row: Dict,
     brand_aliases: List[str],
     result_id: str,
     domain_hierarchy: Optional[List[str]] = None,
@@ -353,25 +184,31 @@ def validate_brand(
     )
     return False
 
-async def filter_model_results(df: pd.DataFrame, debug: bool = True, logger: Optional[logging.Logger] = None, brand_aliases: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+async def filter_model_results(
+    results: List[Dict],
+    debug: bool = True,
+    logger: Optional[logging.Logger] = None,
+    brand_aliases: Optional[List[str]] = None
+) -> Tuple[List[Dict], List[Dict]]:
     logger = logger or default_logger
     try:
         if debug:
             logger.debug("\nDebugging and Filtering Model Results:")
 
-        required_columns = ['ProductModel', 'ImageSource', 'ImageUrl', 'ImageDesc', 'ResultID']
-        if not all(col in df.columns for col in required_columns):
-            missing_cols = [col for col in required_columns if col not in df.columns]
-            raise ValueError(f"DataFrame missing required columns: {missing_cols}")
+        required_keys = ['ProductModel', 'ImageSource', 'ImageUrl', 'ImageDesc', 'ResultID']
+        for res in results:
+            if not all(key in res for key in required_keys):
+                missing_keys = [key for key in required_keys if key not in res]
+                raise ValueError(f"Result missing required keys: {missing_keys}")
 
-        keep_indices = []
-        discarded_indices = []
+        keep_results = []
+        discarded_results = []
 
-        if df.empty:
-            logger.warning("Empty DataFrame provided to filter_model_results")
-            return df.copy(), df.copy()
+        if not results:
+            logger.warning("Empty result list provided to filter_model_results")
+            return [], []
 
-        brand_rules = await fetch_brand_rules(BRAND_RULES_URL, logger=logger)
+        brand_rules = await fetch_brand_rules(logger=logger)
         brand_names = []
         domain_hierarchy = []
         for rule in brand_rules.get("brand_rules", []):
@@ -381,22 +218,21 @@ async def filter_model_results(df: pd.DataFrame, debug: bool = True, logger: Opt
         brand_pattern = '|'.join(re.escape(name.lower()) for name in brand_names)
         domain_pattern = '|'.join(re.escape(domain.lower()) for domain in domain_hierarchy)
 
-        for idx, row in df.iterrows():
-            if pd.isna(row['ProductModel']) or not str(row['ProductModel']).strip():
-                logger.warning(f"ResultID {row['ResultID']}: Skipping row due to missing or empty ProductModel")
-                discarded_indices.append(idx)
+        for res in results:
+            result_id = res['ResultID']
+            model = str(res['ProductModel'])
+            if not model.strip():
+                logger.warning(f"ResultID {result_id}: Skipping row due to missing or empty ProductModel")
+                discarded_results.append(res)
                 continue
 
-            model = str(row['ProductModel'])
             aliases = generate_aliases(model)
-            result_id = row['ResultID']
-
-            has_model_match = validate_model(row, aliases, result_id, logger)
+            has_model_match = validate_model(res, aliases, result_id, logger)
             has_brand_match = False
 
-            source = clean_string(row.get('ImageSource', ''), preserve_url=True)
-            url = clean_string(row.get('ImageUrl', ''), preserve_url=True)
-            desc = clean_string(row.get('ImageDesc', ''))
+            source = clean_string(res.get('ImageSource', ''), preserve_url=True)
+            url = clean_string(res.get('ImageUrl', ''), preserve_url=True)
+            desc = clean_string(res.get('ImageDesc', ''))
             combined_text = f"{source} {desc} {url}".lower()
             if re.search(brand_pattern, combined_text) or re.search(domain_pattern, combined_text) or (brand_aliases and any(alias.lower() in combined_text for alias in brand_aliases)):
                 has_brand_match = True
@@ -404,32 +240,37 @@ async def filter_model_results(df: pd.DataFrame, debug: bool = True, logger: Opt
                     logger.debug(f"ResultID {result_id}: Brand or domain match found")
 
             if has_model_match or has_brand_match:
-                keep_indices.append(idx)
+                keep_results.append(res)
                 if debug:
                     logger.debug(f"ResultID {result_id}: Keeping row (model_match={has_model_match}, brand_match={has_brand_match})")
             else:
-                discarded_indices.append(idx)
+                discarded_results.append(res)
                 if debug:
                     logger.debug(f"ResultID {result_id}: Discarding row (no model or brand match)")
 
-        exact_df = df.loc[keep_indices].copy() if keep_indices else pd.DataFrame(columns=df.columns)
-        discarded_df = df.loc[discarded_indices].copy() if discarded_indices else pd.DataFrame(columns=df.columns)
-
-        logger.info(f"Filtered {len(exact_df)} rows with matches and {len(discarded_df)} rows discarded")
-        return exact_df, discarded_df
+        logger.info(f"Filtered {len(keep_results)} rows with matches and {len(discarded_results)} rows discarded")
+        return keep_results, discarded_results
     except Exception as e:
         logger.error(f"Error in filter_model_results: {e}", exc_info=True)
-        return pd.DataFrame(columns=df.columns), df.copy()
+        return [], results
 
-def calculate_priority(row: pd.Series, exact_df: pd.DataFrame, model_clean: str, model_aliases: List[str], brand_clean: str, brand_aliases: List[str], logger: Optional[logging.Logger] = None) -> int:
+def calculate_priority(
+    row: Dict,
+    exact_results: List[Dict],
+    model_clean: str,
+    model_aliases: List[str],
+    brand_clean: str,
+    brand_aliases: List[str],
+    logger: Optional[logging.Logger] = None
+) -> int:
     logger = logger or default_logger
     try:
-        model_matched = row.name in exact_df.index
+        model_matched = any(res['ResultID'] == row['ResultID'] for res in exact_results)
         brand_matched = False
 
-        desc_clean = row['ImageDesc_clean'].lower() if 'ImageDesc_clean' in row else ''
-        source_clean = row['ImageSource_clean'].lower() if 'ImageSource_clean' in row else ''
-        url_clean = row['ImageUrl_clean'].lower() if 'ImageUrl_clean' in row else ''
+        desc_clean = row.get('ImageDesc_clean', '').lower()
+        source_clean = row.get('ImageSource_clean', '').lower()
+        url_clean = row.get('ImageUrl_clean', '').lower()
         
         if brand_clean:
             for alias in brand_aliases:
