@@ -10,7 +10,7 @@ import os
 import urllib.parse
 import mimetypes
 from logging_config import setup_job_logger
-from config import S3_CONFIG,conn_str,async_engine,engine
+from config import S3_CONFIG
 # Import database configuration
 from config import VERSION
 # Initialize default logger
@@ -49,7 +49,6 @@ def get_s3_client(service='s3', logger=None, file_id=None):
     except Exception as e:
         logger.error(f"Error creating {service.upper()} client: {e}", exc_info=True)
         raise
-
 import boto3
 from botocore.config import Config
 
@@ -146,7 +145,6 @@ def upload_file_to_space_sync(file_src, save_as, is_public=True, logger=None, fi
     if is_public and result_urls.get('s3'):
         return result_urls['s3']
     return None
-
 def double_encode_plus(filename, logger=None):
     logger = logger or default_logger
     logger.debug(f"Encoding filename: {filename}")
@@ -154,15 +152,16 @@ def double_encode_plus(filename, logger=None):
     second_pass = urllib.parse.quote(first_pass)
     logger.debug(f"Double-encoded filename: {second_pass}")
     return second_pass
+
 async def upload_file_to_space(file_src, save_as, is_public=True, public=None, logger=None, file_id=None):
+    if public is not None:
+        is_public = public  # Map public to is_public
+        logger.warning("Use of 'public' parameter is deprecated; use 'is_public' instead")
     logger = logger or default_logger
     if logger == default_logger and file_id:
         logger, _ = setup_job_logger(job_id=file_id, console_output=True)
         logger.info(f"Setup logger for upload_file_to_space, FileID: {file_id}")
-    logger.debug(f"Parameters: logger_type={type(logger)}, logger={logger}, file_id={file_id}")
-    if public is not None:
-        is_public = public
-        logger.warning("The 'public' parameter is deprecated and will be removed in a future version; use 'is_public' instead")
+
     result_urls = {}
 
     if not os.path.exists(file_src):
