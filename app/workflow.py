@@ -19,15 +19,11 @@ from common import fetch_brand_rules
 from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, search_variation
 from endpoint_utils import sync_get_endpoint
 from logging_config import setup_job_logger
-from config import S3_CONFIG
+from aws_s3 import upload_file_to_space
 import psutil
 from email_utils import send_message_email
 import httpx
 import aiofiles
-import aiobotocore.session
-from aiobotocore.config import AioConfig
-import urllib.parse
-import mimetypes
 from database_config import async_engine, engine
 from sqlalchemy.sql import text
 import pandas as pd
@@ -38,7 +34,6 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
-
 
 async def async_process_entry_search(
     search_string: str,
@@ -415,7 +410,7 @@ async def generate_download_file(
     logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
     process = psutil.Process()
     temp_images_dir, temp_excel_dir = None, None
-    from aws_s3 import upload_file_to_space
+
     try:
         file_id = int(file_id)
         async with async_engine.connect() as conn:
