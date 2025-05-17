@@ -797,13 +797,117 @@ async def api_process_ai_images(
             "timestamp": timestamp
         }
 
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from logging_config import setup_job_logger
+from aws_s3 import upload_file_to_space, upload_file_to_space_sync
+import logging
+import asyncio
+import os
+import json
+import traceback
+import psutil
+import pyodbc
+import datetime
+from typing import Optional, List
+from workflow import generate_download_file
+from database import update_log_url_in_db
+from config import conn_str
+
+router = APIRouter()
+
+# Global debouncing cache
+LAST_UPLOAD = {}
+
+async def run_job_with_logging(job_func, file_id, **kwargs) -> dict:
+    file_id_str = str(file_id)
+    logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
+    result = None
+    debug_info = {"memory_usage": {}, "log_file": log_file}
+    
+    try:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.info(f"Starting job {func_name} for ID: {file_id}")
+
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
+
+        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+            result = await job_func(file_id, **kwargs)
+        else:
+            result = job_func(file_id, **kwargs)
+
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        if debug_info["memory_usage"]["after"] > 1000:
+            logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+
+        logger.info(f"Completed job {func_name} for ID: {file_id}")
+        return {
+            "status_code": 200,
+            "message": f"Job {func_name} completed successfully for ID: {file_id}",
+            "data": result,
+            "debug_info": debug_info
+        }
+    except Exception as e:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.error(f"Error in job {func_name} for ID: {file_id}: {str(e)}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        debug_info["error_traceback"] = traceback.format_exc()
+        return {
+            "status_code": 500,
+            "message": f"Error in job {func_name} for ID {file_id}: {str(e)}",
+            "data": None,
+            "debug_info": debug_info
+        }
+    finally:
+        if os.path.exists(log_file):
+            import hashlib
+            import time
+            file_hash = hashlib.md5(open(log_file, "rb").read()).hexdigest()
+            current_time = time.time()
+            key = (log_file, file_id_str)
+            
+            if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
+                logger.info(f"Skipping redundant upload for {log_file}")
+            else:
+                try:
+                    upload_result = upload_file_to_space(
+                        file_src=log_file,
+                        save_as=f"job_logs/job_{file_id_str}.log",
+                        is_public=True,
+                        logger=logger,
+                        file_id=file_id_str
+                    )
+                    upload_url = await upload_result if asyncio.iscoroutine(upload_result) else upload_result
+                    await update_log_url_in_db(file_id_str, upload_url, logger)
+                    logger.info(f"Log uploaded to: {upload_url}")
+                    debug_info["log_url"] = upload_url
+                    LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time}
+                except Exception as upload_error:
+                    logger.warning(f"Async upload failed for ID {file_id_str}: {upload_error}")
+                    upload_url = upload_file_to_space_sync(
+                        file_src=log_file,
+                        save_as=f"job_logs/job_{file_id_str}.log",
+                        is_public=True,
+                        logger=logger,
+                        file_id=file_id_str
+                    )
+                    await update_log_url_in_db(file_id_str, upload_url, logger)
+                    logger.info(f"Log uploaded to: {upload_url}")
+                    debug_info["log_url"] = upload_url
+                    LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time}
+        else:
+            logger.warning(f"Log file {log_file} does not exist, skipping upload")
+            debug_info["log_url"] = None
+
 @router.post("/generate-download-file/{file_id}", tags=["Export"])
 async def api_generate_download_file(
     background_tasks: BackgroundTasks,
     file_id: str
 ):
     logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Received request to generate download file for FileID: {file_id}")
+    logger.info(f"Received request to generate download file for ID: {file_id}")
     debug_info = {"memory_usage": {}, "log_file": log_filename, "database_state": {}}
     timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
 
@@ -829,15 +933,13 @@ async def api_generate_download_file(
                     "SortOrder": result[2]
                 }
             else:
-                debug_info["database_state"]["entry_69801"] = "Not found for FileID"
+                debug_info["database_state"]["entry_69801"] = "Not found for ID"
 
         background_tasks.add_task(run_job_with_logging, generate_download_file, file_id)
         background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
         debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
         logger.debug(f"Memory after job: RSS={debug_info['memory_usage']['after']:.2f} MB")
-
-        # Removed direct upload logic to avoid redundancy
 
         # Check if entry_69801 is a dictionary before accessing AiJson
         entry_69801 = debug_info["database_state"].get("entry_69801", "Not found")
@@ -846,7 +948,7 @@ async def api_generate_download_file(
         return {
             "status": "success",
             "status_code": 202,
-            "message": f"Download file generation queued for FileID: {file_id}",
+            "message": f"Download file generation queued for ID: {file_id}",
             "data": {
                 "validated_response": {
                     "status": "error" if is_error else "unknown",
@@ -861,49 +963,30 @@ async def api_generate_download_file(
                         } if is_error else {},
                         "entry_id": 69801,
                         "file_id": file_id,
-                        "result_id": None
+                        "result_id": null
                     },
                     "retry_flag": is_error,
                     "timestamp": "2025-05-17T00:36:00-04:00"
                 },
-                "implementation_details": {
-                    "code_changes": [
-                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
-                        "Added error JSON for timeouts in process_entry to flag retries",
-                        "Updated fetch_missing_images to include entries with AiJson error states",
-                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
-                    ],
-                    "database_state": debug_info["database_state"],
-                    "resubmission": {
-                        "endpoint": "/api/v3/process-images-ai/{file_id}",
-                        "background_task": "monitor_and_resubmit_failed_jobs",
-                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
-                        "max_attempts": 3
+                "debug_info": {
+                    "memory_usage": {
+                        "before": debug_info["memory_usage"]["before"],
+                        "after": debug_info["memory_usage"]["after"]
                     },
-                    "recommendations": [
-                        "Increase worker memory limit to 1GB+",
-                        "Monitor API response times for thedataproxy.com",
-                        f"Confirm FileID {file_id} for EntryID 69801"
-                    ],
-                    "debug_info": debug_info
+                    "log_file": log_filename,
+                    "database_state": debug_info["database_state"]
                 },
-                "job_result": None
+                "job_result": null
             },
             "timestamp": timestamp
         }
     except Exception as e:
-        logger.error(f"Error queuing download file for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Error queuing download file for ID {file_id}: {e}", exc_info=True)
         debug_info["error_traceback"] = traceback.format_exc()
-        if os.path.exists(log_filename):
-            upload_url = await upload_file_to_space(
-                log_filename, f"job_logs/job_{file_id}.log", is_public=True, logger=logger, file_id=file_id
-            )
-            await update_log_url_in_db(file_id, upload_url, logger)
-            debug_info["log_url"] = upload_url
         return {
             "status": "error",
             "status_code": 500,
-            "message": f"Error queuing download file for FileID: {file_id}: {str(e)}",
+            "message": f"Error queuing download file for ID: {file_id}: {str(e)}",
             "data": {
                 "validated_response": {
                     "status": "error",
@@ -918,33 +1001,21 @@ async def api_generate_download_file(
                         },
                         "entry_id": 69801,
                         "file_id": file_id,
-                        "result_id": None
+                        "result_id": null
                     },
-                    "retry_flag": True,
+                    "retry_flag": true,
                     "timestamp": "2025-05-17T00:36:00-04:00"
                 },
-                "implementation_details": {
-                    "code_changes": [
-                        "Modified process_entry to process images in batches of 10 with 30-second timeout",
-                        "Added error JSON for timeouts in process_entry to flag retries",
-                        "Updated fetch_missing_images to include entries with AiJson error states",
-                        "Enhanced monitor_and_resubmit_failed_jobs with email alerts after max attempts"
-                    ],
-                    "database_state": debug_info["database_state"],
-                    "resubmission": {
-                        "endpoint": "/api/v3/process-images-ai/{file_id}",
-                        "background_task": "monitor_and_resubmit_failed_jobs",
-                        "retry_trigger": "WORKER TIMEOUT or SIGKILL in job_logs/job_{file_id}.log",
-                        "max_attempts": 3
+                "debug_info": {
+                    "memory_usage": {
+                        "before": debug_info["memory_usage"].get("before", 0),
+                        "after": debug_info["memory_usage"].get("after", 0)
                     },
-                    "recommendations": [
-                        "Increase worker memory limit to 1GB+",
-                        "Monitor API response times for thedataproxy.com",
-                        f"Confirm FileID {file_id} for EntryID 69801"
-                    ],
-                    "debug_info": debug_info
+                    "log_file": log_filename,
+                    "database_state": debug_info["database_state"],
+                    "error_traceback": debug_info["error_traceback"]
                 },
-                "job_result": None
+                "job_result": null
             },
             "timestamp": timestamp
         }
