@@ -31,7 +31,7 @@ import mimetypes
 from database_config import async_engine, engine
 from sqlalchemy.sql import text
 import pandas as pd
-
+from aws_s3 import upload_file_to_space
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
