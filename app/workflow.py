@@ -19,7 +19,7 @@ from common import fetch_brand_rules
 from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, search_variation
 from endpoint_utils import sync_get_endpoint
 from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space
+
 import psutil
 from email_utils import send_message_email
 import httpx
@@ -490,7 +490,7 @@ async def generate_download_file(
             logger.error(f"Excel file not found at {local_filename}")
             return {"error": f"Excel file not found", "log_filename": log_filename}
         logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
-
+        from aws_s3 import upload_file_to_space
         public_url = await upload_file_to_space(
             file_src=local_filename,
             save_as=processed_file_name,
