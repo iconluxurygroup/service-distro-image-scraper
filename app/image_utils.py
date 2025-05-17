@@ -38,9 +38,7 @@ from collections import Counter
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import PatternFill
-from openpyxl.utils import get_column_letter
-from aiohttp_retry import RetryClient, ExponentialRetry
-from aiohttp import ClientTimeout
+
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
