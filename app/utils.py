@@ -24,6 +24,7 @@ from database_config import async_engine
 from search_utils import update_search_sort_order, insert_search_results
 import aiofiles
 import aiohttp
+import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from requests.exceptions import RequestException
 from icon_image_lib.google_parser import process_search_result
