@@ -171,7 +171,6 @@ async def update_search_sort_order(
                     (file_id, entry_id)
                 )
                 columns = [column[0] for column in cursor.description]
-                rows = await cursor.fetchall()
                 logger.debug(f"Raw rows: {rows[:2]}")  # Log first two rows
                 logger.debug(f"Columns: {columns}")
                 if rows and len(rows[0]) != len(columns):
