@@ -122,6 +122,16 @@ from typing import Optional, List, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases
 from database_config import conn_str
+import logging
+import pandas as pd
+import re
+import aioodbc
+import pyodbc
+import asyncio
+from typing import Optional, List, Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases
+from database_config import conn_str
 
 @retry(
     stop=stop_after_attempt(3),
@@ -196,11 +206,11 @@ async def update_search_sort_order(
                     logger.warning(f"No data found for FileID {file_id}, EntryID {entry_id}")
                     return []
 
-                # Validate row structure
+                # Validate all rows
                 expected_columns = len(columns)
-                malformed_rows = [i for i, row in enumerate(rows) if len(row) != expected_columns]
+                malformed_rows = [(i, len(row)) for i, row in enumerate(rows) if len(row) != expected_columns]
                 if malformed_rows:
-                    logger.error(f"Malformed rows detected at indices {malformed_rows[:10]}: expected {expected_columns} columns, got {[len(rows[i]) for i in malformed_rows[:10]]}")
+                    logger.error(f"Malformed rows detected: {[(i, count) for i, count in malformed_rows[:10]]}")
                     # Fallback to pyodbc
                     logger.info("Falling back to pyodbc for query execution")
                     loop = asyncio.get_event_loop()
@@ -211,9 +221,9 @@ async def update_search_sort_order(
                             return cursor.fetchall()
                     rows = await loop.run_in_executor(None, sync_fetch)
                     logger.debug(f"pyodbc rows (first 2): {rows[:2]}")
-                    malformed_rows = [i for i, row in enumerate(rows) if len(row) != expected_columns]
+                    malformed_rows = [(i, len(row)) for i, row in enumerate(rows) if len(row) != expected_columns]
                     if malformed_rows:
-                        logger.error(f"pyodbc also returned malformed rows at indices {malformed_rows[:10]}")
+                        logger.error(f"pyodbc also returned malformed rows: {[(i, count) for i, count in malformed_rows[:10]]}")
                         return []
 
                 df = pd.DataFrame(rows, columns=columns)
@@ -336,6 +346,8 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Unexpected error for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         return None
+
+
 async def fetch_missing_images(file_id: str, limit: int = 1000, ai_analysis_only: bool = True, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or logging.getLogger(__name__)
     try:
@@ -406,11 +418,22 @@ import aioodbc
 from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from database_config import conn_str
+import logging
+import pandas as pd
+import aioodbc
+from typing import Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str
 
-def validate_thumbnail_url(url: Optional[str]) -> bool:
+def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
+    logger = logger or logging.getLogger(__name__)
     if not url or url == '' or 'placeholder' in str(url).lower():
+        logger.debug(f"Invalid thumbnail URL: {url}")
         return False
-    return str(url).startswith(('http://', 'https://'))
+    if not str(url).startswith(('http://', 'https://')):
+        logger.debug(f"Non-HTTP thumbnail URL: {url}")
+        return False
+    return True
 
 @retry(
     stop=stop_after_attempt(3),
@@ -436,7 +459,8 @@ async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logge
 
         # Filter rows with invalid thumbnail URLs or placeholders
         original_len = len(df)
-        df = df[df['ImageUrlThumbnail'].apply(validate_thumbnail_url) & ~df['ImageUrl'].str.contains('placeholder://', na=False)]
+        df = df[df['ImageUrlThumbnail'].apply(lambda x: validate_thumbnail_url(x, logger)) & 
+                ~df['ImageUrl'].str.contains('placeholder://', na=False)]
         if df.empty:
             logger.warning(f"No rows with valid thumbnail URLs after filtering {original_len} rows")
             return False
