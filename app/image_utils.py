@@ -12,10 +12,6 @@ default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-import urllib.parse
-import logging
-from typing import Optional
-
 
 def double_encode_plus(url: str, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
@@ -23,7 +19,7 @@ def double_encode_plus(url: str, logger: Optional[logging.Logger] = None) -> str
     # First pass: Replace '+' with '%2B' to preserve it
     first_pass = url.replace('+', '%2B')
     # Second pass: URL-encode the entire string, preserving safe characters
-    encoded = urllib.parse.quote(first_pass, safe=':/?=&')
+    encoded = quote(first_pass, safe=':/?=&')
     logger.debug(f"Double-encoded URL: {encoded}")
     return encoded
 
@@ -32,7 +28,7 @@ def decode_url(url: str, logger: Optional[logging.Logger] = None) -> str:
     logger.debug(f"Decoding URL: {url}")
     try:
         # Unquote URL to handle percent-encoded characters (e.g., %3D -> =)
-        decoded = urllib.parse.unquote(url)
+        decoded = quote(url, safe=':/?=&')
         # Fix common escaping issues (e.g., '\=' -> '=')
         decoded = decoded.replace('\\=', '=').replace('\\&', '&')
         logger.debug(f"Decoded URL: {decoded}")
@@ -40,6 +36,7 @@ def decode_url(url: str, logger: Optional[logging.Logger] = None) -> str:
     except Exception as e:
         logger.error(f"Error decoding URL {url}: {e}", exc_info=True)
         return url
+
 def clean_url(url: str, attempt: int = 1) -> str:
     try:
         if attempt == 1:
@@ -137,11 +134,16 @@ async def download_image(
     timeout: int = 30,
     max_clean_attempts: int = 3
 ) -> bool:
+    # Decode URL from database to fix escaped characters
+    decoded_url = decode_url(url, logger)
+    logger.debug(f"Decoded URL: {decoded_url}")
+
     for attempt in range(1, max_clean_attempts + 1):
         try:
-            cleaned_url = clean_url(url, attempt)
-            encoded_url = encode_url(cleaned_url)
+            cleaned_url = clean_url(decoded_url, attempt)
+            encoded_url = double_encode_plus(cleaned_url, logger)
             logger.debug(f"Attempt {attempt} - Raw URL: {url}")
+            logger.debug(f"Attempt {attempt} - Decoded URL: {decoded_url}")
             logger.debug(f"Attempt {attempt} - Cleaned URL: {cleaned_url}")
             logger.debug(f"Attempt {attempt} - Encoded URL: {encoded_url}")
 
