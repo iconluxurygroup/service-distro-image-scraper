@@ -12,8 +12,6 @@ import aiofiles
 import datetime
 from typing import Optional, Dict, List, Tuple
 from db_utils import (
-    sync_get_endpoint,
-    update_search_sort_order,
     get_send_to_email,
     insert_search_results,
     get_images_excel_db,
@@ -23,7 +21,9 @@ from db_utils import (
     export_dai_json,
     update_log_url_in_db,
     fetch_last_valid_entry,
+    update_search_sort_order,  # Assuming this is still in db_utils
 )
+from endpoint_utils import sync_get_endpoint  # New module
 from image_utils import download_all_images
 from excel_utils import write_excel_image, write_failed_downloads_to_excel
 from common import fetch_brand_rules
@@ -59,7 +59,7 @@ async def async_process_entry_search(
     brand: str,
     endpoint: str,
     entry_id: int,
-    use_all_variations: bool,  # Kept for compatibility, not used in generate_search_variations
+    use_all_variations: bool,
     file_id_db: int,
     logger: logging.Logger
 ) -> List[pd.DataFrame]:
@@ -90,7 +90,7 @@ async def async_process_entry_search(
     variations = []
     for category, var_list in variations_dict.items():
         variations.extend(var_list)
-    variations = list(dict.fromkeys(variations))  # Remove duplicates while preserving order
+    variations = list(dict.fromkeys(variations))
     logger.debug(f"Worker PID {process.pid}: Generated {len(variations)} unique search variations for EntryID {entry_id}: {variations}")
     
     if not variations:
@@ -107,16 +107,24 @@ async def async_process_entry_search(
                 endpoint=endpoint,
                 entry_id=entry_id,
                 logger=logger,
-                use_all_variations=False,  # Prevent recursive variation generation
+                use_all_variations=False,
                 file_id_db=file_id_db
             )
+            # Validate result
+            for df in result:
+                if not all(col in df.columns for col in ['EntryID', 'ImageUrl', 'ImageDesc', 'ImageSource', 'ImageUrlThumbnail']):
+                    logger.error(f"Worker PID {process.pid}: Invalid DataFrame for variation '{variation}' in EntryID {entry_id}: missing columns")
+                    return []
+                if df['ImageUrl'].str.contains('placeholder://error').any():
+                    logger.warning(f"Worker PID {process.pid}: Placeholder error in results for variation '{variation}' in EntryID {entry_id}")
+                    return []
             return result
         except Exception as e:
             logger.error(f"Worker PID {process.pid}: Error processing variation '{variation}' for EntryID {entry_id}: {e}")
             return []
     
-    # Run all variations concurrently with a semaphore
-    semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent requests
+    # Run variations concurrently with a semaphore
+    semaphore = asyncio.Semaphore(10)
     async def process_with_semaphore(variation: str) -> List[pd.DataFrame]:
         async with semaphore:
             return await process_variation(variation)
@@ -137,6 +145,7 @@ async def async_process_entry_search(
     
     if not combined_results:
         logger.warning(f"Worker PID {process.pid}: No valid results for EntryID {entry_id} after processing {len(variations)} variations")
+        return []
     
     # Validate EntryID consistency
     for df in combined_results:
@@ -183,6 +192,7 @@ def process_entry_search(args):
     finally:
         logger.removeHandler(handler)
         handler.close()
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
