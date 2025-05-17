@@ -378,20 +378,31 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
             ws.column_dimensions[column].width = adjusted_width
 
         # Line 9: Save Excel file
+        # Line 9: Save Excel file
         wb.save(excel_filename)
         logger.info(f"Excel file generated: {excel_filename}")
 
-        # Line 10: Upload to R2
-        public_url = await upload_file_to_space(
-            file_src=excel_filename,
-            save_as=f"excel_results/image_results_{file_id}.xlsx",
-            is_public=True,
-            logger=logger,
-            file_id=str(file_id)
-        )
-        if not public_url:
-            logger.error(f"Failed to upload Excel file for FileID {file_id}")
-            return {"error": "Failed to upload Excel file", "log_filename": log_filename}
+        # Line 10: Upload to R2 with debug logging
+        logger.debug(f"Checking if Excel file exists: {excel_filename}")
+        if not os.path.exists(excel_filename):
+            logger.error(f"Excel file {excel_filename} does not exist for upload for FileID {file_id}")
+            return {"error": f"Excel file {excel_filename} not found", "log_filename": log_filename}
+        logger.debug(f"Uploading to R2: file_src={excel_filename}, save_as=excel_results/image_results_{file_id}.xlsx, is_public=True")
+        try:
+            public_url = await upload_file_to_space(
+                file_src=excel_filename,
+                save_as=f"excel_results/image_results_{file_id}.xlsx",
+                is_public=True,
+                logger=logger,
+                file_id=str(file_id)
+            )
+            logger.debug(f"Upload result: public_url={public_url}")
+            if not public_url:
+                logger.error(f"Failed to upload Excel file for FileID {file_id}")
+                return {"error": "Failed to upload Excel file", "log_filename": log_filename}
+        except Exception as upload_error:
+            logger.error(f"Upload error for FileID {file_id}: {upload_error}", exc_info=True)
+            return {"error": f"Upload failed: {str(upload_error)}", "log_filename": log_filename}
 
         # Line 11: Update database
         await update_file_location_complete(str(file_id), public_url, logger)
