@@ -1,11 +1,20 @@
-import asyncio
 import logging
-import os
+import pandas as pd
+import pyodbc
+import asyncio
+import json
 import datetime
-import hashlib
+import os
 import time
-from typing import Optional, Dict, List
+import hashlib
+import psutil
+import httpx
 from fastapi import BackgroundTasks
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str, async_engine
+from s3_utils import upload_file_to_space
 from db_utils import (
     get_send_to_email,
     get_images_excel_db,
@@ -21,15 +30,9 @@ from common import fetch_brand_rules
 from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
 from endpoint_utils import sync_get_endpoint
 from logging_config import setup_job_logger
-from s3_utils import upload_file_to_space
-import psutil
 from email_utils import send_message_email
-import httpx
 import aiofiles
-from database_config import async_engine, engine
-from sqlalchemy.sql import text
-import pandas as pd
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from typing import Optional, List, Dict
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -350,7 +353,6 @@ async def process_restart_batch(
         return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
         await async_engine.dispose()
-        engine.dispose()
         logger.info(f"Disposed database engines")
 
 async def generate_download_file(
@@ -424,7 +426,7 @@ async def generate_download_file(
                 {
                     'ExcelRowID': int(row['ExcelRowID']),
                     'ImageUrl': row['ImageUrl'],
-                    'ImageUrlThumbnail': row['ImageUrlThumbnail'],
+                    'ImageUrlThumbnail': row.get('ImageUrlThumbnail', ''),
                     'Brand': row.get('Brand', ''),
                     'Style': row.get('Style', ''),
                     'Color': row.get('Color', ''),
@@ -535,5 +537,4 @@ async def generate_download_file(
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
         await async_engine.dispose()
-        engine.dispose()
         logger.info(f"Cleaned up resources for ID {file_id}")
