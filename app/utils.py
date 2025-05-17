@@ -1,7 +1,6 @@
 import logging
 import asyncio
 import os
-import pandas as pd
 import time
 from typing import List, Dict, Optional, Tuple, Any
 from sqlalchemy.sql import text
@@ -88,11 +87,11 @@ async def process_search_row_gcloud(
     logger: Optional[logging.Logger] = None,
     remaining_retries: int = 5,
     total_attempts: Optional[List[int]] = None
-) -> pd.DataFrame:
+) -> List[Dict]:
     logger = logger or default_logger
     if not search_string or len(search_string.strip()) < 3:
         logger.warning(f"Invalid search string for EntryID {entry_id}: '{search_string}'")
-        return pd.DataFrame()
+        return []
 
     total_attempts = total_attempts or [0]
     base_url = "https://api.thedataproxy.com/v2/proxy/fetch"
@@ -134,20 +133,23 @@ async def process_search_row_gcloud(
                         logger.warning(f"Worker PID {process.pid}: No result returned for EntryID {entry_id} in region {region}")
                         continue
                     results_html_bytes = result_data if isinstance(result_data, bytes) else result_data.encode("utf-8")
-                    df = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
+                    results = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
                     mem_info = process.memory_info()
                     logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                    if not df.empty:
+                    if results:
                         irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
-                        df = df[~df['ImageDesc'].str.lower().str.contains('|'.join(irrelevant_keywords), na=False)]
-                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(df)} rows for EntryID {entry_id}")
-                        return df
-                    logger.warning(f"Worker PID {process.pid}: Empty DataFrame for EntryID {entry_id} in region {region}")
+                        filtered_results = [
+                            res for res in results
+                            if not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
+                        ]
+                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
+                        return filtered_results
+                    logger.warning(f"Worker PID {process.pid}: Empty results for EntryID {entry_id} in region {region}")
             except (aiohttp.ClientError, json.JSONDecodeError) as e:
                 logger.warning(f"Worker PID {process.pid}: Attempt {attempt} failed for {fetch_endpoint} in region {region}: {e}")
                 continue
     logger.error(f"Worker PID {process.pid}: All GCloud attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
-    return pd.DataFrame()
+    return []
 
 @retry(
     stop=stop_after_attempt(3),
@@ -166,12 +168,12 @@ async def process_search_row(
     max_retries: int = 15,
     brand: Optional[str] = None,
     category: Optional[str] = None
-) -> pd.DataFrame:
+) -> List[Dict]:
     logger = logger or default_logger
     process = psutil.Process()
     if not search_string or not endpoint:
         logger.warning(f"Worker PID {process.pid}: Invalid input for EntryID {entry_id}: search_string={search_string}, endpoint={endpoint}")
-        return pd.DataFrame()
+        return []
 
     total_attempts = [0]
     
@@ -219,17 +221,29 @@ async def process_search_row(
                     if not unpacked_html or len(unpacked_html) < 100:
                         logger.warning(f"Worker PID {process.pid}: Invalid HTML for {search_url}")
                         raise ValueError("Invalid HTML content")
-                    df = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
+                    results = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
                     mem_info = process.memory_info()
                     logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                    if not df.empty:
+                    if results:
                         irrelevant_keywords = ['wallpaper', 'furniture', 'decor', 'stock photo', 'pistol', 'mattress', 'trunk', 'clutch', 'solenoid', 'card', 'pokemon']
-                        df = df[df['ImageDesc'].str.lower().str.contains('scotch|soda|sneaker|shoe|hoodie|shirt|jacket|pants|apparel|clothing', na=False) &
-                               ~df['ImageDesc'].str.lower().str.contains('|'.join(irrelevant_keywords), na=False)]
-                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(df)} rows for EntryID {entry_id}")
-                        return df
+                        filtered_results = [
+                            res for res in results
+                            if 'scotch' in res.get('ImageDesc', '').lower() or
+                               'soda' in res.get('ImageDesc', '').lower() or
+                               'sneaker' in res.get('ImageDesc', '').lower() or
+                               'shoe' in res.get('ImageDesc', '').lower() or
+                               'hoodie' in res.get('ImageDesc', '').lower() or
+                               'shirt' in res.get('ImageDesc', '').lower() or
+                               'jacket' in res.get('ImageDesc', '').lower() or
+                               'pants' in res.get('ImageDesc', '').lower() or
+                               'apparel' in res.get('ImageDesc', '').lower() or
+                               'clothing' in res.get('ImageDesc', '').lower()
+                               and not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
+                        ]
+                        logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
+                        return filtered_results
                     logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id}")
-                    return df
+                    return []
         except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
             logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {fetch_endpoint}: {e}")
             attempt_num += 1
@@ -237,13 +251,13 @@ async def process_search_row(
                 break
 
     if total_attempts[0] < max_retries:
-        gcloud_df = await process_search_row_gcloud(search_string, entry_id, logger, max_retries - total_attempts[0], total_attempts)
-        if not gcloud_df.empty:
-            logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_df)} images")
-            return gcloud_df
+        gcloud_results = await process_search_row_gcloud(search_string, entry_id, logger, max_retries - total_attempts[0], total_attempts)
+        if gcloud_results:
+            logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_results)} images")
+            return gcloud_results
         logger.error(f"Worker PID {process.pid}: GCloud fallback also failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     
-    return pd.DataFrame()
+    return []
 
 def generate_search_variations(
     search_string: str,
@@ -359,7 +373,7 @@ async def search_variation(
             if not await log_retry_status("GCloud", total_attempts[0] + 1):
                 break
             result = await process_search_row_gcloud(variation, entry_id, logger, remaining_retries=5, total_attempts=total_attempts)
-            if not result.empty:
+            if result:
                 logger.info(f"Worker PID {process.pid}: GCloud attempt succeeded for EntryID {entry_id} with {len(result)} images in region {region}")
                 return {"variation": variation, "result": result, "status": "success", "result_count": len(result)}
             logger.warning(f"Worker PID {process.pid}: GCloud attempt failed in region {region}")
@@ -368,7 +382,7 @@ async def search_variation(
             if not await log_retry_status("Primary", attempt + 1):
                 break
             result = await process_search_row(variation, endpoint, entry_id, logger, search_type, max_retries=15, brand=brand, category=category)
-            if not result.empty:
+            if result:
                 logger.info(f"Worker PID {process.pid}: Primary attempt succeeded for EntryID {entry_id} with {len(result)} images")
                 return {"variation": variation, "result": result, "status": "success", "result_count": len(result)}
             logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt + 1} failed")
@@ -376,13 +390,13 @@ async def search_variation(
         logger.error(f"Worker PID {process.pid}: All attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
         return {
             "variation": variation,
-            "result": pd.DataFrame([{
+            "result": [{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://no-results",
                 "ImageDesc": f"No results found for {variation}",
                 "ImageSource": "N/A",
                 "ImageUrlThumbnail": "placeholder://no-results"
-            }]),
+            }],
             "status": "failed",
             "result_count": 1,
             "error": "All search attempts failed"
@@ -391,13 +405,13 @@ async def search_variation(
         logger.error(f"Worker PID {process.pid}: Error searching variation '{variation}' for EntryID {entry_id}: {e}", exc_info=True)
         return {
             "variation": variation,
-            "result": pd.DataFrame([{
+            "result": [{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://error",
                 "ImageDesc": f"Error for {variation}: {str(e)}",
                 "ImageSource": "N/A",
                 "ImageUrlThumbnail": "placeholder://error"
-            }]),
+            }],
             "status": "failed",
             "result_count": 1,
             "error": str(e)
@@ -492,10 +506,10 @@ async def process_single_all(
             logger.debug(f"Worker PID {process.pid}: Memory before searching variation: RSS={mem_info.rss / 1024**2:.2f} MB")
             result = await search_variation(variation, endpoint, entry_id, search_type, result_brand, result_category, logger)
             results.append(result)
-        successful_results = [res for res in results if res["status"] == "success" and not res["result"].empty]
+        successful_results = [res for res in results if res["status"] == "success" and res["result"]]
         if successful_results:
             result_count = sum(len(res["result"]) for res in successful_results)
-            all_results.extend([res["result"] for res in successful_results])
+            all_results.extend([item for res in successful_results for item in res["result"]])
             logger.info(f"Worker PID {process.pid}: Found {len(successful_results)} successful variations with {result_count} total results for search type '{search_type}' for EntryID {entry_id}")
         else:
             logger.info(f"Worker PID {process.pid}: No successful results for search type '{search_type}' for EntryID {entry_id}")
@@ -504,32 +518,46 @@ async def process_single_all(
         try:
             mem_info = process.memory_info()
             logger.debug(f"Worker PID {process.pid}: Memory before combining results: RSS={mem_info.rss / 1024**2:.2f} MB")
-            combined_df = pd.concat(all_results, ignore_index=True, copy=False)
-            logger.info(f"Worker PID {process.pid}: Combined {len(combined_df)} results from all search types for EntryID {entry_id}")
-            for api_col, db_col in api_to_db_mapping.items():
-                if api_col in combined_df.columns and db_col not in combined_df.columns:
-                    combined_df.rename(columns={api_col: db_col}, inplace=True)
-            if not all(col in combined_df.columns for col in required_columns):
-                logger.error(f"Worker PID {process.pid}: Missing columns {set(required_columns) - set(combined_df.columns)} in result for EntryID {entry_id}")
-                return False
-            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
-            logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
-            insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
+            # Rename columns using api_to_db_mapping
+            combined_results = []
+            for res in all_results:
+                new_res = {}
+                for key, value in res.items():
+                    new_key = api_to_db_mapping.get(key, key)
+                    new_res[new_key] = value
+                combined_results.append(new_res)
+            logger.info(f"Worker PID {process.pid}: Combined {len(combined_results)} results from all search types for EntryID {entry_id}")
+            # Verify required columns
+            for res in combined_results:
+                for col in required_columns:
+                    if col not in res:
+                        logger.warning(f"Worker PID {process.pid}: Missing column {col} in result for EntryID {entry_id}")
+                        res[col] = ''
+            # Deduplicate results
+            deduplicated_results = []
+            seen = set()
+            for res in combined_results:
+                key = (res['EntryID'], res['ImageUrl'])
+                if key not in seen:
+                    seen.add(key)
+                    deduplicated_results.append(res)
+            logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
+            insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
             if not insert_success:
                 logger.error(f"Worker PID {process.pid}: Failed to insert deduplicated results for EntryID {entry_id}")
                 return False
-            logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
+            logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_results)} results for EntryID {entry_id}")
             
             update_result = await update_search_sort_order(
-            file_id=str(file_id_db),
-            entry_id=str(entry_id),
-            brand=result_brand,
-            model=result_model,
-            color=result_color,
-            category=result_category,
-            logger=logger,
-            brand_rules=brand_rules
-        )
+                file_id=str(file_id_db),
+                entry_id=str(entry_id),
+                brand=result_brand,
+                model=result_model,
+                color=result_color,
+                category=result_category,
+                logger=logger,
+                brand_rules=brand_rules
+            )
             if update_result is None:
                 logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
                 return False
@@ -592,15 +620,15 @@ async def process_single_all(
             return False
 
     logger.info(f"Worker PID {process.pid}: No results to insert for EntryID {entry_id}")
-    placeholder_df = pd.DataFrame([{
+    placeholder_results = [{
         "EntryID": entry_id,
         "ImageUrl": "placeholder://no-results",
         "ImageDesc": f"No results found for {search_string}",
         "ImageSource": "N/A",
         "ImageUrlThumbnail": "placeholder://no-results"
-    }])
+    }]
     try:
-        insert_success = await insert_search_results(placeholder_df, logger=logger, file_id=str(file_id_db))
+        insert_success = await insert_search_results(placeholder_results, logger=logger, file_id=str(file_id_db))
         if insert_success:
             logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
             async with async_engine.connect() as conn:
@@ -710,41 +738,55 @@ async def process_single_row(
             logger.debug(f"Worker PID {process.pid}: Memory before searching variation: RSS={mem_info.rss / 1024**2:.2f} MB")
             result = await search_variation(variation, endpoint, entry_id, search_type, result_brand, result_category, logger)
             results.append(result)
-        successful_results = [res for res in results if res["status"] == "success" and not res["result"].empty]
+        successful_results = [res for res in results if res["status"] == "success" and res["result"]]
         if successful_results:
-            all_results.extend([res["result"] for res in successful_results])
+            all_results.extend([item for res in successful_results for item in res["result"]])
             break
 
     if all_results:
         try:
             mem_info = process.memory_info()
             logger.debug(f"Worker PID {process.pid}: Memory before combining results: RSS={mem_info.rss / 1024**2:.2f} MB")
-            combined_df = pd.concat(all_results, ignore_index=True, copy=False)
-            logger.info(f"Worker PID {process.pid}: Combined {len(combined_df)} results for EntryID {entry_id}")
-            for api_col, db_col in api_to_db_mapping.items():
-                if api_col in combined_df.columns and db_col not in combined_df.columns:
-                    combined_df.rename(columns={api_col: db_col}, inplace=True)
-            if not all(col in combined_df.columns for col in required_columns):
-                logger.error(f"Worker PID {process.pid}: Missing columns {set(required_columns) - set(combined_df.columns)} in result for EntryID {entry_id}")
-                return False
-            deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-            logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows")
-            insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
+            # Rename columns using api_to_db_mapping
+            combined_results = []
+            for res in all_results:
+                new_res = {}
+                for key, value in res.items():
+                    new_key = api_to_db_mapping.get(key, key)
+                    new_res[new_key] = value
+                combined_results.append(new_res)
+            logger.info(f"Worker PID {process.pid}: Combined {len(combined_results)} results for EntryID {entry_id}")
+            # Verify required columns
+            for res in combined_results:
+                for col in required_columns:
+                    if col not in res:
+                        logger.warning(f"Worker PID {process.pid}: Missing column {col} in result for EntryID {entry_id}")
+                        res[col] = ''
+            # Deduplicate results
+            deduplicated_results = []
+            seen = set()
+            for res in combined_results:
+                key = (res['EntryID'], res['ImageUrl'])
+                if key not in seen:
+                    seen.add(key)
+                    deduplicated_results.append(res)
+            logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} rows")
+            insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
             if not insert_success:
                 logger.error(f"Worker PID {process.pid}: Failed to insert deduplicated results for EntryID {entry_id}")
                 return False
-            logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
+            logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_results)} results for EntryID {entry_id}")
             
             update_result = await update_search_sort_order(
-            file_id=str(file_id_db),
-            entry_id=str(entry_id),
-            brand=result_brand,
-            model=result_model,
-            color=result_color,
-            category=result_category,
-            logger=logger,
-            brand_rules=brand_rules
-        )
+                file_id=str(file_id_db),
+                entry_id=str(entry_id),
+                brand=result_brand,
+                model=result_model,
+                color=result_color,
+                category=result_category,
+                logger=logger,
+                brand_rules=brand_rules
+            )
             if update_result is None:
                 logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
                 return False
@@ -809,15 +851,15 @@ async def process_single_row(
             return False
 
     logger.info(f"Worker PID {process.pid}: No results to insert for EntryID {entry_id}")
-    placeholder_df = pd.DataFrame([{
+    placeholder_results = [{
         "EntryID": entry_id,
         "ImageUrl": "placeholder://no-results",
         "ImageDesc": f"No results found for {search_string}",
         "ImageSource": "N/A",
         "ImageUrlThumbnail": "placeholder://no-results"
-    }])
+    }]
     try:
-        insert_success = await insert_search_results(placeholder_df, logger=logger, file_id=str(file_id_db))
+        insert_success = await insert_search_results(placeholder_results, logger=logger, file_id=str(file_id_db))
         if insert_success:
             logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
             async with async_engine.connect() as conn:
@@ -841,7 +883,7 @@ async def process_single_row(
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, ValueError, pd.errors.EmptyDataError)),
+    retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, ValueError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Worker PID {psutil.Process().pid}: Retrying process_and_tag_results for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
@@ -855,7 +897,7 @@ async def process_and_tag_results(
     logger,
     use_all_variations: bool = False,
     file_id_db: int = None
-) -> List[pd.DataFrame]:
+) -> List[Dict]:
     logger = logger or default_logger
     process = psutil.Process()
     try:
@@ -870,7 +912,7 @@ async def process_and_tag_results(
 
         if file_id_db is None:
             logger.error(f"Worker PID {process.pid}: FileID not provided for EntryID {entry_id}")
-            return [pd.DataFrame([{
+            return [{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://error",
                 "ImageDesc": "Error: FileID not provided",
@@ -878,7 +920,7 @@ async def process_and_tag_results(
                 "ImageUrlThumbnail": "placeholder://error",
                 "search_type": "default",
                 "priority": 4
-            }])]
+            }]
 
         max_row_retries = 3
         process_func = process_single_all if use_all_variations else process_single_row
@@ -898,7 +940,7 @@ async def process_and_tag_results(
 
         if not success:
             logger.error(f"Worker PID {process.pid}: Processing failed for EntryID {entry_id}")
-            return [pd.DataFrame([{
+            return [{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://error",
                 "ImageDesc": "Error: Processing failed",
@@ -906,7 +948,7 @@ async def process_and_tag_results(
                 "ImageUrlThumbnail": "placeholder://error",
                 "search_type": "default",
                 "priority": 4
-            }])]
+            }]
 
         try:
             async with async_engine.connect() as conn:
@@ -927,12 +969,14 @@ async def process_and_tag_results(
                 """)
                 logger.debug(f"Worker PID {process.pid}: Executing database query for EntryID {entry_id}")
                 result = await conn.execute(query, {"entry_id": entry_id})
-                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                rows = result.fetchall()
+                columns = result.keys()
+                results = [dict(zip(columns, row)) for row in rows]
                 result.close()
-                logger.debug(f"Worker PID {process.pid}: Retrieved {len(df)} rows for EntryID {entry_id}")
+                logger.debug(f"Worker PID {process.pid}: Retrieved {len(results)} rows for EntryID {entry_id}")
         except SQLAlchemyError as e:
             logger.error(f"Worker PID {process.pid}: Failed to retrieve results for EntryID {entry_id}: {e}", exc_info=True)
-            return [pd.DataFrame([{
+            return [{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://error",
                 "ImageDesc": f"Error: Database retrieval failed: {str(e)}",
@@ -940,50 +984,59 @@ async def process_and_tag_results(
                 "ImageUrlThumbnail": "placeholder://error",
                 "search_type": "default",
                 "priority": 4
-            }])]
+            }]
 
-        all_dfs = []
-        if not df.empty:
-            df['search_type'] = 'default'
-            df['ImageDesc_clean'] = df['ImageDesc'].apply(clean_string, preserve_url=False)
-            df['ImageSource_clean'] = df['ImageSource'].apply(clean_string, preserve_url=True)
-            df['ImageUrl_clean'] = df['ImageUrl'].apply(clean_string, preserve_url=True)
-            df['ProductBrand_clean'] = df.get('ProductBrand', '').apply(clean_string, preserve_url=False)
+        if results:
+            for res in results:
+                res['search_type'] = 'default'
+                res['ImageDesc_clean'] = clean_string(res.get('ImageDesc', ''), preserve_url=False)
+                res['ImageSource_clean'] = clean_string(res.get('ImageSource', ''), preserve_url=True)
+                res['ImageUrl_clean'] = clean_string(res.get('ImageUrl', ''), preserve_url=True)
+                res['ProductBrand_clean'] = clean_string(res.get('ProductBrand', ''), preserve_url=False)
 
             brand_aliases = []
             for rule in brand_rules["brand_rules"]:
                 if any(brand.lower() in name.lower() for name in rule.get("names", [])):
                     brand_aliases = rule.get("names", [])
                     break
-            exact_df, _ = await filter_model_results(
-                df,
+            exact_results, _ = await filter_model_results(
+                results,
                 debug=False,
                 logger=logger,
                 brand_aliases=brand_aliases
             )
 
-            def calculate_priority_vectorized(df, exact_df, model_clean, model_aliases, brand_clean, brand_aliases):
-                model_matched = df.index.isin(exact_df.index)
-                brand_matched = df['ImageDesc_clean'].str.contains('|'.join(brand_aliases), case=False, na=False) | \
-                                df['ImageSource_clean'].str.contains('|'.join(brand_aliases), case=False, na=False) | \
-                                df['ImageUrl_clean'].str.contains('|'.join(brand_aliases), case=False, na=False)
-                priority = pd.Series(4, index=df.index)
-                priority[model_matched & brand_matched] = 1
-                priority[model_matched & ~brand_matched] = 2
-                priority[~model_matched & brand_matched] = 3
-                return priority
+            def calculate_priority_list(results, exact_results, model_clean, model_aliases, brand_clean, brand_aliases):
+                exact_ids = {res['ResultID'] for res in exact_results}
+                priorities = []
+                for res in results:
+                    model_matched = res['ResultID'] in exact_ids
+                    brand_matched = (
+                        any(alias.lower() in res.get('ImageDesc_clean', '').lower() for alias in brand_aliases) or
+                        any(alias.lower() in res.get('ImageSource_clean', '').lower() for alias in brand_aliases) or
+                        any(alias.lower() in res.get('ImageUrl_clean', '').lower() for alias in brand_aliases)
+                    )
+                    if model_matched and brand_matched:
+                        priority = 1
+                    elif model_matched:
+                        priority = 2
+                    elif brand_matched:
+                        priority = 3
+                    else:
+                        priority = 4
+                    res['priority'] = priority
+                    priorities.append(res)
+                return priorities
 
             model_clean = normalize_model(model or search_string)
             model_aliases = generate_aliases(model_clean)
             brand_clean = clean_string(brand).lower() if brand else ''
             brand_aliases = await generate_brand_aliases(brand_clean, {}) if brand else []
-            df['priority'] = calculate_priority_vectorized(
-                df, exact_df, model_clean, model_aliases, brand_clean, brand_aliases
+            prioritized_results = calculate_priority_list(
+                results, exact_results, model_clean, model_aliases, brand_clean, brand_aliases
             )
-
-            all_dfs.append(df)
         else:
-            placeholder_df = pd.DataFrame([{
+            prioritized_results = [{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://no-results",
                 "ImageDesc": f"No results found for {search_string}",
@@ -991,19 +1044,18 @@ async def process_and_tag_results(
                 "ImageUrlThumbnail": "placeholder://no-results",
                 "search_type": "default",
                 "priority": 4
-            }])
-            all_dfs.append(placeholder_df)
+            }]
 
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
-        return all_dfs
+        return prioritized_results
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
         raise
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
-        return [pd.DataFrame([{
+        return [{
             "EntryID": entry_id,
             "ImageUrl": "placeholder://error",
             "ImageDesc": f"Error: {str(e)}",
@@ -1011,7 +1063,7 @@ async def process_and_tag_results(
             "ImageUrlThumbnail": "placeholder://error",
             "search_type": "default",
             "priority": 4
-        }])]
+        }]
 
 def sync_process_and_tag_results(*args, **kwargs):
     """Synchronous wrapper for process_and_tag_results."""
