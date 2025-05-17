@@ -35,7 +35,7 @@ def clean_url(url: str, attempt: int = 1) -> str:
             while '%25' in url:
                 url = url.replace('%25', '%')
             parsed = urlparse(url)
-            path = parsed.path  # No further %2f decoding
+            path = parsed.path
             cleaned_url = f"{parsed.scheme}://{parsed.netloc}{path}"
             if parsed.query:
                 cleaned_url += f"?{parsed.query}"
@@ -51,7 +51,7 @@ def clean_url(url: str, attempt: int = 1) -> str:
                    (f"?{parsed.query}" if parsed.query else "") + \
                    (f"#{parsed.fragment}" if parsed.fragment else "")
 
-        # Fallback: Return original URL if all attempts fail
+        # Fallback: Return original URL
         return url
 
     except Exception as e:
@@ -62,7 +62,7 @@ def encode_url(url: str) -> str:
     """Encode URL, preserving slashes in path and encoding query values."""
     try:
         parsed = urlparse(url)
-        path = parsed.path  # Preserve path as-is after cleaning
+        path = parsed.path
         if parsed.query:
             query_dict = parse_qs(parsed.query)
             encoded_query = urlencode(
@@ -110,14 +110,12 @@ async def download_image(
     """Download image, trying multiple cleaned versions of the URL."""
     for attempt in range(1, max_clean_attempts + 1):
         try:
-            # Clean URL with increasing leniency
             cleaned_url = clean_url(url, attempt)
             encoded_url = encode_url(cleaned_url)
             logger.debug(f"Attempt {attempt} - Raw URL: {url}")
             logger.debug(f"Attempt {attempt} - Cleaned URL: {cleaned_url}")
             logger.debug(f"Attempt {attempt} - Encoded URL: {encoded_url}")
 
-            # Validate URL
             if not await validate_url(encoded_url, session, logger):
                 logger.warning(f"Attempt {attempt} - Skipping inaccessible URL: {encoded_url}")
                 continue
@@ -176,14 +174,18 @@ async def download_all_images(
         thumb_url = image.get('ImageUrlThumbnail', '')
         filename = os.path.join(temp_dir, f"image_{excel_row_id}.jpg")
 
+        logger.debug(f"Processing ExcelRowID {excel_row_id}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
+
         async with aiohttp.ClientSession() as session:
             # Try main image
             success = await download_image(main_url, filename, session, logger)
-            if not success and thumb_url:
-                # Fallback to thumbnail without forcing specific characters
-                logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
-                success = await download_image(thumb_url, filename, session, logger)
-            
+            if not success:
+                if thumb_url:
+                    logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
+                    success = await download_image(thumb_url, filename, session, logger)
+                else:
+                    logger.warning(f"No thumbnail URL available for ExcelRowID {excel_row_id}")
+
             if not success:
                 logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
                 failed_downloads.append((main_url, excel_row_id))
