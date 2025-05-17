@@ -19,7 +19,7 @@ from common import (
 import pyodbc
 from database_config import conn_str  # Import conn_str
 
-from db_utils import get_endpoint, sync_get_endpoint
+from endpoint_utils import get_endpoint, sync_get_endpoint
 from image_utils import download_all_images
 from excel_utils import write_excel_image
 from email_utils import send_email, send_message_email
