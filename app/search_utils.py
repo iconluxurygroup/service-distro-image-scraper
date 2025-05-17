@@ -147,14 +147,11 @@ async def update_search_sort_order(
         if not text:
             return ""
         try:
-            # Escape single backslashes to prevent invalid escape sequences
             text = text.replace('\\', '\\\\')
-            # Decode Unicode escapes (e.g., \u0026 to &), normalize to NFC, and lowercase
             text = unicodedata.normalize('NFC', text.encode().decode('unicode_escape')).lower().strip()
             return text
         except UnicodeDecodeError as e:
             logger.warning(f"Worker PID {process.pid}: UnicodeDecodeError in normalize_text for field '{field}': {e}, input: {text[:100]}")
-            # Fallback: Remove invalid characters and normalize
             text = unicodedata.normalize('NFC', text.encode('ascii', 'ignore').decode('ascii')).lower().strip()
             return text
 
@@ -218,7 +215,7 @@ async def update_search_sort_order(
             await conn.commit()
             logger.debug(f"Worker PID {process.pid}: Reset SortOrder to NULL for EntryID {entry_id}")
 
-        # Fetch results
+        # Fetch results using a fresh connection
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT 
@@ -278,7 +275,6 @@ async def update_search_sort_order(
 
         # Rank brand matches
         if match_results:
-            # Sort by match_score (descending) and field presence (ImageDesc first)
             def rank_key(res):
                 has_desc = 1 if res["ImageDesc_clean"] else 0
                 has_source = 1 if res["ImageSource_clean"] else 0
@@ -287,14 +283,18 @@ async def update_search_sort_order(
             
             match_results.sort(key=rank_key)
             for index, res in enumerate(match_results, 1):
-                res["new_sort_order"] = index  # 1 for best, 2 for second, etc.
+                res["new_sort_order"] = index
                 logger.debug(f"Worker PID {process.pid}: ResultID {res['ResultID']}: Assigned SortOrder={index}, match_score={res['match_score']}, ImageDesc: {res['ImageDesc_clean'][:100]}")
 
-        # Update SortOrder
+        # Prepare bulk update
+        update_params = [
+            {"sort_order": int(res["new_sort_order"]), "result_id": int(res["ResultID"])}
+            for res in results
+        ]
+
+        # Perform bulk update with a fresh connection
         async with async_engine.connect() as conn:
-            update_count = 0
-            success_count = 0
-            for res in results:
+            if update_params:
                 try:
                     await conn.execute(
                         text("""
@@ -302,17 +302,29 @@ async def update_search_sort_order(
                             SET SortOrder = :sort_order 
                             WHERE ResultID = :result_id
                         """),
-                        {"sort_order": int(res["new_sort_order"]), "result_id": int(res["ResultID"])}
+                        update_params
                     )
-                    update_count += 1
-                    success_count += 1
-                    logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {res['new_sort_order']} for ResultID {res['ResultID']}")
+                    await conn.commit()
+                    logger.info(f"Worker PID {process.pid}: Successfully updated {len(update_params)} rows for EntryID {entry_id}")
                 except SQLAlchemyError as e:
-                    logger.error(f"Worker PID {process.pid}: Failed to update ResultID {res['ResultID']}: {e}")
-                    continue
-            await conn.commit()
-
-            logger.info(f"Worker PID {process.pid}: Updated {success_count}/{update_count} rows for EntryID {entry_id}")
+                    logger.error(f"Worker PID {process.pid}: Bulk update failed for EntryID {entry_id}: {e}")
+                    # Fallback to individual updates with delay
+                    for param in update_params:
+                        try:
+                            await conn.execute(
+                                text("""
+                                    UPDATE utb_ImageScraperResult 
+                                    SET SortOrder = :sort_order 
+                                    WHERE ResultID = :result_id
+                                """),
+                                param
+                            )
+                            await conn.commit()
+                            logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {param['sort_order']} for ResultID {param['result_id']}")
+                            await asyncio.sleep(0.1)  # Small delay to prevent connection overload
+                        except SQLAlchemyError as e:
+                            logger.error(f"Worker PID {process.pid}: Failed to update ResultID {param['result_id']}: {e}")
+                            continue
 
         # Verify updates
         async with async_engine.connect() as conn:
@@ -357,14 +369,14 @@ async def update_search_sort_order(
             for r in verified_results[:3]:
                 logger.info(f"Worker PID {process.pid}: Sample - ResultID: {r['ResultID']}, EntryID: {r['EntryID']}, SortOrder: {r['SortOrder']}, ImageDesc: {r['ImageDesc'][:100]}")
 
-        return success_count > 0
+        return null_count == 0  # Return True if no NULL SortOrder values
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return False
+        raise
     except ValueError as e:
         logger.error(f"Worker PID {process.pid}: ValueError in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return False
+        raise
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
