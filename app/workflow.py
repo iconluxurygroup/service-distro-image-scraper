@@ -475,6 +475,23 @@ from email_utils import send_email
 from config import conn_str
 import pyodbc
 
+import pandas as pd
+import logging
+import os
+import asyncio
+import httpx
+import aiofiles
+import datetime
+from typing import Optional, Dict, List
+from database import get_images_excel_db, get_send_to_email, update_file_location_complete, update_file_generate_complete
+from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from image_utils import download_all_images
+from common import create_temp_dirs, cleanup_temp_dirs
+from aws_s3 import upload_file_to_space
+from email_utils import send_message_email
+from config import conn_str
+import pyodbc
+
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
@@ -500,7 +517,6 @@ async def generate_download_file(
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory before fetching images: RSS={mem_info.rss / 1024**2:.2f} MB")
         
-        # Use synchronous query (no await)
         selected_images_df = get_images_excel_db(str(file_id), logger=logger)
         logger.info(f"Fetched DataFrame for ID {file_id}, shape: {selected_images_df.shape}, columns: {list(selected_images_df.columns)}")
         
@@ -514,10 +530,6 @@ async def generate_download_file(
             "Color",
             "Category"
         ]
-        if selected_images_df.empty:
-            logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for ID {file_id}. Check database records.")
-            return {"error": f"No images found for ID {file_id}", "log_filename": log_filename}
-        
         if list(selected_images_df.columns) != expected_columns:
             logger.error(f"Invalid columns in DataFrame for ID {file_id}. Got: {list(selected_images_df.columns)}, Expected: {expected_columns}")
             return {"error": f"Invalid DataFrame columns: {list(selected_images_df.columns)}", "log_filename": log_filename}
@@ -525,6 +537,70 @@ async def generate_download_file(
         if selected_images_df.shape[1] != 7:
             logger.error(f"Invalid DataFrame shape for ID {file_id}: got {selected_images_df.shape}, expected (N, 7)")
             return {"error": f"Invalid DataFrame shape: {selected_images_df.shape}", "log_filename": log_filename}
+        
+        # Handle empty DataFrame
+        if selected_images_df.empty:
+            logger.warning(f"Worker PID {process.pid}: ⚠️ No images found for ID {file_id}. Creating empty Excel file.")
+            # Create an empty Excel file
+            template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
+            base_name, extension = os.path.splitext(original_filename)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            unique_id = base_name[-8:] if len(base_name) >= 8 else base_name
+            processed_file_name = f"super_scraper/jobs/{file_id}/{base_name}_scraper_{timestamp}_{unique_id}{extension}"
+            
+            temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
+            local_filename = os.path.join(temp_excel_dir, original_filename)
+            
+            # Download template file
+            logger.info(f"Worker PID {process.pid}: 📥 Downloading template file from {template_file_path}")
+            async with httpx.AsyncClient() as client:
+                response = await client.get(template_file_path, timeout=httpx.Timeout(30, connect=10))
+                response.raise_for_status()
+                async with aiofiles.open(local_filename, 'wb') as f:
+                    await f.write(response.content)
+            
+            # Verify template file
+            if not os.path.exists(local_filename):
+                logger.error(f"Worker PID {process.pid}: Template file not found at {local_filename}")
+                return {"error": f"Failed to download template file", "log_filename": log_filename}
+            logger.debug(f"Worker PID {process.pid}: Template file saved: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
+            
+            # Write empty sheet
+            with pd.ExcelWriter(local_filename, engine='openpyxl', mode='a') as writer:
+                pd.DataFrame({"Message": ["No images found for this file"]}).to_excel(writer, sheet_name="NoImages", index=False)
+            
+            # Upload to S3
+            public_url = await upload_file_to_space(
+                file_src=local_filename,
+                save_as=processed_file_name,
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            
+            if not public_url:
+                logger.error(f"Worker PID {process.pid}: ❌ Upload failed for ID {file_id}")
+                return {"error": "Failed to upload processed file", "log_filename": log_filename}
+            
+            # Update database
+            await update_file_location_complete(str(file_id), public_url, logger=logger)
+            await update_file_generate_complete(str(file_id), logger=logger)
+            
+            # Send email notification
+            send_to_email_addr = await get_send_to_email(file_id, logger=logger)
+            if not send_to_email_addr:
+                logger.error(f"Worker PID {process.pid}: ❌ No email address for ID {file_id}")
+                return {"error": "Failed to retrieve email address", "log_filename": log_filename}
+            subject_line = f"{original_filename} Job Notification - No Images"
+            await send_message_email(
+                to_emails=send_to_email_addr,
+                subject=subject_line,
+                message=f"No images were found for FileID {file_id}. An empty Excel file has been generated.\nDownload URL: {public_url}",
+                logger=logger
+            )
+            
+            logger.info(f"Worker PID {process.pid}: 🏁 Completed ID {file_id} with no images")
+            return {"message": "No images found, empty Excel file generated", "public_url": public_url, "log_filename": log_filename}
         
         # Log sample data
         logger.debug(f"Sample DataFrame rows: {selected_images_df.head(2).to_dict(orient='records')}")
@@ -541,7 +617,7 @@ async def generate_download_file(
                 'Category': row.get('Category', '')
             }
             for _, row in selected_images_df.iterrows()
-            if pd.notna(row['ImageUrl']) or pd.notna(row['ImageUrlThumbnail'])
+            if pd.notna(row['ImageUrl']) and row['ImageUrl']
         ]
         logger.info(f"Worker PID {process.pid}: 📋 Selected {len(selected_image_list)} valid images after filtering")
         
@@ -617,22 +693,19 @@ async def generate_download_file(
             return {"error": "Failed to upload processed file", "log_filename": log_filename}
 
         # Update database
-        from database import update_file_location_complete, update_file_generate_complete
         await update_file_location_complete(str(file_id), public_url, logger=logger)
         await update_file_generate_complete(str(file_id), logger=logger)
 
         # Send email notification
-        from database import get_send_to_email
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if not send_to_email_addr:
             logger.error(f"Worker PID {process.pid}: ❌ No email address for ID {file_id}")
             return {"error": "Failed to retrieve email address", "log_filename": log_filename}
         subject_line = f"{original_filename} Job Notification"
-        await send_email(
+        await send_message_email(
             to_emails=send_to_email_addr,
             subject=subject_line,
-            download_url=public_url,
-            job_id=file_id,
+            message=f"Excel file generation for FileID {file_id} completed successfully.\nDownload URL: {public_url}",
             logger=logger
         )
 
@@ -643,6 +716,15 @@ async def generate_download_file(
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: 🔴 Error for ID {file_id}: {e}", exc_info=True)
+        # Send error email
+        send_to_email_addr = await get_send_to_email(file_id, logger=logger)
+        if send_to_email_addr:
+            await send_message_email(
+                to_emails=send_to_email_addr,
+                subject=f"Error: Job Failed for FileID {file_id}",
+                message=f"Excel file generation for FileID {file_id} failed.\nError: {str(e)}\nLog file: {log_filename}",
+                logger=logger
+            )
         return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename}
     finally:
         if temp_images_dir and temp_excel_dir:
