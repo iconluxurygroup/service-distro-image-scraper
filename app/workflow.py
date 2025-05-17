@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import pandas as pd
 import datetime
 from typing import Optional, Dict, List, Tuple
 from search_utils import update_search_sort_order, insert_search_results
@@ -24,6 +23,7 @@ from utils import (
     cleanup_temp_dirs,
     process_and_tag_results,
     generate_search_variations,
+    search_variation,
     process_search_row_gcloud
 )
 from logging_config import setup_job_logger
@@ -32,10 +32,17 @@ import psutil
 from email_utils import send_message_email
 from image_reason import process_entry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import aiohttp, httpx, aiofiles
+import aiohttp
+import httpx
+import aiofiles
 from database_config import conn_str, async_engine, engine
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
+
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
@@ -47,7 +54,7 @@ async def async_process_entry_search(
     use_all_variations: bool,
     file_id_db: int,
     logger: logging.Logger
-) -> List[pd.DataFrame]:
+) -> List[Dict]:
     process = psutil.Process()
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory before task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
@@ -70,15 +77,17 @@ async def async_process_entry_search(
         raise ValueError(f"Failed to generate search variations: {e}")
     
     variations = []
+    search_types = []
     for category, var_list in variations_dict.items():
-        variations.extend(var_list)
+        for var in var_list:
+            variations.append(var)
+            search_types.append(category)
     variations = list(dict.fromkeys(variations))
     logger.debug(f"Worker PID {process.pid}: Generated {len(variations)} unique search variations for EntryID {entry_id}: {variations}")
     
     if not variations:
         logger.warning(f"Worker PID {process.pid}: No variations generated for EntryID {entry_id}")
         return []
-    
     
     async def process_variation(
         variation: str,
@@ -99,7 +108,6 @@ async def async_process_entry_search(
                 logger.warning(f"No results for variation '{variation}' for EntryID {entry_id}")
                 return result
             
-            # Validate required columns
             for item in result_data:
                 if not all(col in item for col in required_columns):
                     missing_cols = set(required_columns) - set(item.keys())
@@ -126,13 +134,21 @@ async def async_process_entry_search(
                 'error': str(e)
             }
     
-    semaphore = asyncio.Semaphore(4)  # Limit concurrency
-    async def process_with_semaphore(variation: str) -> List[pd.DataFrame]:
+    semaphore = asyncio.Semaphore(4)
+    async def process_with_semaphore(variation: str, search_type: str) -> Dict:
         async with semaphore:
-            return await process_variation(variation)
+            return await process_variation(
+                variation=variation,
+                endpoint=endpoint,
+                entry_id=entry_id,
+                search_type=search_type,
+                brand=brand,
+                category=None,
+                logger=logger
+            )
     
     results = await asyncio.gather(
-        *(process_with_semaphore(variation) for variation in variations),
+        *(process_with_semaphore(variation, search_type) for variation, search_type in zip(variations, search_types)),
         return_exceptions=True
     )
     
@@ -141,17 +157,17 @@ async def async_process_entry_search(
         if isinstance(result, Exception):
             logger.error(f"Error processing variation {variations[idx]} for EntryID {entry_id}: {result}", exc_info=True)
             continue
-        if result:
-            combined_results.extend(result)
+        if result.get('status') == 'success' and result.get('result'):
+            combined_results.extend(result['result'])
     
     if not combined_results:
         logger.warning(f"No valid results for EntryID {entry_id} after processing {len(variations)} variations")
         return []
     
-    for df in combined_results:
-        if 'EntryID' in df.columns and not df['EntryID'].eq(entry_id).all():
-            logger.error(f"EntryID mismatch in DataFrame for EntryID {entry_id}: {df['EntryID'].tolist()}")
-            raise ValueError(f"EntryID mismatch in DataFrame for EntryID {entry_id}")
+    for item in combined_results:
+        if item.get('EntryID') != entry_id:
+            logger.error(f"EntryID mismatch in result for EntryID {entry_id}: {item.get('EntryID')}")
+            raise ValueError(f"EntryID mismatch in result for EntryID {entry_id}")
     
     mem_info = process.memory_info()
     logger.debug(f"Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
@@ -182,7 +198,7 @@ async def process_restart_batch(
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 1
-        MAX_CONCURRENCY = 4  # Limit concurrent async tasks
+        MAX_CONCURRENCY = 4
 
         logger.info(f"Using max_concurrency={MAX_CONCURRENCY} for async tasks")
 
@@ -243,7 +259,7 @@ async def process_restart_batch(
             result.close()
 
         if not entries:
-            logger.warning(f"No entries found")
+            logger.warning(f"No valid EntryIDs found for FileID {file_id_db}")
             return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
@@ -277,22 +293,28 @@ async def process_restart_batch(
                         logger.error(f"No results for EntryID {entry_id}")
                         return entry_id, False
 
-                    combined_df = pd.concat(results, ignore_index=True, copy=False)
-                    if 'EntryID' not in combined_df.columns or not combined_df['EntryID'].eq(entry_id).all():
-                        logger.error(f"EntryID mismatch for EntryID {entry_id}")
-                        return entry_id, False
+                    combined_results = []
+                    for res in results:
+                        new_res = {}
+                        for key, value in res.items():
+                            new_key = api_to_db_mapping.get(key, key)
+                            new_res[new_key] = value
+                        combined_results.append(new_res)
 
-                    for api_col, db_col in api_to_db_mapping.items():
-                        if api_col in combined_df.columns and db_col not in combined_df.columns:
-                            combined_df.rename(columns={api_col: db_col}, inplace=True)
-
-                    if not all(col in combined_df.columns for col in required_columns):
+                    if not all(all(col in res for col in required_columns) for res in combined_results):
                         logger.error(f"Missing columns for EntryID {entry_id}")
                         return entry_id, False
 
-                    deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first')
-                    logger.info(f"Deduplicated to {len(deduplicated_df)} rows")
-                    insert_success = await insert_search_results(deduplicated_df, logger=logger, file_id=str(file_id_db))
+                    deduplicated_results = []
+                    seen = set()
+                    for res in combined_results:
+                        key = (res['EntryID'], res['ImageUrl'])
+                        if key not in seen:
+                            seen.add(key)
+                            deduplicated_results.append(res)
+                    logger.info(f"Deduplicated to {len(deduplicated_results)} rows")
+
+                    insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
                     if not insert_success:
                         logger.error(f"Failed to insert results for EntryID {entry_id}")
                         return entry_id, False
@@ -300,7 +322,7 @@ async def process_restart_batch(
                     update_result = await update_search_sort_order(
                         str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                     )
-                    if update_result is None:
+                    if update_result is None or not update_result:
                         logger.error(f"SortOrder update failed for EntryID {entry_id}")
                         return entry_id, False
 
@@ -349,7 +371,10 @@ async def process_restart_batch(
                 """),
                 {"file_id": file_id_db_int}
             )
-            total_entries, positive_entries, null_entries = result.fetchone()
+            row = result.fetchone()
+            total_entries = row[0] if row else 0
+            positive_entries = row[1] if row and row[1] is not None else 0
+            null_entries = row[2] if row and row[2] is not None else 0
             logger.info(
                 f"Verification: {total_entries} total entries, "
                 f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
@@ -369,7 +394,7 @@ async def process_restart_batch(
                 f"Last EntryID: {last_entry_id_processed}\n"
                 f"Log file: {log_filename}"
             )
-            await send_message_email(to_emails, subject=subject, message=message, logger=logger)
+            await send_message_email(to_emails, subject=subject, message= message, logger=logger)
 
         return {
             "message": "Search processing completed",
@@ -390,7 +415,6 @@ async def process_restart_batch(
         engine.dispose()
         logger.info(f"Disposed database engines")
 
-# ... (rest of workflow.py, e.g., generate_download_file, detect_job_failure, etc., unchanged) ...
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
