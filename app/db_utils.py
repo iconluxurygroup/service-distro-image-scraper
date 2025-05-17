@@ -103,10 +103,20 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
 from database_config import conn_str  # Import conn_str from database_config
 
+import logging
+import pandas as pd
+import re
+import aioodbc
+import asyncio
+from typing import Optional, List, Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from common import clean_string, validate_model, validate_brand, calculate_priority, generate_aliases
+from database_config import conn_str
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),  # Changed from aioodbc.Error to pyodbc.Error
+    retry=retry_if_exception_type(pyodbc.Error),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -171,20 +181,25 @@ async def update_search_sort_order(
                     (file_id, entry_id)
                 )
                 columns = [column[0] for column in cursor.description]
-                logger.debug(f"Raw rows: {rows[:2]}")  # Log first two rows
+                rows = await cursor.fetchall()
+                logger.debug(f"Raw rows (first 2): {rows[:2]}")
                 logger.debug(f"Columns: {columns}")
-                if rows and len(rows[0]) != len(columns):
-                    logger.error(f"Row length mismatch: got {len(rows[0])}, expected {len(columns)}")
+                if not rows:
+                    logger.warning(f"No data found for FileID {file_id}, EntryID {entry_id}")
                     return []
+
+                # Validate row structure
+                expected_columns = len(columns)
+                malformed_rows = [i for i, row in enumerate(rows) if len(row) != expected_columns]
+                if malformed_rows:
+                    logger.error(f"Malformed rows detected at indices {malformed_rows[:10]}: expected {expected_columns} columns, got {[len(rows[i]) for i in malformed_rows[:10]]}")
+                    return []
+
                 df = pd.DataFrame(rows, columns=columns)
                 if df.empty:
-                    logger.warning(f"No data found for FileID: {file_id}, EntryID: {entry_id}")
+                    logger.warning(f"No data found for FileID {file_id}, EntryID {entry_id}")
                     return []
-                rows = await cursor.fetchall()
-                if not rows:
-                    logger.warning(f"No data returned for FileID {file_id}, EntryID {entry_id}")
-                    return []
-                df = pd.DataFrame(rows, columns=columns)
+
                 # Skip placeholder/error results
                 df = df[~df['ImageUrl'].str.contains('placeholder://', na=False)]
                 if df.empty:
