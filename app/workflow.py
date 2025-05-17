@@ -3,7 +3,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import asyncio
-import aio
 import os
 import pandas as pd
 import time
