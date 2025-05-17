@@ -268,6 +268,13 @@ def validate_model(row, expected_models, result_id, logger=None) -> bool:
     logger.warning(f"ResultID {result_id}: Model match failed: Input model='{input_model}', Expected models={expected_models}")
     return False
 
+import re
+from typing import Dict, List
+
+def clean_string(s: str) -> str:
+    # Assuming clean_string removes unwanted characters and normalizes the string
+    return s.strip() if s else ""
+
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
     brand_clean = clean_string(brand).lower()
     if not brand_clean:
@@ -294,9 +301,19 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
         variations.append(words[-1])
 
     aliases.extend(variations)
-    aliases = [alias for alias in aliases if len(alias) >= 4 and alias.lower() not in ["sas", "soda"]]
-    return list(set(aliases))
+    # Filter aliases and remove case-insensitive duplicates
+    seen = set()
+    filtered_aliases = []
+    for alias in aliases:
+        if len(alias) >= 4 and alias.lower() not in ["sas", "soda"]:
+            # Use lowercase for duplicate check
+            alias_lower = alias.lower()
+            if alias_lower not in seen:
+                seen.add(alias_lower)
+                filtered_aliases.append(alias_lower)  # Ensure output is lowercase
 
+    return filtered_aliases
+    
 def validate_brand(
     row: pd.Series,
     brand_aliases: List[str],
