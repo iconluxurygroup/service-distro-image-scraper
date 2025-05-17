@@ -12,14 +12,14 @@ def double_encode_plus(url: str, logger: Optional[logging.Logger] = None) -> str
     logger = logger or default_logger
     logger.debug(f"Encoding URL: {url}")
     try:
-        # Parse URL to handle components separately
+        # Parse URL components
         parsed = urllib.parse.urlparse(url)
         # Encode path, preserving slashes
         path = urllib.parse.quote(parsed.path, safe='/')
-        # Encode query parameters
+        # Encode query parameters, handling multi-valued queries
         query = urllib.parse.urlencode(urllib.parse.parse_qs(parsed.query), doseq=True) if parsed.query else ''
         # Encode fragment
-        fragment = urllib.parse.quote(parsed.fragment) if parsed.fragment else ''
+        fragment = urllib.parse.quote(parsed.fragment, safe='') if parsed.fragment else ''
         # Reconstruct URL
         encoded = f"{parsed.scheme}://{parsed.netloc}{path}"
         if query:
@@ -36,35 +36,38 @@ def decode_url(url: str, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     logger.debug(f"Decoding URL: {url}")
     try:
-        # Remove all backslashes except those in valid escape sequences
-        cleaned = re.sub(r'\\([^\\])', r'\1', url)
-        # Remove encoded backslashes (%5C, %255C)
-        cleaned = re.sub(r'%25?5[Cc]', '', cleaned)
-        # Replace common escape mistakes
-        cleaned = cleaned.replace('q\\=tbn', 'q=tbn').replace('q=tbn', 'q=tbn')
-        # Repeatedly unquote to handle double-encoding
+        # Remove all backslashes aggressively
+        cleaned = re.sub(r'\\+', '', url)
+        # Remove encoded backslashes (%5C, %255C, etc.)
+        cleaned = re.sub(r'%25{0,2}5[Cc]', '', cleaned)
+        # Fix Google-specific patterns
+        cleaned = cleaned.replace('q=tbn', 'q=tbn').replace('q=tbn:', 'q=tbn:').replace('tbn\\:', 'tbn:')
+        # Handle other common escape mistakes
+        cleaned = cleaned.replace('&=s', '&s').replace('&=t', '&t')
+        # Repeatedly unquote to resolve double-encoding
         decoded = cleaned
-        for _ in range(5):  # Increased iterations for complex cases
+        for _ in range(10):  # Increased for stubborn cases
             new_decoded = urllib.parse.unquote(decoded)
             if new_decoded == decoded:
                 break
             decoded = new_decoded
-        # Parse and normalize query parameters
+            logger.debug(f"Unquote iteration: {decoded}")
+        # Parse URL to normalize components
         parsed = urllib.parse.urlparse(decoded)
-        if parsed.query:
-            query_dict = urllib.parse.parse_qs(parsed.query)
-            normalized_query = urllib.parse.urlencode(query_dict, doseq=True)
-            decoded = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            if normalized_query:
-                decoded += f"?{normalized_query}"
-            if parsed.fragment:
-                decoded += f"#{parsed.fragment}"
-        # Validate URL
+        # Reconstruct query parameters
+        query = urllib.parse.urlencode(urllib.parse.parse_qs(parsed.query), doseq=True) if parsed.query else ''
+        # Reconstruct URL
+        final_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if query:
+            final_url += f"?{query}"
+        if parsed.fragment:
+            final_url += f"#{urllib.parse.quote(parsed.fragment, safe='')}"
+        # Validate URL structure
         if not parsed.scheme or not parsed.netloc:
-            logger.warning(f"Invalid URL structure after decoding: {decoded}")
+            logger.warning(f"Invalid URL structure after decoding: {final_url}")
             return url
-        logger.debug(f"Decoded URL: {decoded}")
-        return decoded
+        logger.debug(f"Decoded URL: {final_url}")
+        return final_url
     except Exception as e:
         logger.error(f"Error decoding URL {url}: {e}", exc_info=True)
         return url
