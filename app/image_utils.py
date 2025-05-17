@@ -15,7 +15,6 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)   
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# Existing clean_url and validate_url functions remain unchanged
 def clean_url(url: str, attempt: int = 1) -> str:
     try:
         if attempt == 1:
@@ -74,12 +73,11 @@ async def validate_url(url: str, session: aiohttp.ClientSession, logger: logging
         return False
 
 @retry(
-    stop=stop_after_attempt(3),
+    stop=stop_after_attempt(lambda attempt, kwargs: 4 if kwargs.get('entry_index', 0) >= 2 else 3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((aio flora
-http.ClientResponseError, asyncio.TimeoutError)),
+    retry=retry_if_exception_type((aiohttp.ClientResponseError, asyncio.TimeoutError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying download for URL {retry_state.kwargs['url']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+        f"Retrying download for URL {retry_state.kwargs['url']} (attempt {retry_state.attempt_number}/{4 if retry_state.kwargs.get('entry_index', 0) >= 2 else 3}) after {retry_state.next_action.sleep}s"
     )
 )
 async def download_image(
@@ -87,6 +85,7 @@ async def download_image(
     filename: str,
     session: aiohttp.ClientSession,
     logger: logging.Logger,
+    entry_index: int = 0,
     timeout: int = 30,
     max_clean_attempts: int = 3
 ) -> bool:
@@ -144,35 +143,31 @@ async def download_all_images(
 
     # Define sorting strategies for entries starting from index 2
     sort_strategies = [
-        # Strategy 1: Sort by presence of thumbnail (entries with thumbnails first)
         lambda lst: sorted(lst, key=lambda x: 1 if x.get('ImageUrlThumbnail') else 0, reverse=True),
-        # Strategy 2: Sort by main URL length (shorter URLs first)
         lambda lst: sorted(lst, key=lambda x: len(x.get('ImageUrl', '')), reverse=False),
-        # Strategy 3: Sort by domain name alphabetically
         lambda lst: sorted(lst, key=lambda x: urlparse(x.get('ImageUrl', '')).netloc or ''),
-        # Strategy 4: Sort by ExcelRowID
         lambda lst: sorted(lst, key=lambda x: x.get('ExcelRowID', 0)),
     ]
 
-    async def process_image(image: Dict) -> None:
+    async def process_image(image: Dict, index: int) -> None:
         excel_row_id = image['ExcelRowID']
         main_url = image['ImageUrl']
         thumb_url = image.get('ImageUrlThumbnail', '')
         filename = os.path.join(temp_dir, f"image_{excel_row_id}.jpg")
 
-        logger.debug(f"Processing ExcelRowID {excel_row_id}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
+        logger.debug(f"Processing ExcelRowID {excel_row_id} at index {index}: Main URL = {main_url}, Thumbnail URL = {thumb_url}")
 
         async with aiohttp.ClientSession() as session:
-            success = await download_image(main_url, filename, session, logger)
+            success = await download_image(main_url, filename, session, logger, entry_index=index)
             if not success and thumb_url:
                 logger.debug(f"Falling back to thumbnail {thumb_url} for ExcelRowID {excel_row_id}")
-                success = await download_image(thumb_url, filename, session, logger)
+                success = await download_image(thumb_url, filename, session, logger, entry_index=index)
             
             if not success:
                 logger.error(f"Failed to download both main and thumbnail for ExcelRowID {excel_row_id}")
                 failed_downloads.append((main_url or thumb_url, excel_row_id))
                 if not main_url and not thumb_url:
-                    logger.critical(f"No_extraneous_information: No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID {image.get('FileID', 'unknown')}.")
+                    logger.critical(f"No valid URLs for ExcelRowID {excel_row_id}. Check database for FileID {image.get('FileID', 'unknown')}.")
 
     # Try each sort strategy for entries starting from index 2
     best_failed_downloads = []
@@ -190,7 +185,7 @@ async def download_all_images(
         batches = [current_list[i:i + batch_size] for i in range(0, len(current_list), batch_size)]
         for batch_idx, batch in enumerate(batches, 1):
             logger.info(f"Processing batch {batch_idx} with {len(batch)} images")
-            await asyncio.gather(*(process_image(image) for image in batch))
+            await asyncio.gather(*(process_image(image, idx) for idx, image in enumerate(current_list)))
             logger.info(f"Batch {batch_idx} completed, failures: {len(failed_downloads)}")
 
         logger.info(f"Sort strategy {strategy_idx} completed with {len(failed_downloads)} failures")
@@ -200,7 +195,7 @@ async def download_all_images(
         if min_failures == 0:
             break
 
-    # Retry failed downloads with a fallback strategy (e.g., alternate URLs or cleaned URLs)
+    # Retry failed downloads with fallback strategy
     if best_failed_downloads:
         logger.info(f"Retrying {len(best_failed_downloads)} failed downloads with fallback strategy")
         retry_failed = []
@@ -210,13 +205,11 @@ async def download_all_images(
                 continue
             filename = os.path.join(temp_dir, f"image_{excel_row_id}.jpg")
             async with aiohttp.ClientSession() as session:
-                # Try cleaned main URL with different cleaning attempt
                 main_url = clean_url(image['ImageUrl'], attempt=3)
-                success = await download_image(main_url, filename, session, logger)
+                success = await download_image(main_url, filename, session, logger, entry_index=image_list.index(image))
                 if not success and image.get('ImageUrlThumbnail'):
-                    # Try cleaned thumbnail URL
                     thumb_url = clean_url(image['ImageUrlThumbnail'], attempt=3)
-                    success = await download_image(thumb_url, filename, session, logger)
+                    success = await download_image(thumb_url, filename, session, logger, entry_index=image_list.index(image))
                 if not success:
                     retry_failed.append((url, excel_row_id))
         best_failed_downloads = retry_failed
