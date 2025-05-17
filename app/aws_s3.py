@@ -10,14 +10,15 @@ import os
 import urllib.parse
 import mimetypes
 from logging_config import setup_job_logger
-import aioodbc 
-# Import database configuration
-from config import VERSION,S3_CONFIG
-from database_config import async_engine, engine
-# Initialize default logger
+from config import VERSION, S3_CONFIG
+from database_config import async_engine, engine, conn_str
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 def get_s3_client(service='s3', logger=None, file_id=None):
     logger = logger or default_logger
@@ -27,7 +28,7 @@ def get_s3_client(service='s3', logger=None, file_id=None):
     try:
         logger.info(f"Creating {service.upper()} client")
         session = aiobotocore.session.get_session()
-        config = AioConfig(signature_version='s3v4')  # Explicitly use Signature Version 4
+        config = AioConfig(signature_version='s3v4')
         if service == 'r2':
             logger.debug(f"R2 config: endpoint={S3_CONFIG['r2_endpoint']}, access_key={S3_CONFIG['r2_access_key'][:4]}...")
             return session.create_client(
@@ -50,6 +51,7 @@ def get_s3_client(service='s3', logger=None, file_id=None):
     except Exception as e:
         logger.error(f"Error creating {service.upper()} client: {e}", exc_info=True)
         raise
+
 import boto3
 from botocore.config import Config
 
@@ -146,6 +148,7 @@ def upload_file_to_space_sync(file_src, save_as, is_public=True, logger=None, fi
     if is_public and result_urls.get('s3'):
         return result_urls['s3']
     return None
+
 def double_encode_plus(filename, logger=None):
     logger = logger or default_logger
     logger.debug(f"Encoding filename: {filename}")
@@ -158,8 +161,8 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
     if public is not None:
         is_public = public
         logger.warning("Use of 'public' parameter is deprecated; use 'is_public' instead")
-    logger = logger or logging.getLogger(__name__)
-    if logger == logging.getLogger(__name__) and file_id:
+    logger = logger or default_logger
+    if logger == default_logger and file_id:
         logger, _ = setup_job_logger(job_id=file_id, console_output=True)
         logger.info(f"Setup logger for upload_file_to_space, FileID: {file_id}")
 
@@ -169,18 +172,24 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         logger.error(f"Local file does not exist: {file_src}")
         raise FileNotFoundError(f"Local file does not exist: {file_src}")
 
-    # Check if log URL already exists
-    async with aioodbc.connect(dsn=conn_str) as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute("SELECT LogFileUrl FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
-            existing_url = await cursor.fetchone()
+    # Check if log URL already exists using SQLAlchemy
+    try:
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT LogFileUrl FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": file_id}
+            )
+            existing_url = result.fetchone()
             if existing_url and existing_url[0]:
                 logger.info(f"Log already uploaded for FileID {file_id}: {existing_url[0]}")
                 return existing_url[0]
+    except SQLAlchemyError as e:
+        logger.error(f"Database error checking LogFileUrl for FileID {file_id}: {e}", exc_info=True)
+        # Proceed with upload if database check fails
 
     content_type, _ = mimetypes.guess_type(file_src)
     if not content_type:
-        content_type = 'text/plain'
+        content_type = 'text/plain' if file_src.endswith('.log') else 'application/octet-stream'
         logger.debug(f"Set Content-Type to {content_type} for {file_src}")
 
     file_size = os.path.getsize(file_src)
@@ -189,14 +198,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
-            async with get_session().create_client(
-                "s3",
-                region_name=S3_CONFIG['region'],
-                endpoint_url=S3_CONFIG['endpoint'],
-                aws_access_key_id=S3_CONFIG['access_key'],
-                aws_secret_access_key=S3_CONFIG['secret_key'],
-                config=AioConfig(signature_version='s3v4')
-            ) as s3_client:
+            async with get_s3_client(service='s3', logger=logger, file_id=file_id) as s3_client:
                 logger.info(f"Uploading {file_src} to S3: {S3_CONFIG['bucket_name']}/{save_as}")
                 with open(file_src, 'rb') as file:
                     await s3_client.put_object(
@@ -206,7 +208,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                         ACL='public-read' if is_public else 'private',
                         ContentType=content_type
                     )
-                double_encoded_key = urllib.parse.quote(save_as.replace('+', '%2B'))
+                double_encoded_key = double_encode_plus(save_as, logger=logger)
                 s3_url = f"https://{S3_CONFIG['bucket_name']}.s3.{S3_CONFIG['region']}.amazonaws.com/{double_encoded_key}"
                 logger.info(f"Uploaded {file_src} to S3: {s3_url} with Content-Type: {content_type}")
                 result_urls['s3'] = s3_url
@@ -221,14 +223,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
 
     for attempt in range(max_attempts):
         try:
-            async with get_session().create_client(
-                "s3",
-                region_name='auto',
-                endpoint_url=S3_CONFIG['r2_endpoint'],
-                aws_access_key_id=S3_CONFIG['r2_access_key'],
-                aws_secret_access_key=S3_CONFIG['r2_secret_key'],
-                config=AioConfig(signature_version='s3v4')
-            ) as r2_client:
+            async with get_s3_client(service='r2', logger=logger, file_id=file_id) as r2_client:
                 logger.info(f"Uploading {file_src} to R2: {S3_CONFIG['r2_bucket_name']}/{save_as}")
                 with open(file_src, 'rb') as file:
                     await r2_client.put_object(
@@ -238,7 +233,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                         ACL='public-read' if is_public else 'private',
                         ContentType=content_type
                     )
-                double_encoded_key = urllib.parse.quote(save_as.replace('+', '%2B'))
+                double_encoded_key = double_encode_plus(save_as, logger=logger)
                 r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
                 logger.info(f"Uploaded {file_src} to R2: {r2_url} with Content-Type: {content_type}")
                 result_urls['r2'] = r2_url
@@ -252,6 +247,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
             break
 
     if is_public and result_urls.get('r2'):
-        await update_log_url_in_db(file_id, result_urls['r2'], logger)
+        if file_id:
+            await update_log_url_in_db(file_id, result_urls['r2'], logger)
         return result_urls['r2']
     return None
