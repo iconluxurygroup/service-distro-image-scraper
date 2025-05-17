@@ -47,6 +47,9 @@ import aiohttp
 
 BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
 
+# Thread lock for sort order updates
+SORT_ORDER_LOCK = threading.Lock()
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -79,6 +82,12 @@ async def async_process_entry_search(
         use_all_variations=use_all_variations,
         file_id_db=file_id_db
     )
+    
+    # Validate EntryID in results
+    for df in result:
+        if 'EntryID' in df.columns and not df['EntryID'].eq(entry_id).all():
+            logger.error(f"Worker PID {process.pid}: EntryID mismatch in DataFrame for EntryID {entry_id}: {df['EntryID'].tolist()}")
+            raise ValueError(f"EntryID mismatch in DataFrame for EntryID {entry_id}")
     
     mem_info = process.memory_info()
     logger.debug(f"Worker PID {process.pid}: Memory after task for EntryID {entry_id}: RSS={mem_info.rss / 1024**2:.2f} MB")
@@ -121,48 +130,39 @@ def process_entry_search(args):
         logger.removeHandler(handler)
         handler.close()
 
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import logging
-import asyncio
-import os
-import pandas as pd
-import time
-import pyodbc
-import httpx
-import json
-import aiofiles
-import datetime
-from typing import Optional, Dict, List, Tuple
-import psutil
-import gc
-from config import conn_str
-from db_utils import (
-    sync_get_endpoint,
-    insert_search_results,
-    update_search_sort_order,
-    get_send_to_email,
-    sync_update_search_sort_order,
-)
-from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space
-from email_utils import send_message_email
-from utils import fetch_brand_rules
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import aiohttp
-
-BRAND_RULES_URL = os.getenv("BRAND_RULES_URL", "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json")
-
-# Existing async_process_entry_search and process_entry_search functions remain unchanged
-# ... (omitted for brevity, assume they are the same as provided)
+def insert_search_results(df: pd.DataFrame, logger: logging.Logger) -> bool:
+    """Insert search results into database with transaction isolation."""
+    process = psutil.Process()
+    try:
+        with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
+            cursor = conn.cursor()
+            # Assuming table structure; adjust columns as needed
+            query = """
+                INSERT INTO utb_ImageScraperResult (
+                    EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
+                ) VALUES (?, ?, ?, ?, ?)
+            """
+            for _, row in df.iterrows():
+                cursor.execute(query, (
+                    row['EntryID'],
+                    row['ImageUrl'],
+                    row.get('ImageDesc', ''),
+                    row.get('ImageSource', ''),
+                    row.get('ImageUrlThumbnail', '')
+                ))
+            conn.commit()
+            logger.info(f"Worker PID {process.pid}: Inserted {len(df)} rows into utb_ImageScraperResult")
+            return True
+    except pyodbc.Error as e:
+        logger.error(f"Worker PID {process.pid}: Failed to insert search results: {e}", exc_info=True)
+        return False
 
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
-    use_all_variations: bool = False,
-    batch_size: int = 20  # Default batch size of 20
+    use_all_variations: bool = False
 ) -> Dict[str, str]:
-    """Process a batch of entries for a file using threading, with batching and memory cleanup."""
+    """Process a batch of entries for a file using threading and upload log file to S3."""
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
         # Initialize logger
@@ -178,12 +178,14 @@ async def process_restart_batch(
             except Exception as e:
                 logger.error(f"Worker PID {process.pid}: Memory logging failed: {e}")
 
-        logger.info(f"Worker PID {process.pid}: 🔁 Starting processing for FileID: {file_id_db}, batch_size: {batch_size}")
+        logger.debug(f"Worker PID {process.pid}: Input file_id_db: {file_id_db}, entry_id: {entry_id}, use_all_variations: {use_all_variations}")
+        logger.info(f"Worker PID {process.pid}: 🔁 Starting processing for FileID: {file_id_db}")
         log_memory_usage()
 
         file_id_db_int = file_id_db
+        BATCH_SIZE = 1  # Keep batch size small to control memory
         CPU_CORES = psutil.cpu_count(logical=False) or 4  # Fallback to 4 if detection fails
-        MAX_WORKERS = min(CPU_CORES, 4)  # Limit to 4 workers to control memory usage
+        MAX_WORKERS = CPU_CORES * 2  # 2 threads per physical core
 
         logger.info(f"Worker PID {process.pid}: Detected {CPU_CORES} physical CPU cores, setting max_workers={MAX_WORKERS}")
 
@@ -247,12 +249,8 @@ async def process_restart_batch(
             return {"error": "No entries found", "log_filename": log_filename, "log_public_url": ""}
 
         # Create batches
-        if batch_size == 0:  # Process all at once
-            entry_batches = [entries]
-            logger.info(f"Worker PID {process.pid}: Processing all {len(entries)} entries at once")
-        else:
-            entry_batches = [entries[i:i + batch_size] for i in range(0, len(entries), batch_size)]
-            logger.info(f"Worker PID {process.pid}: Created {len(entry_batches)} batches of size {batch_size}")
+        entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
+        logger.info(f"Worker PID {process.pid}: Created {len(entry_batches)} batches")
 
         successful_entries = 0
         failed_entries = 0
@@ -262,10 +260,10 @@ async def process_restart_batch(
         }
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        # Process batches
+        # Use ThreadPoolExecutor with dynamic workers
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
-                logger.info(f"Worker PID {process.pid}: Processing batch {batch_idx}/{len(entry_batches)} with {len(batch_entries)} entries")
+                logger.info(f"Worker PID {process.pid}: Processing batch {batch_idx}/{len(entry_batches)}")
                 start_time = datetime.datetime.now()
 
                 tasks = [
@@ -274,15 +272,9 @@ async def process_restart_batch(
                 ]
                 logger.debug(f"Worker PID {process.pid}: Tasks: {tasks}")
 
-                # Process tasks with a timeout to prevent hangs
-                try:
-                    results = list(executor.map(process_entry_search, tasks, timeout=60))  # 60-second timeout per task
-                except TimeoutError as e:
-                    logger.error(f"Worker PID {process.pid}: Timeout processing batch {batch_idx}: {e}")
-                    failed_entries += len(batch_entries)
-                    continue
-
-                logger.debug(f"Worker PID {process.pid}: Batch {batch_idx} results: {results}")
+                # Process tasks and collect results in order
+                results = [executor.submit(process_entry_search, task) for task in tasks]
+                results = [future.result() for future in results]  # Wait for results in order
 
                 for (entry_id, search_string, brand, color, category), result in zip(batch_entries, results):
                     try:
@@ -297,9 +289,15 @@ async def process_restart_batch(
                             failed_entries += 1
                             continue
 
-                        # Process DataFrame incrementally
+                        # Process DataFrame incrementally to reduce memory usage
                         combined_df = pd.concat(dfs, ignore_index=True, copy=False)
-                        logger.debug(f"Worker PID {process.pid}: Combined DataFrame for EntryID {entry_id}: {len(combined_df)} rows")
+                        logger.debug(f"Worker PID {process.pid}: Combined DataFrame for EntryID {entry_id}: {combined_df.to_dict()}")
+
+                        # Validate EntryID in DataFrame
+                        if 'EntryID' not in combined_df.columns or not combined_df['EntryID'].eq(entry_id).all():
+                            logger.error(f"Worker PID {process.pid}: EntryID mismatch for EntryID {entry_id}: {combined_df['EntryID'].tolist()}")
+                            failed_entries += 1
+                            continue
 
                         for api_col, db_col in api_to_db_mapping.items():
                             if api_col in combined_df.columns and db_col not in combined_df.columns:
@@ -310,36 +308,30 @@ async def process_restart_batch(
                             failed_entries += 1
                             continue
 
-                        # Optimize deduplication
                         deduplicated_df = combined_df.drop_duplicates(subset=['EntryID', 'ImageUrl'], keep='first', inplace=False)
                         logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_df)} rows for EntryID {entry_id}")
 
-                        # Insert results incrementally
-                        with pyodbc.connect(conn_str, autocommit=True) as conn:
-                            insert_success = insert_search_results(deduplicated_df, logger=logger)
-                            if not insert_success:
-                                logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
-                                failed_entries += 1
-                                continue
-
-                        logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
-
-                        # Update sort order
-                        update_result = await update_search_sort_order(
-                            str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                        )
-                        if update_result is None:
-                            logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
+                        # Insert results with transaction isolation
+                        insert_success = insert_search_results(deduplicated_df, logger=logger)
+                        if not insert_success:
+                            logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
                             failed_entries += 1
                             continue
 
+                        logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_df)} results for EntryID {entry_id}")
+
+                        # Update sort order with lock
+                        with SORT_ORDER_LOCK:
+                            update_result = await update_search_sort_order(
+                                str(file_id_db_int), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                            )
+                            if update_result is None:
+                                logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
+                                failed_entries += 1
+                                continue
+
                         logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
                         successful_entries += 1
-
-                        # Clean up DataFrames
-                        del combined_df
-                        del deduplicated_df
-                        gc.collect()  # Force garbage collection
 
                     except Exception as e:
                         logger.error(f"Worker PID {process.pid}: Error processing EntryID {entry_id}: {e}", exc_info=True)
@@ -348,10 +340,6 @@ async def process_restart_batch(
                 elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
                 logger.info(f"Worker PID {process.pid}: Completed batch {batch_idx} in {elapsed_time:.2f} seconds")
                 log_memory_usage()
-
-                # Reset memory after each batch
-                gc.collect()
-                logger.debug(f"Worker PID {process.pid}: Garbage collection triggered after batch {batch_idx}")
 
         # Final verification
         with pyodbc.connect(conn_str, autocommit=False, timeout=30) as conn:
@@ -428,6 +416,8 @@ async def process_restart_batch(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error processing FileID {file_id_db}: {e}", exc_info=True)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": ""}
+
+# Rest of the functions remain unchanged
 async def generate_download_file(
     file_id: int,
     logger: Optional[logging.Logger] = None,
