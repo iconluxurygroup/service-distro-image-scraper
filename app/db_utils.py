@@ -1572,9 +1572,14 @@ async def update_sort_order_per_entry(file_id: str, logger: Optional[logging.Log
     except Exception as e:
             logger.error(f"Error in per-entry SortOrder update for FileID {file_id}: {e}", exc_info=True)
             return None
+import logging
+import pandas as pd
+import aioodbc
+from typing import Optional
+from config import conn_str
 
 async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     try:
         file_id = int(file_id)
         async with aioodbc.connect(dsn=conn_str) as conn:
@@ -1599,20 +1604,34 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                     WHERE f.ID = ?
                     ORDER BY s.ExcelRowID
                 """
-                logger.debug(f"Executing query: {query} with FileID: {file_id}")
+                logger.debug(f"Executing query: {query} with ID: {file_id}")
                 await cursor.execute(query, (file_id,))
                 rows = await cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
                 df = pd.DataFrame(rows, columns=columns)
-                logger.info(f"Fetched {len(df)} rows for Excel export for FileID {file_id}")
+                logger.info(f"Fetched {len(df)} rows for Excel export for ID {file_id}")
+                if df.empty:
+                    logger.warning(f"No data returned for ID {file_id}. Check utb_ImageScraperFiles and utb_ImageScraperRecords.")
+                    # Log table counts for diagnostics
+                    await cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = ?", (file_id,))
+                    file_count = (await cursor.fetchone())[0]
+                    await cursor.execute("SELECT COUNT(*) FROM utb_ImageScraperRecords WHERE FileID = ?", (file_id,))
+                    record_count = (await cursor.fetchone())[0]
+                    await cursor.execute(
+                        "SELECT COUNT(*) FROM utb_ImageScraperResult r INNER JOIN utb_ImageScraperRecords s ON r.EntryID = s.EntryID WHERE s.FileID = ? AND r.SortOrder >= 0",
+                        (file_id,)
+                    )
+                    result_count = (await cursor.fetchone())[0]
+                    logger.debug(f"Diagnostic counts: utb_ImageScraperFiles={file_count}, utb_ImageScraperRecords={record_count}, utb_ImageScraperResult={result_count}")
+                else:
+                    logger.debug(f"Sample rows: {df.head(2).to_dict(orient='records')}")
                 return df
-    except pyodbc.Error as e:
-        logger.error(f"Database error in get_images_excel_db: {e}", exc_info=True)
+    except aioodbc.Error as e:
+        logger.error(f"Database error in get_images_excel_db for ID {file_id}: {e}", exc_info=True)
         return pd.DataFrame()
     except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
+        logger.error(f"Invalid ID format: {e}", exc_info=True)
         return pd.DataFrame()
-
 async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     try:
