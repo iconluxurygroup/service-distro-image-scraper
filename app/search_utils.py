@@ -25,7 +25,6 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
         logger.debug(f"Non-HTTP thumbnail URL: {url}")
         return False
     return True
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -54,21 +53,28 @@ async def insert_search_results(
         return False
 
     try:
+        # Validate and cast EntryID to integer
+        df = df.copy()  # Avoid modifying the original DataFrame
+        df['EntryID'] = pd.to_numeric(df['EntryID'], errors='coerce').astype('Int64')
+        if df['EntryID'].isna().any():
+            logger.error(f"Worker PID {process.pid}: Invalid EntryID values in DataFrame: {df[df['EntryID'].isna()]}")
+            return False
+
         async with async_engine.connect() as conn:
-            # Clear any existing cursors or result sets
+            # Clear connection state
             try:
-                await conn.execute(text("SELECT 1"))  # Dummy query to reset connection
+                await conn.execute(text("SELECT 1"))
                 await conn.commit()
             except Exception as e:
                 logger.warning(f"Worker PID {process.pid}: Failed to clear connection state: {e}")
 
             parameters = [
                 (
-                    row["EntryID"],
-                    row["ImageUrl"],
-                    row["ImageDesc"],
-                    row["ImageSource"],
-                    row["ImageUrlThumbnail"]
+                    int(row["EntryID"]),  # Ensure integer
+                    str(row["ImageUrl"]) if pd.notna(row["ImageUrl"]) else "",
+                    str(row["ImageDesc"]) if pd.notna(row["ImageDesc"]) else "",
+                    str(row["ImageSource"]) if pd.notna(row["ImageSource"]) else "",
+                    str(row["ImageUrlThumbnail"]) if pd.notna(row["ImageUrlThumbnail"]) else ""
                 )
                 for _, row in df.iterrows()
             ]
@@ -76,9 +82,18 @@ async def insert_search_results(
             result = await conn.execute(
                 text("""
                     INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
                 """),
-                parameters
+                [
+                    {
+                        "entry_id": param[0],
+                        "image_url": param[1],
+                        "image_desc": param[2],
+                        "image_source": param[3],
+                        "image_url_thumbnail": param[4]
+                    }
+                    for param in parameters
+                ]
             )
             await conn.commit()
             logger.info(f"Worker PID {process.pid}: Successfully inserted {len(parameters)} rows for FileID {file_id}")
