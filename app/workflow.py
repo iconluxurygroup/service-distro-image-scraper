@@ -25,7 +25,7 @@ from db_utils import (
 )
 from search_utils import update_search_sort_order, insert_search_results
 from image_utils import download_all_images
-from excel_utils import write_excel_image, write_failed_downloads_to_excel
+from excel_utils import write_excel_image
 from common import fetch_brand_rules
 from utils import create_temp_dirs, cleanup_temp_dirs, generate_search_variations, process_and_tag_results
 from endpoint_utils import sync_get_endpoint
@@ -446,9 +446,6 @@ async def generate_download_file(
             failed_entries = len(failed_downloads)
             logger.info(f"Processed {successful_entries} successful entries, {failed_entries} failed entries")
 
-            if failed_downloads:
-                logger.info(f"Writing {len(failed_downloads)} failed downloads to Excel")
-                await write_failed_downloads_to_excel(failed_downloads, local_filename, logger=logger)
 
         if not os.path.exists(local_filename):
             logger.error(f"Excel file not found at {local_filename}")
