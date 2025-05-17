@@ -797,11 +797,7 @@ async def api_process_ai_images(
             "timestamp": timestamp
         }
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter,
-from logging_config import setup_job_logger
-from aws_s3 import upload_file_to_space, upload_file_to_space_sync
-import logging
-import asyncio
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 import os
 import json
 import traceback
