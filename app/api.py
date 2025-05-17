@@ -33,7 +33,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from ai_utils import batch_vision_reason
-
+from endpoint_utils import sync_get_endpoint
 app = FastAPI(title="super_scraper", version=VERSION)
 
 default_logger = logging.getLogger(__name__)
