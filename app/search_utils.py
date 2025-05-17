@@ -6,7 +6,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import conn_str, async_engine
-from common import clean_string, normalize_model, validate_model, validate_brand, calculate_priority, generate_aliases, generate_brand_aliases
+from common import clean_string, normalize_model, validate_model, validate_brand, generate_aliases, generate_brand_aliases
 import psutil
 import pyodbc
 
@@ -175,10 +175,15 @@ async def update_search_sort_order(
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
-            # Pass all required arguments to calculate_priority
-            res["priority"] = calculate_priority(
-                model_matched, brand_matched, model_clean, model_aliases, brand_clean, brand_aliases
-            )
+            # Inline priority calculation without Pandas
+            if model_matched and brand_matched:
+                res["priority"] = 1
+            elif model_matched:
+                res["priority"] = 2
+            elif brand_matched:
+                res["priority"] = 3
+            else:
+                res["priority"] = 4
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
         sorted_results = sorted(results, key=lambda x: x["priority"])
