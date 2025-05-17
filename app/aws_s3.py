@@ -167,6 +167,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
 
     if not os.path.exists(file_src):
         logger.error(f"Local file does not exist: {file_src}")
+        await log_upload_to_db(file_id, file_src, save_as, None, None, None, "FAILED", logger)
         raise FileNotFoundError(f"Local file does not exist: {file_src}")
 
     content_type, _ = mimetypes.guess_type(file_src)
@@ -174,12 +175,39 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         content_type = 'text/plain' if file_src.endswith('.log') else 'application/octet-stream'
         logger.warning(f"Could not determine Content-Type for {file_src}, using {content_type}")
 
-    # Log file details
     file_size = os.path.getsize(file_src)
     logger.info(f"Uploading file: {file_src}, size: {file_size / 1024:.2f} KB, save_as: {save_as}")
 
-    # Upload to S3
+    # Attempt R2 upload
     max_attempts = 3
+    r2_success = False
+    for attempt in range(max_attempts):
+        try:
+            async with get_s3_client(service='r2', logger=logger, file_id=file_id) as r2_client:
+                logger.info(f"Uploading {file_src} to R2: {S3_CONFIG['r2_bucket_name']}/{save_as}")
+                with open(file_src, 'rb') as file:
+                    await r2_client.put_object(
+                        Bucket=S3_CONFIG['r2_bucket_name'],
+                        Key=save_as,
+                        Body=file,
+                        ACL='public-read' if is_public else 'private',
+                        ContentType=content_type
+                    )
+                double_encoded_key = double_encode_plus(save_as, logger=logger)
+                r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
+                logger.info(f"Uploaded {file_src} to R2: {r2_url} with Content-Type: {content_type}")
+                result_urls['r2'] = r2_url
+                r2_success = True
+                break
+        except Exception as e:
+            if attempt < max_attempts - 1 and 'SignatureDoesNotMatch' in str(e):
+                logger.warning(f"SignatureDoesNotMatch on attempt {attempt + 1}, retrying after delay...")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            logger.error(f"Failed to upload {file_src} to R2: {e}", exc_info=True)
+            break
+
+    # Attempt S3 upload (regardless of R2 success)
     for attempt in range(max_attempts):
         try:
             async with get_s3_client(service='s3', logger=logger, file_id=file_id) as s3_client:
@@ -203,35 +231,24 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                 await asyncio.sleep(2 ** attempt)
                 continue
             logger.error(f"Failed to upload {file_src} to S3: {e}", exc_info=True)
-            raise
+            break
 
-    # Upload to R2 with retries
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            async with get_s3_client(service='r2', logger=logger, file_id=file_id) as r2_client:
-                logger.info(f"Uploading {file_src} to R2: {S3_CONFIG['r2_bucket_name']}/{save_as}")
-                with open(file_src, 'rb') as file:
-                    await r2_client.put_object(
-                        Bucket=S3_CONFIG['r2_bucket_name'],
-                        Key=save_as,
-                        Body=file,
-                        ACL='public-read' if is_public else 'private',
-                        ContentType=content_type
-                    )
-                double_encoded_key = double_encode_plus(save_as, logger=logger)
-                r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
-                logger.info(f"Uploaded {file_src} to R2: {r2_url} with Content-Type: {content_type}")
-                result_urls['r2'] = r2_url
-                break
-        except Exception as e:
-            if attempt < max_attempts - 1 and 'SignatureDoesNotMatch' in str(e):
-                logger.warning(f"SignatureDoesNotMatch on attempt {attempt + 1}, retrying after delay...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            logger.error(f"Failed to upload {file_src} to R2: {e}", exc_info=True)
-            break  # Don't raise, allow process to continue
+    # Log to database
+    status = "SUCCESS" if r2_success or result_urls.get('s3') else "FAILED"
+    await log_upload_to_db(
+        file_id=file_id,
+        file_src=file_src,
+        save_as=save_as,
+        content_type=content_type,
+        r2_url=result_urls.get('r2'),
+        s3_url=result_urls.get('s3'),
+        status=status,
+        logger=logger
+    )
 
-    if is_public and result_urls.get('s3'):
+    # Prioritize R2 URL if available, fallback to S3
+    if is_public and result_urls.get('r2'):
+        return result_urls['r2']
+    elif is_public and result_urls.get('s3'):
         return result_urls['s3']
     return None
