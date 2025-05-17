@@ -156,7 +156,7 @@ def double_encode_plus(filename, logger=None):
     return second_pass
 
 async def upload_file_to_space(file_src, save_as, is_public=True, public=None, logger=None, file_id=None):
-    logger = logger or default_logger  # Initialize logger first
+    logger = logger or default_logger  # Initialize first
     if logger == default_logger and file_id:
         logger, _ = setup_job_logger(job_id=file_id, console_output=True)
         logger.info(f"Setup logger for upload_file_to_space, FileID: {file_id}")
