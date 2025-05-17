@@ -365,7 +365,152 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
     except Exception as e:
         logger.error(f"Error updating entries for FileID: {file_id}, error: {str(e)}")
         return None
+import logging
+import pyodbc
+from typing import Optional, List, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from database_config import conn_str  # Import conn_str from database_config
 
+# Existing database functions (e.g., update_sort_order_per_entry, get_send_to_email) would be here
+# For brevity, only adding update_initial_sort_order
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(pyodbc.Error),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_initial_sort_order for FileID {retry_state.kwargs['file_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+    """
+    Perform an initial sort order update for all entries under a given file_id.
+    Sets SortOrder based on match_score from AiJson, with fallback to ResultID.
+    Returns a list of updated records for verification.
+    """
+    logger = logger or logging.getLogger(__name__)
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting initial SortOrder update for FileID: {file_id}")
+
+        with pyodbc.connect(conn_str, autocommit=False) as conn:
+            cursor = conn.cursor()
+
+            # Fetch all results for the file_id
+            cursor.execute(
+                """
+                SELECT 
+                    t.ResultID,
+                    t.EntryID,
+                    CASE WHEN ISJSON(t.AiJson) = 1 
+                         THEN ISNULL(TRY_CAST(JSON_VALUE(t.AiJson, '$.match_score') AS FLOAT), 0)
+                         ELSE 0 END AS match_score,
+                    t.ImageDesc,
+                    t.ImageSource,
+                    t.ImageUrl,
+                    t.SortOrder
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+                """,
+                (file_id,)
+            )
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            if not rows:
+                logger.warning(f"No data found for FileID: {file_id}")
+                return []
+
+            # Process results
+            results = [dict(zip(columns, row)) for row in rows]
+            updates = []
+            for result in results:
+                result_id = result['ResultID']
+                match_score = result['match_score']
+                # Assign SortOrder: positive for valid match_score (>0), -2 for invalid or zero
+                new_sort_order = int(match_score * 100) if match_score > 0 else -2
+                updates.append((result_id, new_sort_order))
+
+            # Reset existing SortOrder
+            cursor.execute(
+                "UPDATE utb_ImageScraperResult SET SortOrder = NULL WHERE EntryID IN "
+                "(SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?)",
+                (file_id,)
+            )
+
+            # Apply updates
+            if updates:
+                values_clause = ", ".join(f"({result_id}, {sort_order})" for result_id, sort_order in updates)
+                cursor.execute(
+                    f"""
+                    UPDATE utb_ImageScraperResult
+                    SET SortOrder = v.sort_order
+                    FROM (VALUES {values_clause}) AS v(result_id, sort_order)
+                    WHERE utb_ImageScraperResult.ResultID = v.result_id
+                    """
+                )
+                logger.info(f"Updated {len(updates)} rows for FileID: {file_id}")
+
+            # Verify and fix NULL SortOrder
+            cursor.execute(
+                """
+                SELECT 
+                    COUNT(*) AS total_count,
+                    SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                    SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+                """,
+                (file_id,)
+            )
+            row = cursor.fetchone()
+            total_count, positive_count, null_count = row
+            logger.info(f"Verification for FileID {file_id}: {total_count} total rows, "
+                       f"{positive_count} positive SortOrder, {null_count} NULL SortOrder")
+            if null_count > 0:
+                logger.warning(f"Found {null_count} rows with NULL SortOrder for FileID {file_id}")
+                cursor.execute(
+                    "UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID IN "
+                    "(SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = ?) AND SortOrder IS NULL",
+                    (file_id,)
+                )
+                logger.info(f"Set {null_count} NULL SortOrder rows to -2 for FileID: {file_id}")
+
+            # Fetch updated results
+            cursor.execute(
+                """
+                SELECT ResultID, EntryID, SortOrder, ImageDesc, ImageSource, ImageUrl
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON r.EntryID = t.EntryID
+                WHERE r.FileID = ?
+                ORDER BY SortOrder DESC
+                """,
+                (file_id,)
+            )
+            final_results = [
+                {
+                    "ResultID": r[0],
+                    "EntryID": r[1],
+                    "SortOrder": r[2],
+                    "ImageDesc": r[3],
+                    "ImageSource": r[4],
+                    "ImageUrl": r[5]
+                }
+                for r in cursor.fetchall()
+            ]
+
+            conn.commit()
+            logger.info(f"Completed initial SortOrder update for FileID: {file_id} with {len(final_results)} results")
+            return final_results
+
+    except pyodbc.Error as e:
+        logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error for FileID {file_id}: {e}", exc_info=True)
+        return None
 import logging
 import pandas as pd
 import re
