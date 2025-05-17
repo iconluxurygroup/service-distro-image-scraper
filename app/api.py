@@ -234,6 +234,7 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
         )
     except SQLAlchemyError as e:
         logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
         logger.error(f"Error queuing download file for FileID {file_id}: {e}", exc_info=True)
@@ -242,12 +243,13 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
 
 @router.get("/job-status/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_get_job_status(file_id: str):
-    logger, _ = setup_job_logger(job_id=file_id, console_output=True)
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     logger.info(f"Checking job status for FileID: {file_id}")
     
     job_status = JOB_STATUS.get(file_id)
     if not job_status:
         logger.warning(f"No job found for FileID: {file_id}")
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=404, detail=f"No job found for FileID {file_id}")
     
     return JobStatusResponse(
@@ -260,22 +262,28 @@ async def api_get_job_status(file_id: str):
 
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     result = await run_job_with_logging(update_sort_order, file_id)
     if result["status_code"] != 200:
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
     return result
 
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     result = await run_job_with_logging(update_initial_sort_order, file_id)
     if result["status_code"] != 200:
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
     return result
 
 @router.get("/no-image-sort/{file_id}", tags=["Sorting"])
 async def api_no_image_sort(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     result = await run_job_with_logging(update_sort_no_image_entry, file_id)
     if result["status_code"] != 200:
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=result["status_code"], detail=result["message"])
     return result
 
@@ -295,6 +303,7 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         )
         if "error" in result:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=500, detail=result["error"])
         
         if background_tasks:
@@ -336,6 +345,7 @@ async def api_restart_search_all(
                 endpoint_errors = debug_info.get("endpoint_errors", [])
                 for error in endpoint_errors:
                     logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
         
         if background_tasks:
@@ -378,6 +388,7 @@ async def api_process_ai_images(
         
         if result["status_code"] != 200:
             logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
         
         if background_tasks:
