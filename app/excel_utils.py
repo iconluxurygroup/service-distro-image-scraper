@@ -1,5 +1,7 @@
 import os
 import logging
+import asyncio
+import aiofiles.os
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
@@ -146,27 +148,30 @@ def resize_image(image_path, logger=None):
         logger.error(f"❌ Error resizing image: {e}, for image: {image_path}", exc_info=True)
         return False
 
-def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="A", row_offset=5, logger=None):
-    """Write one image per entry to an Excel file starting at row 6, removing unneeded rows, trying multiple sort orders."""
+async def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="A", row_offset=5, logger=None, sort_by='ExcelRowID'):
+    """Write one image per entry to an Excel file starting at row 6, removing unneeded rows, with optional sorting."""
     logger = logger or default_logger
     failed_rows = []
 
     try:
-        logger.debug(f"📂 Loading workbook from {local_filename}")
-        wb = load_workbook(local_filename)
+        # Run synchronous openpyxl load_workbook in executor
+        loop = asyncio.get_running_loop()
+        wb = await loop.run_in_executor(None, load_workbook, local_filename)
         ws = wb.active
+        logger.debug(f"📂 Loaded workbook from {local_filename}")
 
         if ws.max_row < 5:
             logger.error(f"❌ Excel file must have at least 5 rows for header")
             return failed_rows
 
         logger.info(f"🖼️ Processing images for {local_filename}")
-        if not os.path.exists(temp_dir):
+        # Async check for temp_dir existence
+        if not await aiofiles.os.path.exists(temp_dir):
             logger.error(f"❌ Temp directory does not exist: {temp_dir}")
             return failed_rows
 
-        # Clean and list image files
-        image_files = [clean_string(f, is_url=False) for f in os.listdir(temp_dir)]
+        # Async list directory
+        image_files = [clean_string(f, is_url=False) async for f in aiofiles.os.scandir(temp_dir) if f.is_file()]
         if not image_files:
             logger.warning(f"⚠️ No images found in {temp_dir}")
             return failed_rows
@@ -186,101 +191,68 @@ def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="
                 logger.warning(f"⚠️ Invalid ExcelRowID: {cleaned_item['ExcelRowID']}")
                 continue
             cleaned_data.append(cleaned_item)
-            logger.debug(f"🧹 Cleaned item: {cleaned_item}")
         logger.info(f"🧹 Cleaned {len(cleaned_data)} of {len(image_data)} entries")
 
-        # Create image map
+        # Sort image_data
+        if sort_by == 'SortOrder':
+            cleaned_data.sort(key=lambda x: (x['SortOrder'], -1 if x['ExcelRowID'] >= 2 else 0, x['ExcelRowID']))
+            logger.info("📊 Sorted by SortOrder, prioritizing later entries")
+        else:
+            cleaned_data.sort(key=lambda x: x['ExcelRowID'])
+            logger.info("📊 Sorted by ExcelRowID")
+
+        # Create a map of ExcelRowID to filename
         image_map = {}
         for f in image_files:
             if '_' in f and f.split('_')[0].isdigit():
                 row_id = int(f.split('_')[0])
                 image_map[row_id] = f
 
-        # Define sorting strategies
-        sort_strategies = [
-            ('SortOrder', lambda x: (x['SortOrder'], -1 if x['ExcelRowID'] >= 2 else 0, x['ExcelRowID'])),
-            ('ImageAvailability', lambda x: (0 if x['ExcelRowID'] in image_map else 1, -1 if x['ExcelRowID'] >= 2 else 0, x['ExcelRowID'])),
-            ('Brand', lambda x: (x['Brand'].lower(), -1 if x['ExcelRowID'] >= 2 else 0, x['ExcelRowID'])),
-            ('ExcelRowID', lambda x: x['ExcelRowID'])
-        ]
-
-        best_failed_rows = []
-        min_failures = float('inf')
-        best_sorted_data = cleaned_data
-
-        # Try each sort strategy
-        for strategy_name, sort_key in sort_strategies:
-            failed_rows.clear()
-            logger.info(f"📊 Trying sort strategy: {strategy_name}")
-            sorted_data = sorted(cleaned_data, key=sort_key)
-            logger.debug(f"📊 Sorted order: {[item['ExcelRowID'] for item in sorted_data]}")
-
-            # Process entries
-            for item in sorted_data:
-                row_id = item['ExcelRowID']
-                row_number = row_id + row_offset
-
-                success = False
-                if row_id in image_map:
-                    image_file = image_map[row_id]
-                    image_path = os.path.join(temp_dir, image_file)
-                    for attempt in range(2):  # Try twice
-                        if verify_png_image_single(image_path, logger=logger):
-                            img = Image(image_path)
-                            anchor = f"{column}{row_number}"
-                            img.anchor = anchor
-                            ws.add_image(img)
-                            logger.info(f"✅ Image added at {anchor} (attempt {attempt+1})")
-                            success = True
-                            break
-                        logger.warning(f"⚠️ Image verification failed for {image_file} (attempt {attempt+1})")
-                        # Retry with cleaned filename
-                        image_path = os.path.join(temp_dir, clean_string(image_file, is_url=False))
-
-                if not success:
-                    logger.warning(f"⚠️ No image found or verification failed for row {row_id}")
-                    failed_rows.append(row_id)
-
-                # Populate cleaned data
-                ws[f"B{row_number}"] = item['Brand']
-                ws[f"D{row_number}"] = item['Style']
-                ws[f"E{row_number}"] = item['Color']
-                ws[f"H{row_number}"] = item['Category']
-                logger.debug(f"✍️ Wrote data for row {row_number}: {item}")
-
-                # Validate
-                if not ws[f"B{row_number}"].value:
-                    logger.warning(f"⚠️ Missing Brand in B{row_number}")
-                if not ws[f"D{row_number}"].value:
-                    logger.warning(f"⚠️ Missing Style in D{row_number}")
-
-            logger.info(f"📊 Sort strategy {strategy_name} completed with {len(failed_rows)} failures")
-            if len(failed_rows) < min_failures:
-                min_failures = len(failed_rows)
-                best_failed_rows = failed_rows.copy()
-                best_sorted_data = sorted_data
-                wb.save(local_filename + f".{strategy_name}.xlsx")  # Save for debugging
-            if min_failures == 0:
-                break
-
-        # Use best sorted data for final output
-        failed_rows = best_failed_rows
-        for item in best_sorted_data:
+        # Process each entry
+        for item in cleaned_data:
             row_id = item['ExcelRowID']
             row_number = row_id + row_offset
+
+            if row_id in image_map:
+                image_file = image_map[row_id]
+                image_path = os.path.join(temp_dir, image_file)
+                # Run synchronous verify_png_image_single in executor
+                success = await loop.run_in_executor(None, verify_png_image_single, image_path, logger)
+                if success:
+                    img = Image(image_path)
+                    anchor = f"{column}{row_number}"
+                    img.anchor = anchor
+                    ws.add_image(img)
+                    logger.info(f"✅ Image added at {anchor}")
+                else:
+                    failed_rows.append(row_id)
+                    logger.warning(f"⚠️ Image verification failed for {image_file}")
+            else:
+                logger.warning(f"⚠️ No image found for row {row_id}")
+                failed_rows.append(row_id)
+
+            # Populate cleaned data
             ws[f"B{row_number}"] = item['Brand']
             ws[f"D{row_number}"] = item['Style']
             ws[f"E{row_number}"] = item['Color']
             ws[f"H{row_number}"] = item['Category']
+            logger.debug(f"✍️ Wrote data for row {row_number}: {item}")
+
+            # Validate
+            if not ws[f"B{row_number}"].value:
+                logger.warning(f"⚠️ Missing Brand in B{row_number}")
+            if not ws[f"D{row_number}"].value:
+                logger.warning(f"⚠️ Missing Style in D{row_number}")
 
         # Remove unneeded rows
-        max_data_row = max(item['ExcelRowID'] for item in best_sorted_data) + row_offset
+        max_data_row = max(item['ExcelRowID'] for item in cleaned_data) + row_offset
         if ws.max_row > max_data_row:
             logger.info(f"🗑️ Removing rows {max_data_row + 1} to {ws.max_row}")
             ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
 
-        wb.save(local_filename)
-        logger.info(f"🏁 Finished processing images with best strategy (failures: {len(failed_rows)})")
+        # Run synchronous wb.save in executor
+        await loop.run_in_executor(None, wb.save, local_filename)
+        logger.info("🏁 Finished processing images")
         return failed_rows
 
     except Exception as e:
@@ -347,13 +319,11 @@ def write_failed_downloads_to_excel(failed_downloads, excel_file, logger=None):
                     cell_reference = f"{get_column_letter(1)}{row_id}"
                     logger.debug(f"✍️ Writing URL {cleaned_url} to cell {cell_reference}")
                     ws[cell_reference] = cleaned_url
-                    for attempt in range(2):
-                        try:
-                            highlight_cell(excel_file, cell_reference, logger=logger)
-                            break
-                        except ValueError as e:
-                            logger.warning(f"⚠️ Highlight attempt {attempt+1} failed for {cell_reference}: {e}")
-                            continue
+                    try:
+                        highlight_cell(excel_file, cell_reference, logger=logger)
+                    except ValueError as e:
+                        logger.warning(f"⚠️ Skipping highlight for {cell_reference}: {e}")
+                        continue
             
             logger.debug(f"💾 Saving workbook to {excel_file}")
             wb.save(excel_file)
