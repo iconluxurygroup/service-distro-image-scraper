@@ -15,7 +15,7 @@ from logging_config import setup_job_logger
 from aws_s3 import upload_file_to_space, upload_file_to_space_sync
 from email_utils import send_message_email
 from workflow import generate_download_file, process_restart_batch, batch_vision_reason
-from database import (
+from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
     fetch_last_valid_entry,
