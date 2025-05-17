@@ -59,7 +59,7 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
         current_time = time.time()
         key = (log_filename, file_id)
 
-        LAST_UPLOAD = {}  # Local cache for deduplication
+        LAST_UPLOAD = {}
         if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
             logger.info(f"Skipping redundant upload for {log_filename}")
             return LAST_UPLOAD[key]["url"]
@@ -396,9 +396,7 @@ async def generate_download_file(
 
         template_file_path = "https://iconluxurygroup.s3.us-east-2.amazonaws.com/ICON_DISTRO_USD_20250312.xlsx"
         base_name, extension = os.path.splitext(original_filename)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        unique_id = base_name[-8:] if len(base_name) >= 8 else base_name
-        processed_file_name = f"super_scraper/jobs/{file_id}/{base_name}_scraper_{timestamp}_{unique_id}{extension}"
+        processed_file_name = f"excel_files/{file_id}/{base_name}{extension}"
 
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id, logger=logger)
         local_filename = os.path.join(temp_excel_dir, original_filename)
@@ -456,7 +454,7 @@ async def generate_download_file(
             return {"error": f"Excel file not found", "log_filename": log_filename}
         logger.debug(f"Excel file exists: {local_filename}, size: {os.path.getsize(local_filename)} bytes")
 
-        logger.debug(f"Uploading Excel file to R2: {processed_file_name}")
+        logger.info(f"Uploading Excel file to R2: {processed_file_name}")
         public_url = await upload_file_to_space(
             file_src=local_filename,
             save_as=processed_file_name,
@@ -468,7 +466,7 @@ async def generate_download_file(
         if not public_url:
             logger.error(f"Upload failed for ID {file_id}")
             return {"error": "Failed to upload processed file", "log_filename": log_filename}
-        logger.info(f"File uploaded to R2, public_url: {public_url}")
+        logger.info(f"Excel file uploaded to R2, public_url: {public_url}")
 
         await update_file_location_complete(str(file_id), public_url, logger=logger)
         await update_file_generate_complete(str(file_id), logger=logger)
@@ -483,7 +481,8 @@ async def generate_download_file(
         subject_line = f"{original_filename} Job Notification{' - No Images' if not has_valid_images else ''}"
         user_message = (
             f"Excel file generation for FileID {file_id} {'completed successfully' if has_valid_images else 'completed with no valid images'}.\n"
-            f"Download Excel file: {public_url}"
+            f"Download Excel file: {public_url}\n"
+            f"Log file: {log_public_url or log_filename}"
         )
         logger.debug(f"Scheduling user email to {send_to_email_addr} with public_url: {public_url}, message: {user_message}")
         background_tasks.add_task(
@@ -501,7 +500,8 @@ async def generate_download_file(
             f"Successful entries: {successful_entries}/{len(entries)}\n"
             f"Failed entries: {failed_entries}\n"
             f"Last EntryID: {max(entries) if entries else 0}\n"
-            f"Log file: {log_filename}"
+            f"Excel file: {public_url}\n"
+            f"Log file: {log_public_url or log_filename}"
         )
         logger.debug(f"Scheduling admin email to {admin_email} with message: {admin_message}")
         background_tasks.add_task(
@@ -516,14 +516,15 @@ async def generate_download_file(
         return {
             "message": "Processing completed successfully" if has_valid_images else "No valid images found, empty Excel file generated",
             "public_url": public_url,
-            "log_filename": log_filename
+            "log_filename": log_filename,
+            "log_public_url": log_public_url or ""
         }
     except Exception as e:
         logger.error(f"Error for ID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(str(file_id), log_filename, logger)
         send_to_email_addr = await get_send_to_email(file_id, logger=logger)
         if send_to_email_addr:
-            error_message = f"Excel file generation for FileID {file_id} failed.\nError: {str(e)}\nLog file: {log_filename}"
+            error_message = f"Excel file generation for FileID {file_id} failed.\nError: {str(e)}\nLog file: {log_public_url or log_filename}"
             logger.debug(f"Scheduling error email to {send_to_email_addr} with message: {error_message}")
             background_tasks.add_task(
                 send_message_email,
@@ -532,7 +533,7 @@ async def generate_download_file(
                 message=error_message,
                 logger=logger
             )
-        return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename}
+        return {"error": f"An error occurred: {str(e)}", "log_filename": log_filename, "log_public_url": log_public_url or ""}
     finally:
         if temp_images_dir and temp_excel_dir:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir], logger=logger)
