@@ -127,6 +127,16 @@ async def insert_search_results(
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((SQLAlchemyError, ValueError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -227,40 +237,36 @@ async def update_search_sort_order(
                 logger.warning(f"Worker PID {process.pid}: No eligible data found for FileID: {file_id}, EntryID: {entry_id}")
                 return False
 
-            # Convert rows to list of dicts for processing
+            # Convert rows to list of dicts
             results = [dict(zip(columns, row)) for row in rows]
             logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
-            # Clean result fields and prepare for filtering
+            # Clean result fields and prepare for processing
             for res in results:
                 for col in ["ImageDesc", "ImageSource", "ImageUrl", "ProductBrand", "ProductModel"]:
                     res[f"{col}_clean"] = clean_string(res.get(col, '')) if res.get(col) else ''
                 res["priority"] = None
                 res["new_sort_order"] = -2  # Default sort order
 
-            # Filter model results (adapted for list of dicts)
-            exact_results = []
-            discarded_results = []
-            for res in results:
-                # Simulate DataFrame row for compatibility with validate_model
-                row_proxy = type('RowProxy', (), {
-                    col: res.get(col, '') for col in ["ImageDesc_clean", "ImageSource_clean", "ImageUrl_clean", "ProductBrand_clean", "ProductModel_clean", "ResultID"]
-                })()
-                if await asyncio.get_event_loop().run_in_executor(None, lambda: validate_model(row_proxy, model_aliases, res["ResultID"], logger)):
-                    exact_results.append(res)
-                else:
-                    discarded_results.append(res)
+            # Filter model results
+            exact_results, discarded_results = await filter_model_results(results, debug=True, logger=logger, brand_aliases=brand_aliases)
             logger.info(f"Worker PID {process.pid}: Filtered {len(exact_results)} exact matches and {len(discarded_results)} discarded rows for EntryID {entry_id}")
 
             # Calculate priorities
             for res in results:
-                # Simulate DataFrame row for calculate_priority
-                row_proxy = type('RowProxy', (), {
-                    col: res.get(col, '') for col in ["ImageDesc_clean", "ImageSource_clean", "ImageUrl_clean", "ProductBrand_clean", "ProductModel_clean", "ResultID", "match_score"]
-                })()
+                row_proxy = {
+                    'ImageDesc_clean': res['ImageDesc_clean'],
+                    'ImageSource_clean': res['ImageSource_clean'],
+                    'ImageUrl_clean': res['ImageUrl_clean'],
+                    'ProductBrand_clean': res['ProductBrand_clean'],
+                    'ProductModel_clean': res['ProductModel_clean'],
+                    'ResultID': res['ResultID'],
+                    'match_score': res['match_score'],
+                    'get': lambda key, default='': res.get(key, default)
+                }
                 res["priority"] = calculate_priority(
                     row_proxy, 
-                    pd.DataFrame(exact_results),  # Temporary DataFrame for compatibility; minimal impact as it's small
+                    exact_results, 
                     model_clean, 
                     model_aliases, 
                     brand_clean, 
@@ -271,19 +277,25 @@ async def update_search_sort_order(
 
             # Process matches
             match_results = [res for res in results if res["priority"] in [1, 2, 3]]
-            domain_hierarchy = None  # Assuming same as original; adjust if needed
+            domain_hierarchy = None  # Assuming same as original
             if match_results:
                 # Sort by priority and match_score
-                match_results.sort(key=lambda x: (x["priority"], -x["match_score"]))  # Descending match_score
+                match_results.sort(key=lambda x: (x["priority"], -x["match_score"]))
                 valid_results = []
                 for res in match_results:
-                    row_proxy = type('RowProxy', (), {
-                        col: res.get(col, '') for col in ["ImageDesc_clean", "ImageSource_clean", "ImageUrl_clean", "ProductBrand_clean", "ProductModel_clean", "ResultID"]
-                    })()
-                    if res["priority"] in [1, 2] and await asyncio.get_event_loop().run_in_executor(None, lambda: validate_model(row_proxy, model_aliases, res["ResultID"], logger)):
+                    row_proxy = {
+                        'ImageDesc_clean': res['ImageDesc_clean'],
+                        'ImageSource_clean': res['ImageSource_clean'],
+                        'ImageUrl_clean': res['ImageUrl_clean'],
+                        'ProductBrand_clean': res['ProductBrand_clean'],
+                        'ProductModel_clean': res['ProductModel_clean'],
+                        'ResultID': res['ResultID'],
+                        'get': lambda key, default='': res.get(key, default)
+                    }
+                    if res["priority"] in [1, 2] and validate_model(row_proxy, model_aliases, res["ResultID"], logger):
                         valid_results.append(res)
                     elif res["priority"] == 3:
-                        brand_found = await asyncio.get_event_loop().run_in_executor(None, lambda: validate_brand(row_proxy, brand_aliases, res["ResultID"], domain_hierarchy, logger))
+                        brand_found = validate_brand(row_proxy, brand_aliases, res["ResultID"], domain_hierarchy, logger)
                         if brand_found:
                             valid_results.append(res)
                         else:
@@ -292,7 +304,7 @@ async def update_search_sort_order(
                             res["priority"] = 4
                     else:
                         logger.warning(f"Worker PID {process.pid}: Model validation failed for ResultID {res['ResultID']}, checking brand")
-                        brand_found = await asyncio.get_event_loop().run_in_executor(None, lambda: validate_brand(row_proxy, brand_aliases, res["ResultID"], domain_hierarchy, logger))
+                        brand_found = validate_brand(row_proxy, brand_aliases, res["ResultID"], domain_hierarchy, logger)
                         res["new_sort_order"] = -2 if not brand_found else None
                         res["priority"] = 4 if not brand_found else 3
                         if brand_found:
