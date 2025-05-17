@@ -14,8 +14,8 @@ def extract_thumbnail_url(url: str, logger: Optional[logging.Logger] = None) -> 
         # Detect Google thumbnail URL
         if 'tbn' in url.lower():
             logger.debug("Detected Google thumbnail URL")
-            # Extract thumbnail ID (between 'tbn' or 'tbn:' and '&s', '\&s', or end)
-            tbn_match = re.search(r'tbn[:%3A]?([A-Za-z0-9_-]+)(?:[\\&]?s|$)', url, re.IGNORECASE)
+            # Extract thumbnail ID (after 'tbn' or 'tbn:' or 'q\=tbn', before '&s', '\&s', or end)
+            tbn_match = re.search(r'(?:tbn[:%3A]?|q\\=tbn)([A-Za-z0-9_-]+)(?:[\\&]?s|$)', url, re.IGNORECASE)
             if tbn_match:
                 thumbnail_id = tbn_match.group(1)
                 # Rebuild using template
@@ -23,7 +23,8 @@ def extract_thumbnail_url(url: str, logger: Optional[logging.Logger] = None) -> 
                 logger.debug(f"Rebuilt thumbnail URL: {rebuilt_url}")
                 return rebuilt_url
             else:
-                logger.warning("Failed to extract thumbnail ID")
+                logger.warning(f"Failed to extract thumbnail ID from {url}")
+                return url
         # Return unchanged for non-Google URLs
         logger.debug("Non-Google URL, returning unchanged")
         return url
