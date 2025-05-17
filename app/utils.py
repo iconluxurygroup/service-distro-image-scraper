@@ -424,8 +424,6 @@ async def search_variation(
             "error": str(e)
         }
 
-    
-
 async def process_single_all(
     entry_id: int,
     search_string: str,
@@ -439,7 +437,7 @@ async def process_single_all(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    logger = logger or logging.getLogger(__name__)
+    logger = logger or default_logger
     process = psutil.Process()
     
     try:
@@ -508,338 +506,55 @@ async def process_single_all(
         if search_type not in variations:
             logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found in variations for EntryID {entry_id}")
             continue
-        logger.info(f"Worker PID {process.pid}: Processing search type '{search_type}' for EntryID {entry_id} with variations: {variations[search_type]}")
-        results = []
+        logger.info(f"Worker PID {process.pid}: Processing search type '{search_type}' for EntryID {entry_id}")
         for variation in variations[search_type]:
-            mem_info = process.memory_info()
-            logger.debug(f"Worker PID {process.pid}: Memory before searching variation: RSS={mem_info.rss / 1024**2:.2f} MB")
-            result = await search_variation(variation, endpoint, entry_id, search_type, result_brand, result_category, logger)
-            results.append(result)
-        successful_results = [res for res in results if res["status"] == "success" and res["result"]]
-        if successful_results:
-            result_count = sum(len(res["result"]) for res in successful_results)
-            all_results.extend([item for res in successful_results for item in res["result"]])
-            logger.info(f"Worker PID {process.pid}: Found {len(successful_results)} successful variations with {result_count} total results for search type '{search_type}' for EntryID {entry_id}")
-        else:
-            logger.info(f"Worker PID {process.pid}: No successful results for search type '{search_type}' for EntryID {entry_id}")
-
-    if all_results:
-        try:
-            mem_info = process.memory_info()
-            logger.debug(f"Worker PID {process.pid}: Memory before combining results: RSS={mem_info.rss / 1024**2:.2f} MB")
-            combined_results = []
-            for res in all_results:
-                new_res = {}
-                for key, value in res.items():
-                    new_key = api_to_db_mapping.get(key, key)
-                    new_res[new_key] = value
-                combined_results.append(new_res)
-            logger.info(f"Worker PID {process.pid}: Combined {len(combined_results)} results from all search types for EntryID {entry_id}")
-            
-            for res in combined_results:
-                for col in required_columns:
-                    if col not in res:
-                        logger.warning(f"Worker PID {process.pid}: Missing column {col} in result for EntryID {entry_id}")
-                        res[col] = ''
-            
-            deduplicated_results = []
-            seen = set()
-            for res in combined_results:
-                key = (res['EntryID'], res['ImageUrl'])
-                if key not in seen:
-                    seen.add(key)
-                    deduplicated_results.append(res)
-            logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
-            
-            insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
-            if not insert_success:
-                logger.error(f"Worker PID {process.pid}: Failed to insert deduplicated results for EntryID {entry_id}")
-                return False
-            logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_results)} results for EntryID {entry_id}")
-            
-            update_result = await update_search_sort_order(
-                file_id=str(file_id_db),
-                entry_id=str(entry_id),
+            logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
+            search_result = await search_variation(
+                variation=variation,
+                endpoint=endpoint,
+                entry_id=entry_id,
+                search_type=search_type,
                 brand=result_brand,
-                model=result_model,
-                color=result_color,
                 category=result_category,
-                logger=logger,
-                brand_rules=brand_rules
-            )
-            if update_result is None or not update_result:
-                logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
-                return False
-            logger.info(f"Worker PID {process.pid}: Updated sort order for EntryID {entry_id}")
-
-            logger.info(f"Worker PID {process.pid}: Starting AI analysis for EntryID {entry_id}")
-            ai_result = await batch_vision_reason(
-                file_id=str(file_id_db),
-                entry_ids=[entry_id],
-                step=0,
-                limit=1000,
-                concurrency=5,
                 logger=logger
             )
-            if ai_result.get("status_code") != 200:
-                logger.error(f"Worker PID {process.pid}: AI analysis failed for EntryID {entry_id}: {ai_result.get('message')}")
-                return False
-            logger.info(f"Worker PID {process.pid}: Completed AI analysis for EntryID {entry_id} with {len(ai_result.get('data', []))} results")
+            if search_result["status"] == "success" and search_result["result"]:
+                logger.info(f"Worker PID {process.pid}: Found {search_result['result_count']} results for variation '{variation}' in search type '{search_type}'")
+                all_results.extend(search_result["result"])
+            else:
+                logger.warning(f"Worker PID {process.pid}: No valid results for variation '{variation}' in search type '{search_type}'")
 
-            try:
-                async with async_engine.connect() as conn:
-                    result = await conn.execute(
-                        text("""
-                            SELECT 
-                                COUNT(*) AS total_count,
-                                SUM(CASE WHEN SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                                SUM(CASE WHEN SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                            FROM utb_ImageScraperResult 
-                            WHERE EntryID = :entry_id
-                        """),
-                        {"entry_id": entry_id}
-                    )
-                    row = result.fetchone()
-                    total_count, positive_count, null_count = row
-                    logger.info(f"Worker PID {process.pid}: Verification: {total_count} total rows, {positive_count} positive SortOrder, {null_count} NULL SortOrder for EntryID {entry_id}")
-                    if null_count > 0:
-                        logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                        await conn.execute(
-                            text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND SortOrder IS NULL"),
-                            {"entry_id": entry_id}
-                        )
-                        await conn.commit()
-                        logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder rows to -2 for EntryID {entry_id}")
-                    if total_count == 0:
-                        logger.error(f"Worker PID {process.pid}: No rows found in utb_ImageScraperResult for EntryID {entry_id} after insertion")
-                        return False
-                    result.close()
-            except SQLAlchemyError as e:
-                logger.error(f"Worker PID {process.pid}: Failed to verify SortOrder for EntryID {entry_id}: {e}", exc_info=True)
-                return False
-            mem_info = process.memory_info()
-            logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
-            return True
-        except SQLAlchemyError as e:
-            logger.error(f"Worker PID {process.pid}: Database error during batch update for EntryID {entry_id}: {e}", exc_info=True)
-            raise
-        except Exception as e:
-            logger.error(f"Worker PID {process.pid}: Error during batch database update for EntryID {entry_id}: {e}", exc_info=True)
-            return False
+        if all_results:
+            logger.info(f"Worker PID {process.pid}: Found {len(all_results)} total results for search type '{search_type}' for EntryID {entry_id}")
+            break  # Stop after finding results for one search type
 
-    logger.info(f"Worker PID {process.pid}: No results to insert for EntryID {entry_id}")
-    placeholder_results = [{
-        "EntryID": entry_id,
-        "ImageUrl": "placeholder://no-results",
-        "ImageDesc": f"No results found for {search_string}",
-        "ImageSource": "N/A",
-        "ImageUrlThumbnail": "placeholder://no-results"
-    }]
-    try:
-        insert_success = await insert_search_results(placeholder_results, logger=logger, file_id=str(file_id_db))
-        if insert_success:
-            logger.info(f"Worker PID {process.pid}: Inserted placeholder row for EntryID {entry_id}")
-            async with async_engine.connect() as conn:
-                await conn.execute(
-                    text("UPDATE utb_ImageScraperResult SET SortOrder = -2 WHERE EntryID = :entry_id AND ImageUrl = :image_url"),
-                    {"entry_id": entry_id, "image_url": "placeholder://no-results"}
-                )
-                await conn.commit()
-                logger.info(f"Worker PID {process.pid}: Set SortOrder=-2 for placeholder row for EntryID {entry_id}")
-            return True
-        else:
-            logger.error(f"Worker PID {process.pid}: Failed to insert placeholder row for EntryID {entry_id}")
-            return False
-    except SQLAlchemyError as e:
-        logger.error(f"Worker PID {process.pid}: Database error inserting placeholder row for EntryID {entry_id}: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Unexpected error inserting placeholder row for EntryID {entry_id}: {e}", exc_info=True)
+    if not all_results:
+        logger.error(f"Worker PID {process.pid}: No results found across all search types for EntryID {entry_id}")
         return False
 
+    logger.info(f"Worker PID {process.pid}: Combined {len(all_results)} results from all search types for EntryID {entry_id}")
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError, ValueError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Worker PID {psutil.Process().pid}: Retrying process_and_tag_results for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    deduplicated_results = []
+    seen = set()
+    for res in all_results:
+        key = (res['EntryID'], res['ImageUrl'])
+        if key not in seen:
+            seen.add(key)
+            deduplicated_results.append(res)
+    logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
+
+    insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
+    if not insert_success:
+        logger.error(f"Worker PID {process.pid}: Failed to insert results for EntryID {entry_id}")
+        return False
+
+    logger.info(f"Worker PID {process.pid}: Inserted {len(deduplicated_results)} results for EntryID {entry_id}")
+
+    update_result = await update_search_sort_order(
+        str(file_id_db), str(entry_id), result_brand, result_model, result_color, result_category, logger, brand_rules=brand_rules
     )
-)
-async def process_and_tag_results(
-    search_string,
-    brand,
-    model,
-    endpoint,
-    entry_id,
-    logger,
-    use_all_variations: bool = False,
-    file_id_db: int = None
-) -> List[Dict]:
-    logger = logger or default_logger
-    process = psutil.Process()
-    try:
-        logger.debug(f"Worker PID {process.pid}: Starting process_and_tag_results for EntryID {entry_id}")
-        mem_info = process.memory_info()
-        logger.debug(f"Worker PID {process.pid}: Memory before processing: RSS={mem_info.rss / 1024**2:.2f} MB")
-        
-        brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
-        if not brand_rules:
-            logger.warning(f"Worker PID {process.pid}: No brand rules fetched for EntryID {entry_id}")
-            brand_rules = {"brand_rules": []}
+    if update_result is None or not update_result:
+        logger.error(f"Worker PID {process.pid}: SortOrder update failed for EntryID {entry_id}")
+        return False
 
-        if file_id_db is None:
-            logger.error(f"Worker PID {process.pid}: FileID not provided for EntryID {entry_id}")
-            return [{
-                "EntryID": entry_id,
-                "ImageUrl": "placeholder://error",
-                "ImageDesc": "Error: FileID not provided",
-                "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://error",
-                "search_type": "default",
-                "priority": 4
-            }]
-
-        max_row_retries = 3
-        process_func = process_single_all if use_all_variations else process_single_row
-        logger.debug(f"Worker PID {process.pid}: Calling process_func for EntryID {entry_id}")
-        success = await process_func(
-            entry_id=entry_id,
-            search_string=search_string,
-            max_row_retries=max_row_retries,
-            file_id_db=file_id_db,
-            brand_rules=brand_rules,
-            endpoint=endpoint,
-            brand=brand,
-            model=model,
-            logger=logger
-        )
-        logger.debug(f"Worker PID {process.pid}: Process func result for EntryID {entry_id}: {success}")
-
-        if not success:
-            logger.error(f"Worker PID {process.pid}: Processing failed for EntryID {entry_id}")
-            return [{
-                "EntryID": entry_id,
-                "ImageUrl": "placeholder://error",
-                "ImageDesc": "Error: Processing failed",
-                "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://error",
-                "search_type": "default",
-                "priority": 4
-            }]
-
-        try:
-            async with async_engine.connect() as conn:
-                query = text("""
-                    SELECT 
-                        r.EntryID, 
-                        r.ImageUrl, 
-                        r.ImageDesc, 
-                        r.ImageSource, 
-                        r.ImageUrlThumbnail, 
-                        r.ResultID, 
-                        rec.ProductModel, 
-                        rec.ProductBrand
-                    FROM utb_ImageScraperResult r
-                    INNER JOIN utb_ImageScraperRecords rec
-                        ON r.EntryID = rec.EntryID
-                    WHERE r.EntryID = :entry_id
-                """)
-                logger.debug(f"Worker PID {process.pid}: Executing database query for EntryID {entry_id}")
-                result = await conn.execute(query, {"entry_id": entry_id})
-                rows = result.fetchall()
-                columns = result.keys()
-                results = [dict(zip(columns, row)) for row in rows]
-                result.close()
-                logger.debug(f"Worker PID {process.pid}: Retrieved {len(results)} rows for EntryID {entry_id}")
-        except SQLAlchemyError as e:
-            logger.error(f"Worker PID {process.pid}: Failed to retrieve results for EntryID {entry_id}: {e}", exc_info=True)
-            return [{
-                "EntryID": entry_id,
-                "ImageUrl": "placeholder://error",
-                "ImageDesc": f"Error: Database retrieval failed: {str(e)}",
-                "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://error",
-                "search_type": "default",
-                "priority": 4
-            }]
-
-        all_results = []
-        if results:
-            for res in results:
-                res['search_type'] = 'default'
-                res['ImageDesc_clean'] = clean_string(res.get('ImageDesc', ''), preserve_url=False)
-                res['ImageSource_clean'] = clean_string(res.get('ImageSource', ''), preserve_url=True)
-                res['ImageUrl_clean'] = clean_string(res.get('ImageUrl', ''), preserve_url=True)
-                res['ProductBrand_clean'] = clean_string(res.get('ProductBrand', ''), preserve_url=False)
-
-            brand_aliases = []
-            for rule in brand_rules["brand_rules"]:
-                if any(brand.lower() in name.lower() for name in rule.get("names", [])):
-                    brand_aliases = rule.get("names", [])
-                    break
-            exact_results, _ = await filter_model_results(
-                results,
-                debug=False,
-                logger=logger,
-                brand_aliases=brand_aliases
-            )
-
-            def calculate_priority_list(results, exact_results, model_clean, model_aliases, brand_clean, brand_aliases):
-                exact_ids = {res['ResultID'] for res in exact_results}
-                prioritized_results = []
-                for res in results:
-                    model_matched = res['ResultID'] in exact_ids
-                    brand_matched = (
-                        any(alias.lower() in res.get('ImageDesc_clean', '').lower() for alias in brand_aliases) or
-                        any(alias.lower() in res.get('ImageSource_clean', '').lower() for alias in brand_aliases) or
-                        any(alias.lower() in res.get('ImageUrl_clean', '').lower() for alias in brand_aliases)
-                    )
-                    if model_matched and brand_matched:
-                        priority = 1
-                    elif model_matched:
-                        priority = 2
-                    elif brand_matched:
-                        priority = 3
-                    else:
-                        priority = 4
-                    res['priority'] = priority
-                    prioritized_results.append(res)
-                return prioritized_results
-
-            model_clean = normalize_model(model or search_string)
-            model_aliases = generate_aliases(model_clean)
-            brand_clean = clean_string(brand).lower() if brand else ''
-            brand_aliases = await generate_brand_aliases(brand_clean, {}) if brand else []
-            all_results = calculate_priority_list(
-                results, exact_results, model_clean, model_aliases, brand_clean, brand_aliases
-            )
-        else:
-            all_results = [{
-                "EntryID": entry_id,
-                "ImageUrl": "placeholder://no-results",
-                "ImageDesc": f"No results found for {search_string}",
-                "ImageSource": "N/A",
-                "ImageUrlThumbnail": "placeholder://no-results",
-                "search_type": "default",
-                "priority": 4
-            }]
-
-        mem_info = process.memory_info()
-        logger.debug(f"Worker PID {process.pid}: Memory after processing: RSS={mem_info.rss / 1024**2:.2f} MB")
-        return all_results
-
-    except SQLAlchemyError as e:
-        logger.error(f"Worker PID {process.pid}: Database error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Unexpected error in process_and_tag_results for EntryID {entry_id}: {e}", exc_info=True)
-        return [{
-            "EntryID": entry_id,
-            "ImageUrl": "placeholder://error",
-            "ImageDesc": f"Error: {str(e)}",
-            "ImageSource": "N/A",
-            "ImageUrlThumbnail": "placeholder://error",
-            "search_type": "default",
-            "priority": 4
-        }]
+    return True

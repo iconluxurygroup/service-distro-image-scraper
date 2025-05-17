@@ -527,18 +527,37 @@ async def generate_download_file(
             logger.error(f"No email address for ID {file_id}")
             return {"error": "Failed to retrieve email address", "log_filename": log_filename}
 
+        # User email with public_url
         subject_line = f"{original_filename} Job Notification{' - No Images' if not has_valid_images else ''}"
-        message = (
+        user_message = (
             f"Excel file generation for FileID {file_id} {'completed successfully' if has_valid_images else 'completed with no valid images'}.\n"
-            f"Download URL: {public_url}\n"
-            f"Log file: {log_filename}"
+            f"Download Excel file: {public_url}"
         )
-        logger.debug(f"Scheduling email to {send_to_email_addr} with public_url: {public_url}, message: {message}")
+        logger.debug(f"Scheduling user email to {send_to_email_addr} with public_url: {public_url}, message: {user_message}")
         background_tasks.add_task(
             send_message_email,
             to_emails=send_to_email_addr,
             subject=subject_line,
-            message=message,
+            message=user_message,
+            logger=logger
+        )
+
+        # Admin email with log file only
+        admin_email = "nik@luxurymarket.com"
+        admin_subject = f"Admin Log: Job Completed for FileID {file_id}"
+        admin_message = (
+            f"Processing for FileID {file_id} completed.\n"
+            f"Successful entries: {successful_entries}/{len(entries)}\n"
+            f"Failed entries: {failed_entries}\n"
+            f"Last EntryID: {last_entry_id_processed}\n"
+            f"Log file: {log_filename}"
+        )
+        logger.debug(f"Scheduling admin email to {admin_email} with message: {admin_message}")
+        background_tasks.add_task(
+            send_message_email,
+            to_emails=[admin_email],
+            subject=admin_subject,
+            message=admin_message,
             logger=logger
         )
 
