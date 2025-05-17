@@ -35,53 +35,54 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-async def insert_search_results(df: pd.DataFrame, logger: Optional[logging.Logger] = None, file_id: Optional[str] = None) -> bool:
+async def insert_search_results(
+    df: pd.DataFrame,
+    logger: Optional[logging.Logger] = None,
+    file_id: str = None
+) -> bool:
     logger = logger or logging.getLogger(__name__)
-    try:
-        if df.empty:
-            logger.warning("Empty DataFrame provided for insertion")
-            return False
-        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
-        if not all(col in df.columns for col in required_columns):
-            missing_cols = set(required_columns) - set(df.columns)
-            logger.error(f"Missing required columns: {missing_cols}")
-            return False
-        original_len = len(df)
-        # Fallback to ImageUrl if ImageUrlThumbnail is invalid
-        df['ImageUrlThumbnail'] = df.apply(
-            lambda row: row['ImageUrl'] if not validate_thumbnail_url(row['ImageUrlThumbnail'], logger) else row['ImageUrlThumbnail'], axis=1
-        )
-        df = df[df['ImageUrlThumbnail'].apply(lambda x: validate_thumbnail_url(x, logger)) & 
-                ~df['ImageUrl'].str.contains('placeholder://', na=False)]
-        logger.debug(f"Filtered to {len(df)} rows with valid thumbnail URLs from {original_len} rows")
-        if df.empty:
-            logger.warning(f"No rows with valid thumbnail URLs after filtering {original_len} rows")
-            return False
-        async with async_engine.connect() as conn:
-            for _, row in df.iterrows():
-                await conn.execute(
-                    text("""
-                        INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
-                        VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail)
-                    """),
-                    {
-                        "entry_id": row['EntryID'],
-                        "image_url": row['ImageUrl'],
-                        "image_desc": row['ImageDesc'],
-                        "image_source": row['ImageSource'],
-                        "image_url_thumbnail": row['ImageUrlThumbnail']
-                    }
-                )
-            await conn.commit()
-        logger.info(f"Inserted {len(df)} rows into utb_ImageScraperResult for FileID {file_id}")
-        return True
-    except SQLAlchemyError as e:
-        logger.error(f"Database error during insertion for FileID {file_id or 'unknown'}: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error during insertion for FileID {file_id or 'unknown'}: {e}", exc_info=True)
+    process = psutil.Process()
+
+    if df.empty:
+        logger.warning(f"Worker PID {process.pid}: Empty DataFrame provided for insert_search_results")
         return False
 
+    required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+    if not all(col in df.columns for col in required_columns):
+        missing_cols = set(required_columns) - set(df.columns)
+        logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
+        return False
+
+    try:
+        async with async_engine.connect() as conn:
+            # Ensure no pending results on the connection
+            await conn.execute(text("SELECT 1"))  # Dummy query to clear connection state
+            await conn.commit()  # Commit to ensure connection is clean
+
+            parameters = [
+                (
+                    row["EntryID"],
+                    row["ImageUrl"],
+                    row["ImageDesc"],
+                    row["ImageSource"],
+                    row["ImageUrlThumbnail"]
+                )
+                for _, row in df.iterrows()
+            ]
+            logger.debug(f"Worker PID {process.pid}: Inserting {len(parameters)} rows into utb_ImageScraperResult")
+            await conn.execute(
+                text("""
+                    INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
+                    VALUES (?, ?, ?, ?, ?)
+                """),
+                parameters
+            )
+            await conn.commit()
+            logger.info(f"Worker PID {process.pid}: Successfully inserted {len(parameters)} rows for FileID {file_id}")
+            return True
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Failed to insert results for FileID {file_id}: {e}", exc_info=True)
+        return False
 import logging
 import pandas as pd
 import re
