@@ -1590,16 +1590,13 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
                         s.ProductCategory AS Category
                     FROM utb_ImageScraperFiles f
                     INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID
-                    LEFT JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID AND r.SortOrder = 1
+                    LEFT JOIN (
+                        SELECT EntryID, ImageUrl, ImageUrlThumbnail, SortOrder
+                        FROM utb_ImageScraperResult
+                        WHERE SortOrder IS NOT NULL AND SortOrder >= 0
+                        AND ROW_NUMBER() OVER (PARTITION BY EntryID ORDER BY SortOrder DESC) = 1
+                    ) r ON r.EntryID = s.EntryID
                     WHERE f.ID = ?
-                    GROUP BY 
-                        s.ExcelRowID, 
-                        r.ImageUrl, 
-                        r.ImageUrlThumbnail, 
-                        s.ProductBrand, 
-                        s.ProductModel, 
-                        s.ProductColor, 
-                        s.ProductCategory
                     ORDER BY s.ExcelRowID
                 """
                 logger.debug(f"Executing query: {query} with FileID: {file_id}")
