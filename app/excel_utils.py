@@ -1,4 +1,3 @@
-# excel_utils.py
 import os
 import logging
 from openpyxl import load_workbook
@@ -7,16 +6,39 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from typing import List, Dict
 from PIL import Image as IMG2
-from io import BytesIO
 import numpy as np
 from collections import Counter
+import urllib.parse
+import re
+
 # Module-level logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,  # Set to DEBUG for detailed tracing
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+
+def clean_string(value: str, is_url: bool = False) -> str:
+    """Clean a string by removing backslashes and decoding URL-encoded characters."""
+    if not value:
+        return ""
+    cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
+    cleaned = re.sub(r'[\x00-\x1F\x7F]+', '', cleaned).strip()
+    if is_url:
+        cleaned = urllib.parse.unquote(cleaned)
+        try:
+            parsed = urllib.parse.urlparse(cleaned)
+            if parsed.scheme and parsed.netloc:
+                path = re.sub(r'/+', '/', parsed.path)
+                cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
+                if parsed.query:
+                    cleaned += f"?{parsed.query}"
+                if parsed.fragment:
+                    cleaned += f"#{parsed.fragment}"
+        except ValueError:
+            cleaned = ""
+    return cleaned
 
 def verify_png_image_single(image_path, logger=None):
     logger = logger or default_logger
@@ -135,9 +157,9 @@ def resize_image(image_path, logger=None):
     except Exception as e:
         logger.error(f"❌ Error resizing image: {e}, for image: {image_path}", exc_info=True)
         return False
-    
-def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="A", row_offset=5, logger=None):
-    """Write one image per entry to an Excel file starting at row 6, removing unneeded rows."""
+
+def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="A", row_offset=5, logger=None, sort_by='ExcelRowID'):
+    """Write one image per entry to an Excel file starting at row 6, removing unneeded rows, with optional sorting."""
     logger = logger or default_logger
     failed_rows = []
 
@@ -160,15 +182,43 @@ def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="
             logger.warning(f"⚠️ No images found in {temp_dir}")
             return failed_rows
 
+        # Clean and validate image_data
+        cleaned_data = []
+        for item in image_data:
+            cleaned_item = {
+                'ExcelRowID': item.get('ExcelRowID', 0),
+                'Brand': clean_string(item.get('Brand', '')),
+                'Style': clean_string(item.get('Style', '')),
+                'Color': clean_string(item.get('Color', '')),
+                'Category': clean_string(item.get('Category', '')),
+                'SortOrder': item.get('SortOrder', 9999)  # Default high value for unsorted
+            }
+            if not isinstance(cleaned_item['ExcelRowID'], int) or cleaned_item['ExcelRowID'] < 1:
+                logger.warning(f"⚠️ Invalid ExcelRowID: {cleaned_item['ExcelRowID']}")
+                continue
+            cleaned_data.append(cleaned_item)
+        logger.info(f"🧹 Cleaned {len(cleaned_data)} of {len(image_data)} entries")
+
+        # Sort image_data
+        if sort_by == 'SortOrder':
+            # Prioritize lower SortOrder, then ExcelRowID; boost later entries (ExcelRowID >= 2)
+            cleaned_data.sort(key=lambda x: (x['SortOrder'], -1 if x['ExcelRowID'] >= 2 else 0, x['ExcelRowID']))
+            logger.info("📊 Sorted by SortOrder, prioritizing later entries")
+        else:
+            # Default: sort by ExcelRowID
+            cleaned_data.sort(key=lambda x: x['ExcelRowID'])
+            logger.info("📊 Sorted by ExcelRowID")
+
         # Create a map of ExcelRowID to filename
         image_map = {}
         for f in image_files:
+            f = clean_string(f, is_url=False)  # Clean filename
             if '_' in f and f.split('_')[0].isdigit():
                 row_id = int(f.split('_')[0])
                 image_map[row_id] = f
 
         # Process each entry
-        for item in image_data:
+        for item in cleaned_data:
             row_id = item['ExcelRowID']
             row_number = row_id + row_offset  # e.g., ExcelRowID=1 -> row 6
 
@@ -188,13 +238,12 @@ def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="
                 logger.warning(f"⚠️ No image found for row {row_id}")
                 failed_rows.append(row_id)
 
-            # Populate data
-            ws[f"B{row_number}"] = item.get('Brand', '')
-            ws[f"D{row_number}"] = item.get('Style', '')
-            if item.get('Color'):
-                ws[f"E{row_number}"] = item['Color']
-            if item.get('Category'):
-                ws[f"H{row_number}"] = item['Category']
+            # Populate cleaned data
+            ws[f"B{row_number}"] = item['Brand']
+            ws[f"D{row_number}"] = item['Style']
+            ws[f"E{row_number}"] = item['Color']
+            ws[f"H{row_number}"] = item['Category']
+            logger.debug(f"✍️ Wrote data for row {row_number}: {item}")
 
             # Validate
             if not ws[f"B{row_number}"].value:
@@ -203,7 +252,7 @@ def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="
                 logger.warning(f"⚠️ Missing Style in D{row_number}")
 
         # Remove unneeded rows
-        max_data_row = max(item['ExcelRowID'] for item in image_data) + row_offset
+        max_data_row = max(item['ExcelRowID'] for item in cleaned_data) + row_offset
         if ws.max_row > max_data_row:
             logger.info(f"🗑️ Removing rows {max_data_row + 1} to {ws.max_row}")
             ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
@@ -213,7 +262,7 @@ def write_excel_image(local_filename, temp_dir, image_data: List[Dict], column="
         return failed_rows
 
     except Exception as e:
-        logger.error(f"❌ Error writing images: {e}")
+        logger.error(f"❌ Error writing images: {e}", exc_info=True)
         return failed_rows
 
 def highlight_cell(excel_file, cell_reference, logger=None):
@@ -275,9 +324,10 @@ def write_failed_downloads_to_excel(failed_downloads, excel_file, logger=None):
             
             for url, row_id in failed_downloads:
                 if url and url != 'None found in this filter':
+                    cleaned_url = clean_string(url, is_url=True)
                     cell_reference = f"{get_column_letter(1)}{row_id}"  # Column A
-                    logger.debug(f"✍️ Writing URL {url} to cell {cell_reference}")
-                    ws[cell_reference] = str(url)
+                    logger.debug(f"✍️ Writing URL {cleaned_url} to cell {cell_reference}")
+                    ws[cell_reference] = cleaned_url
                     try:
                         highlight_cell(excel_file, cell_reference, logger=logger)
                     except ValueError as e:
