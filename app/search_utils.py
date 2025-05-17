@@ -55,9 +55,12 @@ async def insert_search_results(
 
     try:
         async with async_engine.connect() as conn:
-            # Ensure no pending results on the connection
-            await conn.execute(text("SELECT 1"))  # Dummy query to clear connection state
-            await conn.commit()  # Commit to ensure connection is clean
+            # Clear any existing cursors or result sets
+            try:
+                await conn.execute(text("SELECT 1"))  # Dummy query to reset connection
+                await conn.commit()
+            except Exception as e:
+                logger.warning(f"Worker PID {process.pid}: Failed to clear connection state: {e}")
 
             parameters = [
                 (
@@ -70,7 +73,7 @@ async def insert_search_results(
                 for _, row in df.iterrows()
             ]
             logger.debug(f"Worker PID {process.pid}: Inserting {len(parameters)} rows into utb_ImageScraperResult")
-            await conn.execute(
+            result = await conn.execute(
                 text("""
                     INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
                     VALUES (?, ?, ?, ?, ?)
@@ -80,10 +83,14 @@ async def insert_search_results(
             await conn.commit()
             logger.info(f"Worker PID {process.pid}: Successfully inserted {len(parameters)} rows for FileID {file_id}")
             return True
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Failed to insert results for FileID {file_id}: {e}", exc_info=True)
+    except SQLAlchemyError as e:
+        logger.error(f"Worker PID {process.pid}: Database error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
-import logging
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
+        return False
+
+
 import pandas as pd
 import re
 import aioodbc

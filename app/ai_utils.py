@@ -8,6 +8,10 @@ from image_reason import process_entry
 from search_utils import update_search_sort_order
 from db_utils import update_log_url_in_db, export_dai_json
 from database_config import conn_str, async_engine
+from config import setup_job_logger
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 import pyodbc
 import psutil
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type

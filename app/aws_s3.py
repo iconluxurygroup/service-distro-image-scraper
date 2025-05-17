@@ -14,7 +14,8 @@ from config import VERSION, S3_CONFIG
 from database_config import async_engine, engine, conn_str
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-
+from db_utils import (
+    update_log_url_in_db)
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
