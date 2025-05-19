@@ -123,6 +123,131 @@ class SearchClient:
                     continue
             self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
             return []
+async def process_and_tag_results(
+    search_string: str,
+    brand: Optional[str] = None,
+    model: Optional[str] = None,
+    endpoint: str = None,
+    entry_id: int = None,
+    logger: Optional[logging.Logger] = None,
+    use_all_variations: bool = False,
+    file_id_db: Optional[int] = None
+) -> List[Dict]:
+    logger = logger or default_logger
+    process = psutil.Process()
+    
+    try:
+        logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
+        
+        # Generate search variations
+        variations = generate_search_variations(
+            search_string=search_string,
+            brand=brand,
+            model=model,
+            logger=logger
+        )
+        
+        all_results = []
+        search_types = [
+            "default", "delimiter_variations", "color_variations",
+            "brand_alias", "no_color", "model_alias", "category_specific"
+        ]
+        
+        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+        
+        # Initialize SearchClient
+        endpoint = endpoint or SEARCH_PROXY_API_URL
+        client = SearchClient(endpoint=endpoint, logger=logger)
+        
+        try:
+            for search_type in search_types:
+                if search_type not in variations:
+                    logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
+                    continue
+                
+                logger.info(f"Worker PID {process.pid}: Processing search type '{search_type}' for EntryID {entry_id}")
+                for variation in variations[search_type]:
+                    logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
+                    
+                    # Use SearchClient.search instead of search_variation
+                    search_results = await client.search(
+                        term=variation,
+                        brand=brand or "",
+                        entry_id=entry_id
+                    )
+                    
+                    if search_results:
+                        logger.info(f"Worker PID {process.pid}: Found {len(search_results)} results for variation '{variation}'")
+                        tagged_results = []
+                        for res in search_results:
+                            tagged_result = {
+                                "EntryID": entry_id,
+                                "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
+                                "ImageDesc": res.get("ImageDesc", ""),
+                                "ImageSource": res.get("ImageSource", "N/A"),
+                                "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
+                                "ProductCategory": res.get("ProductCategory", "")
+                            }
+                            if all(col in tagged_result for col in required_columns):
+                                tagged_results.append(tagged_result)
+                            else:
+                                logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
+                        
+                        all_results.extend(tagged_results)
+                        logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{variation}'")
+                    else:
+                        logger.warning(f"Worker PID {process.pid}: No valid results for variation '{variation}' in search type '{search_type}'")
+                
+                if all_results and not use_all_variations:
+                    logger.info(f"Worker PID {process.pid}: Stopping after {len(all_results)} results from '{search_type}' for EntryID {entry_id}")
+                    break
+        finally:
+            await client.close()
+        
+        if not all_results:
+            logger.error(f"Worker PID {process.pid}: No valid results found across all search types for EntryID {entry_id}")
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No results found for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results",
+                "ProductCategory": ""
+            }]
+        
+        # Deduplicate results
+        deduplicated_results = []
+        seen_urls = set()
+        for res in all_results:
+            image_url = res["ImageUrl"]
+            if image_url not in seen_urls and image_url != "placeholder://no-results":
+                seen_urls.add(image_url)
+                deduplicated_results.append(res)
+        
+        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
+        
+        # Filter irrelevant results
+        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
+        filtered_results = [
+            res for res in deduplicated_results
+            if not any(kw.lower() in res.get("ImageDesc", "").lower() for kw in irrelevant_keywords)
+        ]
+        
+        logger.info(f"Worker PID {process.pid}: Filtered to {len(filtered_results)} results after removing irrelevant items for EntryID {entry_id}")
+        
+        return filtered_results
+    
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
+        return [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://error",
+            "ImageDesc": f"Error processing: {str(e)}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://error",
+            "ProductCategory": ""
+        }]
+
 async def process_results(
     raw_results: List[Dict],
     entry_id: int,
