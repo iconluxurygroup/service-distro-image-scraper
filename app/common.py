@@ -214,7 +214,7 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
     filtered_aliases = []
     for alias in aliases:
         alias_lower = alias.lower()
-        if len(alias_lower) >= 4 and alias_lower not in ["sas", "soda"] and alias_lower not in seen:
+        if len(alias_lower) >= 4 and alias_lower not in ["sas", "soda","s&s","scotch"] and alias_lower not in seen:
             seen.add(alias_lower)
             filtered_aliases.append(alias_lower)
 
