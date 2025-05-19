@@ -116,10 +116,6 @@ async def insert_search_results(
             logger.debug(f"Worker PID {process.pid}: Invalid ImageUrlThumbnail, setting to empty: {image_url_thumbnail}")
             image_url_thumbnail = ""
 
-        if category == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
-            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
-            continue
-
         param = {
             "entry_id": entry_id,
             "image_url": image_url,
@@ -187,8 +183,6 @@ async def insert_search_results(
                     continue
 
             logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(parameters)} rows for FileID {file_id}")
-            if inserted_count == 0 and updated_count == 0:
-                logger.warning(f"Worker PID {process.pid}: No rows inserted or updated for FileID {file_id}; likely all rows are duplicates or invalid")
             return inserted_count > 0 or updated_count > 0
 
     except SQLAlchemyError as e:
