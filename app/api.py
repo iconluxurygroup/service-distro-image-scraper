@@ -796,17 +796,29 @@ async def process_restart_batch(
                     logger.warning(f"No valid EntryIDs to verify for FileID {file_id_db}")
                     result_count = 0
                 else:
-                    query = text("""
-                        SELECT COUNT(*) AS result_count
-                        FROM utb_ImageScraperResult
-                        WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
-                    """)
-                    parameters = {"entry_ids": tuple(entry_ids)}
-                    logger.debug(f"Executing verification query with EntryIDs: {entry_ids}, Parameters: {parameters}")
                     try:
-                        result = await conn.execute(query, parameters)
-                        result_count = result.scalar()
-                        result.close()
+                        async with async_engine.connect() as conn:
+                            if len(entry_ids) == 1:
+                                # Use = for single EntryID to avoid TVP
+                                query = text("""
+                                    SELECT COUNT(*) AS result_count
+                                    FROM utb_ImageScraperResult
+                                    WHERE EntryID = :entry_id AND ImageUrl NOT LIKE 'placeholder://%'
+                                """)
+                                parameters = {"entry_id": entry_ids[0]}
+                            else:
+                                # Use IN for multiple EntryIDs
+                                query = text("""
+                                    SELECT COUNT(*) AS result_count
+                                    FROM utb_ImageScraperResult
+                                    WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
+                                """)
+                                parameters = {"entry_ids": tuple(entry_ids)}
+                            
+                            logger.debug(f"Executing verification query with EntryIDs: {entry_ids}, Parameters: {parameters}")
+                            result = await conn.execute(query, parameters)
+                            result_count = result.scalar()
+                            result.close()
                     except SQLAlchemyError as e:
                         logger.error(f"Verification query failed for FileID {file_id_db}: {e}", exc_info=True)
                         result_count = 0
