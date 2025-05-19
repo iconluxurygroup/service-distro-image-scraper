@@ -600,8 +600,8 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        BATCH_SIZE = 1  # Keep small to allow more parallel batches
-        MAX_CONCURRENCY = 20  # Global concurrency limit across all batches
+        BATCH_SIZE = 5  # Keep small to allow more parallel batches
+        MAX_CONCURRENCY = 40  # Global concurrency limit across all batches
         MAX_ENTRY_RETRIES = 3
         MAX_PARALLEL_BATCHES = 10 # Maximum number of batches to process concurrently
 
