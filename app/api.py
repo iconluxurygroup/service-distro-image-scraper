@@ -293,7 +293,6 @@ async def process_results(
     return results
 
 
-
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -361,7 +360,7 @@ async def async_process_entry_search(
             if not term_results:
                 logger.warning(f"No results for term '{term}' in EntryID {entry_id}")
                 continue
-            logger.debug(f"Raw results for term '{term}': {[(res['ImageUrl'], res['ImageDesc'][:50]) for res in term_results]}")
+            logger.debug(f"Raw results for term '{term}': {[(res['ImageUrl'][:100], res['ImageDesc'][:50]) for res in term_results]}")
             all_results.extend(term_results)
             logger.info(f"Added {len(term_results)} results for term '{term}' in EntryID {entry_id}")
 
@@ -377,14 +376,19 @@ async def async_process_entry_search(
             await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
             return placeholder_result
 
+        # Log all results before filtering
+        logger.debug(f"All results before filtering: {[(res['ImageUrl'][:100], res['ImageDesc'][:50]) for res in all_results]}")
+
         # Filter out placeholder results early
         valid_results = [
             res for res in all_results
             if not res["ImageUrl"].startswith("placeholder://")
         ]
         logger.info(f"Filtered to {len(valid_results)} non-placeholder results for EntryID {entry_id}")
+        if not valid_results:
+            logger.warning(f"All results were placeholders for EntryID {entry_id}")
 
-        # Validate results using model and brand checks
+        # Validate results using model and brand checks (relaxed)
         from common import generate_aliases, validate_model, validate_brand
         brand_rules = await fetch_brand_rules(logger=logger)
         brand_aliases = []
@@ -402,13 +406,27 @@ async def async_process_entry_search(
                 "ImageUrl": res["ImageUrl"],
                 "ResultID": f"{entry_id}_{hashlib.md5(res['ImageUrl'].encode()).hexdigest()[:8]}"
             }
+            # Relax validation: accept results with either model or brand match, or partial matches
             model_match = validate_model(row, model_aliases, row["ResultID"], logger)
             brand_match = validate_brand(row, brand_aliases, row["ResultID"], logger=logger)
-            if model_match or brand_match:
+            # Add fuzzy matching for partial matches
+            model_fuzzy_match = any(fuzz.partial_ratio(alias, row["ImageDesc"].lower()) > 70 or
+                                    fuzz.partial_ratio(alias, row["ImageSource"].lower()) > 70 or
+                                    fuzz.partial_ratio(alias, row["ImageUrl"].lower()) > 70
+                                    for alias in model_aliases)
+            brand_fuzzy_match = any(fuzz.partial_ratio(alias, row["ImageDesc"].lower()) > 70 or
+                                    fuzz.partial_ratio(alias, row["ImageSource"].lower()) > 70 or
+                                    fuzz.partial_ratio(alias, row["ImageUrl"].lower()) > 70
+                                    for alias in brand_aliases)
+            if model_match or brand_match or model_fuzzy_match or brand_fuzzy_match:
                 filtered_results.append(res)
-                logger.debug(f"Kept result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, ImageUrl={res['ImageUrl']}")
+                logger.debug(f"Kept result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, "
+                             f"model_fuzzy_match={model_fuzzy_match}, brand_fuzzy_match={brand_fuzzy_match}, "
+                             f"ImageUrl={res['ImageUrl'][:100]}, ImageDesc={res['ImageDesc'][:50]}")
             else:
-                logger.debug(f"Discarded result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, ImageUrl={res['ImageUrl']}, ImageDesc={res['ImageDesc'][:100]}")
+                logger.debug(f"Discarded result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, "
+                             f"model_fuzzy_match={model_fuzzy_match}, brand_fuzzy_match={brand_fuzzy_match}, "
+                             f"ImageUrl={res['ImageUrl'][:100]}, ImageDesc={res['ImageDesc'][:50]}")
 
         logger.info(f"Filtered to {len(filtered_results)} validated results for EntryID {entry_id}")
 
@@ -421,7 +439,8 @@ async def async_process_entry_search(
                 seen_keys.add(dedup_key)
                 deduplicated_results.append(res)
             else:
-                logger.debug(f"Discarded duplicate result for EntryID {entry_id}: ImageUrl={res['ImageUrl']}, ImageDesc={res['ImageDesc'][:100]}")
+                logger.debug(f"Discarded duplicate result for EntryID {entry_id}: ImageUrl={res['ImageUrl'][:100]}, "
+                             f"ImageDesc={res['ImageDesc'][:50]}")
         logger.info(f"Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
 
         if not deduplicated_results:

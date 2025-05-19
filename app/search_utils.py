@@ -202,6 +202,7 @@ async def insert_search_results(
         return False
 
 
+from fuzzywuzzy import fuzz
 
 @retry(
     stop=stop_after_attempt(3),
@@ -287,8 +288,33 @@ async def update_search_sort_order(
             image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
             logger.debug(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
 
-            model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
-            brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
+            model_matched = False
+            brand_matched = False
+
+            # Check for model matches (exact or fuzzy)
+            for alias in model_aliases:
+                if alias in image_desc or alias in image_source or alias in image_url:
+                    model_matched = True
+                    break
+                # Fuzzy match for model
+                if (fuzz.partial_ratio(alias, image_desc) > 70 or
+                    fuzz.partial_ratio(alias, image_source) > 70 or
+                    fuzz.partial_ratio(alias, image_url) > 70):
+                    model_matched = True
+                    break
+
+            # Check for brand matches (exact or fuzzy)
+            for alias in brand_aliases:
+                if alias in image_desc or alias in image_source or alias in image_url:
+                    brand_matched = True
+                    break
+                # Fuzzy match for brand
+                if (fuzz.partial_ratio(alias, image_desc) > 70 or
+                    fuzz.partial_ratio(alias, image_source) > 70 or
+                    fuzz.partial_ratio(alias, image_url) > 70):
+                    brand_matched = True
+                    break
+
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
             if model_matched and brand_matched:
