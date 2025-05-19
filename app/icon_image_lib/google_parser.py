@@ -3,7 +3,6 @@ import chardet
 from bs4 import BeautifulSoup
 import logging
 
-# Assuming LR class is in icon_image_lib.LR; otherwise, include it directly here
 from icon_image_lib.LR import LR
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,10 +41,12 @@ def get_original_images(html_bytes, logger=None):
     """Extract image data from Google image search HTML."""
     logger = logger or logging.getLogger(__name__)
     html_content = decode_html_bytes(html_bytes, logger)
+    logger.debug(f"Raw HTML (first 500 chars): {html_content[:500]}")
 
     start_tag = 'FINANCE",[22,1]]]]]'
     end_tag = ':[null,null,null,"glbl'
     matched_google_image_data = LR().get(html_content, start_tag, end_tag)
+    logger.debug(f"Matched Google image data (first 200 chars): {str(matched_google_image_data)[:200]}")
     
     if 'Error' in matched_google_image_data or not matched_google_image_data:
         logger.warning('Main results tags not found or no data extracted')
@@ -64,6 +65,7 @@ def get_original_images(html_bytes, logger=None):
     
     if not main_image_urls:
         main_image_urls = main_thumbs
+        logger.debug("No main image URLs found, falling back to thumbnails")
 
     min_length = min(len(main_image_urls), len(main_descriptions), len(main_source_urls), len(main_thumbs))
     main_image_urls = main_image_urls[:min_length][:50]
@@ -73,15 +75,20 @@ def get_original_images(html_bytes, logger=None):
 
     logger.debug(f"Main results: URLs={len(main_image_urls)}, Descriptions={len(main_descriptions)}, "
                  f"Sources={len(main_source_urls)}, Thumbs={len(main_thumbs)}")
+    logger.debug(f"Sample URLs: {main_image_urls[:3]}")
+    logger.debug(f"Sample Descriptions: {main_descriptions[:3]}")
+    logger.debug(f"Sample Sources: {main_source_urls[:3]}")
     return main_image_urls, main_descriptions, main_source_urls, main_thumbs
 
 def get_results_page_results(html_bytes, final_urls, final_descriptions, final_sources, final_thumbs, logger=None):
     """Extract additional image data from results page HTML without base64."""
     logger = logger or logging.getLogger(__name__)
     html_content = decode_html_bytes(html_bytes, logger)
+    logger.debug(f"Results page HTML (first 500 chars): {html_content[:500]}")
 
     soup = BeautifulSoup(html_content, 'html.parser')
     result_divs = soup.find_all('div', class_='H8Rx8c')
+    logger.debug(f"Found {len(result_divs)} result divs with class 'H8Rx8c'")
 
     if not result_divs:
         logger.warning("No result items found in additional results page")
@@ -109,6 +116,7 @@ def get_results_page_results(html_bytes, final_urls, final_descriptions, final_s
         link_tag = div.find_next('a', class_='zReHs')
         url = clean_image_url(link_tag['href']) if link_tag and 'href' in link_tag.attrs else 'No image URL'
         final_urls.append(url)
+        logger.debug(f"Appended result: URL={url[:100]}, Desc={description[:50]}, Source={source[:50]}, Thumb={thumb[:100]}")
 
     if len(final_urls) > 100:
         final_urls = final_urls[:100]
@@ -125,30 +133,41 @@ def process_search_result(image_html_bytes, results_html_bytes, entry_id: int, l
     logger = logger or logging.getLogger(__name__)
     
     final_urls, final_descriptions, final_sources, final_thumbs = get_original_images(image_html_bytes, logger)
+    logger.debug(f"After get_original_images for EntryID {entry_id}: URLs={len(final_urls)}, "
+                 f"Sample URLs={final_urls[:3]}")
     
     if results_html_bytes:
         final_urls, final_descriptions, final_sources, final_thumbs = get_results_page_results(
             results_html_bytes, final_urls, final_descriptions, final_sources, final_thumbs, logger
         )
+        logger.debug(f"After get_results_page_results for EntryID {entry_id}: URLs={len(final_urls)}, "
+                     f"Sample URLs={final_urls[:3]}")
     
     min_length = min(len(final_urls), len(final_descriptions), len(final_sources), len(final_thumbs))
     if min_length < max(len(final_urls), len(final_descriptions), len(final_sources), len(final_thumbs)):
-        logger.warning(f"Data lists have different lengths: {[len(lst) for lst in [final_urls, final_descriptions, final_sources, final_thumbs]]}. Using minimum length: {min_length}")
+        logger.warning(f"Data lists have different lengths: {[len(lst) for lst in [final_urls, final_descriptions, final_sources, final_thumbs]]}. "
+                      f"Using minimum length: {min_length}")
         final_urls = final_urls[:min_length]
         final_descriptions = final_descriptions[:min_length]
         final_sources = final_sources[:min_length]
         final_thumbs = final_thumbs[:min_length]
 
+    if not final_urls:
+        logger.warning(f"No valid image URLs extracted for EntryID {entry_id}")
+        return []
+
     results = [
         {
-            'EntryID': entry_id,
-            'ImageUrl': final_urls[i],
-            'ImageDesc': final_descriptions[i],
-            'ImageSource': final_sources[i],
-            'ImageUrlThumbnail': final_thumbs[i]
+            'entry_id': entry_id,  # Changed to match SearchClient.search expectation
+            'image_url': final_urls[i],
+            'description': final_descriptions[i],
+            'source': final_sources[i],
+            'thumbnail_url': final_thumbs[i]
         }
         for i in range(min_length)
     ]
     
     logger.info(f"Processed EntryID {entry_id} with {len(results)} images")
+    logger.debug(f"Final results for EntryID {entry_id}: "
+                 f"{[(r['image_url'][:100], r['description'][:50]) for r in results]}")
     return results
