@@ -900,6 +900,8 @@ async def process_restart_batch(
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
+
+
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
@@ -915,9 +917,9 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
         
         if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
-            result = await job_func(file_id, **kwargs)
+            result = await job_func(file_id, logger=logger, **kwargs)
         else:
-            result = job_func(file_id, **kwargs)
+            result = job_func(file_id, logger=logger, **kwargs)
         
         debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
         logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
@@ -931,11 +933,21 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
             "data": result,
             "debug_info": debug_info
         }
-        logger.debug(f"Returning result for FileID {file_id}: {return_value}")
+        logger.debug(f"Returning success result for FileID {file_id}: {return_value}")
+        return return_value
+    except asyncio.CancelledError as e:
+        logger.error(f"Job {func_name} for FileID: {file_id} cancelled: {e}")
+        return_value = {
+            "status_code": 500,
+            "message": f"Job {func_name} cancelled for FileID {file_id}: {str(e)}",
+            "data": None,
+            "debug_info": debug_info
+        }
+        logger.debug(f"Returning cancelled result for FileID {file_id}: {return_value}")
         return return_value
     except Exception as e:
         func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
-        logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}", exc_info=True)
         logger.debug(f"Traceback: {traceback.format_exc()}")
         debug_info["error_traceback"] = traceback.format_exc()
         if "placeholder://error" in str(e):
@@ -953,7 +965,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         try:
             debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
         except Exception as e:
-            logger.error(f"Failed to upload log file for FileID {file_id}: {e}")
+            logger.error(f"Failed to upload log file for FileID: {file_id}: {e}", exc_info=True)
             debug_info["log_url"] = None
 
 async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
