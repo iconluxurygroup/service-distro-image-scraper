@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 from typing import Optional, Dict
 from config import DB_PASSWORD
-from sqlalchemy.sql import text
+
 logger = logging.getLogger(__name__)
 
 # Configure logging if no handlers exist
