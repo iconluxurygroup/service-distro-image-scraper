@@ -200,7 +200,6 @@ async def insert_search_results(
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
 from pyodbc import Error as PyodbcError
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -233,7 +232,7 @@ async def update_search_sort_order(
                 WHERE r.EntryID = :entry_id AND rec.FileID = :file_id
             """)
             result = await read_conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
-            rows = await result.fetchall()  # Explicitly fetch all rows
+            rows = result.fetchall()  # Remove await, as fetchall() is synchronous with aioodbc
             columns = result.keys()
             result.close()  # Close result explicitly
             await read_conn.commit()  # Commit to release locks
