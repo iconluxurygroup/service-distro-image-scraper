@@ -121,13 +121,14 @@ async def fetch_last_valid_entry(file_id: str, logger: logging.Logger) -> Option
             SELECT TOP 1 EntryID 
             FROM utb_ImageScraperRecords 
             WHERE FileID = :file_id 
-            ORDER BY EntryID DESC
+            AND Step1 IS NULL
+            ORDER BY EntryID ASC
         """)
         result = await conn.execute(query, {"file_id": int(file_id)})
         row = result.fetchone()
         result.close()
         last_entry_id = int(row[0]) if row else None
-        logger.info(f"Retrieved last valid EntryID: {last_entry_id} for FileID: {file_id}")
+        logger.info(f"Retrieved earliest unprocessed EntryID: {last_entry_id} for FileID: {file_id}")
         return last_entry_id
 
 @retry(
