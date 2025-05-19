@@ -140,7 +140,7 @@ async def process_and_tag_results(
         logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
         
         # Generate search variations
-        variations = generate_search_variations(
+        variations = await generate_search_variations(
             search_string=search_string,
             brand=brand,
             model=model,
