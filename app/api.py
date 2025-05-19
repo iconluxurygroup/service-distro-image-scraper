@@ -341,8 +341,7 @@ async def async_process_entry_search(
         return all_results
     finally:
         await client.close()
-
-def generate_search_variations(
+async def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
     model: Optional[str] = None,
@@ -459,7 +458,7 @@ def generate_search_variations(
     logger.debug(f"Added no-color variation: '{no_color_string}'")
 
     if model:
-        model_aliases = generate_aliases(model)
+        model_aliases = await generate_aliases(model) if asyncio.iscoroutinefunction(generate_aliases) else generate_aliases(model)
         model_alias_variations = [f"{brand} {alias}" if brand else alias for alias in model_aliases]
         variations["model_alias"] = list(set(model_alias_variations))
         logger.debug(f"Generated {len(model_alias_variations)} model alias variations")

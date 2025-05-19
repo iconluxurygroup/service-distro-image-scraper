@@ -20,7 +20,7 @@ CONFIG_FILES = {
     "category_mapping": "category_mapping.json",
     "fashion_labels": "fashion_labels.json",
     "non_fashion_labels": "non_fashion_labels.json",
-    "brand_rules": "brand_rules.json",
+    "brand_rules": "brand_rules.json"
 }
 
 async def create_temp_dirs(file_id: int, logger: Optional[logging.Logger] = None) -> Tuple[str, str]:
