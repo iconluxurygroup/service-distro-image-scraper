@@ -14,7 +14,6 @@ import pyodbc
 import re
 import urllib.parse
 
-
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -201,13 +200,10 @@ async def insert_search_results(
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
 
-
-from fuzzywuzzy import fuzz
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((pyodbc.Error, ValueError)),
+    retry=retry_if_exception_type((py Cemented ODBCError, SQLAlchemyError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -237,12 +233,14 @@ async def update_search_sort_order(
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
             columns = result.keys()
-            result.close()
-            await conn.commit()
+            result.close()  # Explicitly close result
+            await conn.commit()  # Commit to release locks
+        
+        results = [dict(zip(columns, row)) for row in rows]
+        logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
-            # Insert placeholder result with SortOrder = -1
             async with async_engine.begin() as conn:
                 await conn.execute(
                     text("""
@@ -296,22 +294,10 @@ async def update_search_sort_order(
                 if alias in image_desc or alias in image_source or alias in image_url:
                     model_matched = True
                     break
-                # Fuzzy match for model
-                if (fuzz.partial_ratio(alias, image_desc) > 70 or
-                    fuzz.partial_ratio(alias, image_source) > 70 or
-                    fuzz.partial_ratio(alias, image_url) > 70):
-                    model_matched = True
-                    break
 
             # Check for brand matches (exact or fuzzy)
             for alias in brand_aliases:
                 if alias in image_desc or alias in image_source or alias in image_url:
-                    brand_matched = True
-                    break
-                # Fuzzy match for brand
-                if (fuzz.partial_ratio(alias, image_desc) > 70 or
-                    fuzz.partial_ratio(alias, image_source) > 70 or
-                    fuzz.partial_ratio(alias, image_url) > 70):
                     brand_matched = True
                     break
 
@@ -346,6 +332,7 @@ async def update_search_sort_order(
                 except SQLAlchemyError as e:
                     logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, EntryID {entry_id}: {e}")
                     return False
+            await conn.commit()  # Ensure commit after all updates
             logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(sorted_results)} rows for EntryID {entry_id}")
 
         return True
@@ -356,7 +343,7 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
-
+    
 # @retry(    stop=stop_after_attempt(3),
 #     wait=wait_exponential(multiplier=1, min=2, max=10),
 #     retry=retry_if_exception_type(SQLAlchemyError),
