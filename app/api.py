@@ -1148,7 +1148,7 @@ async def api_restart_search_all(
         if current_status in ["queued", "running"]:
             logger.warning(f"Job for FileID {file_id} is already {current_status}")
             await asyncio.sleep(5)  # Wait 5 seconds
-            if JOB_S TATUS.get(file_id, {}).get("status") in ["queued", "running"]:
+            if JOB_STATUS.get(file_id, {}).get("status") in ["queued", "running"]:
                 raise HTTPException(status_code=400, detail=f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
         
         # Check for duplicate request_id
@@ -1193,7 +1193,7 @@ async def api_restart_search_all(
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
 
 
-        
+
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
     file_id: str,
