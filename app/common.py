@@ -293,17 +293,6 @@ async def generate_search_variations(
         model_alias_variations = [alias for alias in model_aliases]  # Use model aliases directly, without brand prefix
         variations["model_alias"] = list(set(model_alias_variations))
         logger.debug(f"Generated {len(model_alias_variations)} model alias variations: {model_alias_variations}")
-
-    if category and "apparel" in category.lower():
-        apparel_terms = ["sneaker", "shoe", "hoodie", "shirt", "jacket", "pants", "clothing"]
-        category_variations = [f"{search_string} {term}" for term in apparel_terms]
-        if brand and model:
-            category_variations.extend([f"{brand} {model} {term}" for term in apparel_terms])
-        variations["category_specific"] = list(set(category_variations))
-        logger.debug(f"Generated {len(category_variations)} category-specific variations: {category_variations}")
-
-    for key in variations:
-        variations[key] = list(set(variations[key]))
     
     total_variations = sum(len(v) for v in variations.values())
     logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
