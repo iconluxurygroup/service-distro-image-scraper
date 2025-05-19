@@ -290,6 +290,22 @@ async def async_process_entry_search(
 ) -> List[Dict]:
     logger.debug(f"Processing search for EntryID {entry_id}, FileID {file_id_db}, Use all variations: {use_all_variations}")
     
+    # Check for existing valid results
+    async with async_engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                SELECT COUNT(*) FROM utb_ImageScraperResult
+                WHERE EntryID = :entry_id AND ImageUrl NOT LIKE 'placeholder://%'
+            """),
+            {"entry_id": entry_id}
+        )
+        valid_result_count = result.scalar()
+        result.close()
+    
+    if valid_result_count > 0:
+        logger.info(f"Found {valid_result_count} valid results for EntryID {entry_id}, skipping search")
+        return []  # Skip search, rely on update_search_sort_order
+    
     # Generate search variations
     search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
     
@@ -299,12 +315,10 @@ async def async_process_entry_search(
         "no_color", "model_alias", "category_specific"
     ]
     
-    # Collect all search terms
     for variation_type in variation_types:
         if variation_type in search_terms_dict:
             search_terms.extend(search_terms_dict[variation_type])
     
-    # Normalize and deduplicate search terms
     search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
     logger.info(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
 
@@ -331,7 +345,6 @@ async def async_process_entry_search(
         return all_results
     finally:
         await client.close()
-
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
     try:
@@ -434,7 +447,6 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
     finally:
         log_memory_usage()
 
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -460,7 +472,7 @@ async def process_restart_batch(
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 1
-        MAX_CONCURRENCY = 2
+        MAX_CONCURRENCY = 10
         MAX_ENTRY_RETRIES = 3
 
         async with async_engine.connect() as conn:
@@ -498,11 +510,9 @@ async def process_restart_batch(
             query = text("""
                 SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory 
                 FROM utb_ImageScraperRecords r
-                LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
                 WHERE r.FileID = :file_id 
                 AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
                 AND r.Step1 IS NULL
-                AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.SortOrder <= 0)
                 ORDER BY r.EntryID
             """)
             result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
@@ -564,20 +574,19 @@ async def process_restart_batch(
                         deduplicated_results.append(res)
                 logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
-                # Insert results (placeholders are handled in async_process_entry_search)
+                # Insert results if non-placeholder
+                insert_success = True
                 if deduplicated_results:
                     insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
-                    if not insert_success:
-                        logger.error(f"Failed to insert results for EntryID {entry_id}")
-                        return entry_id, False
+                    logger.info(f"Insert results for EntryID {entry_id}: {'Success' if insert_success else 'Failed'}")
 
                 # Update sort order
                 update_result = await update_search_sort_order(
                     str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                 )
+                logger.info(f"Update SortOrder for EntryID {entry_id}: {'Success' if update_result else 'Failed'}")
                 if update_result is None or not update_result:
                     logger.error(f"SortOrder update failed for EntryID {entry_id}")
-                    # Continue to mark Step1 to prevent reprocessing
 
                 # Mark Step1 as complete
                 async with async_engine.connect() as conn:
@@ -640,7 +649,6 @@ async def process_restart_batch(
                 logger.warning(f"Found {null_entries} entries with NULL SortOrder")
             result.close()
 
-            # Verify non-placeholder results
             result = await conn.execute(
                 text("""
                     SELECT COUNT(*) AS result_count
