@@ -573,14 +573,14 @@ async def update_sort_order(
     logger: Optional[logging.Logger] = None,
     db_queue: Optional[DatabaseQueue] = None
 ) -> Dict[str, Any]:
-    logger = logger or logger
+    logger = logger or logging.getLogger(__name__)
     db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
     await db_queue.start()
 
     try:
         file_id = int(file_id)
         logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
-
+        
         async def fetch_entries(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
@@ -590,6 +590,7 @@ async def update_sort_order(
             result = await conn.execute(query, params)
             entries = result.fetchall()
             result.close()
+            logger.debug(f"Fetched {len(entries)} entries for FileID: {file_id}")
             return entries
 
         entries = await db_queue.enqueue(
@@ -597,19 +598,20 @@ async def update_sort_order(
             {"file_id": file_id},
             connection_type="read"
         )
-        logger.debug(f"Fetched {len(entries)} entries for FileID: {file_id}")
-
+        
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id}")
-            return {"results": [], "success_count": 0, "failure_count": 0}
-
+            result = {"results": [], "success_count": 0, "failure_count": 0}
+            logger.debug(f"Returning empty result for FileID: {file_id}: {result}")
+            return result
+        
         results = []
         success_count = 0
         failure_count = 0
 
         for entry in entries:
             entry_id, brand, model, color, category = entry
-            logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
+            logger.debug(f"Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
             try:
                 entry_results = await update_search_sort_order(
                     file_id=str(file_id),
@@ -621,12 +623,12 @@ async def update_sort_order(
                     logger=logger,
                     db_queue=db_queue
                 )
-                results.append({"EntryID": entry_id, "Success": entry_results["success"], "Error": entry_results.get("error")})
-                if entry_results["success"]:
+                results.append({"EntryID": entry_id, "Success": bool(entry_results)})
+                if entry_results:
                     success_count += 1
                 else:
                     failure_count += 1
-                    logger.warning(f"Failed to update EntryID {entry_id}: {entry_results.get('error', 'Unknown error')}")
+                    logger.warning(f"No results for EntryID {entry_id}")
             except Exception as e:
                 logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
                 results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
@@ -692,7 +694,7 @@ async def update_sort_order(
             "failure_count": failure_count,
             "verification": verification
         }
-        logger.debug(f"Returning result for FileID: {file_id}: {result}")
+        logger.debug(f"Returning final result for FileID: {file_id}: {result}")
         return result
     except SQLAlchemyError as e:
         logger.error(f"Database error in batch SortOrder update for FileID: {file_id}: {e}", exc_info=True)
@@ -710,4 +712,7 @@ async def update_sort_order(
         logger.debug(f"Returning error result for FileID: {file_id}: {result}")
         return result
     finally:
-        await db_queue.stop()
+        try:
+            await db_queue.stop()
+        except Exception as e:
+            logger.error(f"Failed to stop database queue for FileID: {file_id}: {e}", exc_info=True)
