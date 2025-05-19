@@ -116,7 +116,6 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             if parsed.fragment:
                 cleaned += f"#{parsed.fragment}"
         except ValueError:
-            logger.debug(f"Invalid URL format: {cleaned}")
             return ""
     return cleaned
 
