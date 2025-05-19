@@ -141,7 +141,6 @@ import asyncio
 import logging
 import psutil
 from typing import List, Dict, Optional
-
 async def process_and_tag_results(
     search_string: str,
     brand: Optional[str] = None,
@@ -166,13 +165,13 @@ async def process_and_tag_results(
             logger=logger
         )
         
-        # Define the ordered list of variation types
+        # Define ordered variation types
         ordered_types = [
             "default", "delimiter_variations", "color_variations",
             "brand_alias", "no_color", "model_alias", "category_specific"
         ]
         
-        # Map each unique variation to its primary type (earliest in ordered_types)
+        # Map variations to primary type
         variation_to_primary_type = {}
         for search_type in ordered_types:
             if search_type in variations:
@@ -181,7 +180,7 @@ async def process_and_tag_results(
                     if var_lower not in variation_to_primary_type:
                         variation_to_primary_type[var_lower] = search_type
         
-        # Create an ordered list of variations
+        # Create ordered list of variations
         variation_order = []
         for primary_type in ordered_types:
             vars_for_type = sorted(
@@ -189,47 +188,54 @@ async def process_and_tag_results(
             )
             variation_order.extend(vars_for_type)
         
-        logger.info(f"Worker PID {process.pid}: Processing {len(variation_order)} unique variations in order for EntryID {entry_id}")
+        logger.info(f"Worker PID {process.pid}: Processing {len(variation_order)} unique variations for EntryID {entry_id}")
         
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
-        
         endpoint = endpoint or SEARCH_PROXY_API_URL
-        client = SearchClient(endpoint=endpoint, logger=logger)
+        client = SearchClient(endpoint=endpoint, logger=logger, max_concurrency=8)  # Increased concurrency
         
         try:
-            # Create and execute search tasks in the specified order
-            search_tasks = []
-            for var_lower in variation_order:
-                logger.debug(f"Worker PID {process.pid}: Queuing search for variation '{var_lower}' for EntryID {entry_id}")
-                search_tasks.append(client.search(term=var_lower, brand=brand or "", entry_id=entry_id))
-            
-            # Execute all tasks concurrently, results returned in task order
-            search_results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
-            
+            # Process variations in chunks
+            chunk_size = 5  # Adjust based on API limits and server capacity
+            max_valid_results = 10  # Stop after finding enough results
             all_results = []
-            for var_lower, search_results in zip(variation_order, search_results_list):
-                if isinstance(search_results, Exception):
-                    logger.error(f"Worker PID {process.pid}: Search failed for variation '{var_lower}' in EntryID {entry_id}: {search_results}")
-                    continue
-                if not search_results:
-                    logger.warning(f"Worker PID {process.pid}: No results for variation '{var_lower}' in EntryID {entry_id}")
-                    continue
-                tagged_results = []
-                for res in search_results:
-                    tagged_result = {
-                        "EntryID": entry_id,
-                        "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
-                        "ImageDesc": res.get("ImageDesc", ""),
-                        "ImageSource": res.get("ImageSource", "N/A"),
-                        "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
-                        "ProductCategory": res.get("ProductCategory", "")
-                    }
-                    if all(col in tagged_result for col in required_columns):
-                        tagged_results.append(tagged_result)
-                    else:
-                        logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
-                all_results.extend(tagged_results)
-                logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{var_lower}' in EntryID {entry_id}")
+            valid_result_count = 0
+            
+            for i in range(0, len(variation_order), chunk_size):
+                if valid_result_count >= max_valid_results:
+                    logger.info(f"Stopping search for EntryID {entry_id}: Reached {max_valid_results} valid results")
+                    break
+                
+                chunk = variation_order[i:i + chunk_size]
+                search_tasks = [
+                    client.search(term=var_lower, brand=brand or "", entry_id=entry_id)
+                    for var_lower in chunk
+                ]
+                
+                search_results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
+                
+                for var_lower, search_results in zip(chunk, search_results_list):
+                    if isinstance(search_results, Exception):
+                        logger.error(f"Worker PID {process.pid}: Search failed for variation '{var_lower}' in EntryID {entry_id}: {search_results}")
+                        continue
+                    if not search_results:
+                        logger.warning(f"Worker PID {process.pid}: No results for variation '{var_lower}' in EntryID {entry_id}")
+                        continue
+                    tagged_results = []
+                    for res in search_results:
+                        tagged_result = {
+                            "EntryID": entry_id,
+                            "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
+                            "ImageDesc": res.get("ImageDesc", ""),
+                            "ImageSource": res.get("ImageSource", "N/A"),
+                            "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
+                            "ProductCategory": res.get("ProductCategory", "")
+                        }
+                        if all(col in tagged_result for col in required_columns):
+                            tagged_results.append(tagged_result)
+                    valid_result_count += len([res for res in tagged_results if not res["ImageUrl"].startswith("placeholder://")])
+                    all_results.extend(tagged_results)
+                    logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{var_lower}' in EntryID {entry_id}")
         
         finally:
             await client.close()
@@ -245,7 +251,7 @@ async def process_and_tag_results(
                 "ProductCategory": ""
             }]
         
-        # Deduplicate results while preserving order
+        # Deduplicate results
         seen_urls = set()
         deduplicated_results = []
         for res in all_results:
@@ -255,16 +261,13 @@ async def process_and_tag_results(
                 deduplicated_results.append(res)
         logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
         
-        # Filter irrelevant results while preserving order
+        # Filter irrelevant results
         irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
-        filtered_results = []
-        for res in deduplicated_results:
-            image_desc = res.get("ImageDesc", "").lower()
-            if any(kw.lower() in image_desc for kw in irrelevant_keywords):
-                logger.debug(f"Worker PID {process.pid}: Filtered out result for EntryID {entry_id} due to keywords in ImageDesc: {image_desc[:100]}")
-                continue
-            filtered_results.append(res)
-        logger.info(f"Worker PID {process.pid}: Filtered to {len(filtered_results)} results after removing irrelevant items for EntryID {entry_id}")
+        filtered_results = [
+            res for res in deduplicated_results
+            if not any(kw.lower() in res.get("ImageDesc", "").lower() for kw in irrelevant_keywords)
+        ]
+        logger.info(f"Worker PID {process.pid}: Filtered to {len(filtered_results)} results for EntryID {entry_id}")
         
         return filtered_results
     
