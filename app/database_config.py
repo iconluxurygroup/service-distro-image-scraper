@@ -43,16 +43,19 @@ if not all(param in conn_str for param in required_params):
 
 encoded_conn_str = quote_plus(conn_str)
 
-# Create engines with error handling
 try:
     async_engine = create_async_engine(
         f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}",
         echo=False,
-        pool_size=10,           # Reduced for typical workloads
-        max_overflow=20,        # Allow moderate overflow
-        pool_timeout=30,        # Reduced timeout
-        pool_pre_ping=True,
-        pool_recycle=3600,
+        pool_size=8,           # Reduced to avoid resource exhaustion
+        max_overflow=10,       # Reduced overflow
+        pool_timeout=15,       # Shorter timeout
+        pool_pre_ping=True,    # Ensure connection health check
+        pool_recycle=1800,     # Recycle every 30 minutes
+        connect_args={
+            "timeout": 30,
+            "retry_interval": 2,
+        },
         isolation_level="READ COMMITTED"
     )
     logger.info(f"Initialized async_engine with server: {DB_SERVER}, database: {DB_NAME}")
@@ -62,9 +65,10 @@ try:
         echo=False,
         pool_size=5,
         max_overflow=5,
-        pool_timeout=30,
+        pool_timeout=15,
         pool_pre_ping=True,
-        pool_recycle=3600,
+        pool_recycle=1800,
+        connect_args={"timeout": 30},
         isolation_level="READ COMMITTED"
     )
     logger.info(f"Initialized sync engine with server: {DB_SERVER}, database: {DB_NAME}")
