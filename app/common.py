@@ -183,6 +183,7 @@ def normalize_model(model: Any) -> str:
     if not isinstance(model, str):
         return str(model).strip().lower()
     return model.strip().lower()
+
 async def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
@@ -225,7 +226,7 @@ async def generate_search_variations(
                 if variation != search_string:
                     delimiter_variations.append(variation)
     variations["delimiter_variations"] = list(set(delimiter_variations))
-    logger.debug(f"Generated {len(delimiter_variations)} delimiter variations: {delimiter_variations}")
+    logger.debug(f"Generated {len(delimiter_variations)} delimiter variations")
 
     if color:
         color_variations = [
@@ -234,7 +235,7 @@ async def generate_search_variations(
             f"{model} {color}" if model else search_string
         ]
         variations["color_variations"] = list(set(color_variations))
-        logger.debug(f"Generated {len(color_variations)} color variations: {color_variations}")
+        logger.debug(f"Generated {len(color_variations)} color variations")
 
     if brand:
         brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
@@ -251,7 +252,6 @@ async def generate_search_variations(
         brand_alias_variations = [f"{alias} {model}" for alias in brand_aliases if model]
         variations["brand_alias"] = list(set(brand_alias_variations))
         logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations: {brand_alias_variations}")
-
     no_color_string = search_string
     if brand and brand_rules and "brand_rules" in brand_rules:
         for rule in brand_rules["brand_rules"]:
@@ -292,7 +292,7 @@ async def generate_search_variations(
         model_aliases = await generate_aliases(model) if asyncio.iscoroutinefunction(generate_aliases) else generate_aliases(model)
         model_alias_variations = [f"{brand} {alias}" if brand else alias for alias in model_aliases]
         variations["model_alias"] = list(set(model_alias_variations))
-        logger.debug(f"Generated {len(model_alias_variations)} model alias variations: {model_alias_variations}")
+        logger.debug(f"Generated {len(model_alias_variations)} model alias variations")
 
     if category and "apparel" in category.lower():
         apparel_terms = ["sneaker", "shoe", "hoodie", "shirt", "jacket", "pants", "clothing"]
@@ -300,13 +300,12 @@ async def generate_search_variations(
         if brand and model:
             category_variations.extend([f"{brand} {model} {term}" for term in apparel_terms])
         variations["category_specific"] = list(set(category_variations))
-        logger.debug(f"Generated {len(category_variations)} category-specific variations: {category_variations}")
+        logger.debug(f"Generated {len(category_variations)} category-specific variations")
 
     for key in variations:
         variations[key] = list(set(variations[key]))
     
-    total_variations = sum(len(v) for v in variations.values())
-    logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
+    logger.info(f"Generated total of {sum(len(v) for v in variations.values())} unique variations for search string '{search_string}'")
     return variations
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
     brand_clean = clean_string(brand).lower()
