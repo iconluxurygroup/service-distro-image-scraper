@@ -478,7 +478,7 @@ async def update_search_sort_order(
                         SELECT ResultID, EntryID, SortOrder
                         FROM utb_ImageScraperResult
                         WHERE EntryID IN :entry_ids
-                    """).bindparams(entry_ids=tuple_(entry_ids))
+                    """).bindparams(entry_ids=tuple(entry_ids))
                     params = {"entry_ids": tuple(entry_ids)}
                 
                 result = await conn.execute(query, params)
