@@ -326,6 +326,7 @@ def is_connection_busy_error(exception):
         if isinstance(orig, PyodbcError):
             return "HY000" in str(orig) and "Connection is busy" in str(orig)
     return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -348,7 +349,6 @@ async def update_search_sort_order(
 ) -> Dict[str, Any]:
     logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
-    db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
 
     try:
         # Fetch results
@@ -364,7 +364,7 @@ async def update_search_sort_order(
                 rows = result.fetchall()
                 columns = result.keys()
             finally:
-                result.close()  # Ensure cursor is closed
+                result.close()
             return rows, columns
 
         try:
@@ -374,11 +374,11 @@ async def update_search_sort_order(
                 connection_type="read"
             ) or (None, None)
         except Exception as e:
-            logger.error(f"Failed to fetch results for EntryID {entry_id}: {e}", exc_info=True)
+            logger.error(f"Worker PID {process.pid}: Failed to fetch results for EntryID {entry_id}: {e}", exc_info=True)
             return {"success": False, "error": str(e), "entry_id": entry_id}
 
         if rows is None or columns is None:
-            logger.error(f"Queue returned None for EntryID {entry_id}")
+            logger.error(f"Worker PID {process.pid}: Queue returned None for EntryID {entry_id}")
             return {"success": False, "error": "Queue operation failed", "entry_id": entry_id}
 
         results = [dict(zip(columns, row)) for row in rows]
@@ -409,7 +409,7 @@ async def update_search_sort_order(
                 logger.info(f"Worker PID {process.pid}: Inserted placeholder result with SortOrder = -1 for EntryID {entry_id}")
                 return {"success": True, "entry_id": entry_id}
             except Exception as e:
-                logger.error(f"Failed to insert placeholder for EntryID {entry_id}: {e}", exc_info=True)
+                logger.error(f"Worker PID {process.pid}: Failed to insert placeholder for EntryID {entry_id}: {e}", exc_info=True)
                 return {"success": False, "error": str(e), "entry_id": entry_id}
 
         # Process brand and model aliases
@@ -448,8 +448,7 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-
-
+        # Perform bulk update using DataFrame
         async def update_sort_order(conn: AsyncConnection, params: List[Dict]):
             try:
                 # Convert params to DataFrame
@@ -461,17 +460,28 @@ async def update_search_sort_order(
                 update_df["sort_order"] = update_df["sort_order"].astype(int)
                 
                 # Fetch existing utb_ImageScraperResult data for relevant EntryIDs
-                entry_ids = tuple(update_df["entry_id"].unique())
+                entry_ids = list(update_df["entry_id"].unique())
                 if not entry_ids:
-                    logger.warning(f"Worker PID {psutil.Process().pid}: No entry IDs provided for update")
+                    logger.warning(f"Worker PID {process.pid}: No entry IDs provided for update")
                     return 0
                 
-                query = text("""
-                    SELECT ResultID, EntryID, SortOrder
-                    FROM utb_ImageScraperResult
-                    WHERE EntryID IN :entry_ids
-                """).bindparams(entry_ids=entry_ids)
-                result = await conn.execute(query)
+                # Handle single or multiple entry_ids for IN clause
+                if len(entry_ids) == 1:
+                    query = text("""
+                        SELECT ResultID, EntryID, SortOrder
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID = :entry_id
+                    """)
+                    params = {"entry_id": entry_ids[0]}
+                else:
+                    query = text("""
+                        SELECT ResultID, EntryID, SortOrder
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID IN :entry_ids
+                    """).bindparams(entry_ids=tuple_(entry_ids))
+                    params = {"entry_ids": tuple(entry_ids)}
+                
+                result = await conn.execute(query, params)
                 rows = result.fetchall()
                 result.close()
                 
@@ -497,17 +507,17 @@ async def update_search_sort_order(
                 # Update SortOrder: use new sort_order where available, keep existing otherwise
                 merged_df["SortOrder"] = merged_df["sort_order"].fillna(merged_df["SortOrder"]).astype(int)
                 
-                # Filter rows where SortOrder needs updating (i.e., new SortOrder differs from existing)
+                # Filter rows where SortOrder needs updating
                 update_rows = merged_df[
                     merged_df["sort_order"].notnull() & 
                     (merged_df["SortOrder"] != merged_df["sort_order"])
                 ][["ResultID", "EntryID", "SortOrder"]]
                 
                 if update_rows.empty:
-                    logger.debug(f"Worker PID {psutil.Process().pid}: No SortOrder updates needed")
+                    logger.debug(f"Worker PID {process.pid}: No SortOrder updates needed")
                     return 0
                 
-                # Prepare and execute UPDATE statements
+                # Execute UPDATE statements
                 update_query = text("""
                     UPDATE utb_ImageScraperResult
                     SET SortOrder = :SortOrder
@@ -522,11 +532,11 @@ async def update_search_sort_order(
                     })
                     row_count += result.rowcount
                 
-                logger.debug(f"Worker PID {psutil.Process().pid}: Updated {row_count} rows with new SortOrder")
+                logger.debug(f"Worker PID {process.pid}: Updated {row_count} rows with new SortOrder")
                 return max(0, row_count)
             
             except Exception as e:
-                logger.error(f"Worker PID {psutil.Process().pid}: Error in update_sort_order: {e}", exc_info=True)
+                logger.error(f"Worker PID {process.pid}: Error in update_sort_order: {e}", exc_info=True)
                 raise
 
         update_params = []
@@ -553,7 +563,7 @@ async def update_search_sort_order(
                     row_count = 0
                 logger.info(f"Worker PID {process.pid}: Bulk updated SortOrder for {row_count} rows for EntryID {entry_id}")
             except Exception as e:
-                logger.error(f"Failed to update sort order for EntryID {entry_id}: {e}", exc_info=True)
+                logger.error(f"Worker PID {process.pid}: Failed to update sort order for EntryID {entry_id}: {e}", exc_info=True)
                 return {"success": False, "error": str(e), "entry_id": entry_id}
         else:
             logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
