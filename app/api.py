@@ -16,6 +16,7 @@ import aiohttp
 import pandas as pd
 from typing import Optional, List, Dict, Any, Callable
 from icon_image_lib.google_parser import process_search_result
+from common import generate_brand_aliases
 from logging_config import setup_job_logger
 from s3_utils import upload_file_to_space
 from ai_utils import batch_vision_reason
@@ -341,30 +342,6 @@ async def async_process_entry_search(
     finally:
         await client.close()
 
-def generate_brand_aliases(brand: str) -> List[str]:
-    """
-    Generate a list of brand aliases for the given brand.
-    Returns a list of alternate brand names or spellings.
-    """
-    brand = brand.lower().strip()
-    aliases = [brand]
-    
-    brand_alias_map = {
-        "nike": ["nike inc.", "nke", "nikes"],
-        "adidas": ["adidas ag", "addidas", "adi"],
-        "gucci": ["gucci group", "guchi"],
-        "louis vuitton": ["lv", "louis v", "vuitton"],
-    }
-    
-    if brand in brand_alias_map:
-        aliases.extend(brand_alias_map[brand])
-    
-    aliases.append(brand.replace(" ", ""))
-    if len(brand.split()) > 1:
-        aliases.append("".join(word[0] for word in brand.split()))
-    
-    return list(set(aliases))
-
 def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
@@ -419,7 +396,28 @@ def generate_search_variations(
         logger.debug(f"Generated {len(color_variations)} color variations")
 
     if brand:
-        brand_aliases = generate_brand_aliases(brand) or generate_aliases(brand)
+        predefined_aliases = {
+            "alexander mcqueen": ["amcq"],
+            "saint laurent": ["ysl", "yves saint laurent"],
+            "balenciaga": ["balenci", "bal"],
+            "bottega veneta": ["bv", "bottega"],
+            "givenchy": ["giv"],
+            "gucci": ["gucci"],
+            "loewe": ["loewe"],
+            "veja": ["veja"],
+            "fendi": ["fendi"],
+            "versace": ["versace"],
+            "burberry": ["burb", "burberry"],
+            "jacquemus": ["jacquemus"],
+            "moncler": ["moncler"],
+            "dolce & gabbana": ["dolce", "dg", "dolce gabbana"],
+            "salvatore ferragamo": ["ferragamo", "sf"],
+            "balmain": ["balmain"],
+            "chloe": ["chloe"],
+            "marc jacobs": ["marc jacobs"],
+            "vans": ["vans"]
+        }
+        brand_aliases = await generate_brand_aliases(brand, predefined_aliases) or await generate_aliases(brand)
         brand_alias_variations = [f"{alias} {model}" for alias in brand_aliases if model]
         variations["brand_alias"] = list(set(brand_alias_variations))
         logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations")

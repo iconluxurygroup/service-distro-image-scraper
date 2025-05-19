@@ -15,12 +15,12 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
 CONFIG_FILES = {
     "category_hierarchy": "category_hierarchy.json",
     "category_mapping": "category_mapping.json",
     "fashion_labels": "fashion_labels.json",
-    "non_fashion_labels": "non_fashion_labels.json"
+    "non_fashion_labels": "non_fashion_labels.json",
+    "brand_rules": "brand_rules.json",
 }
 
 async def create_temp_dirs(file_id: int, logger: Optional[logging.Logger] = None) -> Tuple[str, str]:
