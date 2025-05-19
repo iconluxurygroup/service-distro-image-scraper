@@ -16,7 +16,7 @@ import aiohttp
 import pandas as pd
 from typing import Optional, List, Dict, Any, Callable
 from icon_image_lib.google_parser import process_search_result
-from common import generate_brand_aliases
+from common import generate_search_variations
 from logging_config import setup_job_logger
 from s3_utils import upload_file_to_space
 from ai_utils import batch_vision_reason
@@ -344,131 +344,6 @@ async def async_process_entry_search(
         return all_results
     finally:
         await client.close()
-
-async def generate_search_variations(
-    search_string: str,
-    brand: Optional[str] = None,
-    model: Optional[str] = None,
-    color: Optional[str] = None,
-    category: Optional[str] = None,
-    brand_rules: Optional[Dict] = None,
-    logger: Optional[logging.Logger] = None
-) -> Dict[str, List[str]]:
-    logger = logger or default_logger
-    variations = {
-        "default": [],
-        "delimiter_variations": [],
-        "color_variations": [],
-        "brand_alias": [],
-        "no_color": [],
-        "model_alias": [],
-        "category_specific": []
-    }
-
-    if not search_string or not isinstance(search_string, str):
-        logger.warning("Empty or invalid search string provided")
-        return variations
-    
-    search_string = clean_string(search_string).lower()
-    brand = clean_string(brand).lower() if brand else None
-    model = clean_string(model).lower() if model else search_string
-    color = clean_string(color).lower() if color else None
-    category = clean_string(category).lower() if category else None
-
-    variations["default"].append(search_string)
-    logger.debug(f"Added default variation: '{search_string}'")
-
-    delimiters = [' ', '-', '_', '/']
-    delimiter_variations = []
-    for delim in delimiters:
-        if delim in search_string:
-            for new_delim in delimiters:
-                variation = search_string.replace(delim, new_delim)
-                if variation != search_string:
-                    delimiter_variations.append(variation)
-    variations["delimiter_variations"] = list(set(delimiter_variations))
-    logger.debug(f"Generated {len(delimiter_variations)} delimiter variations")
-
-    if color:
-        color_variations = [
-            f"{search_string} {color}",
-            f"{brand} {model} {color}" if brand and model else search_string,
-            f"{model} {color}" if model else search_string
-        ]
-        variations["color_variations"] = list(set(color_variations))
-        logger.debug(f"Generated {len(color_variations)} color variations")
-
-    if brand:
-        brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
-        predefined_aliases = {}
-        for rule in brand_rules_data.get("brand_rules", []):
-            if rule.get("is_active", False):
-                full_name = clean_string(rule.get("full_name", "")).lower()
-                if full_name:
-                    predefined_aliases[full_name] = [
-                        clean_string(name).lower() for name in rule.get("names", [])
-                        if clean_string(name).lower() != full_name
-                    ]
-        brand_aliases = await generate_brand_aliases(brand, predefined_aliases) or await generate_aliases(brand)
-        brand_alias_variations = [f"{alias} {model}" for alias in brand_aliases if model]
-        variations["brand_alias"] = list(set(brand_alias_variations))
-        logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations")
-
-    no_color_string = search_string
-    if brand and brand_rules and "brand_rules" in brand_rules:
-        for rule in brand_rules["brand_rules"]:
-            if any(brand in name.lower() for name in rule.get("names", [])):
-                sku_format = rule.get("sku_format", {})
-                color_separator = sku_format.get("color_separator", "_")
-                expected_length = rule.get("expected_length", {})
-                base_length = expected_length.get("base", [6])[0]
-                with_color_length = expected_length.get("with_color", [10])[0]
-
-                if not color_separator:
-                    logger.debug(f"No color separator for brand {brand}, using full search string")
-                    break
-
-                if color_separator in search_string:
-                    parts = search_string.split(color_separator)
-                    base_part = parts[0]
-                    if len(base_part) >= base_length and len(search_string) <= with_color_length:
-                        no_color_string = base_part
-                        logger.debug(f"Extracted no-color string: '{no_color_string}' using separator '{color_separator}'")
-                        break
-                elif len(search_string) <= base_length:
-                    no_color_string = search_string
-                    logger.debug(f"No color suffix detected, using: '{no_color_string}'")
-                    break
-
-    if no_color_string == search_string:
-        for delim in ['_', '-', ' ']:
-            if delim in search_string:
-                no_color_string = search_string.rsplit(delim, 1)[0]
-                logger.debug(f"Fallback no-color string: '{no_color_string}' using delimiter '{delim}'")
-                break
-
-    variations["no_color"].append(no_color_string)
-    logger.debug(f"Added no-color variation: '{no_color_string}'")
-
-    if model:
-        model_aliases = await generate_aliases(model) if asyncio.iscoroutinefunction(generate_aliases) else generate_aliases(model)
-        model_alias_variations = [f"{brand} {alias}" if brand else alias for alias in model_aliases]
-        variations["model_alias"] = list(set(model_alias_variations))
-        logger.debug(f"Generated {len(model_alias_variations)} model alias variations")
-
-    if category and "apparel" in category.lower():
-        apparel_terms = ["sneaker", "shoe", "hoodie", "shirt", "jacket", "pants", "clothing"]
-        category_variations = [f"{search_string} {term}" for term in apparel_terms]
-        if brand and model:
-            category_variations.extend([f"{brand} {model} {term}" for term in apparel_terms])
-        variations["category_specific"] = list(set(category_variations))
-        logger.debug(f"Generated {len(category_variations)} category-specific variations")
-
-    for key in variations:
-        variations[key] = list(set(variations[key]))
-    
-    logger.info(f"Generated total of {sum(len(v) for v in variations.values())} unique variations for search string '{search_string}'")
-    return variations
 
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
