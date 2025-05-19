@@ -5,8 +5,6 @@ import json
 import aiofiles
 import signal
 import atexit
-import asyncio
-import traceback
 from typing import Optional, List, Dict, Callable, Any
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 from sqlalchemy.sql import text
@@ -19,6 +17,15 @@ import pyodbc
 import re
 import urllib.parse
 import asyncio
+import traceback
+
+# Database Indexes (apply these to the database for performance)
+"""
+CREATE INDEX idx_file_id ON utb_ImageScraperRecords (FileID);
+CREATE INDEX idx_entry_id ON utb_ImageScraperResult (EntryID);
+CREATE INDEX idx_result_entry ON utb_ImageScraperResult (EntryID, FileID);
+CREATE INDEX idx_sort_order ON utb_ImageScraperResult (SortOrder);
+"""
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -27,8 +34,30 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
 
+# Global DatabaseQueue instance
+global_db_queue = None
 
-# DatabaseQueue class
+# Signal handler for graceful shutdown
+def setup_signal_handlers():
+    def handle_shutdown(signum, frame):
+        logger.info(f"Received signal {signum}, initiating graceful shutdown")
+        if global_db_queue:
+            asyncio.create_task(global_db_queue.stop())
+        asyncio.create_task(async_engine.dispose())
+        logger.info("Shutdown complete")
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+# Initialize application
+def initialize_app():
+    global global_db_queue
+    global_db_queue = DatabaseQueue(logger=logger)
+    setup_signal_handlers()
+    atexit.register(lambda: asyncio.run(async_engine.dispose()))
+
+initialize_app()
+
 # DatabaseQueue class
 class DatabaseQueue:
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -95,29 +124,7 @@ class DatabaseQueue:
         except SQLAlchemyError as e:
             self.logger.warning(f"Connection health check failed: {e}")
             return False
-# Global DatabaseQueue instance
-global_db_queue = None
 
-# Signal handler for graceful shutdown
-def setup_signal_handlers():
-    def handle_shutdown(signum, frame):
-        logger.info(f"Received signal {signum}, initiating graceful shutdown")
-        if global_db_queue:
-            asyncio.create_task(global_db_queue.stop())
-        asyncio.create_task(async_engine.dispose())
-        logger.info("Shutdown complete")
-
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-# Initialize application
-def initialize_app():
-    global global_db_queue
-    global_db_queue = DatabaseQueue(logger=logger)
-    setup_signal_handlers()
-    atexit.register(lambda: asyncio.run(async_engine.dispose()))
-
-initialize_app()
 def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
     logger = logger or logger
     if not url or url == '' or 'placeholder' in str(url).lower():
@@ -232,32 +239,39 @@ async def insert_search_results(
             return False
 
         async def insert_or_update_result(conn: AsyncConnection, params: List[Dict]):
-            update_query = text("""
-                UPDATE utb_ImageScraperResult
-                SET ImageDesc = t.image_desc,
-                    ImageSource = t.image_source,
-                    ImageUrlThumbnail = t.image_url_thumbnail,
-                    CreateTime = CURRENT_TIMESTAMP
-                FROM (VALUES :update_values) AS t(entry_id, image_url, image_desc, image_source, image_url_thumbnail)
-                WHERE utb_ImageScraperResult.EntryID = t.entry_id AND utb_ImageScraperResult.ImageUrl = t.image_url
-            """)
-            update_values = [(p["entry_id"], p["image_url"], p["image_desc"], p["image_source"], p["image_url_thumbnail"]) for p in params]
-            result = await conn.execute(update_query, {"update_values": update_values})
-            updated_count = result.rowcount
+            try:
+                update_query = text("""
+                    UPDATE utb_ImageScraperResult
+                    SET ImageDesc = t.image_desc,
+                        ImageSource = t.image_source,
+                        ImageUrlThumbnail = t.image_url_thumbnail,
+                        CreateTime = CURRENT_TIMESTAMP
+                    FROM (VALUES :update_values) AS t(entry_id, image_url, image_desc, image_source, image_url_thumbnail)
+                    WHERE utb_ImageScraperResult.EntryID = t.entry_id AND utb_ImageScraperResult.ImageUrl = t.image_url
+                """)
+                update_values = [(p["entry_id"], p["image_url"], p["image_desc"], p["image_source"], p["image_url_thumbnail"]) for p in params]
+                result = await conn.execute(update_query, {"update_values": update_values})
+                updated_count = result.rowcount
 
-            insert_query = text("""
-                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime, SortOrder)
-                SELECT t.entry_id, t.image_url, t.image_desc, t.image_source, t.image_url_thumbnail, CURRENT_TIMESTAMP, t.sort_order
-                FROM (VALUES :insert_values) AS t(entry_id, image_url, image_desc, image_source, image_url_thumbnail, sort_order)
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM utb_ImageScraperResult
-                    WHERE EntryID = t.entry_id AND ImageUrl = t.image_url
-                )
-            """)
-            insert_values = [(p["entry_id"], p["image_url"], p["image_desc"], p["image_source"], p["image_url_thumbnail"], -1 if p["image_url"] == "placeholder://no-results" else None) for p in params]
-            result = await conn.execute(insert_query, {"insert_values": insert_values})
-            inserted_count = result.rowcount
-            return inserted_count, updated_count
+                insert_query = text("""
+                    INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime, SortOrder)
+                    SELECT t.entry_id, t.image_url, t.image_desc, t.image_source, t.image_url_thumbnail, CURRENT_TIMESTAMP, t.sort_order
+                    FROM (VALUES :insert_values) AS t(entry_id, image_url, image_desc, image_source, image_url_thumbnail, sort_order)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM utb_ImageScraperResult
+                        WHERE EntryID = t.entry_id AND ImageUrl = t.image_url
+                    )
+                """)
+                insert_values = [(p["entry_id"], p["image_url"], p["image_desc"], p["image_source"], p["image_url_thumbnail"], -1 if p["image_url"] == "placeholder://no-results" else None) for p in params]
+                result = await conn.execute(insert_query, {"insert_values": insert_values})
+                inserted_count = result.rowcount
+                return inserted_count, updated_count
+            except SQLAlchemyError as e:
+                logger.error(f"Worker PID {process.pid}: SQLAlchemy error in insert_or_update_result: {e}", exc_info=True)
+                raise
+            except Exception as e:
+                logger.error(f"Worker PID {process.pid}: Unexpected error in insert_or_update_result: {e}", exc_info=True)
+                raise
 
         inserted_count, updated_count = await db_queue.enqueue(
             insert_or_update_result,
@@ -284,6 +298,7 @@ def is_connection_busy_error(exception):
         if isinstance(orig, PyodbcError):
             return "HY000" in str(orig) and "Connection is busy" in str(orig)
     return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -545,10 +560,10 @@ async def update_sort_no_image_entry(
         raise
     except ValueError as ve:
         logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
-        return None
+        return {"error": str(ve)}
     except Exception as e:
         logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
-        return None
+        return {"error": str(e)}
     finally:
         await db_queue.stop()
 
