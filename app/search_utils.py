@@ -282,7 +282,6 @@ def is_connection_busy_error(exception):
         if isinstance(orig, PyodbcError):
             return "HY000" in str(orig) and "Connection is busy" in str(orig)
     return False
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -306,7 +305,6 @@ async def update_search_sort_order(
     logger = logger or logger
     process = psutil.Process()
     db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
-    await db_queue.start()
 
     try:
         # Fetch results
@@ -442,7 +440,8 @@ async def update_search_sort_order(
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
     finally:
-        await db_queue.stop()
+        # Do not stop the queue here to allow reuse
+        pass
 
 @retry(
     stop=stop_after_attempt(3),
@@ -564,7 +563,7 @@ async def update_sort_order(
     file_id: str,
     logger: Optional[logging.Logger] = None,
     db_queue: Optional[DatabaseQueue] = None
-) -> Optional[List[Dict]]:
+) -> Dict[str, Any]:
     logger = logger or logger
     db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
     await db_queue.start()
@@ -589,10 +588,11 @@ async def update_sort_order(
             {"file_id": file_id},
             connection_type="read"
         )
+        logger.debug(f"Fetched {len(entries)} entries for FileID: {file_id}")
 
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id}")
-            return []
+            return {"results": [], "success_count": 0, "failure_count": 0}
 
         results = []
         success_count = 0
@@ -619,9 +619,9 @@ async def update_sort_order(
                     failure_count += 1
                     logger.warning(f"No results for EntryID {entry_id}")
             except Exception as e:
+                logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
                 results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
                 failure_count += 1
-                logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
 
         logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
 
@@ -677,13 +677,21 @@ async def update_sort_order(
                    f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder, "
                    f"{verification['NonPlaceholderResults']} non-placeholder results")
 
-        return results
+        return {
+            "results": results,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "verification": verification
+        }
 
     except SQLAlchemyError as e:
         logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        raise
+        return {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
+    except ValueError as ve:
+        logger.error(f"Invalid file_id format for FileID {file_id}: {ve}", exc_info=True)
+        return {"error": str(ve), "results": [], "success_count": 0, "failure_count": 0}
     except Exception as e:
-        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        return None
+        logger.error(f"Unexpected error in batch SortOrder update for FileID {file_id}: {e}\n{traceback.format_exc()}")
+        return {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
     finally:
         await db_queue.stop()
