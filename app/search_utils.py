@@ -444,10 +444,10 @@ async def update_search_sort_order(
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return False
+        return {"error": str(e)}
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return False
+        return  {"error": str(e)}
     finally:
         # Do not stop the queue here to allow reuse
         pass
