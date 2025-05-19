@@ -68,20 +68,33 @@ class DatabaseQueue:
                             if not await self._is_connection_healthy(conn):
                                 raise SQLAlchemyError("Connection unhealthy")
                             result = await operation(conn, params)
-                            future.set_result(result)
+                            if not future.done():
+                                future.set_result(result)
+                            else:
+                                self.logger.warning(f"Future already done for operation {operation.__name__}")
                     else:
                         async with async_engine.begin() as conn:
                             if not await self._is_connection_healthy(conn):
                                 raise SQLAlchemyError("Connection unhealthy")
                             result = await operation(conn, params)
                             await conn.commit()
-                            future.set_result(result)
+                            if not future.done():
+                                future.set_result(result)
+                            else:
+                                self.logger.warning(f"Future already done for operation {operation.__name__}")
                 except Exception as e:
                     self.logger.error(f"Error processing database task: {e}", exc_info=True)
-                    future.set_exception(e)
+                    if not future.done():
+                        try:
+                            future.set_exception(e)
+                        except asyncio.InvalidStateError:
+                            self.logger.error(f"Cannot set exception on future for operation {operation.__name__}: invalid state", exc_info=True)
+                    else:
+                        self.logger.warning(f"Future already done, cannot set exception for operation {operation.__name__}")
                 finally:
                     self.queue.task_done()
             except asyncio.CancelledError:
+                self.logger.info("Queue worker cancelled")
                 break
             except Exception as e:
                 self.logger.error(f"Unexpected error in queue worker: {e}", exc_info=True)
