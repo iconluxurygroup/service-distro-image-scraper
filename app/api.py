@@ -1110,23 +1110,45 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
-
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
 async def api_restart_search_all(
     file_id: str,
     entry_id: Optional[int] = None,
     request_id: Optional[str] = Query(None),
+    reset_step1: bool = Query(False, description="Reset Step1 timestamp to allow reprocessing"),
     background_tasks: BackgroundTasks = None
 ):
     logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + f" with request_id: {request_id}")
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + 
+                (f", EntryID: {entry_id}" if entry_id else "") + 
+                f" with request_id: {request_id}, reset_step1: {reset_step1}")
     
     try:
-        # Check if job is already running
-        if JOB_STATUS.get(file_id, {}).get("status") in ["queued", "running"]:
-            logger.warning(f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
+        current_status = JOB_STATUS.get(file_id, {}).get("status")
+        
+        # If job is completed or failed, allow resetting
+        if current_status in ["completed", "failed"]:
+            logger.info(f"Job for FileID {file_id} is {current_status}, resetting status")
+            JOB_STATUS.pop(file_id, None)  # Clear the job status
+            if reset_step1:
+                logger.info(f"Resetting Step1 for FileID {file_id}")
+                async with async_engine.begin() as conn:
+                    result = await conn.execute(
+                        text("""
+                            UPDATE utb_ImageScraperRecords
+                            SET Step1 = NULL
+                            WHERE FileID = :file_id
+                        """),
+                        {"file_id": int(file_id)}
+                    )
+                    rows_affected = result.rowcount
+                    logger.info(f"Reset Step1 for {rows_affected} entries for FileID: {file_id}")
+        
+        # Check if job is already running or queued
+        if current_status in ["queued", "running"]:
+            logger.warning(f"Job for FileID {file_id} is already {current_status}")
             await asyncio.sleep(5)  # Wait 5 seconds
-            if JOB_STATUS.get(file_id, {}).get("status") in ["queued", "running"]:
+            if JOB_S TATUS.get(file_id, {}).get("status") in ["queued", "running"]:
                 raise HTTPException(status_code=400, detail=f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
         
         # Check for duplicate request_id
@@ -1162,13 +1184,16 @@ async def api_restart_search_all(
         return {
             "status": "success",
             "status_code": 200,
-            "message": f"Processing restart with all variations queued for FileID: {file_id}",
+            "message": f"Processing restart with all variations queued for FileID {file_id}",
             "data": JOB_STATUS[file_id]
         }
     except Exception as e:
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
+
+
+        
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
     file_id: str,
