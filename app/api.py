@@ -583,10 +583,12 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        BATCH_SIZE = 1
-        MAX_CONCURRENCY = 10
+        BATCH_SIZE = 1  # Keep small to allow more parallel batches
+        MAX_CONCURRENCY = 10  # Global concurrency limit across all batches
         MAX_ENTRY_RETRIES = 3
+        MAX_PARALLEL_BATCHES = 5  # Maximum number of batches to process concurrently
 
+        # Validate FileID
         async with async_engine.connect() as conn:
             result = await conn.execute(
                 text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
@@ -597,7 +599,7 @@ async def process_restart_batch(
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
             result.close()
 
-        # Fetch all entries, ignoring Step1 and entry_id filters if use_all_variations or reset_step1
+        # Fetch entries
         async with async_engine.connect() as conn:
             if use_all_variations:
                 query = text("""
@@ -620,25 +622,15 @@ async def process_restart_batch(
 
             result = await conn.execute(query, parameters)
             all_entries = [(row[0], row[1], row[2], row[3], row[4], row[5]) for row in result.fetchall()]
-            # Relax ProductModel filter to include NULLs
             entries = [(row[0], row[1] or "", row[2], row[3], row[4]) for row in all_entries]
             logger.info(f"Found {len(entries)} entries for FileID {file_id_db}: {[row[0] for row in entries]}")
-            logger.debug(f"Entry details: {[(row[0], 'Step1=' + (str(row[5]) if row[5] else 'NULL')) for row in all_entries]}")
             result.close()
 
             if not entries:
-                logger.warning(f"No valid EntryIDs found for FileID {file_id_db}. Checking all records.")
-                query = text("""
-                    SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory, Step1
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = :file_id
-                """)
-                result = await conn.execute(query, {"file_id": file_id_db_int})
-                all_records = result.fetchall()
-                logger.info(f"All entries for FileID {file_id_db}: {[(row[0], 'Step1=' + (str(row[5]) if row[5] else 'NULL')) for row in all_records]}")
-                result.close()
+                logger.warning(f"No valid EntryIDs found for FileID {file_id_db}")
                 return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
+        # Fetch brand rules
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched")
@@ -647,6 +639,7 @@ async def process_restart_batch(
         endpoint = SEARCH_PROXY_API_URL
         logger.info(f"Using endpoint: {endpoint} with API key authentication")
 
+        # Create batches
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
         logger.info(f"Created {len(entry_batches)} batches")
 
@@ -655,10 +648,12 @@ async def process_restart_batch(
         last_entry_id_processed = entry_id or 0
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+        # Global semaphore for all tasks
+        global_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
         async def process_entry(entry):
             entry_id, search_string, brand, color, category = entry
-            async with semaphore:
+            async with global_semaphore:
                 try:
                     all_results = []
                     for attempt in range(1, MAX_ENTRY_RETRIES + 1):
@@ -675,15 +670,15 @@ async def process_restart_batch(
                             )
                             if results and any(not res["ImageUrl"].startswith("placeholder://") for res in results):
                                 all_results.extend(results)
-                                logger.info(f"Valid results obtained for EntryID {entry_id} on attempt {attempt}, exiting retry loop")
+                                logger.info(f"Valid results obtained for EntryID {entry_id} on attempt {attempt}")
                                 break
-                            logger.warning(f"No valid results on attempt {attempt} for EntryID {entry_id}, retrying")
+                            logger.warning(f"No valid results on attempt {attempt} for EntryID {entry_id}")
                         except Exception as e:
                             logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
                             if attempt < MAX_ENTRY_RETRIES:
                                 await asyncio.sleep(2 ** attempt)
                             continue
-                    
+
                     # Validate and insert results
                     if all_results:
                         deduplicated_results = []
@@ -694,7 +689,7 @@ async def process_restart_batch(
                                 seen.add(key)
                                 deduplicated_results.append(res)
                         logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
-                        
+
                         insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
                         logger.info(f"Insert results for EntryID {entry_id}: {'Success' if insert_success else 'Failed'}")
                     else:
@@ -707,13 +702,13 @@ async def process_restart_batch(
                             "ImageUrlThumbnail": "placeholder://no-results"
                         }]
                         await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
-                    
+
                     # Update sort order
                     update_result = await update_search_sort_order(
                         str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                     )
                     logger.info(f"Update SortOrder for EntryID {entry_id}: {'Success' if update_result else 'Failed'}")
-                    
+
                     # Mark Step1 as complete
                     async with async_engine.connect() as conn:
                         result = await conn.execute(
@@ -725,14 +720,14 @@ async def process_restart_batch(
                             logger.error(f"Failed to update Step1 for EntryID {entry_id}: No rows affected")
                         else:
                             logger.info(f"Marked Step1 complete for EntryID {entry_id}")
-                    
+
                     return entry_id, True
                 except Exception as e:
                     logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
                     return entry_id, False
 
-        for batch_idx, batch_entries in enumerate(entry_batches, 1):
-            logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
+        async def process_batch(batch_entries, batch_idx):
+            logger.info(f"Starting batch {batch_idx}/{len(entry_batches)}")
             start_time = datetime.datetime.now()
 
             results = await asyncio.gather(
@@ -740,23 +735,49 @@ async def process_restart_batch(
                 return_exceptions=True
             )
 
+            batch_successful = 0
+            batch_failed = 0
             for entry, result in zip(batch_entries, results):
                 entry_id = entry[0]
                 if isinstance(result, Exception):
                     logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
-                    failed_entries += 1
+                    batch_failed += 1
                     continue
                 entry_id_result, success = result
                 if success:
-                    successful_entries += 1
+                    batch_successful += 1
+                    nonlocal last_entry_id_processed
                     last_entry_id_processed = entry_id
                 else:
-                    failed_entries += 1
+                    batch_failed += 1
 
             elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-            logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
+            logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s: {batch_successful} successful, {batch_failed} failed")
+            return batch_successful, batch_failed
+
+        # Process batches in parallel with limited concurrency
+        batch_tasks = []
+        for batch_idx, batch_entries in enumerate(entry_batches, 1):
+            batch_tasks.append(process_batch(batch_entries, batch_idx))
+
+        # Run batches in parallel, limiting to MAX_PARALLEL_BATCHES
+        for i in range(0, len(batch_tasks), MAX_PARALLEL_BATCHES):
+            current_batch_tasks = batch_tasks[i:i + MAX_PARALLEL_BATCHES]
+            logger.info(f"Executing parallel batch group {i//MAX_PARALLEL_BATCHES + 1}: {len(current_batch_tasks)} batches")
+            batch_results = await asyncio.gather(*current_batch_tasks, return_exceptions=True)
+
+            for batch_result in batch_results:
+                if isinstance(batch_result, Exception):
+                    logger.error(f"Batch failed: {batch_result}", exc_info=True)
+                    failed_entries += len(batch_entries)  # Assume all entries in batch failed
+                else:
+                    batch_successful, batch_failed = batch_result
+                    successful_entries += batch_successful
+                    failed_entries += batch_failed
+
             log_memory_usage()
 
+        # Post-processing verification
         async with async_engine.connect() as conn:
             result = await conn.execute(
                 text("""
@@ -781,42 +802,27 @@ async def process_restart_batch(
                 logger.warning(f"Found {null_entries} entries with NULL SortOrder")
             result.close()
 
-            # Post-job verification for non-placeholder results
-            if not entries:
-                logger.warning(f"No entries to verify for FileID {file_id_db}")
-                result_count = 0
-            else:
-                entry_ids = [entry[0] for entry in entries if isinstance(entry[0], (int, str))]
-                if not entry_ids:
-                    logger.warning(f"No valid EntryIDs to verify for FileID {file_id_db}")
+            # Verify non-placeholder results
+            entry_ids = [entry[0] for entry in entries]
+            if entry_ids:
+                try:
+                    query = text("""
+                        SELECT COUNT(*) AS result_count
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
+                    """)
+                    parameters = {"entry_ids": tuple(entry_ids)}
+                    result = await conn.execute(query, parameters)
+                    result_count = result.scalar()
+                    result.close()
+                except SQLAlchemyError as e:
+                    logger.error(f"Verification query failed for FileID {file_id_db}: {e}", exc_info=True)
                     result_count = 0
-                else:
-                    try:
-                        async with async_engine.connect() as conn:
-                            if len(entry_ids) == 1:
-                                query = text("""
-                                    SELECT COUNT(*) AS result_count
-                                    FROM utb_ImageScraperResult
-                                    WHERE EntryID = :entry_id AND ImageUrl NOT LIKE 'placeholder://%'
-                                """)
-                                parameters = {"entry_id": entry_ids[0]}
-                            else:
-                                query = text("""
-                                    SELECT COUNT(*) AS result_count
-                                    FROM utb_ImageScraperResult
-                                    WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
-                                """)
-                                parameters = {"entry_ids": tuple(entry_ids)}
-                            
-                            logger.debug(f"Executing verification query with EntryIDs: {entry_ids}, Parameters: {parameters}")
-                            result = await conn.execute(query, parameters)
-                            result_count = result.scalar()
-                            result.close()
-                    except SQLAlchemyError as e:
-                        logger.error(f"Verification query failed for FileID {file_id_db}: {e}", exc_info=True)
-                        result_count = 0
+            else:
+                result_count = 0
             logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
-        
+
+        # Send email notification
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
@@ -831,6 +837,7 @@ async def process_restart_batch(
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
+        # Upload log file
         log_public_url = await upload_file_to_space(
             file_src=log_filename,
             save_as=f"job_logs/job_{file_id_db}.log",
@@ -840,7 +847,7 @@ async def process_restart_batch(
         )
         await update_file_location_complete(str(file_id_db), log_public_url, logger)
         await update_file_generate_complete(str(file_id_db), logger)
-        
+
         return {
             "message": "Search processing completed",
             "file_id": str(file_id_db),
@@ -1121,7 +1128,7 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
 
 
-        
+
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
 async def api_restart_search_all(
     file_id: str,
