@@ -1119,6 +1119,9 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
+
+
+        
 @router.post("/restart-search-all/{file_id}", tags=["Processing"])
 async def api_restart_search_all(
     file_id: str,
@@ -1170,7 +1173,8 @@ async def api_restart_search_all(
                 "data": JOB_STATUS[file_id]
             }
         
-        if not entry_id:
+        # Only fetch entry_id if not provided and not resetting all entries
+        if not entry_id and not reset_step1:
             entry_id = await fetch_last_valid_entry(file_id, logger)
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
         
@@ -1200,7 +1204,6 @@ async def api_restart_search_all(
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
-
 
 
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
