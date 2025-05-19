@@ -69,29 +69,6 @@ def unpack_content(encoded_content: str, logger: Optional[logging.Logger] = None
     except Exception as e:
         logger.error(f"Error unpacking content: {e}")
         return None
-
-def check_endpoint_health(endpoint: str, timeout: int = 5, logger: Optional[logging.Logger] = None) -> bool:
-    logger = logger or default_logger
-    health_url = f"{endpoint}/health/google"
-    try:
-        response = httpx.get(health_url, timeout=timeout)
-        response.raise_for_status()
-        status = response.json().get("status", "")
-        logger.debug(f"Health check for {endpoint}: Status={status}, Headers={response.headers}")
-        return "Google is reachable" in status
-    except httpx.RequestException as e:
-        logger.warning(f"Endpoint {endpoint} health check failed: {e}, Headers={getattr(e.response, 'headers', 'N/A')}")
-        return False
-
-def get_healthy_endpoint(endpoints: List[str], logger: Optional[logging.Logger] = None) -> Optional[str]:
-    logger = logger or default_logger
-    for endpoint in endpoints:
-        if check_endpoint_health(endpoint, logger=logger):
-            logger.info(f"Selected healthy endpoint: {endpoint}")
-            return endpoint
-    logger.error("No healthy endpoints found")
-    return None
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),

@@ -36,7 +36,6 @@ from email_utils import send_message_email
 from utils import create_temp_dirs, cleanup_temp_dirs, process_and_tag_results
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
-from utils import get_healthy_endpoint
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
@@ -418,7 +417,6 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         return {"error": str(e), "log_filename": log_filename}
     finally:
         log_memory_usage()
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -475,28 +473,9 @@ async def process_restart_batch(
             logger.warning(f"No brand rules fetched")
             return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
-        # Define a list of possible endpoints (replace with your actual endpoints)
-        endpoints = [
-            SEARCH_PROXY_API_URL,  # Use the primary SEARCH_PROXY_API_URL from config
-            # Add additional endpoints if available, e.g.:
-            # "https://api2.thedataproxy.com/v2/proxy/fetch",
-            # "https://api3.thedataproxy.com/v2/proxy/fetch",
-        ]
-        endpoint = None
-        for attempt in range(5):
-            try:
-                endpoint = get_healthy_endpoint(endpoints, logger=logger)
-                if endpoint:
-                    logger.info(f"Selected healthy endpoint: {endpoint}")
-                    break
-                logger.warning(f"Attempt {attempt + 1} failed to find a healthy endpoint")
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(2)
-        if not endpoint:
-            logger.error(f"No healthy endpoint found")
-            return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+        # Use the primary endpoint directly
+        endpoint = SEARCH_PROXY_API_URL
+        logger.info(f"Using endpoint: {endpoint}")
 
         async with async_engine.connect() as conn:
             query = text("""
@@ -670,7 +649,6 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-
 async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger):
     log_file = f"job_logs/job_{file_id}.log"
     max_attempts = 3
