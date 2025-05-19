@@ -199,11 +199,10 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((pyodbc.Error, ValueError,SQLAlchemyError)),
+    retry=retry_if_exception_type((pyodbc.Error, ValueError, SQLAlchemyError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -223,6 +222,7 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
+        # Fetch results
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
@@ -239,6 +239,7 @@ async def update_search_sort_order(
         results = [dict(zip(columns, row)) for row in rows]
         logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
+        # Handle case with no results
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
             async with async_engine.begin() as conn:
@@ -259,9 +260,7 @@ async def update_search_sort_order(
                 logger.info(f"Worker PID {process.pid}: Inserted placeholder result with SortOrder = -1 for EntryID {entry_id}")
             return True
 
-        results = [dict(zip(columns, row)) for row in rows]
-        logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
-
+        # Process brand and model aliases
         brand_clean = clean_string(brand).lower() if brand else ""
         model_clean = normalize_model(model) if model else ""
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
@@ -280,6 +279,7 @@ async def update_search_sort_order(
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
+        # Assign priorities based on brand and model matches
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
@@ -289,13 +289,13 @@ async def update_search_sort_order(
             model_matched = False
             brand_matched = False
 
-            # Check for model matches (exact or fuzzy)
+            # Check for model matches
             for alias in model_aliases:
                 if alias in image_desc or alias in image_source or alias in image_url:
                     model_matched = True
                     break
 
-            # Check for brand matches (exact or fuzzy)
+            # Check for brand matches
             for alias in brand_aliases:
                 if alias in image_desc or alias in image_source or alias in image_url:
                     brand_matched = True
@@ -316,70 +316,64 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
+        # Perform batch SortOrder update
         async with async_engine.begin() as conn:
-            # Fetch EntryIDs to avoid TVP issues
-            result = await conn.execute(
-                text("""
-                    SELECT EntryID 
-                    FROM utb_ImageScraperRecords 
-                    WHERE FileID = :file_id
-                """),
-                {"file_id": file_id}
-            )
-            entry_ids = [row[0] for row in result.fetchall()]
-            result.close()
+            try:
+                # Prepare batch update parameters
+                update_params = [
+                    {"sort_order": 1 if i == 0 else i + 1, "result_id": res["ResultID"], "entry_id": entry_id}
+                    for i, res in enumerate(sorted_results)
+                ]
+                if update_params:
+                    await conn.execute(
+                        text("""
+                            UPDATE utb_ImageScraperResult
+                            SET SortOrder = :sort_order
+                            WHERE ResultID = :result_id AND EntryID = :entry_id
+                        """),
+                        update_params
+                    )
+                    logger.info(f"Worker PID {process.pid}: Batch updated SortOrder for {len(update_params)} rows Diagnostic Radiology for EntryID {entry_id}")
+                else:
+                    logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
 
-            if not entry_ids:
-                logger.warning(f"No entries found for FileID {file_id}")
-                return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0}
+                # Verify no NULL SortOrder entries remain
+                result = await conn.execute(
+                    text("""
+                        SELECT COUNT(*) FROM utb_ImageScraperResult
+                        WHERE EntryID = :entry_id AND SortOrder IS NULL
+                    """),
+                    {"entry_id": entry_id}
+                )
+                null_count = result.scalar()
+                result.close()
+                if null_count > 0:
+                    logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
+                    # Fallback: Set NULL SortOrder to -2
+                    await conn.execute(
+                        text("""
+                            UPDATE utb_ImageScraperResult
+                            SET SortOrder = -2
+                            WHERE EntryID = :entry_id AND SortOrder IS NULL
+                        """),
+                        {"entry_id": entry_id}
+                    )
+                    logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder entries to -2 for EntryID {entry_id}")
 
-            # Count NULL SortOrder entries
-            result = await conn.execute(
-                text("""
-                    SELECT COUNT(*) 
-                    FROM utb_ImageScraperResult 
-                    WHERE EntryID IN :entry_ids AND SortOrder IS NULL
-                """),
-                {"entry_ids": tuple(entry_ids)}
-            )
-            null_count = result.scalar()
-            logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
+                await conn.commit()  # Ensure commit after all updates
+                return True
 
-            # Delete placeholder entries
-            result = await conn.execute(
-                text("""
-                    DELETE FROM utb_ImageScraperResult
-                    WHERE EntryID IN :entry_ids AND ImageUrl = 'placeholder://no-results'
-                """),
-                {"entry_ids": tuple(entry_ids)}
-            )
-            rows_deleted = result.rowcount
-            logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
+            except SQLAlchemyError as e:
+                logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
+                return False
 
-            # Update NULL SortOrder entries
-            result = await conn.execute(
-                text("""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = -2
-                    WHERE EntryID IN :entry_ids AND SortOrder IS NULL
-                """),
-                {"entry_ids": tuple(entry_ids)}
-            )
-            rows_updated = result.rowcount
-            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
-            
-            return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
-    
     except SQLAlchemyError as e:
-        logger.error(f"Database error updating entries for FileID {file_id}: {e}", exc_info=True)
-        raise
-    except ValueError as ve:
-        logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
-        return None
+        logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
+        return False
     except Exception as e:
-        logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
-        return None
-    
+        logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
+        return False
+            
 # @retry(    stop=stop_after_attempt(3),
 #     wait=wait_exponential(multiplier=1, min=2, max=10),
 #     retry=retry_if_exception_type(SQLAlchemyError),
@@ -580,46 +574,53 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
         
         async with async_engine.begin() as conn:
+            # Fetch EntryIDs to avoid TVP issues
+            result = await conn.execute(
+                text("""
+                    SELECT EntryID 
+                    FROM utb_ImageScraperRecords 
+                    WHERE FileID = :file_id
+                """),
+                {"file_id": file_id}
+            )
+            entry_ids = [row[0] for row in result.fetchall()]
+            result.close()
+
+            if not entry_ids:
+                logger.warning(f"No entries found for FileID {file_id}")
+                return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0}
+
+            # Count NULL SortOrder entries
             result = await conn.execute(
                 text("""
                     SELECT COUNT(*) 
                     FROM utb_ImageScraperResult 
-                    WHERE EntryID IN (
-                        SELECT EntryID 
-                        FROM utb_ImageScraperRecords 
-                        WHERE FileID = :file_id
-                    ) AND SortOrder IS NULL
+                    WHERE EntryID IN :entry_ids AND SortOrder IS NULL
                 """),
-                {"file_id": file_id}
+                {"entry_ids": tuple(entry_ids)}
             )
             null_count = result.scalar()
             logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
 
+            # Delete placeholder entries
             result = await conn.execute(
                 text("""
                     DELETE FROM utb_ImageScraperResult
-                    WHERE EntryID IN (
-                        SELECT r.EntryID
-                        FROM utb_ImageScraperRecords r
-                        WHERE r.FileID = :file_id
-                    ) AND ImageUrl = 'placeholder://no-results'
+                    WHERE EntryID IN :entry_ids AND ImageUrl = 'placeholder://no-results'
                 """),
-                {"file_id": file_id}
+                {"entry_ids": tuple(entry_ids)}
             )
             rows_deleted = result.rowcount
             logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
 
+            # Update NULL SortOrder entries
             result = await conn.execute(
                 text("""
                     UPDATE utb_ImageScraperResult
                     SET SortOrder = -2
-                    WHERE EntryID IN (
-                        SELECT r.EntryID
-                        FROM utb_ImageScraperRecords r
-                        WHERE r.FileID = :file_id
-                    ) AND SortOrder IS NULL
+                    WHERE EntryID IN :entry_ids AND SortOrder IS NULL
                 """),
-                {"file_id": file_id}
+                {"entry_ids": tuple(entry_ids)}
             )
             rows_updated = result.rowcount
             logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
