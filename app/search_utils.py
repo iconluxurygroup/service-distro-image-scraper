@@ -57,6 +57,8 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             logger.debug(f"Invalid URL format: {cleaned}")
             return ""
     return cleaned
+
+
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
@@ -79,6 +81,7 @@ async def insert_search_results(
         if "placeholder://error" in res["ImageUrl"]:
             logger.warning(f"Worker PID {process.pid}: Skipping error placeholder result for EntryID {res['EntryID']}: {res['ImageUrl']}")
             continue
+        logger.debug(f"Worker PID {process.pid}: Valid result for EntryID {res['EntryID']}: {res['ImageUrl']}")
         valid_results.append(res)
 
     if not valid_results:
@@ -115,6 +118,10 @@ async def insert_search_results(
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
             logger.debug(f"Worker PID {process.pid}: Invalid ImageUrlThumbnail, setting to empty: {image_url_thumbnail}")
             image_url_thumbnail = ""
+
+        if category == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
+            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
+            continue
 
         param = {
             "entry_id": entry_id,
@@ -157,10 +164,11 @@ async def insert_search_results(
                     updated_count += result.rowcount
 
                     if result.rowcount == 0:
+                        sort_order = -1 if param["image_url"] == "placeholder://no-results" else None
                         insert_query = text("""
                             INSERT INTO utb_ImageScraperResult
                             (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime, SortOrder)
-                            SELECT :entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, CURRENT_TIMESTAMP, -1
+                            SELECT :entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, CURRENT_TIMESTAMP, :sort_order
                             WHERE NOT EXISTS (
                                 SELECT 1 FROM utb_ImageScraperResult
                                 WHERE EntryID = :entry_id AND ImageUrl = :image_url
@@ -173,7 +181,8 @@ async def insert_search_results(
                                 "image_url": param["image_url"],
                                 "image_desc": param["image_desc"],
                                 "image_source": param["image_source"],
-                                "image_url_thumbnail": param["image_url_thumbnail"]
+                                "image_url_thumbnail": param["image_url_thumbnail"],
+                                "sort_order": sort_order
                             }
                         )
                         inserted_count += result.rowcount
@@ -191,6 +200,9 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
+
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
