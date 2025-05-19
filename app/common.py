@@ -314,7 +314,6 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
     base_brand = brand_clean.replace('&', 'and').replace('  ', ' ')
     variations = [
         base_brand.replace(' ', ''),
-        base_brand.replace(' ', '-'),
         re.sub(r'[^a-z0-9]', '', base_brand),
     ]
 
