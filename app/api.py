@@ -440,7 +440,6 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         return {"error": str(e), "log_filename": log_filename}
     finally:
         log_memory_usage()
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -509,6 +508,10 @@ async def process_restart_batch(
                 AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
                 AND r.Step1 IS NULL
                 AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.SortOrder <= 0)
+                AND NOT EXISTS (
+                    SELECT 1 FROM utb_ImageScraperResult tr 
+                    WHERE tr.EntryID = r.EntryID AND tr.ImageUrl NOT LIKE 'placeholder://%'
+                )
                 ORDER BY r.EntryID
             """)
             result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
@@ -685,7 +688,7 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-
+        
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
