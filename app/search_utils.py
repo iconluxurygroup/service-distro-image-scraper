@@ -199,10 +199,12 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
+from pyodbc import Error as PyodbcError
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((pyodbc.Error, ValueError, SQLAlchemyError)),
+    retry=retry_if_exception_type((PyodbcError, SQLAlchemyError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -222,28 +224,28 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
-        # Fetch results
-        async with async_engine.connect() as conn:
+        # Fetch results using a dedicated read connection
+        async with async_engine.connect() as read_conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
                 FROM utb_ImageScraperResult r
                 INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
                 WHERE r.EntryID = :entry_id AND rec.FileID = :file_id
             """)
-            result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
-            rows = result.fetchall()
+            result = await read_conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
+            rows = await result.fetchall()  # Explicitly fetch all rows
             columns = result.keys()
-            result.close()  # Explicitly close result
-            await conn.commit()  # Commit to release locks
+            result.close()  # Close result explicitly
+            await read_conn.commit()  # Commit to release locks
+            logger.debug(f"Worker PID {process.pid}: Fetched {len(rows)} rows for EntryID {entry_id}")
         
         results = [dict(zip(columns, row)) for row in rows]
-        logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
         # Handle case with no results
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
-            async with async_engine.begin() as conn:
-                await conn.execute(
+            async with async_engine.begin() as write_conn:
+                await write_conn.execute(
                     text("""
                         INSERT INTO utb_ImageScraperResult
                         (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, SortOrder, CreateTime)
@@ -257,6 +259,7 @@ async def update_search_sort_order(
                         "image_url_thumbnail": "placeholder://no-results"
                     }
                 )
+                await write_conn.commit()
                 logger.info(f"Worker PID {process.pid}: Inserted placeholder result with SortOrder = -1 for EntryID {entry_id}")
             return True
 
@@ -289,13 +292,11 @@ async def update_search_sort_order(
             model_matched = False
             brand_matched = False
 
-            # Check for model matches
             for alias in model_aliases:
                 if alias in image_desc or alias in image_source or alias in image_url:
                     model_matched = True
                     break
 
-            # Check for brand matches
             for alias in brand_aliases:
                 if alias in image_desc or alias in image_source or alias in image_url:
                     brand_matched = True
@@ -316,17 +317,15 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        async with async_engine.begin() as conn:
+        # Perform updates using a dedicated write connection
+        async with async_engine.begin() as write_conn:
             try:
-                # Prepare batch update parameters
                 update_params = []
                 match_count = 0
                 for i, res in enumerate(sorted_results):
                     if res["priority"] == 4:
-                        # Non-matching entries get SortOrder = -2
                         sort_order = -2
                     else:
-                        # Matching entries get positive SortOrder (1, 2, etc.)
                         match_count += 1
                         sort_order = match_count
                     update_params.append({
@@ -336,23 +335,29 @@ async def update_search_sort_order(
                     })
                 
                 if update_params:
-                    await conn.execute(
-                        text("""
-                            UPDATE utb_ImageScraperResult
-                            SET SortOrder = :sort_order
-                            WHERE ResultID = :result_id AND EntryID = :entry_id
-                        """),
-                        update_params
-                    )
+                    # Split updates into smaller batches to reduce connection strain
+                    batch_size = 100
+                    for i in range(0, len(update_params), batch_size):
+                        batch_params = update_params[i:i + batch_size]
+                        await write_conn.execute(
+                            text("""
+                                UPDATE utb_ImageScraperResult
+                                SET SortOrder = :sort_order
+                                WHERE ResultID = :result_id AND EntryID = :entry_id
+                            """),
+                            batch_params
+                        )
+                        logger.debug(f"Worker PID {process.pid}: Updated batch of {len(batch_params)} rows for EntryID {entry_id}")
                     logger.info(f"Worker PID {process.pid}: Batch updated SortOrder for {len(update_params)} rows for EntryID {entry_id}")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
 
-                await conn.commit()  # Ensure commit after all updates
+                await write_conn.commit()  # Ensure commit after all updates
                 return True
 
             except SQLAlchemyError as e:
                 logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
+                await write_conn.rollback()
                 return False
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
