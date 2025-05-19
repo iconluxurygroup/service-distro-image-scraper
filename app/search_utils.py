@@ -324,6 +324,7 @@ def is_connection_busy_error(exception):
         if isinstance(orig, PyodbcError):
             return "HY000" in str(orig) and "Connection is busy" in str(orig)
     return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -362,7 +363,7 @@ async def update_search_sort_order(
                 rows = result.fetchall()
                 columns = result.keys()
             finally:
-                result.close()  # Ensure cursor is closed
+                result.close()
             return rows, columns
 
         try:
@@ -446,53 +447,32 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Perform bulk update using a temporary table
-        async def update_sort_order(conn: AsyncConnection, params: List[Dict]):
+        # Store sort order data to a JSON file
+        async def update_sort_order(params: List[Dict]) -> int:
             try:
-                # Create temporary table
-                create_temp_table = text("""
-                    CREATE TABLE #TempSortOrder (
-                        ResultID INT,
-                        EntryID VARCHAR(50),
-                        SortOrder INT
-                    )
-                """)
-                await conn.execute(create_temp_table)
-
-                # Insert values into temp table with explicit cursor reset
-                insert_temp = text("""
-                    INSERT INTO #TempSortOrder (ResultID, EntryID, SortOrder)
-                    VALUES (:result_id, :entry_id, :sort_order)
-                """)
-                for param in params:
-                    # Execute in a new connection context to avoid state issues
-                    async with async_engine.connect() as insert_conn:
-                        await insert_conn.execute(insert_temp, {
-                            "result_id": param["result_id"],
-                            "entry_id": param["entry_id"],
-                            "sort_order": param["sort_order"]
-                        })
-
-                # Update main table from temp table
-                update_query = text("""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = t.SortOrder
-                    FROM utb_ImageScraperResult r
-                    INNER JOIN #TempSortOrder t
-                        ON r.ResultID = t.ResultID AND r.EntryID = t.EntryID
-                """)
-                result = await conn.execute(update_query)
-                row_count = result.rowcount
-                logger.debug(f"Worker PID {process.pid}: Bulk update raw row_count: {row_count}")
-
-                # Drop temp table
-                await conn.execute(text("DROP TABLE #TempSortOrder"))
+                # Prepare data for writing
+                data = [
+                    {
+                        "result_id": param["result_id"],
+                        "entry_id": param["entry_id"],
+                        "sort_order": param["sort_order"]
+                    }
+                    for param in params
+                ]
+                
+                # Write data to file asynchronously
+                filename = f"sort_order_{entry_id}.json"
+                async with aiofiles.open(filename, mode='w', encoding='utf-8') as f:
+                    await f.write(json.dumps(data, indent=2))
+                
+                row_count = len(data)
+                logger.debug(f"Worker PID {process.pid}: Stored {row_count} records to {filename}")
                 return max(0, row_count)
-            except SQLAlchemyError as e:
-                logger.error(f"SQLAlchemy error in update_sort_order: {e}", exc_info=True)
+            except IOError as e:
+                logger.error(f"IO error in update_sort_order for EntryID {entry_id}: {e}", exc_info=True)
                 raise
             except Exception as e:
-                logger.error(f"Unexpected error in update_sort_order: {e}", exc_info=True)
+                logger.error(f"Unexpected error in update_sort_order for EntryID {entry_id}: {e}", exc_info=True)
                 raise
 
         update_params = []
@@ -508,23 +488,19 @@ async def update_search_sort_order(
         if update_params:
             logger.debug(f"Worker PID {process.pid}: Update params: {update_params}")
             try:
-                row_count = await db_queue.enqueue(
-                    update_sort_order,
-                    update_params,
-                    connection_type="write"
-                )
+                row_count = await update_sort_order(update_params)
                 row_count = int(row_count or 0)
                 if row_count < 0:
                     logger.error(f"Worker PID {process.pid}: Negative row_count {row_count} detected")
                     row_count = 0
-                logger.info(f"Worker PID {process.pid}: Bulk updated SortOrder for {row_count} rows for EntryID {entry_id}")
+                logger.info(f"Worker PID {process.pid}: Stored SortOrder for {row_count} rows for EntryID {entry_id}")
             except Exception as e:
-                logger.error(f"Failed to update sort order for EntryID {entry_id}: {e}", exc_info=True)
+                logger.error(f"Failed to store sort order for EntryID {entry_id}: {e}", exc_info=True)
                 return {"success": False, "error": str(e), "entry_id": entry_id}
         else:
-            logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
+            logger.warning(f"Worker PID {process.pid}: No results to store SortOrder for EntryID {entry_id}")
 
-        logger.info(f"Worker PID {process.pid}: Successfully updated sort order for EntryID {entry_id}")
+        logger.info(f"Worker PID {process.pid}: Successfully stored sort order for EntryID {entry_id}")
         return {"success": True, "entry_id": entry_id}
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
