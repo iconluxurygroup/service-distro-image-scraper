@@ -489,7 +489,7 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
 
 
 
-        
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
