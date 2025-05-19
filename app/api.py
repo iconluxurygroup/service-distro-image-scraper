@@ -225,7 +225,7 @@ async def process_and_tag_results(
             if image_url not in seen_urls and image_url != "placeholder://no-results":
                 seen_urls.add(image_url)
                 deduplicated_results.append(res)
-        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results forFengEntryID {entry_id}")
+        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
         
         # Filter irrelevant results
         irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
@@ -292,7 +292,6 @@ async def process_results(
 
     return results
 
-
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -318,12 +317,11 @@ async def async_process_entry_search(
     
     if valid_result_count > 0:
         logger.info(f"Found {valid_result_count} valid results for EntryID {entry_id}, skipping search")
-        return []  # Skip search, rely on update_search_sort_order
-    
-    # Generate search variations
+        return []
+
+    # Generate and deduplicate search variations
     search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
-    
-    search_terms = []
+    search_terms = set()
     variation_types = [
         "default", "delimiter_variations", "color_variations", "brand_alias",
         "no_color", "model_alias", "category_specific"
@@ -331,10 +329,10 @@ async def async_process_entry_search(
     
     for variation_type in variation_types:
         if variation_type in search_terms_dict:
-            search_terms.extend(search_terms_dict[variation_type])
+            search_terms.update(term.lower().strip() for term in search_terms_dict[variation_type])
     
-    search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
-    logger.info(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
+    search_terms = list(search_terms)
+    logger.info(f"Deduplicated to {len(search_terms)} unique search terms for EntryID {entry_id}: {search_terms}")
 
     if not search_terms:
         logger.warning(f"No search terms for EntryID {entry_id}")
@@ -361,12 +359,9 @@ async def async_process_entry_search(
             if not term_results:
                 logger.warning(f"No results for term '{term}' in EntryID {entry_id}")
                 continue
-            results = await process_results(term_results, entry_id, brand, term, logger)
-            logger.debug(f"Processed {len(results)} results for term '{term}' in EntryID {entry_id}")
-            all_results.extend(results)
+            all_results.extend(term_results)
+            logger.info(f"Added {len(term_results)} results for term '{term}' in EntryID {entry_id}")
 
-        logger.info(f"Processed {len(all_results)} total results for EntryID {entry_id}")
-        
         if not all_results:
             logger.warning(f"No valid results for EntryID {entry_id} after processing all variations")
             placeholder_result = [{
@@ -378,8 +373,18 @@ async def async_process_entry_search(
             }]
             await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
             return placeholder_result
-        
-        return all_results
+
+        # Deduplicate results
+        deduplicated_results = []
+        seen_urls = set()
+        for res in all_results:
+            image_url = res["ImageUrl"]
+            if image_url not in seen_urls and image_url != "placeholder://no-results":
+                seen_urls.add(image_url)
+                deduplicated_results.append(res)
+        logger.info(f"Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
+
+        return deduplicated_results
     except Exception as e:
         logger.error(f"Unexpected error in async_process_entry_search for EntryID {entry_id}: {e}", exc_info=True)
         placeholder_result = [{
@@ -606,10 +611,11 @@ async def process_restart_batch(
                                 file_id_db=file_id_db,
                                 logger=logger
                             )
-                            if results and not any(res["ImageUrl"].startswith("placeholder://") for res in results):
+                            if results and any(not res["ImageUrl"].startswith("placeholder://") for res in results):
                                 all_results.extend(results)
-                                break  # Exit retry loop on successful results
-                            logger.warning(f"No valid results on attempt {attempt} for EntryID {entry_id}")
+                                logger.info(f"Valid results obtained for EntryID {entry_id} on attempt {attempt}, exiting retry loop")
+                                break
+                            logger.warning(f"No valid results on attempt {attempt} for EntryID {entry_id}, retrying")
                         except Exception as e:
                             logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
                             if attempt < MAX_ENTRY_RETRIES:
@@ -648,23 +654,29 @@ async def process_restart_batch(
                     
                     # Mark Step1 as complete
                     async with async_engine.connect() as conn:
-                        await conn.execute(
+                        result = await conn.execute(
                             text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
                             {"entry_id": entry_id}
                         )
                         await conn.commit()
-                        logger.info(f"Marked Step1 complete for EntryID {entry_id}")
+                        if result.rowcount == 0:
+                            logger.error(f"Failed to update Step1 for EntryID {entry_id}: No rows affected")
+                        else:
+                            logger.info(f"Marked Step1 complete for EntryID {entry_id}")
                     
                     return entry_id, True
                 except Exception as e:
                     logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
                     async with async_engine.connect() as conn:
-                        await conn.execute(
+                        result = await conn.execute(
                             text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
                             {"entry_id": entry_id}
                         )
                         await conn.commit()
-                        logger.info(f"Marked Step1 complete for EntryID {entry_id} despite error")
+                        if result.rowcount == 0:
+                            logger.error(f"Failed to update Step1 for EntryID {entry_id} on error: No rows affected")
+                        else:
+                            logger.info(f"Marked Step1 complete for EntryID {entry_id} despite error")
                     return entry_id, False
 
         for batch_idx, batch_entries in enumerate(entry_batches, 1):
