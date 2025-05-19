@@ -535,6 +535,7 @@ async def process_restart_batch(
         async def process_entry(entry):
             entry_id, search_string, brand, color, category = entry
             async with semaphore:
+                all_results = []
                 for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                     try:
                         logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
@@ -550,49 +551,56 @@ async def process_restart_batch(
                         if not results:
                             logger.warning(f"No results for EntryID {entry_id} on attempt {attempt}")
                             continue
-
-                        if not all(all(col in res for col in required_columns) for res in results):
-                            logger.error(f"Missing columns for EntryID {entry_id} on attempt {attempt}")
-                            continue
-
-                        deduplicated_results = []
-                        seen = set()
-                        for res in results:
-                            key = (res['EntryID'], res['ImageUrl'])
-                            if key not in seen:
-                                seen.add(key)
-                                deduplicated_results.append(res)
-                        logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
-
-                        insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
-                        if not insert_success:
-                            logger.error(f"Failed to insert results for EntryID {entry_id} on attempt {attempt}")
-                            continue
-
-                        update_result = await update_search_sort_order(
-                            str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
-                        )
-                        if update_result is None or not update_result:
-                            logger.error(f"SortOrder update failed for EntryID {entry_id} on attempt {attempt}")
-                            continue
-
-                        # Mark Step1 as complete
-                        async with async_engine.connect() as conn:
-                            await conn.execute(
-                                text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
-                                {"entry_id": entry_id}
-                            )
-                            await conn.commit()
-                            logger.info(f"Marked Step1 complete for EntryID {entry_id}")
-
-                        return entry_id, True
+                        all_results.extend(results)
                     except Exception as e:
                         logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
                         if attempt < MAX_ENTRY_RETRIES:
                             await asyncio.sleep(2 ** attempt)
                         continue
-                logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                return entry_id, False
+
+                if not all_results:
+                    logger.error(f"No valid results for EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                    return entry_id, False
+
+                # Validate results
+                if not all(all(col in res for col in required_columns) for res in all_results):
+                    logger.error(f"Missing columns for EntryID {entry_id}")
+                    return entry_id, False
+
+                # Deduplicate results
+                deduplicated_results = []
+                seen = set()
+                for res in all_results:
+                    key = (res['EntryID'], res['ImageUrl'])
+                    if key not in seen:
+                        seen.add(key)
+                        deduplicated_results.append(res)
+                logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
+
+                # Insert all results
+                insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
+                if not insert_success:
+                    logger.error(f"Failed to insert results for EntryID {entry_id}")
+                    return entry_id, False
+
+                # Update sort order after all results are inserted
+                update_result = await update_search_sort_order(
+                    str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                )
+                if update_result is None or not update_result:
+                    logger.error(f"SortOrder update failed for EntryID {entry_id}")
+                    return entry_id, False
+
+                # Mark Step1 as complete
+                async with async_engine.connect() as conn:
+                    await conn.execute(
+                        text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
+                        {"entry_id": entry_id}
+                    )
+                    await conn.commit()
+                    logger.info(f"Marked Step1 complete for EntryID {entry_id}")
+
+                return entry_id, True
 
         for batch_idx, batch_entries in enumerate(entry_batches, 1):
             logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
@@ -644,6 +652,19 @@ async def process_restart_batch(
                 logger.warning(f"Found {null_entries} entries with NULL SortOrder")
             result.close()
 
+            # Verify non-placeholder results
+            result = await conn.execute(
+                text("""
+                    SELECT COUNT(*) AS result_count
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
+                """),
+                {"entry_ids": tuple(entry[0] for entry in entries)}
+            )
+            result_count = result.scalar()
+            logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
+            result.close()
+
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
@@ -653,7 +674,8 @@ async def process_restart_batch(
                 f"Failed entries: {failed_entries}\n"
                 f"Last EntryID: {last_entry_id_processed}\n"
                 f"Log file: {log_filename}\n"
-                f"Used all variations: {use_all_variations}"
+                f"Used all variations: {use_all_variations}\n"
+                f"Non-placeholder results written: {result_count}"
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
@@ -688,7 +710,7 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-        
+
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
