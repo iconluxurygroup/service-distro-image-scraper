@@ -763,40 +763,50 @@ async def process_restart_batch(
             log_memory_usage()
 
         async with async_engine.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT COUNT(DISTINCT t.EntryID), 
-                           SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                           SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                    FROM utb_ImageScraperResult t
-                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                    WHERE r.FileID = :file_id
-                """),
-                {"file_id": file_id_db_int}
-            )
-            row = result.fetchone()
-            total_entries = row[0] if row else 0
-            positive_entries = row[1] if row and row[1] is not None else 0
-            null_entries = row[2] if row and row[2] is not None else 0
-            logger.info(
-                f"Verification: {total_entries} total entries, "
-                f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
-            )
-            if null_entries > 0:
-                logger.warning(f"Found {null_entries} entries with NULL SortOrder")
-            result.close()
+        result = await conn.execute(
+            text("""
+                SELECT COUNT(DISTINCT t.EntryID), 
+                    SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                    SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE r.FileID = :file_id
+            """),
+            {"file_id": file_id_db_int}
+        )
+        row = result.fetchone()
+        total_entries = row[0] if row else 0
+        positive_entries = row[1] if row and row[1] is not None else 0
+        null_entries = row[2] if row and row[2] is not None else 0
+        logger.info(
+            f"Verification: {total_entries} total entries, "
+            f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
+        )
+        if null_entries > 0:
+            logger.warning(f"Found {null_entries} entries with NULL SortOrder")
+        result.close()
 
-            result = await conn.execute(
-                text("""
+        # Post-job verification for non-placeholder results
+        if not entries:
+            logger.warning(f"No entries to verify for FileID {file_id_db}")
+            result_count = 0
+        else:
+            entry_ids = [entry[0] for entry in entries if isinstance(entry[0], (int, str))]
+            if not entry_ids:
+                logger.warning(f"No valid EntryIDs to verify for FileID {file_id_db}")
+                result_count = 0
+            else:
+                query = text("""
                     SELECT COUNT(*) AS result_count
                     FROM utb_ImageScraperResult
                     WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
-                """),
-                {"entry_ids": tuple(entry[0] for entry in entries) if entries else (0,)}
-            )
-            result_count = result.scalar()
-            logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
-            result.close()
+                """)
+                parameters = {"entry_ids": tuple(entry_ids)}
+                logger.debug(f"Executing verification query with EntryIDs: {entry_ids}, Parameters: {parameters}")
+                result = await conn.execute(query, parameters)
+                result_count = result.scalar()
+                result.close()
+        logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
 
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
