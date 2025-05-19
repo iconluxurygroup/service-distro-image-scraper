@@ -803,11 +803,14 @@ async def process_restart_batch(
                     """)
                     parameters = {"entry_ids": tuple(entry_ids)}
                     logger.debug(f"Executing verification query with EntryIDs: {entry_ids}, Parameters: {parameters}")
-                    result = await conn.execute(query, parameters)
-                    result_count = result.scalar()
-                    result.close()
+                    try:
+                        result = await conn.execute(query, parameters)
+                        result_count = result.scalar()
+                        result.close()
+                    except SQLAlchemyError as e:
+                        logger.error(f"Verification query failed for FileID {file_id_db}: {e}", exc_info=True)
+                        result_count = 0
             logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
-
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
