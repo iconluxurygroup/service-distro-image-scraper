@@ -28,7 +28,7 @@ from db_utils import (
 from search_utils import update_search_sort_order, insert_search_results, update_sort_order, update_sort_no_image_entry
 from common import fetch_brand_rules, clean_string, generate_aliases
 from database_config import conn_str, async_engine
-from config import BRAND_RULES_URL, VERSION
+from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -36,6 +36,7 @@ from email_utils import send_message_email
 from utils import create_temp_dirs, cleanup_temp_dirs, process_and_tag_results
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
+from utils import get_healthy_endpoint
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
@@ -314,17 +315,16 @@ def generate_search_variations(
     
     logger.info(f"Generated total of {sum(len(v) for v in variations.values())} unique variations for search string '{search_string}'")
     return variations
+
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
     try:
-        # Line 1: Initialize logger
         if logger is None:
             logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
         logger.setLevel(logging.DEBUG)
         process = psutil.Process()
         logger.debug(f"Logger initialized for generate_download_file")
 
-        # Line 2: Log memory usage
         def log_memory_usage():
             mem_info = process.memory_info()
             logger.info(f"Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
@@ -333,24 +333,20 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         logger.info(f"Generating download file for FileID: {file_id}")
         log_memory_usage()
 
-        # Line 3: Fetch data from database
         results_df = await get_images_excel_db(str(file_id), logger)
         if results_df.empty:
             logger.error(f"No data found for FileID {file_id}")
             background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
             return {"error": f"No data found for FileID {file_id}", "log_filename": log_filename}
 
-        # Line 4: Create temporary directory
         temp_dir = f"temp_excel_{file_id}"
         os.makedirs(temp_dir, exist_ok=True)
         excel_filename = os.path.join(temp_dir, f"image_results_{file_id}.xlsx")
 
-        # Line 5: Create Excel workbook
         wb = Workbook()
         ws = wb.active
         ws.title = "Image Results"
 
-        # Line 6: Write headers
         headers = [
             "EntryID", "ProductBrand", "ProductModel", "ProductColor", "ProductCategory",
             "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail", "SortOrder"
@@ -359,12 +355,10 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
             ws[f"{get_column_letter(col)}1"] = header
             ws[f"{get_column_letter(col)}1"].fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
 
-        # Line 7: Write data rows
         for row_idx, row in results_df.iterrows():
             for col_idx, header in enumerate(headers):
                 ws[f"{get_column_letter(col_idx + 1)}{row_idx + 2}"] = row.get(header, "")
 
-        # Line 8: Adjust column widths
         for col in ws.columns:
             max_length = 0
             column = col[0].column_letter
@@ -377,12 +371,9 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column].width = adjusted_width
 
-        # Line 9: Save Excel file
-        # Line 9: Save Excel file
         wb.save(excel_filename)
         logger.info(f"Excel file generated: {excel_filename}")
 
-        # Line 10: Upload to R2 with debug logging
         logger.debug(f"Checking if Excel file exists: {excel_filename}")
         if not os.path.exists(excel_filename):
             logger.error(f"Excel file {excel_filename} does not exist for upload for FileID {file_id}")
@@ -404,11 +395,9 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
             logger.error(f"Upload error for FileID {file_id}: {upload_error}", exc_info=True)
             return {"error": f"Upload failed: {str(upload_error)}", "log_filename": log_filename}
 
-        # Line 11: Update database
         await update_file_location_complete(str(file_id), public_url, logger)
         await update_file_generate_complete(str(file_id), logger)
 
-        # Line 12: Clean up temporary files
         try:
             os.remove(excel_filename)
             os.rmdir(temp_dir)
@@ -416,7 +405,6 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         except Exception as e:
             logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e}")
 
-        # Line 13: Return success
         logger.info(f"Download file generated and uploaded for FileID: {file_id}: {public_url}")
         return {
             "message": "Download file generated successfully",
@@ -425,12 +413,10 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
             "log_filename": log_filename
         }
     except Exception as e:
-        # Line 14: Handle exceptions
         logger.error(f"Error generating download file for FileID {file_id}: {e}", exc_info=True)
         background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
         return {"error": str(e), "log_filename": log_filename}
     finally:
-        # Line 15: Log final memory usage
         log_memory_usage()
 
 async def process_restart_batch(
@@ -489,20 +475,27 @@ async def process_restart_batch(
             logger.warning(f"No brand rules fetched")
             return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
+        # Define a list of possible endpoints (replace with your actual endpoints)
+        endpoints = [
+            SEARCH_PROXY_API_URL,  # Use the primary SEARCH_PROXY_API_URL from config
+            # Add additional endpoints if available, e.g.:
+            # "https://api2.thedataproxy.com/v2/proxy/fetch",
+            # "https://api3.thedataproxy.com/v2/proxy/fetch",
+        ]
         endpoint = None
         for attempt in range(5):
             try:
-                endpoint = sync_get_endpoint(logger=logger)
+                endpoint = get_healthy_endpoint(endpoints, logger=logger)
                 if endpoint:
-                    logger.info(f"Selected endpoint: {endpoint}")
+                    logger.info(f"Selected healthy endpoint: {endpoint}")
                     break
-                logger.warning(f"Attempt {attempt + 1} failed")
+                logger.warning(f"Attempt {attempt + 1} failed to find a healthy endpoint")
                 await asyncio.sleep(2)
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} failed: {e}")
                 await asyncio.sleep(2)
         if not endpoint:
-            logger.error(f"No healthy endpoint")
+            logger.error(f"No healthy endpoint found")
             return {"error": "No healthy endpoint", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         async with async_engine.connect() as conn:

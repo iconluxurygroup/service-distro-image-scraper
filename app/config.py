@@ -12,7 +12,8 @@ SENDER_PASSWORD="wvug kynd dfhd xrjh"
 SENDER_NAME='superscraper'
 GOOGLE_API_KEY='AIzaSyDXfc_kdxa5UX2h9D3WwktefCqdyjHasn8'
 # AWS credentials and region
-
+# config.py
+SEARCH_PROXY_API_URL = "https://api.thedataproxy.com/v2/proxy/fetch"
 BRAND_RULES_URL = "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
 AWS_ACCESS_KEY_ID ='AKIA2CUNLEV6V627SWI7'
 AWS_SECRET_ACCESS_KEY = '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'
