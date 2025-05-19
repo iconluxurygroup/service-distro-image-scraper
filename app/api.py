@@ -8,6 +8,7 @@ import traceback
 import psutil
 import pyodbc
 import datetime
+import urllib.parse
 import hashlib
 import time
 import httpx
