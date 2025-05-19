@@ -21,7 +21,7 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# DatabaseQueue class
+# DatabaseQueue class (unchanged)
 class DatabaseQueue:
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
@@ -30,14 +30,12 @@ class DatabaseQueue:
         self._task = None
 
     async def start(self):
-        """Start the queue worker."""
         if not self._running:
             self._running = True
             self._task = asyncio.create_task(self._worker())
             self.logger.info("Database queue worker started")
 
     async def stop(self):
-        """Stop the queue worker and process remaining tasks."""
         if self._running:
             self._running = False
             await self.queue.join()
@@ -50,13 +48,11 @@ class DatabaseQueue:
             self.logger.info("Database queue worker stopped")
 
     async def enqueue(self, operation: Callable, params: Dict[str, Any], connection_type: str = "write") -> Any:
-        """Enqueue a database operation and wait for its result."""
         future = asyncio.Future()
         await self.queue.put((operation, params, connection_type, future))
         return await future
 
     async def _worker(self):
-        """Process database tasks from the queue."""
         while self._running:
             try:
                 operation, params, connection_type, future = await self.queue.get()
@@ -85,7 +81,6 @@ class DatabaseQueue:
                 self.logger.error(f"Unexpected error in queue worker: {e}", exc_info=True)
 
     async def _is_connection_healthy(self, conn: AsyncConnection) -> bool:
-        """Check if the connection is healthy."""
         try:
             await conn.execute(text("SELECT 1"))
             return True
@@ -407,7 +402,7 @@ async def update_search_sort_order(
             })
 
         if update_params:
-            batch_size = 50  # Reduced from 100
+            batch_size = 50
             updated_rows = 0
             for i in range(0, len(update_params), batch_size):
                 batch_params = update_params[i:i + batch_size]
@@ -416,8 +411,9 @@ async def update_search_sort_order(
                     batch_params,
                     connection_type="write"
                 )
+                row_count = int(row_count or 0)  # Ensure non-negative
                 updated_rows += row_count
-                logger.debug(f"Worker PID {process.pid}: Updated batch of {len(batch_params)} rows for EntryID {entry_id}")
+                logger.debug(f"Worker PID {process.pid}: Batch {i//batch_size + 1} updated {row_count} rows, total {updated_rows}")
             logger.info(f"Worker PID {process.pid}: Batch updated SortOrder for {updated_rows} rows for EntryID {entry_id}")
         else:
             logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
@@ -455,7 +451,6 @@ async def update_sort_no_image_entry(
         file_id = int(file_id)
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
 
-        # Fetch EntryIDs
         async def fetch_entry_ids(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 SELECT EntryID 
@@ -478,7 +473,6 @@ async def update_sort_no_image_entry(
             logger.warning(f"No entries found for FileID {file_id}")
             return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0}
 
-        # Count NULL SortOrder entries
         async def count_null_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 SELECT COUNT(*) 
@@ -497,7 +491,6 @@ async def update_sort_no_image_entry(
         )
         logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
 
-        # Delete placeholders
         async def delete_placeholders(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 DELETE FROM utb_ImageScraperResult
@@ -513,7 +506,6 @@ async def update_sort_no_image_entry(
         )
         logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
 
-        # Update NULL SortOrder
         async def update_null_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 UPDATE utb_ImageScraperResult
@@ -532,6 +524,7 @@ async def update_sort_no_image_entry(
                 {"entry_ids": tuple(batch_entry_ids)},
                 connection_type="write"
             )
+            row_count = int(row_count or 0)
             rows_updated += row_count
             logger.debug(f"Updated {row_count} NULL SortOrder entries in batch {i//batch_size + 1}")
 
@@ -643,11 +636,21 @@ async def update_sort_order(
                 result = await conn.execute(query, params)
                 verification[key] = result.scalar()
                 result.close()
+            # Add non-placeholder count
+            query = text("""
+                SELECT COUNT(*) AS result_count
+                FROM utb_ImageScraperResult
+                WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
+            """)
+            entry_ids = tuple(e[0] for e in entries)
+            result = await conn.execute(query, {"entry_ids": entry_ids})
+            verification["NonPlaceholderResults"] = result.scalar()
+            result.close()
             return verification
 
         verification = await db_queue.enqueue(
             verify_sort_order,
-            {"file_id": file_id},
+            {"file_id": file_id, "entry_ids": tuple(e[0] for e in entries)},
             connection_type="read"
         )
 
@@ -675,7 +678,8 @@ async def update_sort_order(
                    f"{verification['BrandMatchEntries']} entries with brand matches only, "
                    f"{verification['NoMatchEntries']} entries with no matches, "
                    f"{verification['NullSortOrderEntries']} entries with NULL SortOrder, "
-                   f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder")
+                   f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder, "
+                   f"{verification['NonPlaceholderResults']} non-placeholder results")
 
         return results
 
