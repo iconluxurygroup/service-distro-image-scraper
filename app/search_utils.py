@@ -316,14 +316,25 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Perform batch SortOrder update
         async with async_engine.begin() as conn:
             try:
                 # Prepare batch update parameters
-                update_params = [
-                    {"sort_order": 1 if i == 0 else i + 1, "result_id": res["ResultID"], "entry_id": entry_id}
-                    for i, res in enumerate(sorted_results)
-                ]
+                update_params = []
+                match_count = 0
+                for i, res in enumerate(sorted_results):
+                    if res["priority"] == 4:
+                        # Non-matching entries get SortOrder = -2
+                        sort_order = -2
+                    else:
+                        # Matching entries get positive SortOrder (1, 2, etc.)
+                        match_count += 1
+                        sort_order = match_count
+                    update_params.append({
+                        "sort_order": sort_order,
+                        "result_id": res["ResultID"],
+                        "entry_id": entry_id
+                    })
+                
                 if update_params:
                     await conn.execute(
                         text("""
@@ -333,32 +344,9 @@ async def update_search_sort_order(
                         """),
                         update_params
                     )
-                    logger.info(f"Worker PID {process.pid}: Batch updated SortOrder for {len(update_params)} rows Diagnostic Radiology for EntryID {entry_id}")
+                    logger.info(f"Worker PID {process.pid}: Batch updated SortOrder for {len(update_params)} rows for EntryID {entry_id}")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
-
-                # Verify no NULL SortOrder entries remain
-                result = await conn.execute(
-                    text("""
-                        SELECT COUNT(*) FROM utb_ImageScraperResult
-                        WHERE EntryID = :entry_id AND SortOrder IS NULL
-                    """),
-                    {"entry_id": entry_id}
-                )
-                null_count = result.scalar()
-                result.close()
-                if null_count > 0:
-                    logger.warning(f"Worker PID {process.pid}: Found {null_count} rows with NULL SortOrder for EntryID {entry_id}")
-                    # Fallback: Set NULL SortOrder to -2
-                    await conn.execute(
-                        text("""
-                            UPDATE utb_ImageScraperResult
-                            SET SortOrder = -2
-                            WHERE EntryID = :entry_id AND SortOrder IS NULL
-                        """),
-                        {"entry_id": entry_id}
-                    )
-                    logger.info(f"Worker PID {process.pid}: Set {null_count} NULL SortOrder entries to -2 for EntryID {entry_id}")
 
                 await conn.commit()  # Ensure commit after all updates
                 return True
@@ -366,7 +354,6 @@ async def update_search_sort_order(
             except SQLAlchemyError as e:
                 logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
                 return False
-
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
