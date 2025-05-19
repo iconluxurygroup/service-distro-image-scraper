@@ -1119,12 +1119,20 @@ async def api_get_job_status(file_id: str):
         log_url=job_status.get("log_url"),
         timestamp=job_status["timestamp"]
     )
+
+
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    result = await run_job_with_logging(update_sort_order, file_id)
+    try:
+        result = await run_job_with_logging(update_sort_order, file_id)
+    except Exception as e:
+        logger.error(f"Failed to run job for FileID: {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Job execution failed: {str(e)}")
     
-    # Check if result is valid
+    logger.debug(f"Received result for FileID: {file_id}: {result}")
+    
     if not isinstance(result, dict):
         logger.error(f"Unexpected result type for FileID: {file_id}: {type(result)}")
         log_public_url = await upload_log_file(file_id, log_filename, logger)
@@ -1133,10 +1141,6 @@ async def api_match_and_search_sort(file_id: str):
             detail=f"Unexpected result type: {type(result)}"
         )
     
-    # Log the result for debugging
-    logger.debug(f"Received result for FileID: {file_id}: {result}")
-    
-    # Check status code
     if result.get("status_code", 500) != 200:
         logger.error(f"Job failed for FileID: {file_id}: {result.get('message', 'Unknown error')}")
         log_public_url = await upload_log_file(file_id, log_filename, logger)
@@ -1145,9 +1149,16 @@ async def api_match_and_search_sort(file_id: str):
             detail=result.get("message", "Unknown error")
         )
     
-    # Extract data and check for errors
     data = result.get("data", {})
-    if isinstance(data, dict) and data.get("error"):
+    if not isinstance(data, dict):
+        logger.error(f"Unexpected data type in result for FileID: {file_id}: {type(data)}")
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected data type: {type(data)}"
+        )
+    
+    if data.get("error"):
         logger.error(f"Error in job update_sort_order for FileID: {file_id}: {data['error']}")
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(
@@ -1155,14 +1166,19 @@ async def api_match_and_search_sort(file_id: str):
             detail=f"Job error: {data['error']}"
         )
     
-    # Success case
     logger.info(f"Job update_sort_order for FileID: {file_id} completed: "
                 f"{data.get('success_count', 0)} successes, {data.get('failure_count', 0)} failures")
     log_public_url = await upload_log_file(file_id, log_filename, logger)
     return {
-        **result,
-        "log_url": log_public_url
+        "status_code": 200,
+        "message": result.get("message", "Job completed successfully"),
+        "data": data,
+        "log_url": log_public_url,
+        "debug_info": result.get("debug_info", {})
     }
+
+
+
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
