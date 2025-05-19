@@ -447,52 +447,91 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
         # Perform bulk update using a temporary table
+        import pandas as pd
+        from sqlalchemy.ext.asyncio import AsyncConnection
+        from sqlalchemy.sql import text
+        import logging
+        import psutil
+
+        logger = logging.getLogger(__name__)
+
         async def update_sort_order(conn: AsyncConnection, params: List[Dict]):
             try:
-                # Create temporary table
-                create_temp_table = text("""
-                    CREATE TABLE #TempSortOrder (
-                        ResultID INT,
-                        EntryID VARCHAR(50),
-                        SortOrder INT
-                    )
-                """)
-                await conn.execute(create_temp_table)
-
-                # Insert values into temp table with explicit cursor reset
-                insert_temp = text("""
-                    INSERT INTO #TempSortOrder (ResultID, EntryID, SortOrder)
-                    VALUES (:result_id, :entry_id, :sort_order)
-                """)
-                for param in params:
-                    # Execute in a new connection context to avoid state issues
-                    async with async_engine.connect() as insert_conn:
-                        await insert_conn.execute(insert_temp, {
-                            "result_id": param["result_id"],
-                            "entry_id": param["entry_id"],
-                            "sort_order": param["sort_order"]
-                        })
-
-                # Update main table from temp table
+                # Convert params to DataFrame
+                update_df = pd.DataFrame(params, columns=["result_id", "entry_id", "sort_order"])
+                
+                # Ensure consistent data types
+                update_df["result_id"] = update_df["result_id"].astype(int)
+                update_df["entry_id"] = update_df["entry_id"].astype(str)
+                update_df["sort_order"] = update_df["sort_order"].astype(int)
+                
+                # Fetch existing utb_ImageScraperResult data for relevant EntryIDs
+                entry_ids = tuple(update_df["entry_id"].unique())
+                if not entry_ids:
+                    logger.warning(f"Worker PID {psutil.Process().pid}: No entry IDs provided for update")
+                    return 0
+                
+                query = text("""
+                    SELECT ResultID, EntryID, SortOrder
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN :entry_ids
+                """).bindparams(entry_ids=entry_ids)
+                result = await conn.execute(query)
+                rows = result.fetchall()
+                result.close()
+                
+                # Create DataFrame from existing data
+                existing_df = pd.DataFrame(
+                    rows,
+                    columns=["ResultID", "EntryID", "SortOrder"]
+                )
+                
+                # Ensure consistent data types for existing data
+                existing_df["ResultID"] = existing_df["ResultID"].astype(int)
+                existing_df["EntryID"] = existing_df["EntryID"].astype(str)
+                existing_df["SortOrder"] = existing_df["SortOrder"].astype(int, errors="ignore")
+                
+                # Merge update_df with existing_df to apply SortOrder updates
+                merged_df = existing_df.merge(
+                    update_df,
+                    left_on=["ResultID", "EntryID"],
+                    right_on=["result_id", "entry_id"],
+                    how="left"
+                )
+                
+                # Update SortOrder: use new sort_order where available, keep existing otherwise
+                merged_df["SortOrder"] = merged_df["sort_order"].fillna(merged_df["SortOrder"]).astype(int)
+                
+                # Filter rows where SortOrder needs updating (i.e., new SortOrder differs from existing)
+                update_rows = merged_df[
+                    merged_df["sort_order"].notnull() & 
+                    (merged_df["SortOrder"] != merged_df["sort_order"])
+                ][["ResultID", "EntryID", "SortOrder"]]
+                
+                if update_rows.empty:
+                    logger.debug(f"Worker PID {psutil.Process().pid}: No SortOrder updates needed")
+                    return 0
+                
+                # Prepare and execute UPDATE statements
                 update_query = text("""
                     UPDATE utb_ImageScraperResult
-                    SET SortOrder = t.SortOrder
-                    FROM utb_ImageScraperResult r
-                    INNER JOIN #TempSortOrder t
-                        ON r.ResultID = t.ResultID AND r.EntryID = t.EntryID
+                    SET SortOrder = :SortOrder
+                    WHERE ResultID = :ResultID AND EntryID = :EntryID
                 """)
-                result = await conn.execute(update_query)
-                row_count = result.rowcount
-                logger.debug(f"Worker PID {process.pid}: Bulk update raw row_count: {row_count}")
-
-                # Drop temp table
-                await conn.execute(text("DROP TABLE #TempSortOrder"))
+                row_count = 0
+                for _, row in update_rows.iterrows():
+                    result = await conn.execute(update_query, {
+                        "ResultID": row["ResultID"],
+                        "EntryID": row["EntryID"],
+                        "SortOrder": row["SortOrder"]
+                    })
+                    row_count += result.rowcount
+                
+                logger.debug(f"Worker PID {psutil.Process().pid}: Updated {row_count} rows with new SortOrder")
                 return max(0, row_count)
-            except SQLAlchemyError as e:
-                logger.error(f"SQLAlchemy error in update_sort_order: {e}", exc_info=True)
-                raise
+            
             except Exception as e:
-                logger.error(f"Unexpected error in update_sort_order: {e}", exc_info=True)
+                logger.error(f"Worker PID {psutil.Process().pid}: Error in update_sort_order: {e}", exc_info=True)
                 raise
 
         update_params = []
