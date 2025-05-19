@@ -373,6 +373,8 @@ def validate_model(row: Dict, expected_models: List[str], result_id: str, logger
     logger.warning(f"ResultID {result_id}: Model match failed: Input model='{input_model}', Expected models={expected_models}")
     return False
 
+
+
 def validate_brand(
     row: Dict,
     brand_aliases: List[str],
