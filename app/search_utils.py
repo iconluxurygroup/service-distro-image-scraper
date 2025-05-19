@@ -57,7 +57,6 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             logger.debug(f"Invalid URL format: {cleaned}")
             return ""
     return cleaned
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -76,27 +75,36 @@ async def insert_search_results(
     process = psutil.Process()
 
     if not results:
-        logger.warning(f"Worker PID {process.pid}: Empty results provided for insert_search_results")
+        logger.warning(f"Worker PID {process.pid}: Empty results provided for insert_search_results, FileID {file_id}")
         return False
 
     # Validate required columns
     required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+    valid_results = []
     for res in results:
         if not all(col in res for col in required_columns):
             missing_cols = set(required_columns) - set(res.keys())
-            logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
-            return False
+            logger.error(f"Worker PID {process.pid}: Missing columns {missing_cols} in result: {res}")
+            continue
+        if "placeholder://error" in res["ImageUrl"] or "placeholder://no-results" in res["ImageUrl"]:
+            logger.warning(f"Worker PID {process.pid}: Skipping placeholder result for EntryID {res['EntryID']}: {res['ImageUrl']}")
+            continue
+        valid_results.append(res)
+
+    if not valid_results:
+        logger.warning(f"Worker PID {process.pid}: No valid results to insert for FileID {file_id}")
+        return False
 
     # Deduplicate based on EntryID and ImageUrl
     seen = set()
     deduped_results = []
-    for res in results:
+    for res in valid_results:
         image_url = clean_url_string(res.get("ImageUrl", ""), is_url=True)
         key = (res["EntryID"], image_url)
         if key not in seen:
             seen.add(key)
             deduped_results.append(res)
-    logger.info(f"Worker PID {process.pid}: Deduplicated from {len(results)} to {len(deduped_results)} rows")
+    logger.info(f"Worker PID {process.pid}: Deduplicated from {len(valid_results)} to {len(deduped_results)} rows")
 
     # Prepare parameters with cleaned data
     parameters = []
@@ -136,7 +144,7 @@ async def insert_search_results(
         logger.debug(f"Worker PID {process.pid}: Prepared row for EntryID {entry_id}: {param}")
 
     if not parameters:
-        logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id}")
+        logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id} after validation")
         return False
 
     try:
@@ -195,7 +203,7 @@ async def insert_search_results(
 
             logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(parameters)} rows for FileID {file_id}")
             if inserted_count == 0 and updated_count == 0:
-                logger.warning(f"Worker PID {process.pid}: No rows inserted or updated for FileID {file_id}; likely all rows are duplicates")
+                logger.warning(f"Worker PID {process.pid}: No rows inserted or updated for FileID {file_id}; likely all rows are duplicates or invalid")
             return inserted_count > 0 or updated_count > 0
 
     except SQLAlchemyError as e:

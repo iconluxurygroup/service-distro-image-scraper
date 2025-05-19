@@ -943,31 +943,49 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
 async def api_restart_search_all(
     file_id: str,
     entry_id: Optional[int] = None,
+    request_id: Optional[str] = Query(None),  # Add request_id for idempotency
     background_tasks: BackgroundTasks = None
 ):
     logger, log_filename = setup_job_logger(job_id=file_id)
-    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + f" with request_id: {request_id}")
     
     try:
+        # Check if job is already running
+        if JOB_STATUS.get(file_id, {}).get("status") in ["queued", "running"]:
+            logger.warning(f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
+            raise HTTPException(status_code=400, detail=f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
+        
+        # Check for duplicate request_id
+        if request_id and JOB_STATUS.get(file_id, {}).get("request_id") == request_id:
+            logger.info(f"Duplicate request_id {request_id} for FileID {file_id}, returning existing job status")
+            return {
+                "status": "success",
+                "status_code": 200,
+                "message": f"Job for FileID {file_id} already processed with request_id {request_id}",
+                "data": JOB_STATUS[file_id]
+            }
+        
         if not entry_id:
             entry_id = await fetch_last_valid_entry(file_id, logger)
             logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+        
+        JOB_STATUS[file_id] = {
+            "status": "queued",
+            "message": "Job queued for processing",
+            "timestamp": datetime.datetime.now().isoformat(),
+            "request_id": request_id
+        }
         
         result = await run_job_with_logging(
             process_restart_batch,
             file_id,
             entry_id=entry_id,
-            use_all_variations=True
+            use_all_variations=True,
+            logger=logger
         )
         
         if result["status_code"] != 200:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
-            if "placeholder://error" in result["message"]:
-                logger.warning(f"Placeholder error detected; check endpoint logs for FileID {file_id}")
-                debug_info = result.get("debug_info", {})
-                endpoint_errors = debug_info.get("endpoint_errors", [])
-                for error in endpoint_errors:
-                    logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
         
