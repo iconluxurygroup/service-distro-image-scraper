@@ -92,7 +92,7 @@ class DatabaseQueue:
             return True
         except SQLAlchemyError as e:
             self.logger.warning(f"Connection health check failed: {e}")
-            return False
+            return {"error": str(e)}
 # Global DatabaseQueue instance
 global_db_queue = None
 
