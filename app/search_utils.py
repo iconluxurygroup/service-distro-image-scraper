@@ -686,21 +686,28 @@ async def update_sort_order(
                    f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder, "
                    f"{verification['NonPlaceholderResults']} non-placeholder results")
 
-        return {
+        result = {
             "results": results,
             "success_count": success_count,
             "failure_count": failure_count,
             "verification": verification
         }
-
+        logger.debug(f"Returning result for FileID: {file_id}: {result}")
+        return result
     except SQLAlchemyError as e:
-        logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        return {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
+        logger.error(f"Database error in batch SortOrder update for FileID: {file_id}: {e}", exc_info=True)
+        result = {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
+        logger.debug(f"Returning error result for FileID: {file_id}: {result}")
+        return result
     except ValueError as ve:
-        logger.error(f"Invalid file_id format for FileID {file_id}: {ve}", exc_info=True)
-        return {"error": str(ve), "results": [], "success_count": 0, "failure_count": 0}
+        logger.error(f"Invalid file_id format for FileID: {file_id}: {ve}", exc_info=True)
+        result = {"error": str(ve), "results": [], "success_count": 0, "failure_count": 0}
+        logger.debug(f"Returning error result for FileID: {file_id}: {result}")
+        return result
     except Exception as e:
-        logger.error(f"Unexpected error in batch SortOrder update for FileID {file_id}: {e}\n{traceback.format_exc()}")
-        return {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
+        logger.error(f"Unexpected error in batch SortOrder update for FileID: {file_id}: {e}", exc_info=True)
+        result = {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
+        logger.debug(f"Returning error result for FileID: {file_id}: {result}")
+        return result
     finally:
         await db_queue.stop()

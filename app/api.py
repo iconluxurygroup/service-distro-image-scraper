@@ -903,9 +903,9 @@ async def process_restart_batch(
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
-    result = None
     debug_info = {"memory_usage": {}, "log_file": log_file, "endpoint_errors": []}
-    
+    result = None
+
     try:
         func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
         logger.info(f"Starting job {func_name} for FileID: {file_id}")
@@ -925,12 +925,14 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
             logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
         
         logger.info(f"Completed job {func_name} for FileID: {file_id}")
-        return {
+        return_value = {
             "status_code": 200,
             "message": f"Job {func_name} completed successfully for FileID: {file_id}",
             "data": result,
             "debug_info": debug_info
         }
+        logger.debug(f"Returning result for FileID {file_id}: {return_value}")
+        return return_value
     except Exception as e:
         func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
         logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
@@ -939,14 +941,21 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         if "placeholder://error" in str(e):
             debug_info["endpoint_errors"].append({"error": str(e), "timestamp": datetime.datetime.now().isoformat()})
             logger.warning(f"Detected placeholder error in job {func_name} for FileID: {file_id}")
-        return {
+        return_value = {
             "status_code": 500,
             "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
             "data": None,
             "debug_info": debug_info
         }
+        logger.debug(f"Returning error result for FileID {file_id}: {return_value}")
+        return return_value
     finally:
-        debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
+        try:
+            debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
+        except Exception as e:
+            logger.error(f"Failed to upload log file for FileID {file_id}: {e}")
+            debug_info["log_url"] = None
+
 async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
     try:
         JOB_STATUS[file_id] = {
@@ -1098,16 +1107,50 @@ async def api_get_job_status(file_id: str):
         log_url=job_status.get("log_url"),
         timestamp=job_status["timestamp"]
     )
-
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     result = await run_job_with_logging(update_sort_order, file_id)
-    if result["status_code"] != 200:
+    
+    # Check if result is valid
+    if not isinstance(result, dict):
+        logger.error(f"Unexpected result type for FileID: {file_id}: {type(result)}")
         log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=result["status_code"], detail=result["message"])
-    return result
-
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected result type: {type(result)}"
+        )
+    
+    # Log the result for debugging
+    logger.debug(f"Received result for FileID: {file_id}: {result}")
+    
+    # Check status code
+    if result.get("status_code", 500) != 200:
+        logger.error(f"Job failed for FileID: {file_id}: {result.get('message', 'Unknown error')}")
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Unknown error")
+        )
+    
+    # Extract data and check for errors
+    data = result.get("data", {})
+    if isinstance(data, dict) and data.get("error"):
+        logger.error(f"Error in job update_sort_order for FileID: {file_id}: {data['error']}")
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Job error: {data['error']}"
+        )
+    
+    # Success case
+    logger.info(f"Job update_sort_order for FileID: {file_id} completed: "
+                f"{data.get('success_count', 0)} successes, {data.get('failure_count', 0)} failures")
+    log_public_url = await upload_log_file(file_id, log_filename, logger)
+    return {
+        **result,
+        "log_url": log_public_url
+    }
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
