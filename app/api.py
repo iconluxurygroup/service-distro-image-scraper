@@ -265,7 +265,7 @@ async def process_and_tag_results(
         
         return filtered_results
     
-    except Exception as e twenty):
+    except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
         return [{
             "EntryID": entry_id,
