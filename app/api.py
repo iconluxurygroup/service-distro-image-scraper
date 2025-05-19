@@ -77,13 +77,12 @@ class SearchClient:
 
     async def close(self):
         pass  # aiohttp.ClientSession is managed per request
-
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError))
     )
-    async def search(self, term: str, brand: str) -> List[Dict]:
+    async def search(self, term: str, brand: str, entry_id: int) -> List[Dict]:
         async with self.semaphore:
             process = psutil.Process()
             search_url = f"https://www.google.com/search?q={urllib.parse.quote(term)}&tbm=isch"
@@ -106,12 +105,12 @@ class SearchClient:
                                 self.logger.warning(f"Worker PID {process.pid}: No results for term '{term}' in region {region}")
                                 continue
                             results_html_bytes = results if isinstance(results, bytes) else results.encode("utf-8")
-                            formatted_results = process_search_result(results_html_bytes, results_html_bytes, 0, self.logger)
+                            formatted_results = process_search_result(results_html_bytes, results_html_bytes, entry_id, self.logger)
                             if formatted_results:
                                 self.logger.info(f"Worker PID {process.pid}: Found {len(formatted_results)} results for term '{term}' in region {region}")
                                 return [
                                     {
-                                        "EntryID": 0,  # Will be set by caller
+                                        "EntryID": entry_id,  # Use provided entry_id
                                         "ImageUrl": res.get("image_url", "placeholder://no-image"),
                                         "ImageDesc": res.get("description", ""),
                                         "ImageSource": res.get("source", "N/A"),
@@ -125,19 +124,26 @@ class SearchClient:
                     continue
             self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
             return []
-async def process_results(
+   async def process_results(
     raw_results: List[Dict],
     entry_id: int,
     brand: str,
-    search_term: str,
+    search_string: str,  # Renamed from search_term to match process_and_tag_results
     logger: logging.Logger
 ) -> List[Dict]:
     results = []
     required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-    tagged_results = await process_and_tag_results(raw_results, brand=brand, search_term=search_term, logger=logger)
+    # Call process_and_tag_results with correct parameters
+    tagged_results = await process_and_tag_results(
+        search_string=search_string,
+        brand=brand,
+        entry_id=entry_id,
+        logger=logger,
+        use_all_variations=False  # Default value, adjust if needed
+    )
     for result in tagged_results:
-        image_url = result.get("image_url")
+        image_url = result.get("ImageUrl")  # Adjusted to match output of process_and_tag_results
         if not image_url:
             continue
 
@@ -148,7 +154,7 @@ async def process_results(
         formatted_result = {
             "EntryID": entry_id,
             "ImageUrl": image_url,
-            "ImageDesc": result.get("description", ""),
+            "ImageDesc": result.get("ImageDesc", ""),
             "ImageSource": image_source,
             "ImageUrlThumbnail": thumbnail_url
         }
@@ -193,7 +199,7 @@ async def async_process_entry_search(
 
     client = SearchClient(endpoint, logger)
     try:
-        tasks = [client.search(term, brand) for term in search_terms]
+        tasks = [client.search(term, brand, entry_id) for term in search_terms]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_results = []
