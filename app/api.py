@@ -901,22 +901,21 @@ async def process_restart_batch(
         logger.info(f"Disposed database engines")
 
 
-
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
-    logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
+    logger, log_file = await setup_job_logger(job_id=file_id_str, console_output=True)
     debug_info = {"memory_usage": {}, "log_file": log_file, "endpoint_errors": []}
     result = None
 
     try:
-        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        func_name = getattr(job_func, '__name__', 'unknown_function')
         logger.info(f"Starting job {func_name} for FileID: {file_id}")
         
         process = psutil.Process()
         debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
         logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
         
-        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+        if asyncio.iscoroutinefunction(job_func):
             result = await job_func(file_id, logger=logger, **kwargs)
         else:
             result = job_func(file_id, logger=logger, **kwargs)
@@ -925,6 +924,10 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
         if debug_info["memory_usage"]["after"] > 1000:
             logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        
+        if not isinstance(result, dict):
+            logger.error(f"Job {func_name} returned unexpected type: {type(result)}")
+            result = {"error": f"Unexpected result type: {type(result)}", "results": [], "success_count": 0, "failure_count": 0}
         
         logger.info(f"Completed job {func_name} for FileID: {file_id}")
         return_value = {
@@ -936,7 +939,7 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         logger.debug(f"Returning success result for FileID {file_id}: {return_value}")
         return return_value
     except asyncio.CancelledError as e:
-        logger.error(f"Job {func_name} for FileID: {file_id} cancelled: {e}")
+        logger.error(f"Job {func_name} for FileID: {file_id} cancelled: {e}", exc_info=True)
         return_value = {
             "status_code": 500,
             "message": f"Job {func_name} cancelled for FileID {file_id}: {str(e)}",
@@ -946,13 +949,9 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         logger.debug(f"Returning cancelled result for FileID {file_id}: {return_value}")
         return return_value
     except Exception as e:
-        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
         logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}", exc_info=True)
         logger.debug(f"Traceback: {traceback.format_exc()}")
         debug_info["error_traceback"] = traceback.format_exc()
-        if "placeholder://error" in str(e):
-            debug_info["endpoint_errors"].append({"error": str(e), "timestamp": datetime.datetime.now().isoformat()})
-            logger.warning(f"Detected placeholder error in job {func_name} for FileID: {file_id}")
         return_value = {
             "status_code": 500,
             "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
@@ -1186,9 +1185,12 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         except Exception as e:
             logger.error(f"Failed to upload log file for FileID: {file_id}: {e}", exc_info=True)
             debug_info["log_url"] = None
-@router.get("/sort-by-search/{file_id}", tags=["Sorting"])
+
+
+
+@app.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
-    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger, log_filename = await setup_job_logger(job_id=file_id, console_output=True)
     try:
         result = await run_job_with_logging(update_sort_order, file_id)
     except Exception as e:
@@ -1240,7 +1242,9 @@ async def api_match_and_search_sort(file_id: str):
         "data": data,
         "log_url": log_public_url,
         "debug_info": result.get("debug_info", {})
-    }            
+    }
+
+    
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
