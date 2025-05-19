@@ -433,6 +433,8 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         return {"error": str(e), "log_filename": log_filename}
     finally:
         log_memory_usage()
+
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -501,10 +503,6 @@ async def process_restart_batch(
                 AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
                 AND r.Step1 IS NULL
                 AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.SortOrder <= 0)
-                AND NOT EXISTS (
-                    SELECT 1 FROM utb_ImageScraperResult tr 
-                    WHERE tr.EntryID = r.EntryID AND tr.ImageUrl NOT LIKE 'placeholder://%'
-                )
                 ORDER BY r.EntryID
             """)
             result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
@@ -551,14 +549,10 @@ async def process_restart_batch(
                             await asyncio.sleep(2 ** attempt)
                         continue
 
-                if not all_results:
-                    logger.error(f"No valid results for EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                    return entry_id, False
-
                 # Validate results
-                if not all(all(col in res for col in required_columns) for res in all_results):
+                if all_results and not all(all(col in res for col in required_columns) for res in all_results):
                     logger.error(f"Missing columns for EntryID {entry_id}")
-                    return entry_id, False
+                    all_results = []
 
                 # Deduplicate results
                 deduplicated_results = []
@@ -570,19 +564,20 @@ async def process_restart_batch(
                         deduplicated_results.append(res)
                 logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
-                # Insert all results
-                insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
-                if not insert_success:
-                    logger.error(f"Failed to insert results for EntryID {entry_id}")
-                    return entry_id, False
+                # Insert results (placeholders are handled in async_process_entry_search)
+                if deduplicated_results:
+                    insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
+                    if not insert_success:
+                        logger.error(f"Failed to insert results for EntryID {entry_id}")
+                        return entry_id, False
 
-                # Update sort order after all results are inserted
+                # Update sort order
                 update_result = await update_search_sort_order(
                     str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                 )
                 if update_result is None or not update_result:
                     logger.error(f"SortOrder update failed for EntryID {entry_id}")
-                    return entry_id, False
+                    # Continue to mark Step1 to prevent reprocessing
 
                 # Mark Step1 as complete
                 async with async_engine.connect() as conn:
@@ -703,6 +698,7 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
+
 
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
