@@ -584,16 +584,7 @@ async def process_restart_batch(
                     for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                         logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
                         try:
-                            results = await async_process_entry_search(
-                                search_string=search_string,
-                                brand=brand,
-                                endpoint=endpoint,
-                                entry_id=entry_id,
-                                use_all_variations=use_all_variations,
-                                file_id_db=file_id_db,
-                                logger=logger
-                            )
-                            logger.debug(f"Search returned {len(results)} results for EntryID {entry_id}")
+                            results = await async_process_entry_search(...)
                             if results:
                                 all_results.extend(results)
                         except Exception as e:
