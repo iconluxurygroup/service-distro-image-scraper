@@ -251,7 +251,24 @@ async def update_search_sort_order(
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
-            return False
+            # Insert placeholder result with SortOrder = -1
+            async with async_engine.begin() as conn:
+                await conn.execute(
+                    text("""
+                        INSERT INTO utb_ImageScraperResult
+                        (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, SortOrder, CreateTime)
+                        VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, -1, CURRENT_TIMESTAMP)
+                    """),
+                    {
+                        "entry_id": entry_id,
+                        "image_url": "placeholder://no-results",
+                        "image_desc": f"No results found for {model or 'unknown'}",
+                        "image_source": "N/A",
+                        "image_url_thumbnail": "placeholder://no-results"
+                    }
+                )
+                logger.info(f"Worker PID {process.pid}: Inserted placeholder result with SortOrder = -1 for EntryID {entry_id}")
+            return True
 
         results = [dict(zip(columns, row)) for row in rows]
         logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
