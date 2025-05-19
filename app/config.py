@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Dict
 from sqlalchemy.sql import text
 from urllib.parse import quote_plus
-VERSION="3.4.21"
+VERSION="3.7.4"
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"
 SENDER_NAME='superscraper'
