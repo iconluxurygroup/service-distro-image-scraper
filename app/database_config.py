@@ -3,6 +3,7 @@ import os
 from urllib.parse import quote_plus
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.sql import text
 from typing import Optional, Dict
 from config import DB_PASSWORD
 
