@@ -382,6 +382,7 @@ async def update_search_sort_order(
             return {"success": False, "error": "Queue operation failed", "entry_id": entry_id}
 
         results = [dict(zip(columns, row)) for row in rows]
+        logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} results for EntryID {entry_id}")
 
         # Handle no results
         if not rows:
@@ -459,6 +460,9 @@ async def update_search_sort_order(
                 update_df["entry_id"] = update_df["entry_id"].astype(str)
                 update_df["sort_order"] = update_df["sort_order"].astype(int)
                 
+                # Log update_df contents
+                logger.debug(f"Worker PID {process.pid}: update_df for EntryID {entry_id}: {update_df.to_dict(orient='records')}")
+                
                 # Fetch existing utb_ImageScraperResult data for relevant EntryIDs
                 entry_ids = list(update_df["entry_id"].unique())
                 if not entry_ids:
@@ -478,7 +482,7 @@ async def update_search_sort_order(
                         SELECT ResultID, EntryID, SortOrder
                         FROM utb_ImageScraperResult
                         WHERE EntryID IN :entry_ids
-                    """).bindparams(entry_ids=tuple(entry_ids))
+                    """).bindparams(entry_ids=tuple_(entry_ids))
                     params = {"entry_ids": tuple(entry_ids)}
                 
                 result = await conn.execute(query, params)
@@ -490,6 +494,9 @@ async def update_search_sort_order(
                     rows,
                     columns=["ResultID", "EntryID", "SortOrder"]
                 )
+                
+                # Log existing_df contents
+                logger.debug(f"Worker PID {process.pid}: existing_df for EntryID {entry_id}: {existing_df.to_dict(orient='records')}")
                 
                 # Ensure consistent data types for existing data
                 existing_df["ResultID"] = existing_df["ResultID"].astype(int)
@@ -504,6 +511,9 @@ async def update_search_sort_order(
                     how="left"
                 )
                 
+                # Log merged_df before filtering
+                logger.debug(f"Worker PID {process.pid}: merged_df for EntryID {entry_id}: {merged_df[['ResultID', 'EntryID', 'SortOrder', 'sort_order']].to_dict(orient='records')}")
+                
                 # Update SortOrder: use new sort_order where available, keep existing otherwise
                 merged_df["SortOrder"] = merged_df["sort_order"].fillna(merged_df["SortOrder"]).astype(int)
                 
@@ -513,8 +523,13 @@ async def update_search_sort_order(
                     (merged_df["SortOrder"] != merged_df["sort_order"])
                 ][["ResultID", "EntryID", "SortOrder"]]
                 
+                # Log update_rows
                 if update_rows.empty:
-                    logger.debug(f"Worker PID {process.pid}: No SortOrder updates needed")
+                    logger.debug(f"Worker PID {process.pid}: No SortOrder updates needed for EntryID {entry_id}. Possible reasons: no matching rows or SortOrder already matches.")
+                else:
+                    logger.debug(f"Worker PID {process.pid}: update_rows for EntryID {entry_id}: {update_rows.to_dict(orient='records')}")
+                
+                if update_rows.empty:
                     return 0
                 
                 # Execute UPDATE statements
@@ -532,11 +547,11 @@ async def update_search_sort_order(
                     })
                     row_count += result.rowcount
                 
-                logger.debug(f"Worker PID {process.pid}: Updated {row_count} rows with new SortOrder")
+                logger.debug(f"Worker PID {process.pid}: Updated {row_count} rows with new SortOrder for EntryID {entry_id}")
                 return max(0, row_count)
             
             except Exception as e:
-                logger.error(f"Worker PID {process.pid}: Error in update_sort_order: {e}", exc_info=True)
+                logger.error(f"Worker PID {process.pid}: Error in update_sort_order for EntryID {entry_id}: {e}", exc_info=True)
                 raise
 
         update_params = []
@@ -550,7 +565,7 @@ async def update_search_sort_order(
             })
 
         if update_params:
-            logger.debug(f"Worker PID {process.pid}: Update params: {update_params}")
+            logger.debug(f"Worker PID {process.pid}: Update params for EntryID {entry_id}: {update_params}")
             try:
                 row_count = await db_queue.enqueue(
                     update_sort_order,
@@ -559,7 +574,7 @@ async def update_search_sort_order(
                 )
                 row_count = int(row_count or 0)
                 if row_count < 0:
-                    logger.error(f"Worker PID {process.pid}: Negative row_count {row_count} detected")
+                    logger.error(f"Worker PID {process.pid}: Negative row_count {row_count} detected for EntryID {entry_id}")
                     row_count = 0
                 logger.info(f"Worker PID {process.pid}: Bulk updated SortOrder for {row_count} rows for EntryID {entry_id}")
             except Exception as e:
