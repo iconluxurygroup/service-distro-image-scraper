@@ -346,6 +346,27 @@ def is_connection_busy_error(exception):
             return "HY000" in str(orig) and "Connection is busy" in str(orig)
     return False
 
+from typing import Optional, Dict, Any, List
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncConnection
+import logging
+import aiofiles
+import json
+import psutil
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
+from pyodbc import Error as PyodbcError
+
+logger = logging.getLogger(__name__)
+process = psutil.Process()
+
+def is_connection_busy_error(exception):
+    if isinstance(exception, SQLAlchemyError):
+        orig = getattr(exception, "orig", None)
+        if isinstance(orig, PyodbcError):
+            return "HY000" in str(orig) and "Connection is busy" in str(orig)
+    return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -496,45 +517,30 @@ async def update_search_sort_order(
                 logger.error(f"Unexpected error in update_sort_order for EntryID {entry_id}: {e}", exc_info=True)
                 raise
 
-        # Commit sort order data to database
+        # Commit sort order data to database using individual UPDATE statements
         async def commit_sort_order_to_db(conn: AsyncConnection, params: List[Dict]) -> int:
             try:
-                # Create temporary table
-                create_temp_table = text("""
-                    CREATE TABLE #TempSortOrder (
-                        ResultID INT,
-                        EntryID VARCHAR(50),
-                        SortOrder INT
-                    )
-                """)
-                await conn.execute(create_temp_table)
-
-                # Insert values into temp table
-                insert_temp = text("""
-                    INSERT INTO #TempSortOrder (ResultID, EntryID, SortOrder)
-                    VALUES (:result_id, :entry_id, :sort_order)
-                """)
-                for param in params:
-                    await conn.execute(insert_temp, {
-                        "result_id": param["result_id"],
-                        "entry_id": param["entry_id"],
-                        "sort_order": param["sort_order"]
-                    })
-
-                # Update main table from temp table
                 update_query = text("""
                     UPDATE utb_ImageScraperResult
-                    SET SortOrder = t.SortOrder
-                    FROM utb_ImageScraperResult r
-                    INNER JOIN #TempSortOrder t
-                        ON r.ResultID = t.ResultID AND r.EntryID = t.EntryID
+                    SET SortOrder = :sort_order
+                    WHERE ResultID = :result_id AND EntryID = :entry_id
                 """)
-                result = await conn.execute(update_query)
-                row_count = result.rowcount
-                logger.debug(f"Worker PID {process.pid}: Bulk update raw row_count: {row_count}")
-
-                # Drop temp table
-                await conn.execute(text("DROP TABLE #TempSortOrder"))
+                row_count = 0
+                for param in params:
+                    # Check connection health before each update
+                    try:
+                        await conn.execute(text("SELECT 1"))
+                    except SQLAlchemyError as e:
+                        logger.warning(f"Connection health check failed before update for ResultID {param['result_id']}: {e}")
+                        raise
+                    result = await conn.execute(update_query, {
+                        "sort_order": param["sort_order"],
+                        "result_id": param["result_id"],
+                        "entry_id": param["entry_id"]
+                    })
+                    row_count += result.rowcount
+                    logger.debug(f"Worker PID {process.pid}: Updated SortOrder for ResultID {param['result_id']}, EntryID {param['entry_id']}")
+                logger.debug(f"Worker PID {process.pid}: Total updated row_count: {row_count}")
                 return max(0, row_count)
             except SQLAlchemyError as e:
                 logger.error(f"SQLAlchemy error in commit_sort_order_to_db for EntryID {entry_id}: {e}", exc_info=True)
