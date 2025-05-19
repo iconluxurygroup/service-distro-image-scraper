@@ -8,8 +8,6 @@ from typing import Optional, Dict
 from config import DB_PASSWORD
 
 logger = logging.getLogger(__name__)
-
-# Configure logging if no handlers exist
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler()
@@ -27,12 +25,12 @@ if not all([DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD]):
     logger.error(f"Missing environment variables: {missing}")
     raise ValueError(f"Missing required database configuration: {missing}")
 
-# Connection string
+# Connection string with MARS enabled
 conn_str = (
     f"DRIVER={{ODBC Driver 17 for SQL Server}};"
     f"Server={DB_SERVER};Database={DB_NAME};"
     f"Uid={DB_USER};PWD={DB_PASSWORD};"
-    f"MultipleActiveResultSets=False"  # Disable MARS unless required
+    f"MultipleActiveResultSets=True"  # Enable MARS
 )
 
 required_params = ["DRIVER", "Server", "Database", "Uid", "PWD", "MultipleActiveResultSets"]
@@ -43,14 +41,15 @@ if not all(param in conn_str for param in required_params):
 
 encoded_conn_str = quote_plus(conn_str)
 
+# Create engines with error handling
 try:
     async_engine = create_async_engine(
         f"mssql+aioodbc:///?odbc_connect={encoded_conn_str}",
         echo=False,
-        pool_size=8,           # Reduced to avoid resource exhaustion
+        pool_size=8,           # Reduced to avoid exhaustion
         max_overflow=10,       # Reduced overflow
         pool_timeout=15,       # Shorter timeout
-        pool_pre_ping=True,    # Ensure connection health check
+        pool_pre_ping=True,    # Check connection health
         pool_recycle=1800,     # Recycle every 30 minutes
         connect_args={
             "timeout": 30,
