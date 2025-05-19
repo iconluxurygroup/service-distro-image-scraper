@@ -339,7 +339,6 @@ async def async_process_entry_search(
     finally:
         await client.close()
 
-
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
     try:
@@ -360,7 +359,6 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         results_df = await get_images_excel_db(str(file_id), logger)
         if results_df.empty:
             logger.error(f"No data found for FileID {file_id}")
-            # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
             return {"error": f"No data found for FileID {file_id}", "log_filename": log_filename}
 
         temp_dir = f"temp_excel_{file_id}"
