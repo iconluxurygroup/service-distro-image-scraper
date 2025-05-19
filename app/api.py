@@ -395,27 +395,16 @@ async def generate_search_variations(
         logger.debug(f"Generated {len(color_variations)} color variations")
 
     if brand:
-        predefined_aliases = {
-            "alexander mcqueen": ["amcq"],
-            "saint laurent": ["ysl", "yves saint laurent"],
-            "balenciaga": ["balenci", "bal"],
-            "bottega veneta": ["bv", "bottega"],
-            "givenchy": ["giv"],
-            "gucci": ["gucci"],
-            "loewe": ["loewe"],
-            "veja": ["veja"],
-            "fendi": ["fendi"],
-            "versace": ["versace"],
-            "burberry": ["burb", "burberry"],
-            "jacquemus": ["jacquemus"],
-            "moncler": ["moncler"],
-            "dolce & gabbana": ["dolce", "dg", "dolce gabbana"],
-            "salvatore ferragamo": ["ferragamo", "sf"],
-            "balmain": ["balmain"],
-            "chloe": ["chloe"],
-            "marc jacobs": ["marc jacobs"],
-            "vans": ["vans"]
-        }
+        brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
+        predefined_aliases = {}
+        for rule in brand_rules_data.get("brand_rules", []):
+            if rule.get("is_active", False):
+                full_name = clean_string(rule.get("full_name", "")).lower()
+                if full_name:
+                    predefined_aliases[full_name] = [
+                        clean_string(name).lower() for name in rule.get("names", [])
+                        if clean_string(name).lower() != full_name
+                    ]
         brand_aliases = await generate_brand_aliases(brand, predefined_aliases) or await generate_aliases(brand)
         brand_alias_variations = [f"{alias} {model}" for alias in brand_aliases if model]
         variations["brand_alias"] = list(set(brand_alias_variations))
