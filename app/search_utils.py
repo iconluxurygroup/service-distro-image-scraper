@@ -542,6 +542,7 @@ async def update_sort_no_image_entry(
     finally:
         await db_queue.stop()
 
+```python
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -635,21 +636,21 @@ async def update_sort_order(
                 result = await conn.execute(query, params)
                 verification[key] = result.scalar()
                 result.close()
-            # Add non-placeholder count
+            # Non-placeholder count
             query = text("""
                 SELECT COUNT(*) AS result_count
                 FROM utb_ImageScraperResult
                 WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
             """)
-            entry_ids = tuple(e[0] for e in entries)
-            result = await conn.execute(query, {"entry_ids": entry_ids})
+            result = await conn.execute(query, {"entry_ids": params["entry_ids"]})
             verification["NonPlaceholderResults"] = result.scalar()
             result.close()
             return verification
 
+        entry_ids = tuple(e[0] for e in entries)
         verification = await db_queue.enqueue(
             verify_sort_order,
-            {"file_id": file_id, "entry_ids": tuple(e[0] for e in entries)},
+            {"file_id": file_id, "entry_ids": entry_ids},
             connection_type="read"
         )
 
@@ -690,3 +691,4 @@ async def update_sort_order(
         return None
     finally:
         await db_queue.stop()
+```
