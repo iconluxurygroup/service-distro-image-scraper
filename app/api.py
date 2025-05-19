@@ -134,6 +134,11 @@ class SearchClient:
                         continue
                 self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
                 return []    
+import asyncio
+import logging
+import psutil
+from typing import List, Dict, Optional
+
 async def process_and_tag_results(
     search_string: str,
     brand: Optional[str] = None,
@@ -150,7 +155,7 @@ async def process_and_tag_results(
     try:
         logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
         
-        # Generate and deduplicate variations
+        # Generate variations
         variations = await generate_search_variations(
             search_string=search_string,
             brand=brand,
@@ -158,21 +163,30 @@ async def process_and_tag_results(
             logger=logger
         )
         
-        search_types = [
+        # Define the ordered list of variation types
+        ordered_types = [
             "default", "delimiter_variations", "color_variations",
             "brand_alias", "no_color", "model_alias", "category_specific"
         ]
         
-        # Collect unique variations
-        unique_variations = set()
-        for search_type in search_types:
-            if search_type not in variations:
-                logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
-                continue
-            for variation in variations[search_type]:
-                unique_variations.add(variation.lower().strip())
+        # Map each unique variation to its primary type (earliest in ordered_types)
+        variation_to_primary_type = {}
+        for search_type in ordered_types:
+            if search_type in variations:
+                for var in variations[search_type]:
+                    var_lower = var.lower().strip()
+                    if var_lower not in variation_to_primary_type:
+                        variation_to_primary_type[var_lower] = search_type
         
-        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(unique_variations)} unique variations for EntryID {entry_id}: {unique_variations}")
+        # Create an ordered list of variations
+        variation_order = []
+        for primary_type in ordered_types:
+            vars_for_type = sorted(
+                [var_lower for var_lower, type_ in variation_to_primary_type.items() if type_ == primary_type]
+            )
+            variation_order.extend(vars_for_type)
+        
+        logger.info(f"Worker PID {process.pid}: Processing {len(variation_order)} unique variations in order for EntryID {entry_id}")
         
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
         
@@ -180,22 +194,22 @@ async def process_and_tag_results(
         client = SearchClient(endpoint=endpoint, logger=logger)
         
         try:
-            # Create search tasks for unique variations
+            # Create and execute search tasks in the specified order
             search_tasks = []
-            for variation in unique_variations:
-                logger.debug(f"Worker PID {process.pid}: Queuing search for variation '{variation}' for EntryID {entry_id}")
-                search_tasks.append(client.search(term=variation, brand=brand or "", entry_id=entry_id))
+            for var_lower in variation_order:
+                logger.debug(f"Worker PID {process.pid}: Queuing search for variation '{var_lower}' for EntryID {entry_id}")
+                search_tasks.append(client.search(term=var_lower, brand=brand or "", entry_id=entry_id))
             
-            # Execute all tasks at once
+            # Execute all tasks concurrently, results returned in task order
             search_results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
             
             all_results = []
-            for variation, search_results in zip(unique_variations, search_results_list):
+            for var_lower, search_results in zip(variation_order, search_results_list):
                 if isinstance(search_results, Exception):
-                    logger.error(f"Worker PID {process.pid}: Search failed for variation '{variation}' in EntryID {entry_id}: {search_results}")
+                    logger.error(f"Worker PID {process.pid}: Search failed for variation '{var_lower}' in EntryID {entry_id}: {search_results}")
                     continue
                 if not search_results:
-                    logger.warning(f"Worker PID {process.pid}: No results for variation '{variation}' in EntryID {entry_id}")
+                    logger.warning(f"Worker PID {process.pid}: No results for variation '{var_lower}' in EntryID {entry_id}")
                     continue
                 tagged_results = []
                 for res in search_results:
@@ -212,7 +226,7 @@ async def process_and_tag_results(
                     else:
                         logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
                 all_results.extend(tagged_results)
-                logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{variation}' in EntryID {entry_id}")
+                logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{var_lower}' in EntryID {entry_id}")
         
         finally:
             await client.close()
@@ -228,9 +242,9 @@ async def process_and_tag_results(
                 "ProductCategory": ""
             }]
         
-        # Deduplicate results
-        deduplicated_results = []
+        # Deduplicate results while preserving order
         seen_urls = set()
+        deduplicated_results = []
         for res in all_results:
             image_url = res["ImageUrl"]
             if image_url not in seen_urls and image_url != "placeholder://no-results":
@@ -238,7 +252,7 @@ async def process_and_tag_results(
                 deduplicated_results.append(res)
         logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
         
-        # Filter irrelevant results
+        # Filter irrelevant results while preserving order
         irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
         filtered_results = []
         for res in deduplicated_results:
@@ -251,7 +265,7 @@ async def process_and_tag_results(
         
         return filtered_results
     
-    except Exception as e:
+    except Exception as e twenty):
         logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
         return [{
             "EntryID": entry_id,
