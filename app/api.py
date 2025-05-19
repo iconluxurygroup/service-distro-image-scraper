@@ -139,7 +139,6 @@ async def process_and_tag_results(
     try:
         logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
         
-        # Generate search variations
         variations = await generate_search_variations(
             search_string=search_string,
             brand=brand,
@@ -155,12 +154,10 @@ async def process_and_tag_results(
         
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
         
-        # Initialize SearchClient
         endpoint = endpoint or SEARCH_PROXY_API_URL
         client = SearchClient(endpoint=endpoint, logger=logger)
         
         try:
-            # Collect all search tasks
             search_tasks = []
             for search_type in search_types:
                 if search_type not in variations:
@@ -170,10 +167,8 @@ async def process_and_tag_results(
                     logger.debug(f"Worker PID {process.pid}: Queuing search for variation '{variation}' for EntryID {entry_id}")
                     search_tasks.append(client.search(term=variation, brand=brand or "", entry_id=entry_id))
             
-            # Execute all searches concurrently
             search_results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
             
-            # Process results
             for search_results in search_results_list:
                 if isinstance(search_results, Exception):
                     logger.error(f"Worker PID {process.pid}: Search failed for EntryID {entry_id}: {search_results}")
@@ -211,7 +206,6 @@ async def process_and_tag_results(
                 "ProductCategory": ""
             }]
         
-        # Deduplicate results
         deduplicated_results = []
         seen_urls = set()
         for res in all_results:
@@ -219,7 +213,6 @@ async def process_and_tag_results(
             if image_url not in seen_urls and image_url != "placeholder://no-results":
                 seen_urls.add(image_url)
                 deduplicated_results.append(res)
-        
         logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
         
         irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
