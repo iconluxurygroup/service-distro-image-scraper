@@ -317,6 +317,8 @@ async def insert_search_results(
         await db_queue.stop()
 
 from pyodbc import Error as PyodbcError
+        # Perform bulk update using a temporary table
+import pandas as pd
 
 def is_connection_busy_error(exception):
     if isinstance(exception, SQLAlchemyError):
@@ -446,14 +448,7 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Perform bulk update using a temporary table
-        import pandas as pd
-        from sqlalchemy.ext.asyncio import AsyncConnection
-        from sqlalchemy.sql import text
-        import logging
-        import psutil
 
-        logger = logging.getLogger(__name__)
 
         async def update_sort_order(conn: AsyncConnection, params: List[Dict]):
             try:
