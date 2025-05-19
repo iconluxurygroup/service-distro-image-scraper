@@ -549,10 +549,26 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
         logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
         return None
 
+from pyodbc import Error as PyodbcError
+from typing import Optional, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
+import logging
+import psutil
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import async_engine
+
+def is_connection_busy_error(exception):
+    if isinstance(exception, SQLAlchemyError):
+        orig = getattr(exception, "orig", None)
+        if isinstance(orig, PyodbcError):
+            return "HY000" in str(orig)
+    return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
+    retry=retry_if_exception_type(SQLAlchemyError) | retry_if_exception(is_connection_busy_error),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_sort_no_image_entry for FileID {retry_state.kwargs['file_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -563,10 +579,11 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
     try:
         file_id = int(file_id)
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
-        
-        async with async_engine.begin() as conn:
-            # Fetch EntryIDs to avoid TVP issues
-            result = await conn.execute(
+
+        # Fetch EntryIDs and count NULL SortOrder entries using a read connection
+        async with async_engine.connect() as read_conn:
+            logger.debug(f"Executing SELECT EntryID query for FileID {file_id}")
+            result = await read_conn.execute(
                 text("""
                     SELECT EntryID 
                     FROM utb_ImageScraperRecords 
@@ -575,14 +592,16 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                 {"file_id": file_id}
             )
             entry_ids = [row[0] for row in result.fetchall()]
+            logger.debug(f"Fetched {len(entry_ids)} EntryIDs for FileID {file_id}")
             result.close()
+            await read_conn.commit()
 
             if not entry_ids:
                 logger.warning(f"No entries found for FileID {file_id}")
                 return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0}
 
-            # Count NULL SortOrder entries
-            result = await conn.execute(
+            logger.debug(f"Executing COUNT query for NULL SortOrder entries for FileID {file_id}")
+            result = await read_conn.execute(
                 text("""
                     SELECT COUNT(*) 
                     FROM utb_ImageScraperResult 
@@ -592,9 +611,13 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             )
             null_count = result.scalar()
             logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
+            result.close()
+            await read_conn.commit()
 
-            # Delete placeholder entries
-            result = await conn.execute(
+        # Perform DELETE and UPDATE using a write connection
+        async with async_engine.begin() as write_conn:
+            logger.debug(f"Executing DELETE placeholder query for FileID {file_id}")
+            result = await write_conn.execute(
                 text("""
                     DELETE FROM utb_ImageScraperResult
                     WHERE EntryID IN :entry_ids AND ImageUrl = 'placeholder://no-results'
@@ -604,18 +627,25 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             rows_deleted = result.rowcount
             logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
 
-            # Update NULL SortOrder entries
-            result = await conn.execute(
-                text("""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = -2
-                    WHERE EntryID IN :entry_ids AND SortOrder IS NULL
-                """),
-                {"entry_ids": tuple(entry_ids)}
-            )
-            rows_updated = result.rowcount
-            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
+            logger.debug(f"Starting batch UPDATE for NULL SortOrder entries for FileID {file_id}")
+            rows_updated = 0
+            batch_size = 50
+            for i in range(0, len(entry_ids), batch_size):
+                batch_entry_ids = entry_ids[i:i + batch_size]
+                result = await write_conn.execute(
+                    text("""
+                        UPDATE utb_ImageScraperResult
+                        SET SortOrder = -2
+                        WHERE EntryID IN :entry_ids AND SortOrder IS NULL
+                    """),
+                    {"entry_ids": tuple(batch_entry_ids)}
+                )
+                rows_updated += result.rowcount
+                logger.debug(f"Updated {result.rowcount} NULL SortOrder entries in batch {i//batch_size + 1}")
             
+            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
+            await write_conn.commit()
+
             return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
     
     except SQLAlchemyError as e:
