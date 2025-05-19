@@ -15,6 +15,7 @@ import httpx
 import aiohttp
 import pandas as pd
 from typing import Optional, List, Dict, Any, Callable
+from icon_image_lib.google_parser import process_search_result
 from logging_config import setup_job_logger
 from s3_utils import upload_file_to_space
 from ai_utils import batch_vision_reason
