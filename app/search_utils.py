@@ -542,7 +542,7 @@ async def update_sort_no_image_entry(
     finally:
         await db_queue.stop()
 
-```python
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -691,4 +691,3 @@ async def update_sort_order(
         return None
     finally:
         await db_queue.stop()
-```
