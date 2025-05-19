@@ -77,10 +77,10 @@ class SearchClient:
     async def close(self):
         pass  # aiohttp.ClientSession is managed per request
     @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError))
-)
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError))
+    )
     async def search(self, term: str, brand: str, entry_id: int) -> List[Dict]:
         async with self.semaphore:
             process = psutil.Process()
@@ -129,11 +129,11 @@ class SearchClient:
                                                 f"{[(res['ImageUrl'][:100], res['ImageDesc'][:50]) for res in formatted_results_list]}")
                                 return formatted_results_list
                             self.logger.warning(f"Worker PID {process.pid}: Empty results for term unsh '{term}' in region {region}")
-                    except (aiohttp.ClientError, json.JSONDecodeError) as e:
+                except (aiohttp.ClientError, json.JSONDecodeError) as e:
                         self.logger.warning(f"Worker PID {process.pid}: Failed for term '{term}' in region {region}: {e}")
                         continue
                 self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
-                return []
+                return []    
 async def process_and_tag_results(
     search_string: str,
     brand: Optional[str] = None,
