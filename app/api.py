@@ -343,7 +343,6 @@ async def async_process_entry_search(
         return all_results
     finally:
         await client.close()
-
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
     try:
@@ -364,7 +363,7 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         results_df = await get_images_excel_db(str(file_id), logger)
         if results_df.empty:
             logger.error(f"No data found for FileID {file_id}")
-            background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
+            # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
             return {"error": f"No data found for FileID {file_id}", "log_filename": log_filename}
 
         temp_dir = f"temp_excel_{file_id}"
@@ -442,7 +441,7 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         }
     except Exception as e:
         logger.error(f"Error generating download file for FileID {file_id}: {e}", exc_info=True)
-        background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
+        # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
         return {"error": str(e), "log_filename": log_filename}
     finally:
         log_memory_usage()
@@ -683,52 +682,6 @@ async def process_restart_batch(
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
-
-
-
-async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger):
-    log_file = f"job_logs/job_{file_id}.log"
-    max_attempts = 3
-    attempt = 1
-
-    while attempt <= max_attempts:
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                log_content = f.read()
-                if any(err in log_content for err in ["WORKER TIMEOUT", "SIGKILL", "placeholder://error", "No data found"]):
-                    logger.warning(f"Detected failure in job for FileID: {file_id}, attempt {attempt}/{max_attempts}")
-                    last_entry_id = await fetch_last_valid_entry(file_id, logger)
-                    logger.info(f"Resubmitting job for FileID: {file_id} starting from EntryID: {last_entry_id or 'beginning'} with all variations")
-                    
-                    result = await process_restart_batch(
-                        file_id_db=int(file_id),
-                        logger=logger,
-                        entry_id=last_entry_id,
-                        use_all_variations=True
-                    )
-                    
-                    if "error" not in result:
-                        logger.info(f"Resubmission successful for FileID: {file_id}")
-                        await run_generate_download_file(file_id, logger, log_file, BackgroundTasks())
-                        await send_message_email(
-                            to_emails=["nik@luxurymarket.com"],
-                            subject=f"Success: Batch Resubmission for FileID {file_id}",
-                            message=f"Resubmission succeeded for FileID {file_id} starting from EntryID {last_entry_id or 'beginning'} with all variations.\nLog: {log_file}",
-                            logger=logger
-                        )
-                        return
-                    else:
-                        logger.error(f"Resubmission failed for FileID: {file_id}: {result['error']}")
-                    attempt += 1
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    logger.info(f"No failure detected in logs for FileID: {file_id}")
-                    return
-        else:
-            logger.warning(f"Log file {log_file} does not exist for FileID: {file_id}")
-            return
-        await asyncio.sleep(60)
-
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
@@ -776,7 +729,6 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         }
     finally:
         debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
-
 async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
     try:
         JOB_STATUS[file_id] = {
@@ -795,7 +747,7 @@ async def run_generate_download_file(file_id: str, logger: logging.Logger, log_f
                 "timestamp": datetime.datetime.now().isoformat()
             }
             logger.error(f"Job failed for FileID {file_id}: {result['error']}")
-            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+            # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
         else:
             JOB_STATUS[file_id] = {
                 "status": "completed",
@@ -814,7 +766,7 @@ async def run_generate_download_file(file_id: str, logger: logging.Logger, log_f
             "log_url": log_public_url or None,
             "timestamp": datetime.datetime.now().isoformat()
         }
-        background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+        # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
 
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
     @retry(
@@ -975,9 +927,6 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=500, detail=result["error"])
         
-        if background_tasks:
-            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-        
         logger.info(f"Completed restart batch for FileID: {file_id}. Result: {result}")
         return {"status_code": 200, "message": f"Processing restart completed for FileID: {file_id}", "data": result}
     except Exception as e:
@@ -1016,9 +965,6 @@ async def api_restart_search_all(
                     logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        
-        if background_tasks:
-            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
         
         logger.info(f"Completed restart batch for FileID: {file_id}")
         return {
@@ -1060,8 +1006,6 @@ async def api_process_ai_images(
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
         
-        if background_tasks:
-            background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
         
         logger.info(f"Completed AI image processing for FileID: {file_id}")
         return {
