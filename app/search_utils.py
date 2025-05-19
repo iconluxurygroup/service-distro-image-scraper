@@ -3,23 +3,95 @@ import os
 import datetime
 import json
 import aiofiles
-from typing import Optional, List, Dict
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from typing import Optional, List, Dict, Callable, Any
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncConnection
 from database_config import async_engine
 from common import clean_string, normalize_model, generate_aliases
 import psutil
 import pyodbc
 import re
 import urllib.parse
+import asyncio
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
-    logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+# DatabaseQueue class
+class DatabaseQueue:
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        self.logger = logger or logging.getLogger(__name__)
+        self.queue = asyncio.Queue()
+        self._running = False
+        self._task = None
+
+    async def start(self):
+        """Start the queue worker."""
+        if not self._running:
+            self._running = True
+            self._task = asyncio.create_task(self._worker())
+            self.logger.info("Database queue worker started")
+
+    async def stop(self):
+        """Stop the queue worker and process remaining tasks."""
+        if self._running:
+            self._running = False
+            await self.queue.join()
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+            self.logger.info("Database queue worker stopped")
+
+    async def enqueue(self, operation: Callable, params: Dict[str, Any], connection_type: str = "write") -> Any:
+        """Enqueue a database operation and wait for its result."""
+        future = asyncio.Future()
+        await self.queue.put((operation, params, connection_type, future))
+        return await future
+
+    async def _worker(self):
+        """Process database tasks from the queue."""
+        while self._running:
+            try:
+                operation, params, connection_type, future = await self.queue.get()
+                try:
+                    if connection_type == "read":
+                        async with async_engine.connect() as conn:
+                            if not await self._is_connection_healthy(conn):
+                                raise SQLAlchemyError("Connection unhealthy")
+                            result = await operation(conn, params)
+                            future.set_result(result)
+                    else:
+                        async with async_engine.begin() as conn:
+                            if not await self._is_connection_healthy(conn):
+                                raise SQLAlchemyError("Connection unhealthy")
+                            result = await operation(conn, params)
+                            await conn.commit()
+                            future.set_result(result)
+                except Exception as e:
+                    self.logger.error(f"Error processing database task: {e}", exc_info=True)
+                    future.set_exception(e)
+                finally:
+                    self.queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Unexpected error in queue worker: {e}", exc_info=True)
+
+    async def _is_connection_healthy(self, conn: AsyncConnection) -> bool:
+        """Check if the connection is healthy."""
+        try:
+            await conn.execute(text("SELECT 1"))
+            return True
+        except SQLAlchemyError as e:
+            self.logger.warning(f"Connection health check failed: {e}")
+            return False
 
 def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
     logger = logger or default_logger
@@ -34,18 +106,14 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
 def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
     if not value:
         return ""
-    # Basic string cleaning: remove backslashes and encoded backslashes
     cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
-    # Remove control characters and excessive whitespace
     cleaned = re.sub(r'[\x00-\x1F\x7F]+', '', cleaned).strip()
     if is_url:
-        # Decode URL-encoded characters (e.g., %20 to space)
         cleaned = urllib.parse.unquote(cleaned)
-        # Normalize URL path to avoid double slashes
         try:
             parsed = urllib.parse.urlparse(cleaned)
             if not parsed.scheme or not parsed.netloc:
-                return ""  # Invalid URL
+                return ""
             path = re.sub(r'/+', '/', parsed.path)
             cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
             if parsed.query:
@@ -57,141 +125,138 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             return ""
     return cleaned
 
-
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
-    file_id: str = None
+    file_id: str = None,
+    db_queue: Optional[DatabaseQueue] = None
 ) -> bool:
     logger = logger or default_logger
     process = psutil.Process()
-
-    if not results:
-        logger.warning(f"Worker PID {process.pid}: Empty results provided for insert_search_results, FileID {file_id}")
-        return False
-
-    required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
-    valid_results = []
-    for res in results:
-        if not all(col in res for col in required_columns):
-            missing_cols = set(required_columns) - set(res.keys())
-            logger.error(f"Worker PID {process.pid}: Missing columns {missing_cols} in result: {res}")
-            continue
-        if "placeholder://error" in res["ImageUrl"]:
-            logger.warning(f"Worker PID {process.pid}: Skipping error placeholder result for EntryID {res['EntryID']}: {res['ImageUrl']}")
-            continue
-        logger.debug(f"Worker PID {process.pid}: Valid result for EntryID {res['EntryID']}: {res['ImageUrl']}")
-        valid_results.append(res)
-
-    if not valid_results:
-        logger.warning(f"Worker PID {process.pid}: No valid results to insert for FileID {file_id}")
-        return False
-
-    seen = set()
-    deduped_results = []
-    for res in valid_results:
-        image_url = clean_url_string(res.get("ImageUrl", ""), is_url=True)
-        key = (res["EntryID"], image_url)
-        if key not in seen:
-            seen.add(key)
-            deduped_results.append(res)
-    logger.info(f"Worker PID {process.pid}: Deduplicated from {len(valid_results)} to {len(deduped_results)} rows")
-
-    parameters = []
-    for res in deduped_results:
-        try:
-            entry_id = int(res["EntryID"])
-        except (ValueError, TypeError):
-            logger.error(f"Worker PID {process.pid}: Invalid EntryID value: {res.get('EntryID')}")
-            continue
-
-        category = res.get("ProductCategory", "").lower()
-        image_url = clean_url_string(res.get("ImageUrl", ""), is_url=True)
-        image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""), is_url=True)
-        image_desc = clean_url_string(res.get("ImageDesc", ""), is_url=False)
-        image_source = clean_url_string(res.get("ImageSource", ""), is_url=True)
-
-        if not image_url:
-            logger.debug(f"Worker PID {process.pid}: Invalid ImageUrl skipped: {image_url}")
-            continue
-        if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
-            logger.debug(f"Worker PID {process.pid}: Invalid ImageUrlThumbnail, setting to empty: {image_url_thumbnail}")
-            image_url_thumbnail = ""
-
-        if category == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
-            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
-            continue
-
-        param = {
-            "entry_id": entry_id,
-            "image_url": image_url,
-            "image_desc": image_desc or None,
-            "image_source": image_source or None,
-            "image_url_thumbnail": image_url_thumbnail or None
-        }
-        parameters.append(param)
-        logger.debug(f"Worker PID {process.pid}: Prepared row for EntryID {entry_id}: {param}")
-
-    if not parameters:
-        logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id} after validation")
-        return False
+    db_queue = db_queue or DatabaseQueue(logger=logger)
+    await db_queue.start()
 
     try:
-        async with async_engine.begin() as conn:
-            inserted_count = 0
-            updated_count = 0
-            for param in parameters:
-                try:
-                    update_query = text("""
-                        UPDATE utb_ImageScraperResult
-                        SET ImageDesc = :image_desc,
-                            ImageSource = :image_source,
-                            ImageUrlThumbnail = :image_url_thumbnail,
-                            CreateTime = CURRENT_TIMESTAMP
+        if not results:
+            logger.warning(f"Worker PID {process.pid}: Empty results provided for insert_search_results, FileID {file_id}")
+            return False
+
+        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+        valid_results = []
+        for res in results:
+            if not all(col in res for col in required_columns):
+                missing_cols = set(required_columns) - set(res.keys())
+                logger.error(f"Worker PID {process.pid}: Missing columns {missing_cols} in result: {res}")
+                continue
+            if "placeholder://error" in res["ImageUrl"]:
+                logger.warning(f"Worker PID {process.pid}: Skipping error placeholder result for EntryID {res['EntryID']}: {res['ImageUrl']}")
+                continue
+            logger.debug(f"Worker PID {process.pid}: Valid result for EntryID {res['EntryID']}: {res['ImageUrl']}")
+            valid_results.append(res)
+
+        if not valid_results:
+            logger.warning(f"Worker PID {process.pid}: No valid results to insert for FileID {file_id}")
+            return False
+
+        seen = set()
+        deduped_results = []
+        for res in valid_results:
+            image_url = clean_url_string(res.get("ImageUrl", ""), is_url=True)
+            key = (res["EntryID"], image_url)
+            if key not in seen:
+                seen.add(key)
+                deduped_results.append(res)
+        logger.info(f"Worker PID {process.pid}: Deduplicated from {len(valid_results)} to {len(deduped_results)} rows")
+
+        parameters = []
+        for res in deduped_results:
+            try:
+                entry_id = int(res["EntryID"])
+            except (ValueError, TypeError):
+                logger.error(f"Worker PID {process.pid}: Invalid EntryID value: {res.get('EntryID')}")
+                continue
+
+            category = res.get("ProductCategory", "").lower()
+            image_url = clean_url_string(res.get("ImageUrl", ""), is_url=True)
+            image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""), is_url=True)
+            image_desc = clean_url_string(res.get("ImageDesc", ""), is_url=False)
+            image_source = clean_url_string(res.get("ImageSource", ""), is_url=True)
+
+            if not image_url:
+                logger.debug(f"Worker PID {process.pid}: Invalid ImageUrl skipped: {image_url}")
+                continue
+            if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
+                logger.debug(f"Worker PID {process.pid}: Invalid ImageUrlThumbnail, setting to empty: {image_url_thumbnail}")
+                image_url_thumbnail = ""
+
+            if category == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
+                logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
+                continue
+
+            param = {
+                "entry_id": entry_id,
+                "image_url": image_url,
+                "image_desc": image_desc or None,
+                "image_source": image_source or None,
+                "image_url_thumbnail": image_url_thumbnail or None
+            }
+            parameters.append(param)
+            logger.debug(f"Worker PID {process.pid}: Prepared row for EntryID {entry_id}: {param}")
+
+        if not parameters:
+            logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id} after validation")
+            return False
+
+        async def insert_or_update_result(conn: AsyncConnection, params: Dict[str, Any]):
+            update_query = text("""
+                UPDATE utb_ImageScraperResult
+                SET ImageDesc = :image_desc,
+                    ImageSource = :image_source,
+                    ImageUrlThumbnail = :image_url_thumbnail,
+                    CreateTime = CURRENT_TIMESTAMP
+                WHERE EntryID = :entry_id AND ImageUrl = :image_url
+            """)
+            result = await conn.execute(update_query, params)
+            updated_count = result.rowcount
+
+            if updated_count == 0:
+                sort_order = -1 if params["image_url"] == "placeholder://no-results" else None
+                insert_query = text("""
+                    INSERT INTO utb_ImageScraperResult
+                    (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime, SortOrder)
+                    SELECT :entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, CURRENT_TIMESTAMP, :sort_order
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM utb_ImageScraperResult
                         WHERE EntryID = :entry_id AND ImageUrl = :image_url
-                    """)
-                    result = await conn.execute(
-                        update_query,
-                        {
-                            "entry_id": param["entry_id"],
-                            "image_url": param["image_url"],
-                            "image_desc": param["image_desc"],
-                            "image_source": param["image_source"],
-                            "image_url_thumbnail": param["image_url_thumbnail"]
-                        }
                     )
-                    updated_count += result.rowcount
+                """)
+                result = await conn.execute(
+                    insert_query,
+                    {**params, "sort_order": sort_order}
+                )
+                inserted_count = result.rowcount
+            else:
+                inserted_count = 0
+            return inserted_count, updated_count
 
-                    if result.rowcount == 0:
-                        sort_order = -1 if param["image_url"] == "placeholder://no-results" else None
-                        insert_query = text("""
-                            INSERT INTO utb_ImageScraperResult
-                            (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime, SortOrder)
-                            SELECT :entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, CURRENT_TIMESTAMP, :sort_order
-                            WHERE NOT EXISTS (
-                                SELECT 1 FROM utb_ImageScraperResult
-                                WHERE EntryID = :entry_id AND ImageUrl = :image_url
-                            )
-                        """)
-                        result = await conn.execute(
-                            insert_query,
-                            {
-                                "entry_id": param["entry_id"],
-                                "image_url": param["image_url"],
-                                "image_desc": param["image_desc"],
-                                "image_source": param["image_source"],
-                                "image_url_thumbnail": param["image_url_thumbnail"],
-                                "sort_order": sort_order
-                            }
-                        )
-                        inserted_count += result.rowcount
-                except SQLAlchemyError as e:
-                    logger.error(f"Worker PID {process.pid}: Failed to process EntryID {param['entry_id']}: {e}")
-                    logger.debug(f"Row data: {param}")
-                    continue
+        inserted_count = 0
+        updated_count = 0
+        for param in parameters:
+            try:
+                ic, uc = await db_queue.enqueue(
+                    insert_or_update_result,
+                    param,
+                    connection_type="write"
+                )
+                inserted_count += ic
+                updated_count += uc
+            except SQLAlchemyError as e:
+                logger.error(f"Worker PID {process.pid}: Failed to process EntryID {param['entry_id']}: {e}")
+                logger.debug(f"Row data: {param}")
+                continue
 
-            logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(parameters)} rows for FileID {file_id}")
-            return inserted_count > 0 or updated_count > 0
+        logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(parameters)} rows for FileID {file_id}")
+        return inserted_count > 0 or updated_count > 0
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error inserting results for FileID {file_id}: {e}", exc_info=True)
@@ -199,11 +264,22 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
+    finally:
+        await db_queue.stop()
+
 from pyodbc import Error as PyodbcError
+
+def is_connection_busy_error(exception):
+    if isinstance(exception, SQLAlchemyError):
+        orig = getattr(exception, "orig", None)
+        if isinstance(orig, PyodbcError):
+            return "HY000" in str(orig) and "Connection is busy" in str(orig)
+    return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((PyodbcError, SQLAlchemyError)),
+    retry=retry_if_exception_type((PyodbcError, SQLAlchemyError)) | retry_if_exception(is_connection_busy_error),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -217,49 +293,61 @@ async def update_search_sort_order(
     color: Optional[str] = None,
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
-    brand_rules: Optional[Dict] = None
+    brand_rules: Optional[Dict] = None,
+    db_queue: Optional[DatabaseQueue] = None
 ) -> Optional[bool]:
     logger = logger or default_logger
     process = psutil.Process()
-    
+    db_queue = db_queue or DatabaseQueue(logger=logger)
+    await db_queue.start()
+
     try:
-        # Fetch results using a dedicated read connection
-        async with async_engine.connect() as read_conn:
+        # Fetch results
+        async def fetch_results(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
                 FROM utb_ImageScraperResult r
                 INNER JOIN utb_ImageScraperRecords rec ON r.EntryID = rec.EntryID
                 WHERE r.EntryID = :entry_id AND rec.FileID = :file_id
             """)
-            result = await read_conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
-            rows = result.fetchall()  # Remove await, as fetchall() is synchronous with aioodbc
+            result = await conn.execute(query, params)
+            rows = result.fetchall()
             columns = result.keys()
-            result.close()  # Close result explicitly
-            await read_conn.commit()  # Commit to release locks
-            logger.debug(f"Worker PID {process.pid}: Fetched {len(rows)} rows for EntryID {entry_id}")
-        
+            result.close()
+            return rows, columns
+
+        rows, columns = await db_queue.enqueue(
+            fetch_results,
+            {"entry_id": entry_id, "file_id": file_id},
+            connection_type="read"
+        )
+        logger.debug(f"Worker PID {process.pid}: Fetched {len(rows)} rows for EntryID {entry_id}")
+
         results = [dict(zip(columns, row)) for row in rows]
 
-        # Handle case with no results
+        # Handle no results
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
-            async with async_engine.begin() as write_conn:
-                await write_conn.execute(
-                    text("""
-                        INSERT INTO utb_ImageScraperResult
-                        (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, SortOrder, CreateTime)
-                        VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, -1, CURRENT_TIMESTAMP)
-                    """),
-                    {
-                        "entry_id": entry_id,
-                        "image_url": "placeholder://no-results",
-                        "image_desc": f"No results found for {model or 'unknown'}",
-                        "image_source": "N/A",
-                        "image_url_thumbnail": "placeholder://no-results"
-                    }
-                )
-                await write_conn.commit()
-                logger.info(f"Worker PID {process.pid}: Inserted placeholder result with SortOrder = -1 for EntryID {entry_id}")
+            async def insert_placeholder(conn: AsyncConnection, params: Dict[str, Any]):
+                query = text("""
+                    INSERT INTO utb_ImageScraperResult
+                    (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, SortOrder, CreateTime)
+                    VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, -1, CURRENT_TIMESTAMP)
+                """)
+                await conn.execute(query, params)
+
+            await db_queue.enqueue(
+                insert_placeholder,
+                {
+                    "entry_id": entry_id,
+                    "image_url": "placeholder://no-results",
+                    "image_desc": f"No results found for {model or 'unknown'}",
+                    "image_source": "N/A",
+                    "image_url_thumbnail": "placeholder://no-results"
+                },
+                connection_type="write"
+            )
+            logger.info(f"Worker PID {process.pid}: Inserted placeholder result with SortOrder = -1 for EntryID {entry_id}")
             return True
 
         # Process brand and model aliases
@@ -281,167 +369,187 @@ async def update_search_sort_order(
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
-        # Assign priorities based on brand and model matches
+        # Assign priorities
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
             image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
             logger.debug(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
 
-            model_matched = False
-            brand_matched = False
-
-            for alias in model_aliases:
-                if alias in image_desc or alias in image_source or alias in image_url:
-                    model_matched = True
-                    break
-
-            for alias in brand_aliases:
-                if alias in image_desc or alias in image_source or alias in image_url:
-                    brand_matched = True
-                    break
-
+            model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
+            brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
-            if model_matched and brand_matched:
-                res["priority"] = 1
-            elif model_matched:
-                res["priority"] = 2
-            elif brand_matched:
-                res["priority"] = 3
-            else:
-                res["priority"] = 4
+            res["priority"] = 1 if model_matched and brand_matched else 2 if model_matched else 3 if brand_matched else 4
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Perform updates using a dedicated write connection
-        async with async_engine.begin() as write_conn:
-            try:
-                update_params = []
-                match_count = 0
-                for i, res in enumerate(sorted_results):
-                    if res["priority"] == 4:
-                        sort_order = -2
-                    else:
-                        match_count += 1
-                        sort_order = match_count
-                    update_params.append({
-                        "sort_order": sort_order,
-                        "result_id": res["ResultID"],
-                        "entry_id": entry_id
-                    })
-                
-                if update_params:
-                    # Split updates into smaller batches to reduce connection strain
-                    batch_size = 100
-                    for i in range(0, len(update_params), batch_size):
-                        batch_params = update_params[i:i + batch_size]
-                        await write_conn.execute(
-                            text("""
-                                UPDATE utb_ImageScraperResult
-                                SET SortOrder = :sort_order
-                                WHERE ResultID = :result_id AND EntryID = :entry_id
-                            """),
-                            batch_params
-                        )
-                        logger.debug(f"Worker PID {process.pid}: Updated batch of {len(batch_params)} rows for EntryID {entry_id}")
-                    logger.info(f"Worker PID {process.pid}: Batch updated SortOrder for {len(update_params)} rows for EntryID {entry_id}")
-                else:
-                    logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
+        # Perform updates
+        async def update_sort_order(conn: AsyncConnection, params: list):
+            query = text("""
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = :sort_order
+                WHERE ResultID = :result_id AND EntryID = :entry_id
+            """)
+            result = await conn.execute(query, params)
+            return result.rowcount
 
-                await write_conn.commit()  # Ensure commit after all updates
-                return True
+        update_params = []
+        match_count = 0
+        for i, res in enumerate(sorted_results):
+            sort_order = -2 if res["priority"] == 4 else (match_count := match_count + 1)
+            update_params.append({
+                "sort_order": sort_order,
+                "result_id": res["ResultID"],
+                "entry_id": entry_id
+            })
 
-            except SQLAlchemyError as e:
-                logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-                await write_conn.rollback()
-                return False
+        if update_params:
+            batch_size = 50  # Reduced from 100
+            updated_rows = 0
+            for i in range(0, len(update_params), batch_size):
+                batch_params = update_params[i:i + batch_size]
+                row_count = await db_queue.enqueue(
+                    update_sort_order,
+                    batch_params,
+                    connection_type="write"
+                )
+                updated_rows += row_count
+                logger.debug(f"Worker PID {process.pid}: Updated batch of {len(batch_params)} rows for EntryID {entry_id}")
+            logger.info(f"Worker PID {process.pid}: Batch updated SortOrder for {updated_rows} rows for EntryID {entry_id}")
+        else:
+            logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
+
+        return True
+
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return False
-            
-# @retry(    stop=stop_after_attempt(3),
-#     wait=wait_exponential(multiplier=1, min=2, max=10),
-#     retry=retry_if_exception_type(SQLAlchemyError),
-#     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-#         f"Retrying export_dai_json for FileID {retry_state.kwargs['file_id']} "
-#         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-#     )
-# )
-# async def export_dai_json(file_id: int, entry_ids: Optional[List[int]], logger: logging.Logger) -> str:
-#     try:
-#         json_urls = []
-#         async with async_engine.connect() as conn:
-#             query = text("""
-#                 SELECT t.ResultID, t.EntryID, t.AiJson, t.AiCaption, t.ImageIsFashion
-#                 FROM utb_ImageScraperResult t
-#                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-#                 WHERE r.FileID = :file_id AND t.AiJson IS NOT NULL AND t.AiCaption IS NOT NULL
-#             """)
-#             params = {"file_id": file_id}
-#             if entry_ids:
-#                 query = text(query.text + " AND t.EntryID IN :entry_ids")
-#                 params["entry_ids"] = tuple(entry_ids)
-            
-#             logger.debug(f"Executing query: {query} with params: {params}")
-#             result = await conn.execute(query, params)
-#             entry_results = {}
-#             for row in result.fetchall():
-#                 entry_id = row[1]
-#                 result_dict = {
-#                     "ResultID": row[0],
-#                     "EntryID": row[1],
-#                     "AiJson": json.loads(row[2]) if row[2] else {},
-#                     "AiCaption": row[3],
-#                     "ImageIsFashion": bool(row[4])
-#                 }
-#                 if entry_id not in entry_results:
-#                     entry_results[entry_id] = []
-#                 entry_results[entry_id].append(result_dict)
-#             result.close()
+    finally:
+        await db_queue.stop()
 
-#         if not entry_results:
-#             logger.warning(f"No valid AI results to export for FileID {file_id}")
-#             return ""
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type(SQLAlchemyError) | retry_if_exception(is_connection_busy_error),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_sort_no_image_entry for FileID {retry_state.kwargs['file_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def update_sort_no_image_entry(
+    file_id: str,
+    logger: Optional[logging.Logger] = None,
+    db_queue: Optional[DatabaseQueue] = None
+) -> Optional[Dict]:
+    logger = logger or default_logger
+    db_queue = db_queue or DatabaseQueue(logger=logger)
+    await db_queue.start()
 
-#         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-#         temp_json_dir = f"temp_json_{file_id}"
-#         os.makedirs(temp_json_dir, exist_ok=True)
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
 
-#         for entry_id, results in entry_results.items():
-#             json_filename = f"result_{entry_id}_{timestamp}.json"
-#             local_json_path = os.path.join(temp_json_dir, json_filename)
+        # Fetch EntryIDs
+        async def fetch_entry_ids(conn: AsyncConnection, params: Dict[str, Any]):
+            query = text("""
+                SELECT EntryID 
+                FROM utb_ImageScraperRecords 
+                WHERE FileID = :file_id
+            """)
+            result = await conn.execute(query, params)
+            entry_ids = [row[0] for row in result.fetchall()]
+            result.close()
+            return entry_ids
 
-#             async with aiofiles.open(local_json_path, 'w') as f:
-#                 await f.write(json.dumps(results, indent=2))
-            
-#             logger.debug(f"Saved JSON to {local_json_path}, size: {os.path.getsize(local_json_path)} bytes")
-#             logger.debug(f"JSON content sample for EntryID {entry_id}: {json.dumps(results[:2], indent=2)}")
+        entry_ids = await db_queue.enqueue(
+            fetch_entry_ids,
+            {"file_id": file_id},
+            connection_type="read"
+        )
+        logger.debug(f"Fetched {len(entry_ids)} EntryIDs for FileID {file_id}")
 
-#             s3_key = f"super_scraper/jobs/{file_id}/{json_filename}"
-#             public_url = await upload_file_to_space(
-#                 local_json_path, s3_key, is_public=True, logger=logger, file_id=file_id
-#             )
-            
-#             if public_url:
-#                 logger.info(f"Exported JSON for EntryID {entry_id} to {public_url}")
-#                 json_urls.append(public_url)
-#             else:
-#                 logger.error(f"Failed to upload JSON for EntryID {entry_id}")
-            
-#             os.remove(local_json_path)
+        if not entry_ids:
+            logger.warning(f"No entries found for FileID {file_id}")
+            return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0}
 
-#         os.rmdir(temp_json_dir)
-#         return json_urls[0] if json_urls else ""
+        # Count NULL SortOrder entries
+        async def count_null_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
+            query = text("""
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult 
+                WHERE EntryID IN :entry_ids AND SortOrder IS NULL
+            """)
+            result = await conn.execute(query, params)
+            count = result.scalar()
+            result.close()
+            return count
 
-#     except Exception as e:
-#         logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
-#         return ""
+        null_count = await db_queue.enqueue(
+            count_null_sort_order,
+            {"entry_ids": tuple(entry_ids)},
+            connection_type="read"
+        )
+        logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
+
+        # Delete placeholders
+        async def delete_placeholders(conn: AsyncConnection, params: Dict[str, Any]):
+            query = text("""
+                DELETE FROM utb_ImageScraperResult
+                WHERE EntryID IN :entry_ids AND ImageUrl = 'placeholder://no-results'
+            """)
+            result = await conn.execute(query, params)
+            return result.rowcount
+
+        rows_deleted = await db_queue.enqueue(
+            delete_placeholders,
+            {"entry_ids": tuple(entry_ids)},
+            connection_type="write"
+        )
+        logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
+
+        # Update NULL SortOrder
+        async def update_null_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
+            query = text("""
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = -2
+                WHERE EntryID IN :entry_ids AND SortOrder IS NULL
+            """)
+            result = await conn.execute(query, params)
+            return result.rowcount
+
+        rows_updated = 0
+        batch_size = 50
+        for i in range(0, len(entry_ids), batch_size):
+            batch_entry_ids = entry_ids[i:i + batch_size]
+            row_count = await db_queue.enqueue(
+                update_null_sort_order,
+                {"entry_ids": tuple(batch_entry_ids)},
+                connection_type="write"
+            )
+            rows_updated += row_count
+            logger.debug(f"Updated {row_count} NULL SortOrder entries in batch {i//batch_size + 1}")
+
+        logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
+        return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
+
+    except SQLAlchemyError as e:
+        logger.error(f"Database error updating entries for FileID {file_id}: {e}", exc_info=True)
+        raise
+    except ValueError as ve:
+        logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
+        return None
+    finally:
+        await db_queue.stop()
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -451,31 +559,44 @@ async def update_search_sort_order(
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
+async def update_sort_order(
+    file_id: str,
+    logger: Optional[logging.Logger] = None,
+    db_queue: Optional[DatabaseQueue] = None
+) -> Optional[List[Dict]]:
     logger = logger or default_logger
+    db_queue = db_queue or DatabaseQueue(logger=logger)
+    await db_queue.start()
+
     try:
         file_id = int(file_id)
         logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
-        
-        async with async_engine.connect() as conn:
+
+        async def fetch_entries(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
                 FROM utb_ImageScraperRecords 
                 WHERE FileID = :file_id
             """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id}")
-            result = await conn.execute(query, {"file_id": file_id})
+            result = await conn.execute(query, params)
             entries = result.fetchall()
             result.close()
-        
+            return entries
+
+        entries = await db_queue.enqueue(
+            fetch_entries,
+            {"file_id": file_id},
+            connection_type="read"
+        )
+
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id}")
             return []
-            
+
         results = []
         success_count = 0
         failure_count = 0
-        
+
         for entry in entries:
             entry_id, brand, model, color, category = entry
             logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
@@ -487,25 +608,23 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
                     model=model,
                     color=color,
                     category=category,
-                    logger=logger
+                    logger=logger,
+                    db_queue=db_queue
                 )
-                
+                results.append({"EntryID": entry_id, "Success": bool(entry_results)})
                 if entry_results:
-                    results.append({"EntryID": entry_id, "Success": True})
                     success_count += 1
                 else:
-                    results.append({"EntryID": entry_id, "Success": False})
                     failure_count += 1
                     logger.warning(f"No results for EntryID {entry_id}")
             except Exception as e:
                 results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
                 failure_count += 1
                 logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-        
+
         logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
-        
-        async with async_engine.connect() as conn:
-            verification = {}
+
+        async def verify_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
             queries = [
                 ("PositiveSortOrderEntries", "t.SortOrder > 0"),
                 ("BrandMatchEntries", "t.SortOrder = 0"),
@@ -513,6 +632,7 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
                 ("NullSortOrderEntries", "t.SortOrder IS NULL"),
                 ("UnexpectedSortOrderEntries", "t.SortOrder = -1")
             ]
+            verification = {}
             for key, condition in queries:
                 query = text(f"""
                     SELECT COUNT(DISTINCT t.EntryID)
@@ -520,140 +640,50 @@ async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = Non
                     INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                     WHERE r.FileID = :file_id AND {condition}
                 """)
-                result = await conn.execute(query, {"file_id": file_id})
+                result = await conn.execute(query, params)
                 verification[key] = result.scalar()
                 result.close()
-            
+            return verification
+
+        verification = await db_queue.enqueue(
+            verify_sort_order,
+            {"file_id": file_id},
+            connection_type="read"
+        )
+
+        async def fetch_sort_orders(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
                 SELECT t.EntryID, t.SortOrder, t.ImageUrl
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                 WHERE r.FileID = :file_id
             """)
-            result = await conn.execute(query, {"file_id": file_id})
+            result = await conn.execute(query, params)
             sort_orders = result.fetchall()
-            logger.info(f"SortOrder values for FileID {file_id}: {[(row[0], row[1], row[2][:50]) for row in sort_orders]}")
-            
-            logger.info(f"Verification for FileID {file_id}: "
-                       f"{verification['PositiveSortOrderEntries']} entries with model matches, "
-                       f"{verification['BrandMatchEntries']} entries with brand matches only, "
-                       f"{verification['NoMatchEntries']} entries with no matches, "
-                       f"{verification['NullSortOrderEntries']} entries with NULL SortOrder, "
-                       f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder")
-        
+            result.close()
+            return sort_orders
+
+        sort_orders = await db_queue.enqueue(
+            fetch_sort_orders,
+            {"file_id": file_id},
+            connection_type="read"
+        )
+
+        logger.info(f"SortOrder values for FileID {file_id}: {[(row[0], row[1], row[2][:50]) for row in sort_orders]}")
+        logger.info(f"Verification for FileID {file_id}: "
+                   f"{verification['PositiveSortOrderEntries']} entries with model matches, "
+                   f"{verification['BrandMatchEntries']} entries with brand matches only, "
+                   f"{verification['NoMatchEntries']} entries with no matches, "
+                   f"{verification['NullSortOrderEntries']} entries with NULL SortOrder, "
+                   f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder")
+
         return results
+
     except SQLAlchemyError as e:
         logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
         raise
     except Exception as e:
         logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
         return None
-
-from pyodbc import Error as PyodbcError
-from typing import Optional, Dict
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
-import logging
-import psutil
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
-
-def is_connection_busy_error(exception):
-    if isinstance(exception, SQLAlchemyError):
-        orig = getattr(exception, "orig", None)
-        if isinstance(orig, PyodbcError):
-            return "HY000" in str(orig)
-    return False
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError) | retry_if_exception(is_connection_busy_error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_sort_no_image_entry for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[Dict]:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
-
-        # Fetch EntryIDs and count NULL SortOrder entries using a read connection
-        async with async_engine.connect() as read_conn:
-            logger.debug(f"Executing SELECT EntryID query for FileID {file_id}")
-            result = await read_conn.execute(
-                text("""
-                    SELECT EntryID 
-                    FROM utb_ImageScraperRecords 
-                    WHERE FileID = :file_id
-                """),
-                {"file_id": file_id}
-            )
-            entry_ids = [row[0] for row in result.fetchall()]
-            logger.debug(f"Fetched {len(entry_ids)} EntryIDs for FileID {file_id}")
-            result.close()
-            await read_conn.commit()
-
-            if not entry_ids:
-                logger.warning(f"No entries found for FileID {file_id}")
-                return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0}
-
-            logger.debug(f"Executing COUNT query for NULL SortOrder entries for FileID {file_id}")
-            result = await read_conn.execute(
-                text("""
-                    SELECT COUNT(*) 
-                    FROM utb_ImageScraperResult 
-                    WHERE EntryID IN :entry_ids AND SortOrder IS NULL
-                """),
-                {"entry_ids": tuple(entry_ids)}
-            )
-            null_count = result.scalar()
-            logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
-            result.close()
-            await read_conn.commit()
-
-        # Perform DELETE and UPDATE using a write connection
-        async with async_engine.begin() as write_conn:
-            logger.debug(f"Executing DELETE placeholder query for FileID {file_id}")
-            result = await write_conn.execute(
-                text("""
-                    DELETE FROM utb_ImageScraperResult
-                    WHERE EntryID IN :entry_ids AND ImageUrl = 'placeholder://no-results'
-                """),
-                {"entry_ids": tuple(entry_ids)}
-            )
-            rows_deleted = result.rowcount
-            logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
-
-            logger.debug(f"Starting batch UPDATE for NULL SortOrder entries for FileID {file_id}")
-            rows_updated = 0
-            batch_size = 50
-            for i in range(0, len(entry_ids), batch_size):
-                batch_entry_ids = entry_ids[i:i + batch_size]
-                result = await write_conn.execute(
-                    text("""
-                        UPDATE utb_ImageScraperResult
-                        SET SortOrder = -2
-                        WHERE EntryID IN :entry_ids AND SortOrder IS NULL
-                    """),
-                    {"entry_ids": tuple(batch_entry_ids)}
-                )
-                rows_updated += result.rowcount
-                logger.debug(f"Updated {result.rowcount} NULL SortOrder entries in batch {i//batch_size + 1}")
-            
-            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
-            await write_conn.commit()
-
-            return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
-    
-    except SQLAlchemyError as e:
-        logger.error(f"Database error updating entries for FileID {file_id}: {e}", exc_info=True)
-        raise
-    except ValueError as ve:
-        logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
-        return None
+    finally:
+        await db_queue.stop()
