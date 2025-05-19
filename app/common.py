@@ -380,12 +380,23 @@ def validate_brand(
     brand_aliases: List[str],
     result_id: str,
     domain_hierarchy: Optional[List[str]] = None,
+    model_aliases: Optional[List[str]] = None,  # New optional parameter
     logger: Optional[logging.Logger] = None
 ) -> bool:
     logger = logger or default_logger
     if domain_hierarchy is not None and not isinstance(domain_hierarchy, (list, tuple)):
         logger.error(f"Invalid domain_hierarchy type: {type(domain_hierarchy)}. Expected list or None.")
         raise TypeError("domain_hierarchy must be a list or None")
+
+    # Check for model contamination in brand aliases
+    if model_aliases:
+        for alias in brand_aliases:
+            alias_clean = clean_string(alias).lower()
+            for model_alias in model_aliases:
+                model_clean = clean_string(model_alias).lower()
+                if alias_clean == model_clean or fuzz.partial_ratio(alias_clean, model_clean) > 90:
+                    logger.warning(f"ResultID {result_id}: Brand alias '{alias}' resembles model alias '{model_alias}'")
+                    return False  # Reject if brand alias matches model
 
     fields = [
         clean_string(row.get('ImageDesc', ''), preserve_url=False),
