@@ -139,6 +139,7 @@ async def process_and_tag_results(
     try:
         logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
         
+        # Generate and deduplicate variations
         variations = await generate_search_variations(
             search_string=search_string,
             brand=brand,
@@ -146,11 +147,21 @@ async def process_and_tag_results(
             logger=logger
         )
         
-        all_results = []
         search_types = [
             "default", "delimiter_variations", "color_variations",
             "brand_alias", "no_color", "model_alias", "category_specific"
         ]
+        
+        # Collect unique variations
+        unique_variations = set()
+        for search_type in search_types:
+            if search_type not in variations:
+                logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
+                continue
+            for variation in variations[search_type]:
+                unique_variations.add(variation.lower().strip())
+        
+        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(unique_variations)} unique variations for EntryID {entry_id}: {unique_variations}")
         
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
         
@@ -158,22 +169,22 @@ async def process_and_tag_results(
         client = SearchClient(endpoint=endpoint, logger=logger)
         
         try:
+            # Create search tasks for unique variations
             search_tasks = []
-            for search_type in search_types:
-                if search_type not in variations:
-                    logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
-                    continue
-                for variation in variations[search_type]:
-                    logger.debug(f"Worker PID {process.pid}: Queuing search for variation '{variation}' for EntryID {entry_id}")
-                    search_tasks.append(client.search(term=variation, brand=brand or "", entry_id=entry_id))
+            for variation in unique_variations:
+                logger.debug(f"Worker PID {process.pid}: Queuing search for variation '{variation}' for EntryID {entry_id}")
+                search_tasks.append(client.search(term=variation, brand=brand or "", entry_id=entry_id))
             
+            # Execute all tasks at once
             search_results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
             
-            for search_results in search_results_list:
+            all_results = []
+            for variation, search_results in zip(unique_variations, search_results_list):
                 if isinstance(search_results, Exception):
-                    logger.error(f"Worker PID {process.pid}: Search failed for EntryID {entry_id}: {search_results}")
+                    logger.error(f"Worker PID {process.pid}: Search failed for variation '{variation}' in EntryID {entry_id}: {search_results}")
                     continue
                 if not search_results:
+                    logger.warning(f"Worker PID {process.pid}: No results for variation '{variation}' in EntryID {entry_id}")
                     continue
                 tagged_results = []
                 for res in search_results:
@@ -190,13 +201,13 @@ async def process_and_tag_results(
                     else:
                         logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
                 all_results.extend(tagged_results)
-                logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for EntryID {entry_id}")
+                logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{variation}' in EntryID {entry_id}")
         
         finally:
             await client.close()
         
         if not all_results:
-            logger.error(f"Worker PID {process.pid}: No valid results found across all search types for EntryID {entry_id}")
+            logger.error(f"Worker PID {process.pid}: No valid results found across all variations for EntryID {entry_id}")
             return [{
                 "EntryID": entry_id,
                 "ImageUrl": "placeholder://no-results",
@@ -206,6 +217,7 @@ async def process_and_tag_results(
                 "ProductCategory": ""
             }]
         
+        # Deduplicate results
         deduplicated_results = []
         seen_urls = set()
         for res in all_results:
@@ -213,8 +225,9 @@ async def process_and_tag_results(
             if image_url not in seen_urls and image_url != "placeholder://no-results":
                 seen_urls.add(image_url)
                 deduplicated_results.append(res)
-        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
+        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results forFengEntryID {entry_id}")
         
+        # Filter irrelevant results
         irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
         filtered_results = []
         for res in deduplicated_results:
@@ -584,46 +597,55 @@ async def process_restart_batch(
                     for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                         logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
                         try:
-                            results = await async_process_entry_search(...)
-                            if results:
+                            results = await async_process_entry_search(
+                                search_string=search_string,
+                                brand=brand,
+                                endpoint=endpoint,
+                                entry_id=entry_id,
+                                use_all_variations=use_all_variations,
+                                file_id_db=file_id_db,
+                                logger=logger
+                            )
+                            if results and not any(res["ImageUrl"].startswith("placeholder://") for res in results):
                                 all_results.extend(results)
+                                break  # Exit retry loop on successful results
+                            logger.warning(f"No valid results on attempt {attempt} for EntryID {entry_id}")
                         except Exception as e:
                             logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
                             if attempt < MAX_ENTRY_RETRIES:
                                 await asyncio.sleep(2 ** attempt)
                             continue
-
-                    # Validate results
-                    if all_results and not all(all(col in res for col in required_columns) for res in all_results):
-                        logger.error(f"Missing columns for EntryID {entry_id}: {all_results}")
-                        all_results = []
-
-                    # Deduplicate results
-                    deduplicated_results = []
-                    seen = set()
-                    for res in all_results:
-                        key = (res['EntryID'], res['ImageUrl'])
-                        if key not in seen:
-                            seen.add(key)
-                            deduplicated_results.append(res)
-                    logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
-
-                    # Insert results
-                    insert_success = True
-                    if deduplicated_results:
+                    
+                    # Validate and insert results
+                    if all_results:
+                        deduplicated_results = []
+                        seen = set()
+                        for res in all_results:
+                            key = (res['EntryID'], res['ImageUrl'])
+                            if key not in seen:
+                                seen.add(key)
+                                deduplicated_results.append(res)
+                        logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
+                        
                         insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
                         logger.info(f"Insert results for EntryID {entry_id}: {'Success' if insert_success else 'Failed'}")
                     else:
                         logger.warning(f"No results to insert for EntryID {entry_id}")
-
+                        placeholder_result = [{
+                            "EntryID": entry_id,
+                            "ImageUrl": "placeholder://no-results",
+                            "ImageDesc": f"No results found for {search_string}",
+                            "ImageSource": "N/A",
+                            "ImageUrlThumbnail": "placeholder://no-results"
+                        }]
+                        await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
+                    
                     # Update sort order
                     update_result = await update_search_sort_order(
                         str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                     )
                     logger.info(f"Update SortOrder for EntryID {entry_id}: {'Success' if update_result else 'Failed'}")
-                    if update_result is None or not update_result:
-                        logger.error(f"SortOrder update failed for EntryID {entry_id}")
-
+                    
                     # Mark Step1 as complete
                     async with async_engine.connect() as conn:
                         await conn.execute(
@@ -632,11 +654,10 @@ async def process_restart_batch(
                         )
                         await conn.commit()
                         logger.info(f"Marked Step1 complete for EntryID {entry_id}")
-
+                    
                     return entry_id, True
                 except Exception as e:
                     logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
-                    # Mark Step1 to prevent reprocessing
                     async with async_engine.connect() as conn:
                         await conn.execute(
                             text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
