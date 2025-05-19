@@ -9,6 +9,7 @@ import urllib.parse
 from typing import List, Dict, Optional, Tuple, Any
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
+import urllib.parse
 from common import (
     clean_string,
     generate_aliases,
