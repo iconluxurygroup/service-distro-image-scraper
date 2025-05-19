@@ -247,7 +247,7 @@ async def generate_search_variations(
                         clean_string(name).lower() for name in rule.get("names", [])
                         if clean_string(name).lower() != full_name
                     ]
-        brand_aliases = generate_brand_aliases(brand, predefined_aliases) or await generate_aliases(brand)
+        brand_aliases = await generate_brand_aliases(brand, predefined_aliases) or await generate_aliases(brand)
         brand_alias_variations = [f"{alias} {model}" for alias in brand_aliases if model]
         variations["brand_alias"] = list(set(brand_alias_variations))
         logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations: {brand_alias_variations}")
