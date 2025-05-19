@@ -122,10 +122,11 @@ async def insert_search_results(
         image_source = clean_url_string(res.get("ImageSource", ""), is_url=True)
 
         # Validate URLs
-        if image_url and not validate_thumbnail_url(image_url, logger):
+        if not image_url or not validate_thumbnail_url(image_url, logger):
             logger.debug(f"Worker PID {process.pid}: Invalid ImageUrl skipped: {image_url}")
             continue
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
+            logger.debug(f"Worker PID {process.pid}: Invalid ImageUrlThumbnail, setting to empty: {image_url_thumbnail}")
             image_url_thumbnail = ""
 
         # Filter irrelevant URLs for footwear
@@ -135,7 +136,7 @@ async def insert_search_results(
 
         param = {
             "entry_id": entry_id,
-            "image_url": image_url or None,
+            "image_url": image_url,
             "image_desc": image_desc or None,
             "image_source": image_source or None,
             "image_url_thumbnail": image_url_thumbnail or None
@@ -212,7 +213,6 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
