@@ -291,6 +291,7 @@ async def process_results(
 
     return results
 
+
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -301,7 +302,9 @@ async def async_process_entry_search(
     logger: logging.Logger
 ) -> List[Dict]:
     logger.debug(f"Processing search for EntryID {entry_id}, FileID {file_id_db}, Use all variations: {use_all_variations}")
-    search_terms_dict = generate_search_variations(search_string, brand, logger=logger)
+    
+    # Fix: Await the generate_search_variations call
+    search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
     
     search_terms = []
     variation_types = [
@@ -341,6 +344,7 @@ async def async_process_entry_search(
         return all_results
     finally:
         await client.close()
+
 async def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
