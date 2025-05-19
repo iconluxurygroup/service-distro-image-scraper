@@ -124,7 +124,7 @@ class SearchClient:
                     continue
             self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
             return []
-   async def process_results(
+async def process_results(
     raw_results: List[Dict],
     entry_id: int,
     brand: str,
