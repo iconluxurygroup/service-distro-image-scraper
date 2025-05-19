@@ -279,6 +279,7 @@ async def process_results(
 
     return results
 
+
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -324,7 +325,15 @@ async def async_process_entry_search(
 
     if not search_terms:
         logger.warning(f"No search terms for EntryID {entry_id}")
-        return []
+        placeholder_result = [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://no-results",
+            "ImageDesc": f"No search terms generated for {search_string}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://no-results"
+        }]
+        await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
+        return placeholder_result
 
     client = SearchClient(endpoint, logger)
     try:
@@ -337,14 +346,42 @@ async def async_process_entry_search(
                 logger.error(f"Error for term '{term}' in EntryID {entry_id}: {term_results}")
                 continue
             if not term_results:
+                logger.warning(f"No results for term '{term}' in EntryID {entry_id}")
                 continue
             results = await process_results(term_results, entry_id, brand, term, logger)
+            logger.debug(f"Processed {len(results)} results for term '{term}' in EntryID {entry_id}")
             all_results.extend(results)
 
-        logger.info(f"Processed {len(all_results)} results for EntryID {entry_id}")
+        logger.info(f"Processed {len(all_results)} total results for EntryID {entry_id}")
+        
+        if not all_results:
+            logger.warning(f"No valid results for EntryID {entry_id} after processing all variations")
+            placeholder_result = [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No results found for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results"
+            }]
+            await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
+            return placeholder_result
+        
         return all_results
+    except Exception as e:
+        logger.error(f"Unexpected error in async_process_entry_search for EntryID {entry_id}: {e}", exc_info=True)
+        placeholder_result = [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://error",
+            "ImageDesc": f"Error processing: {str(e)}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://error"
+        }]
+        await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
+        return placeholder_result
     finally:
         await client.close()
+
+        
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
     try:
