@@ -848,7 +848,7 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-        
+
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
@@ -1249,5 +1249,69 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
+
+ New endpoint to reset Step1 for a given FileID
+@router.post("/reset-step1/{file_id}", tags=["Database"])
+async def api_reset_step1(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Resetting Step1 for FileID: {file_id}")
+    
+    try:
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id} does not exist")
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
+
+        # Reset Step1 to NULL
+        async with async_engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                    UPDATE utb_ImageScraperRecords
+                    SET Step1 = NULL
+                    WHERE FileID = :file_id
+                """),
+                {"file_id": int(file_id)}
+            )
+            rows_affected = result.rowcount
+            logger.info(f"Reset Step1 for {rows_affected} entries for FileID: {file_id}")
+
+        # Verify the update
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT COUNT(*) 
+                    FROM utb_ImageScraperRecords 
+                    WHERE FileID = :file_id AND Step1 IS NULL
+                """),
+                {"file_id": int(file_id)}
+            )
+            null_count = result.scalar()
+            logger.info(f"Verification: {null_count} entries with NULL Step1 for FileID: {file_id}")
+            result.close()
+
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        
+        return {
+            "status_code": 200,
+            "message": f"Successfully reset Step1 for {rows_affected} entries for FileID: {file_id}",
+            "log_url": log_public_url or None,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+    
+    except SQLAlchemyError as e:
+        logger.error(f"Database error resetting Step1 for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error resetting Step1 for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error resetting Step1 for FileID {file_id}: {str(e)}")
 
 app.include_router(router, prefix="/api/v3")
