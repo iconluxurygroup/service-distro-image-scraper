@@ -18,14 +18,6 @@ import re
 import urllib.parse
 import asyncio
 
-# Database Indexes (apply these to the database for performance)
-"""
-CREATE INDEX idx_file_id ON utb_ImageScraperRecords (FileID);
-CREATE INDEX idx_entry_id ON utb_ImageScraperResult (EntryID);
-CREATE INDEX idx_result_entry ON utb_ImageScraperResult (EntryID, FileID);
-CREATE INDEX idx_sort_order ON utb_ImageScraperResult (SortOrder);
-"""
-
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
