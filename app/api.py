@@ -561,8 +561,6 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
 
 
 
-
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -624,21 +622,33 @@ async def process_restart_batch(
 
         async with async_engine.connect() as conn:
             query = text("""
-                SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory 
+                SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory, r.Step1 
                 FROM utb_ImageScraperRecords r
                 WHERE r.FileID = :file_id 
                 AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
-                AND r.Step1 IS NULL
+                AND (r.Step1 IS NULL OR r.Step1 < DATEADD(MINUTE, -60, GETDATE()))  -- Allow reprocessing if Step1 is old
                 ORDER BY r.EntryID
             """)
             result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
-            entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
-            logger.info(f"Found {len(entries)} entries needing processing")
+            all_entries = [(row[0], row[1], row[2], row[3], row[4], row[5]) for row in result.fetchall()]
+            # Relax ProductModel filter to include NULLs
+            entries = [(row[0], row[1] or "", row[2], row[3], row[4]) for row in all_entries]
+            logger.info(f"Found {len(entries)} entries for FileID {file_id_db}: {[row[0] for row in entries]}")
+            logger.debug(f"Entry details: {[(row[0], 'Step1=' + (str(row[5]) if row[5] else 'NULL')) for row in all_entries]}")
             result.close()
 
-        if not entries:
-            logger.warning(f"No valid EntryIDs found for FileID {file_id_db}")
-            return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+            if not entries:
+                logger.warning(f"No valid EntryIDs found for FileID {file_id_db}. Checking all records.")
+                query = text("""
+                    SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory, Step1
+                    FROM utb_ImageScraperRecords
+                    WHERE FileID = :file_id
+                """)
+                result = await conn.execute(query, {"file_id": file_id_db_int})
+                all_records = result.fetchall()
+                logger.info(f"All entries for FileID {file_id_db}: {[(row[0], 'Step1=' + (str(row[5]) if row[5] else 'NULL')) for row in all_records]}")
+                result.close()
+                return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
         logger.info(f"Created {len(entry_batches)} batches")
@@ -701,37 +711,29 @@ async def process_restart_batch(
                         }]
                         await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
                     
-                    # Update sort order
+                    # Update sort order using the updated function
                     update_result = await update_search_sort_order(
                         str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                     )
                     logger.info(f"Update SortOrder for EntryID {entry_id}: {'Success' if update_result else 'Failed'}")
                     
-                    # Mark Step1 as complete
-                    async with async_engine.connect() as conn:
-                        result = await conn.execute(
-                            text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
-                            {"entry_id": entry_id}
-                        )
-                        await conn.commit()
-                        if result.rowcount == 0:
-                            logger.error(f"Failed to update Step1 for EntryID {entry_id}: No rows affected")
-                        else:
-                            logger.info(f"Marked Step1 complete for EntryID {entry_id}")
+                    # Mark Step1 as complete only if processing succeeds
+                    if all_results or update_result:
+                        async with async_engine.connect() as conn:
+                            result = await conn.execute(
+                                text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
+                                {"entry_id": entry_id}
+                            )
+                            await conn.commit()
+                            if result.rowcount == 0:
+                                logger.error(f"Failed to update Step1 for EntryID {entry_id}: No rows affected")
+                            else:
+                                logger.info(f"Marked Step1 complete for EntryID {entry_id}")
                     
                     return entry_id, True
                 except Exception as e:
                     logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
-                    async with async_engine.connect() as conn:
-                        result = await conn.execute(
-                            text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
-                            {"entry_id": entry_id}
-                        )
-                        await conn.commit()
-                        if result.rowcount == 0:
-                            logger.error(f"Failed to update Step1 for EntryID {entry_id} on error: No rows affected")
-                        else:
-                            logger.info(f"Marked Step1 complete for EntryID {entry_id} despite error")
+                    # Do not mark Step1 complete on error to allow retry
                     return entry_id, False
 
         for batch_idx, batch_entries in enumerate(entry_batches, 1):
@@ -790,7 +792,7 @@ async def process_restart_batch(
                     FROM utb_ImageScraperResult
                     WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
                 """),
-                {"entry_ids": tuple(entry[0] for entry in entries)}
+                {"entry_ids": tuple(entry[0] for entry in entries) if entries else (0,)}
             )
             result_count = result.scalar()
             logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
@@ -817,6 +819,9 @@ async def process_restart_batch(
             logger=logger,
             file_id=str(file_id_db)
         )
+        await update_file_location_complete(str(file_id_db), log_public_url, logger)
+        await update_file_generate_complete(str(file_id_db), logger)
+        
         return {
             "message": "Search processing completed",
             "file_id": str(file_id_db),
@@ -837,11 +842,13 @@ async def process_restart_batch(
             logger=logger,
             file_id=str(file_id_db)
         )
+        await update_file_location_complete(str(file_id_db), log_public_url, logger)
+        await update_file_generate_complete(str(file_id_db), logger)
         return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-
+        
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
     logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)

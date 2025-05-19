@@ -115,29 +115,20 @@ async def get_images_excel_db(file_id: str, logger: Optional[logging.Logger] = N
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-async def fetch_last_valid_entry(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[int]:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT MAX(t.EntryID)
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = :file_id AND t.SortOrder IS NOT NULL
-            """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id}")
-            result = await conn.execute(query, {"file_id": file_id})
-            row = result.fetchone()
-            result.close()
-            if row and row[0]:
-                logger.info(f"Last valid EntryID for FileID {file_id}: {row[0]}")
-                return row[0]
-            logger.info(f"No valid EntryIDs found for FileID {file_id}")
-            return None
-    except Exception as e:
-        logger.error(f"Error fetching last valid EntryID for FileID {file_id}: {e}", exc_info=True)
-        return None
+async def fetch_last_valid_entry(file_id: str, logger: logging.Logger) -> Optional[int]:
+    async with async_engine.connect() as conn:
+        query = text("""
+            SELECT TOP 1 EntryID 
+            FROM utb_ImageScraperRecords 
+            WHERE FileID = :file_id 
+            ORDER BY EntryID DESC
+        """)
+        result = await conn.execute(query, {"file_id": int(file_id)})
+        row = result.fetchone()
+        result.close()
+        last_entry_id = int(row[0]) if row else None
+        logger.info(f"Retrieved last valid EntryID: {last_entry_id} for FileID: {file_id}")
+        return last_entry_id
 
 @retry(
     stop=stop_after_attempt(3),
