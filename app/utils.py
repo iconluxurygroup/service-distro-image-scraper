@@ -69,10 +69,11 @@ def unpack_content(encoded_content: str, logger: Optional[logging.Logger] = None
     except Exception as e:
         logger.error(f"Error unpacking content: {e}")
         return None
+    
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type((aiohttp.ClientError, httpx.HTTPStatusError, TimeoutError, json.JSONDecodeError)),
+    retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Worker PID {psutil.Process().pid}: Retrying process_search_row for EntryID {retry_state.kwargs['entry_id']} (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
@@ -87,15 +88,23 @@ async def process_search_row(
     brand: Optional[str] = None,
     category: Optional[str] = None
 ) -> List[Dict]:
-    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     if not search_string or not endpoint:
         logger.warning(f"Worker PID {process.pid}: Invalid input for EntryID {entry_id}: search_string={search_string}, endpoint={endpoint}")
         return []
 
+    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
+    headers = {
+        "accept": "application/json",
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+    regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
+    search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_string)}&tbm=isch"
+
     total_attempts = [0]
-    
+
     async def log_retry_status(attempt_type: str, attempt_num: int) -> bool:
         total_attempts[0] += 1
         if total_attempts[0] > max_retries:
@@ -104,52 +113,30 @@ async def process_search_row(
         logger.info(f"Worker PID {process.pid}: {attempt_type} attempt {attempt_num} (Total attempts: {total_attempts[0]}/{max_retries}) for EntryID {entry_id}")
         return True
 
-    # Construct the search query
-    query = search_string
-    if brand:
-        query += f" {brand}"
-    if category:
-        query += f" {category}"
-
-    attempt_num = 1
-    while attempt_num <= 3:
-        if not await log_retry_status("Primary", attempt_num):
-            break
-        mem_info = process.memory_info()
-        logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-        try:
-            logger.info(f"Worker PID {process.pid}: Fetching search results for query '{query}' via {SEARCH_PROXY_API_URL}")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    SEARCH_PROXY_API_URL,
-                    json={"q": query, "brand": brand, "category": category},
-                    timeout=60
-                ) as response:
-                    logger.debug(f"Worker PID {process.pid}: Endpoint response: status={response.status}, headers={response.headers}, body={await response.text()[:200]}")
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for attempt, region in enumerate(regions, 1):
+            if not await log_retry_status("Primary", attempt):
+                break
+            fetch_endpoint = f"{endpoint}?region={region}"
+            mem_info = process.memory_info()
+            logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
+            try:
+                logger.info(f"Worker PID {process.pid}: Fetching {search_url} via {fetch_endpoint} with region {region}")
+                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                    body_text = await response.text()
+                    body_preview = body_text[:200] if body_text else ""
+                    logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body={body_preview}")
                     if response.status in (429, 503):
-                        logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {SEARCH_PROXY_API_URL}")
+                        logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
                         raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
                     response.raise_for_status()
-                    try:
-                        result = await response.json()
-                        results = result.get("results", [])
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Worker PID {process.pid}: JSON decode error for query '{query}': {e}")
-                        raise
+                    result = await response.json()
+                    results = result.get("result")
                     if not results:
-                        logger.warning(f"Worker PID {process.pid}: No results in response for query '{query}'")
-                        return []
-                    # Format results for compatibility
-                    formatted_results = [
-                        {
-                            "EntryID": entry_id,
-                            "ImageUrl": res.get("image_url", "placeholder://no-image"),
-                            "ImageDesc": res.get("description", ""),
-                            "ImageSource": res.get("source", "N/A"),
-                            "ImageUrlThumbnail": res.get("thumbnail_url", res.get("image_url", "placeholder://no-thumbnail"))
-                        }
-                        for res in results
-                    ]
+                        logger.warning(f"Worker PID {process.pid}: No results for EntryID {entry_id} in region {region}")
+                        continue
+                    results_html_bytes = results if isinstance(results, bytes) else results.encode("utf-8")
+                    formatted_results = process_search_result(results_html_bytes, results_html_bytes, entry_id, logger)
                     mem_info = process.memory_info()
                     logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
                     if formatted_results:
@@ -161,14 +148,10 @@ async def process_search_row(
                         ]
                         logger.info(f"Worker PID {process.pid}: Filtered out irrelevant results, kept {len(filtered_results)} rows for EntryID {entry_id}")
                         return filtered_results
-                    logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id}")
-                    return []
-        except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {SEARCH_PROXY_API_URL}: {e}")
-            attempt_num += 1
-            if attempt_num > 3:
-                break
-
+                    logger.warning(f"Worker PID {process.pid}: Empty results for EntryID {entry_id} in region {region}")
+            except (aiohttp.ClientError, json.JSONDecodeError) as e:
+                logger.warning(f"Worker PID {process.pid}: Attempt {attempt} failed for {fetch_endpoint} in region {region}: {e}")
+                continue
     logger.error(f"Worker PID {process.pid}: All attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     return []
 

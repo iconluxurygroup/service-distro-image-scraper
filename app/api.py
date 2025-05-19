@@ -11,6 +11,7 @@ import datetime
 import hashlib
 import time
 import httpx
+import aiohttp
 import pandas as pd
 from typing import Optional, List, Dict, Any, Callable
 from logging_config import setup_job_logger
@@ -64,32 +65,64 @@ class SearchClient:
         self.endpoint = endpoint
         self.logger = logger
         self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.client = httpx.AsyncClient(timeout=10.0)
+        self.api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
+        self.headers = {
+            "accept": "application/json",
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json"
+        }
+        self.regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
 
     async def close(self):
-        await self.client.aclose()
+        pass  # aiohttp.ClientSession is managed per request
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError))
+        retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError))
     )
     async def search(self, term: str, brand: str) -> List[Dict]:
         async with self.semaphore:
-            try:
-                response = await self.client.get(
-                    self.endpoint,
-                    params={"q": term, "brand": brand}
-                )
-                response.raise_for_status()
-                return response.json().get("results", [])
-            except httpx.HTTPStatusError as e:
-                self.logger.error(f"HTTP error for term '{term}': {e}")
-                raise
-            except httpx.RequestError as e:
-                self.logger.error(f"Request error for term '{term}': {e}")
-                raise
-
+            process = psutil.Process()
+            search_url = f"https://www.google.com/search?q={urllib.parse.quote(term)}&tbm=isch"
+            for region in self.regions:
+                fetch_endpoint = f"{self.endpoint}?region={region}"
+                self.logger.info(f"Worker PID {process.pid}: Fetching {search_url} via {fetch_endpoint} with region {region}")
+                try:
+                    async with aiohttp.ClientSession(headers=self.headers) as session:
+                        async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                            body_text = await response.text()
+                            body_preview = body_text[:200] if body_text else ""
+                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body={body_preview}")
+                            if response.status in (429, 503):
+                                self.logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
+                                raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
+                            response.raise_for_status()
+                            result = await response.json()
+                            results = result.get("result")
+                            if not results:
+                                self.logger.warning(f"Worker PID {process.pid}: No results for term '{term}' in region {region}")
+                                continue
+                            results_html_bytes = results if isinstance(results, bytes) else results.encode("utf-8")
+                            formatted_results = process_search_result(results_html_bytes, results_html_bytes, 0, self.logger)
+                            if formatted_results:
+                                self.logger.info(f"Worker PID {process.pid}: Found {len(formatted_results)} results for term '{term}' in region {region}")
+                                return [
+                                    {
+                                        "EntryID": 0,  # Will be set by caller
+                                        "ImageUrl": res.get("image_url", "placeholder://no-image"),
+                                        "ImageDesc": res.get("description", ""),
+                                        "ImageSource": res.get("source", "N/A"),
+                                        "ImageUrlThumbnail": res.get("thumbnail_url", res.get("image_url", "placeholder://no-thumbnail"))
+                                    }
+                                    for res in formatted_results
+                                ]
+                            self.logger.warning(f"Worker PID {process.pid}: Empty results for term '{term}' in region {region}")
+                except (aiohttp.ClientError, json.JSONDecodeError) as e:
+                    self.logger.warning(f"Worker PID {process.pid}: Failed for term '{term}' in region {region}: {e}")
+                    continue
+            self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
+            return []
 async def process_results(
     raw_results: List[Dict],
     entry_id: int,
@@ -417,6 +450,10 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
         return {"error": str(e), "log_filename": log_filename}
     finally:
         log_memory_usage()
+
+ 
+
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -475,7 +512,7 @@ async def process_restart_batch(
 
         # Use the primary endpoint directly
         endpoint = SEARCH_PROXY_API_URL
-        logger.info(f"Using endpoint: {endpoint}")
+        logger.info(f"Using endpoint: {endpoint} with API key authentication")
 
         async with async_engine.connect() as conn:
             query = text("""
@@ -649,6 +686,10 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
+
+
+
+
 async def monitor_and_resubmit_failed_jobs(file_id: str, logger: logging.Logger):
     log_file = f"job_logs/job_{file_id}.log"
     max_attempts = 3
