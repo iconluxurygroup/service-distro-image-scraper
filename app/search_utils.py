@@ -27,6 +27,7 @@ if not logger.handlers:
 
 
 # DatabaseQueue class
+# DatabaseQueue class
 class DatabaseQueue:
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
