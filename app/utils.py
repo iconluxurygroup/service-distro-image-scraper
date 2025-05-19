@@ -110,6 +110,7 @@ async def process_search_row(
     brand: Optional[str] = None,
     category: Optional[str] = None
 ) -> List[Dict]:
+    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     if not search_string or not endpoint:
@@ -126,13 +127,12 @@ async def process_search_row(
         logger.info(f"Worker PID {process.pid}: {attempt_type} attempt {attempt_num} (Total attempts: {total_attempts[0]}/{max_retries}) for EntryID {entry_id}")
         return True
 
+    # Construct the search query
     query = search_string
     if brand:
         query += f" {brand}"
     if category:
         query += f" {category}"
-    search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=isch"
-    fetch_endpoint = f"{endpoint}/fetch"
 
     attempt_num = 1
     while attempt_num <= 3:
@@ -141,34 +141,44 @@ async def process_search_row(
         mem_info = process.memory_info()
         logger.debug(f"Worker PID {process.pid}: Memory before API call: RSS={mem_info.rss / 1024**2:.2f} MB")
         try:
-            logger.info(f"Worker PID {process.pid}: Fetching {search_url} via {fetch_endpoint}")
+            logger.info(f"Worker PID {process.pid}: Fetching search results for query '{query}' via {SEARCH_PROXY_API_URL}")
             async with aiohttp.ClientSession() as session:
-                async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                async with session.post(
+                    SEARCH_PROXY_API_URL,
+                    json={"q": query, "brand": brand, "category": category},
+                    timeout=60
+                ) as response:
                     logger.debug(f"Worker PID {process.pid}: Endpoint response: status={response.status}, headers={response.headers}, body={await response.text()[:200]}")
                     if response.status in (429, 503):
-                        logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
+                        logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {SEARCH_PROXY_API_URL}")
                         raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
                     response.raise_for_status()
                     try:
                         result = await response.json()
-                        result_data = result.get("result")
+                        results = result.get("results", [])
                     except json.JSONDecodeError as e:
-                        logger.error(f"Worker PID {process.pid}: JSON decode error for {search_url}: {e}")
+                        logger.error(f"Worker PID {process.pid}: JSON decode error for query '{query}': {e}")
                         raise
-                    if not result_data:
-                        logger.warning(f"Worker PID {process.pid}: No result data in response for {search_url}")
-                        raise ValueError("Empty response result")
-                    unpacked_html = unpack_content(result_data, logger)
-                    if not unpacked_html or len(unpacked_html) < 100:
-                        logger.warning(f"Worker PID {process.pid}: Invalid HTML for {search_url}")
-                        raise ValueError("Invalid HTML content")
-                    results = process_search_result(unpacked_html, unpacked_html, entry_id, logger)
+                    if not results:
+                        logger.warning(f"Worker PID {process.pid}: No results in response for query '{query}'")
+                        return []
+                    # Format results for compatibility
+                    formatted_results = [
+                        {
+                            "EntryID": entry_id,
+                            "ImageUrl": res.get("image_url", "placeholder://no-image"),
+                            "ImageDesc": res.get("description", ""),
+                            "ImageSource": res.get("source", "N/A"),
+                            "ImageUrlThumbnail": res.get("thumbnail_url", res.get("image_url", "placeholder://no-thumbnail"))
+                        }
+                        for res in results
+                    ]
                     mem_info = process.memory_info()
                     logger.debug(f"Worker PID {process.pid}: Memory after API call: RSS={mem_info.rss / 1024**2:.2f} MB")
-                    if results:
+                    if formatted_results:
                         irrelevant_keywords = ['wallpaper', 'furniture', 'decor', 'stock photo', 'pistol', 'mattress', 'trunk', 'clutch', 'solenoid', 'card', 'pokemon']
                         filtered_results = [
-                            res for res in results
+                            res for res in formatted_results
                             if any(kw.lower() in res.get('ImageDesc', '').lower() for kw in ['scotch', 'soda', 'sneaker', 'shoe', 'hoodie', 'shirt', 'jacket', 'pants', 'apparel', 'clothing'])
                             and not any(kw.lower() in res.get('ImageDesc', '').lower() for kw in irrelevant_keywords)
                         ]
@@ -177,18 +187,12 @@ async def process_search_row(
                     logger.warning(f"Worker PID {process.pid}: No valid data for EntryID {entry_id}")
                     return []
         except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {fetch_endpoint}: {e}")
+            logger.warning(f"Worker PID {process.pid}: Primary attempt {attempt_num} failed for {SEARCH_PROXY_API_URL}: {e}")
             attempt_num += 1
             if attempt_num > 3:
                 break
 
-    if total_attempts[0] < max_retries:
-        gcloud_results = await process_search_row_gcloud(search_string, entry_id, logger, max_retries - total_attempts[0], total_attempts)
-        if gcloud_results:
-            logger.info(f"Worker PID {process.pid}: GCloud fallback succeeded for EntryID {entry_id} with {len(gcloud_results)} images")
-            return gcloud_results
-        logger.error(f"Worker PID {process.pid}: GCloud fallback also failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
-    
+    logger.error(f"Worker PID {process.pid}: All attempts failed for EntryID {entry_id} after {total_attempts[0]} total attempts")
     return []
 
 async def process_search_row_gcloud(
@@ -346,7 +350,6 @@ def generate_search_variations(
         logger.debug(f"Worker PID {process.pid}: No color suffix detected, no_color variation same as original: '{search_string}'")
     
     return variations
-
 async def search_variation(
     variation: str,
     endpoint: str,
@@ -356,11 +359,11 @@ async def search_variation(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> Dict:
+    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     try:
-        regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia']
-        max_attempts = 5
+        max_attempts = 3
         total_attempts = [0]
 
         async def log_retry_status(attempt_type: str, attempt_num: int) -> bool:
@@ -371,19 +374,13 @@ async def search_variation(
             logger.info(f"Worker PID {process.pid}: {attempt_type} attempt {attempt_num} (Total attempts: {total_attempts[0]}/{max_attempts}) for EntryID {entry_id}")
             return True
 
-        for region in regions:
-            if not await log_retry_status("GCloud", total_attempts[0] + 1):
-                break
-            result = await process_search_row_gcloud(variation, entry_id, logger, remaining_retries=5, total_attempts=total_attempts)
-            if result:
-                logger.info(f"Worker PID {process.pid}: GCloud attempt succeeded for EntryID {entry_id} with {len(result)} images in region {region}")
-                return {"variation": variation, "result": result, "status": "success", "result_count": len(result)}
-            logger.warning(f"Worker PID {process.pid}: GCloud attempt failed in region {region}")
-
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             if not await log_retry_status("Primary", attempt + 1):
                 break
-            result = await process_search_row(variation, endpoint, entry_id, search_type, max_retries=15, brand=brand, category=category, logger=logger)
+            result = await process_search_row(
+                variation, SEARCH_PROXY_API_URL, entry_id, search_type=search_type,
+                max_retries=15, brand=brand, category=category, logger=logger
+            )
             if result:
                 logger.info(f"Worker PID {process.pid}: Primary attempt succeeded for EntryID {entry_id} with {len(result)} images")
                 return {"variation": variation, "result": result, "status": "success", "result_count": len(result)}
@@ -418,7 +415,6 @@ async def search_variation(
             "result_count": 1,
             "error": str(e)
         }
-
 async def process_and_tag_results(
     search_string: str,
     brand: Optional[str] = None,
@@ -429,6 +425,7 @@ async def process_and_tag_results(
     use_all_variations: bool = False,
     file_id_db: Optional[int] = None
 ) -> List[Dict]:
+    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     
@@ -460,7 +457,7 @@ async def process_and_tag_results(
                 logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
                 search_result = await search_variation(
                     variation=variation,
-                    endpoint=endpoint,
+                    endpoint=SEARCH_PROXY_API_URL,
                     entry_id=entry_id,
                     search_type=search_type,
                     brand=brand,
@@ -535,20 +532,20 @@ async def process_and_tag_results(
             "ImageUrlThumbnail": "placeholder://error",
             "ProductCategory": ""
         }]
-
 async def process_single_all(
     entry_id: int,
     search_string: str,
     max_row_retries: int,
     file_id_db: int,
     brand_rules: dict,
-    endpoint: str,
+    endpoint: str,  # This parameter can be removed if we use config directly
     brand: Optional[str] = None,
     model: Optional[str] = None,
     color: Optional[str] = None,
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
+    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     
@@ -565,7 +562,7 @@ async def process_single_all(
 
     search_types = [
         "default", "delimiter_variations", "color_delimiter",
-        "brand_alias", "brand_name", "no_color"
+        "brand_alias", "no_color"
     ]
     all_results = []
     result_brand = brand
@@ -610,10 +607,6 @@ async def process_single_all(
     logger.debug(f"Worker PID {process.pid}: Memory before generating variations: RSS={mem_info.rss / 1024**2:.2f} MB")
     variations = generate_search_variations(search_string, result_brand, result_model, brand_rules, logger)
     
-    if not endpoint:
-        logger.error(f"Worker PID {process.pid}: No healthy endpoint available for EntryID {entry_id}")
-        return False
-
     for search_type in search_types:
         if search_type not in variations:
             logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found in variations for EntryID {entry_id}")
@@ -623,7 +616,7 @@ async def process_single_all(
             logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
             search_result = await search_variation(
                 variation=variation,
-                endpoint=endpoint,
+                endpoint=SEARCH_PROXY_API_URL,
                 entry_id=entry_id,
                 search_type=search_type,
                 brand=result_brand,
