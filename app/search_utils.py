@@ -188,7 +188,7 @@ async def insert_search_results(
     file_id: str = None,
     db_queue: Optional[DatabaseQueue] = None
 ) -> bool:
-    logger = logger or logger
+    logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
     db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
     await db_queue.start()
@@ -264,41 +264,6 @@ async def insert_search_results(
             logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id} after validation")
             return False
 
-        async def insert_or_update_result(conn: AsyncConnection, params: List[Dict]):
-            try:
-                update_query = text("""
-                    UPDATE utb_ImageScraperResult
-                    SET ImageDesc = t.image_desc,
-                        ImageSource = t.image_source,
-                        ImageUrlThumbnail = t.image_url_thumbnail,
-                        CreateTime = CURRENT_TIMESTAMP
-                    FROM (VALUES :update_values) AS t(entry_id, image_url, image_desc, image_source, image_url_thumbnail)
-                    WHERE utb_ImageScraperResult.EntryID = t.entry_id AND utb_ImageScraperResult.ImageUrl = t.image_url
-                """)
-                update_values = [(p["entry_id"], p["image_url"], p["image_desc"], p["image_source"], p["image_url_thumbnail"]) for p in params]
-                result = await conn.execute(update_query, {"update_values": update_values})
-                updated_count = result.rowcount
-
-                insert_query = text("""
-                    INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime, SortOrder)
-                    SELECT t.entry_id, t.image_url, t.image_desc, t.image_source, t.image_url_thumbnail, CURRENT_TIMESTAMP, t.sort_order
-                    FROM (VALUES :insert_values) AS t(entry_id, image_url, image_desc, image_source, image_url_thumbnail, sort_order)
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM utb_ImageScraperResult
-                        WHERE EntryID = t.entry_id AND ImageUrl = t.image_url
-                    )
-                """)
-                insert_values = [(p["entry_id"], p["image_url"], p["image_desc"], p["image_source"], p["image_url_thumbnail"], -1 if p["image_url"] == "placeholder://no-results" else None) for p in params]
-                result = await conn.execute(insert_query, {"insert_values": insert_values})
-                inserted_count = result.rowcount
-                return inserted_count, updated_count
-            except SQLAlchemyError as e:
-                logger.error(f"Worker PID {process.pid}: SQLAlchemy error in insert_or_update_result: {e}", exc_info=True)
-                raise
-            except Exception as e:
-                logger.error(f"Worker PID {process.pid}: Unexpected error in insert_or_update_result: {e}", exc_info=True)
-                raise
-
         inserted_count, updated_count = await db_queue.enqueue(
             insert_or_update_result,
             parameters,
@@ -315,6 +280,87 @@ async def insert_search_results(
         return False
     finally:
         await db_queue.stop()
+
+async def insert_or_update_result(conn: AsyncConnection, params: List[Dict]):
+    logger = logging.getLogger(__name__)
+    process = psutil.Process()
+    try:
+        # Convert params to DataFrame for easier manipulation
+        df = pd.DataFrame(params, columns=["entry_id", "image_url", "image_desc", "image_source", "image_url_thumbnail"])
+        
+        if df.empty:
+            logger.warning(f"Worker PID {process.pid}: No data to process in insert_or_update_result")
+            return 0, 0
+
+        updated_count = 0
+        inserted_count = 0
+
+        # Update query for existing rows
+        update_query = text("""
+            UPDATE utb_ImageScraperResult
+            SET ImageDesc = :image_desc,
+                ImageSource = :image_source,
+                ImageUrlThumbnail = :image_url_thumbnail,
+                CreateTime = CURRENT_TIMESTAMP
+            WHERE EntryID = :entry_id AND ImageUrl = :image_url
+        """)
+
+        # Insert query for new rows
+        insert_query = text("""
+            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime, SortOrder)
+            SELECT :entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, CURRENT_TIMESTAMP,
+                CASE WHEN :image_url = 'placeholder://no-results' THEN -1 ELSE NULL END
+            WHERE NOT EXISTS (
+                SELECT 1 FROM utb_ImageScraperResult
+                WHERE EntryID = :entry_id AND ImageUrl = :image_url
+            )
+        """)
+
+        # Process updates and inserts in batches to balance performance and memory
+        batch_size = 100  # Adjust based on performance testing
+        for start in range(0, len(df), batch_size):
+            batch = df.iloc[start:start + batch_size]
+            update_params = []
+            insert_params = []
+
+            for _, row in batch.iterrows():
+                param = {
+                    "entry_id": int(row["entry_id"]),
+                    "image_url": row["image_url"] or None,
+                    "image_desc": row["image_desc"] or None,
+                    "image_source": row["image_source"] or None,
+                    "image_url_thumbnail": row["image_url_thumbnail"] or None
+                }
+                update_params.append(param)
+                insert_params.append(param)
+
+            # Execute updates
+            for param in update_params:
+                try:
+                    result = await conn.execute(update_query, param)
+                    updated_count += result.rowcount
+                except SQLAlchemyError as e:
+                    logger.error(f"Worker PID {process.pid}: Failed to update EntryID {param['entry_id']}: {e}")
+                    continue
+
+            # Execute inserts
+            for param in insert_params:
+                try:
+                    result = await conn.execute(insert_query, param)
+                    inserted_count += result.rowcount
+                except SQLAlchemyError as e:
+                    logger.error(f"Worker PID {process.pid}: Failed to insert EntryID {param['entry_id']}: {e}")
+                    continue
+
+        logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} rows")
+        return inserted_count, updated_count
+
+    except SQLAlchemyError as e:
+        logger.error(f"Worker PID {process.pid}: SQLAlchemy error in insert_or_update_result: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Unexpected error in insert_or_update_result: {e}", exc_info=True)
+        raise
 
 from pyodbc import Error as PyodbcError
         # Perform bulk update using a temporary table
