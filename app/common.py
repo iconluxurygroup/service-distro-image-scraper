@@ -129,7 +129,7 @@ def generate_aliases(model: Any) -> List[str]:
     for sep in separators:
         base_model = base_model.replace(sep, '')
     aliases.add(base_model)
-    
+
     # Add digits-only version
     digits_only = re.sub(r'[^0-9]', '', base_model)
     if digits_only and digits_only.isdigit():
@@ -293,6 +293,9 @@ async def generate_search_variations(
         model_alias_variations = [alias for alias in model_aliases]  # Use model aliases directly, without brand prefix
         variations["model_alias"] = list(set(model_alias_variations))
         logger.debug(f"Generated {len(model_alias_variations)} model alias variations: {model_alias_variations}")
+    
+    for key in variations:
+        variations[key] = list(set(variations[key]))  # Ensure all categories are deduplicated
     
     total_variations = sum(len(v) for v in variations.values())
     logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
