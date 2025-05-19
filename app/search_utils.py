@@ -25,29 +25,6 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
 
-# Global DatabaseQueue instance
-global_db_queue = None
-
-# Signal handler for graceful shutdown
-def setup_signal_handlers():
-    def handle_shutdown(signum, frame):
-        logger.info(f"Received signal {signum}, initiating graceful shutdown")
-        if global_db_queue:
-            asyncio.create_task(global_db_queue.stop())
-        asyncio.create_task(async_engine.dispose())
-        logger.info("Shutdown complete")
-
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-# Initialize application
-def initialize_app():
-    global global_db_queue
-    global_db_queue = DatabaseQueue(logger=logger)
-    setup_signal_handlers()
-    atexit.register(lambda: asyncio.run(async_engine.dispose()))
-
-initialize_app()
 
 # DatabaseQueue class
 class DatabaseQueue:
@@ -115,7 +92,29 @@ class DatabaseQueue:
         except SQLAlchemyError as e:
             self.logger.warning(f"Connection health check failed: {e}")
             return False
+# Global DatabaseQueue instance
+global_db_queue = None
 
+# Signal handler for graceful shutdown
+def setup_signal_handlers():
+    def handle_shutdown(signum, frame):
+        logger.info(f"Received signal {signum}, initiating graceful shutdown")
+        if global_db_queue:
+            asyncio.create_task(global_db_queue.stop())
+        asyncio.create_task(async_engine.dispose())
+        logger.info("Shutdown complete")
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+# Initialize application
+def initialize_app():
+    global global_db_queue
+    global_db_queue = DatabaseQueue(logger=logger)
+    setup_signal_handlers()
+    atexit.register(lambda: asyncio.run(async_engine.dispose()))
+
+initialize_app()
 def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
     logger = logger or logger
     if not url or url == '' or 'placeholder' in str(url).lower():
