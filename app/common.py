@@ -216,7 +216,7 @@ async def generate_search_variations(
     variations["default"].append(search_string)
     logger.debug(f"Added default variation: '{search_string}'")
 
-    delimiters = [' ', '-', '_', '/']
+    delimiters = [' ', '-', '_', '/', '.']
     delimiter_variations = []
     for delim in delimiters:
         if delim in search_string:
