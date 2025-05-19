@@ -1250,7 +1250,6 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
 
- New endpoint to reset Step1 for a given FileID
 @router.post("/reset-step1/{file_id}", tags=["Database"])
 async def api_reset_step1(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
