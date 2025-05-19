@@ -117,32 +117,32 @@ def generate_aliases(model: Any) -> List[str]:
     if not model or model.strip() == '':
         return []
     
-    aliases = {model, model.lower(), model.upper()}
-    separators = ['_', '-', ' ', '/', '.']
-    base_model = model
+    # Normalize model to lowercase and clean it
+    model = clean_string(model).lower()
+    aliases = set()  # Use set for deduplication
+    aliases.add(model)  # Add the cleaned model
     
+    separators = ['_', '-', ' ', '/', '.']
+    
+    # Add version with all separators removed
+    base_model = model
     for sep in separators:
         base_model = base_model.replace(sep, '')
-        aliases.add(base_model)
+    aliases.add(base_model)
     
-    for sep in separators:
-        if 's69' in base_model.lower():
-            idx = base_model.lower().index('s69')
-            alias_with_sep = base_model[:idx] + sep + base_model[idx:]
-            aliases.add(alias_with_sep)
-            aliases.add(alias_with_sep.lower())
-            aliases.add(alias_with_sep.upper())
-    
+    # Add digits-only version
     digits_only = re.sub(r'[^0-9]', '', base_model)
     if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
     
+    # Add first part before separator
     for sep in separators:
         if sep in model:
             base = model.split(sep)[0]
             aliases.add(base)
             break
     
+    # Filter out empty or overly short aliases
     return [a for a in aliases if a and len(a) >= len(model) - 3]
 
 async def fetch_brand_rules(
