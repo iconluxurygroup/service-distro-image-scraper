@@ -160,47 +160,43 @@ async def process_and_tag_results(
         client = SearchClient(endpoint=endpoint, logger=logger)
         
         try:
+            # Collect all search tasks
+            search_tasks = []
             for search_type in search_types:
                 if search_type not in variations:
                     logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
                     continue
-                
-                logger.info(f"Worker PID {process.pid}: Processing search type '{search_type}' for EntryID {entry_id}")
                 for variation in variations[search_type]:
-                    logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
-                    
-                    # Use SearchClient.search instead of search_variation
-                    search_results = await client.search(
-                        term=variation,
-                        brand=brand or "",
-                        entry_id=entry_id
-                    )
-                    
-                    if search_results:
-                        logger.info(f"Worker PID {process.pid}: Found {len(search_results)} results for variation '{variation}'")
-                        tagged_results = []
-                        for res in search_results:
-                            tagged_result = {
-                                "EntryID": entry_id,
-                                "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
-                                "ImageDesc": res.get("ImageDesc", ""),
-                                "ImageSource": res.get("ImageSource", "N/A"),
-                                "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
-                                "ProductCategory": res.get("ProductCategory", "")
-                            }
-                            if all(col in tagged_result for col in required_columns):
-                                tagged_results.append(tagged_result)
-                            else:
-                                logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
-                        
-                        all_results.extend(tagged_results)
-                        logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{variation}'")
+                    logger.debug(f"Worker PID {process.pid}: Queuing search for variation '{variation}' for EntryID {entry_id}")
+                    search_tasks.append(client.search(term=variation, brand=brand or "", entry_id=entry_id))
+            
+            # Execute all searches concurrently
+            search_results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
+            
+            # Process results
+            for search_results in search_results_list:
+                if isinstance(search_results, Exception):
+                    logger.error(f"Worker PID {process.pid}: Search failed for EntryID {entry_id}: {search_results}")
+                    continue
+                if not search_results:
+                    continue
+                tagged_results = []
+                for res in search_results:
+                    tagged_result = {
+                        "EntryID": entry_id,
+                        "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
+                        "ImageDesc": res.get("ImageDesc", ""),
+                        "ImageSource": res.get("ImageSource", "N/A"),
+                        "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
+                        "ProductCategory": res.get("ProductCategory", "")
+                    }
+                    if all(col in tagged_result for col in required_columns):
+                        tagged_results.append(tagged_result)
                     else:
-                        logger.warning(f"Worker PID {process.pid}: No valid results for variation '{variation}' in search type '{search_type}'")
-                
-                if all_results and not use_all_variations:
-                    logger.info(f"Worker PID {process.pid}: Stopping after {len(all_results)} results from '{search_type}' for EntryID {entry_id}")
-                    break
+                        logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
+                all_results.extend(tagged_results)
+                logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for EntryID {entry_id}")
+        
         finally:
             await client.close()
         
@@ -247,7 +243,6 @@ async def process_and_tag_results(
             "ImageUrlThumbnail": "placeholder://error",
             "ProductCategory": ""
         }]
-
 async def process_results(
     raw_results: List[Dict],
     entry_id: int,
@@ -343,7 +338,7 @@ async def async_process_entry_search(
     finally:
         await client.close()
 
-        
+
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
     try:
