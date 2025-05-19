@@ -290,7 +290,7 @@ async def generate_search_variations(
 
     if model:
         model_aliases = await generate_aliases(model) if asyncio.iscoroutinefunction(generate_aliases) else generate_aliases(model)
-        model_alias_variations = [f"{brand} {alias}" if brand else alias for alias in model_aliases]
+        model_alias_variations = [alias for alias in model_aliases]  # Use model aliases directly, without brand prefix
         variations["model_alias"] = list(set(model_alias_variations))
         logger.debug(f"Generated {len(model_alias_variations)} model alias variations: {model_alias_variations}")
 
