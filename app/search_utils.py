@@ -650,11 +650,19 @@ async def update_sort_order(
             logger.debug(f"Fetched {len(entries)} entries for FileID: {file_id}")
             return entries
 
-        entries = await db_queue.enqueue(
-            fetch_entries,
-            {"file_id": file_id},
-            connection_type="read"
-        )
+        try:
+            entries = await db_queue.enqueue(
+                fetch_entries,
+                {"file_id": file_id},
+                connection_type="read"
+            ) or None
+        except Exception as e:
+            logger.error(f"Failed to fetch entries for FileID: {file_id}: {e}", exc_info=True)
+            return {"error": f"Failed to fetch entries: {str(e)}", "results": [], "success_count": 0, "failure_count": 0}
+        
+        if entries is None:
+            logger.error(f"Queue returned None for FileID: {file_id}")
+            return {"error": "Queue operation failed", "results": [], "success_count": 0, "failure_count": 0}
         
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id}")
@@ -680,12 +688,12 @@ async def update_sort_order(
                     logger=logger,
                     db_queue=db_queue
                 )
-                results.append({"EntryID": entry_id, "Success": bool(entry_results)})
-                if entry_results:
+                results.append({"EntryID": entry_id, "Success": entry_results["success"], "Error": entry_results.get("error")})
+                if entry_results["success"]:
                     success_count += 1
                 else:
                     failure_count += 1
-                    logger.warning(f"No results for EntryID {entry_id}")
+                    logger.warning(f"Failed to update EntryID {entry_id}: {entry_results.get('error', 'Unknown error')}")
             except Exception as e:
                 logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
                 results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
@@ -712,11 +720,15 @@ async def update_sort_order(
             return verification
 
         entry_ids = tuple(e[0] for e in entries)
-        verification = await db_queue.enqueue(
-            verify_sort_order,
-            {"file_id": file_id, "entry_ids": entry_ids},
-            connection_type="read"
-        )
+        try:
+            verification = await db_queue.enqueue(
+                verify_sort_order,
+                {"file_id": file_id, "entry_ids": entry_ids},
+                connection_type="read"
+            ) or {}
+        except Exception as e:
+            logger.error(f"Failed to verify sort order for FileID: {file_id}: {e}", exc_info=True)
+            verification = {}
 
         async def fetch_sort_orders(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
@@ -730,20 +742,24 @@ async def update_sort_order(
             result.close()
             return sort_orders
 
-        sort_orders = await db_queue.enqueue(
-            fetch_sort_orders,
-            {"file_id": file_id},
-            connection_type="read"
-        )
+        try:
+            sort_orders = await db_queue.enqueue(
+                fetch_sort_orders,
+                {"file_id": file_id},
+                connection_type="read"
+            ) or []
+        except Exception as e:
+            logger.error(f"Failed to fetch sort orders for FileID: {file_id}: {e}", exc_info=True)
+            sort_orders = []
 
         logger.info(f"SortOrder values for FileID {file_id}: {[(row[0], row[1], row[2][:50]) for row in sort_orders]}")
         logger.info(f"Verification for FileID {file_id}: "
-                   f"{verification['PositiveSortOrderEntries']} entries with model matches, "
-                   f"{verification['BrandMatchEntries']} entries with brand matches only, "
-                   f"{verification['NoMatchEntries']} entries with no matches, "
-                   f"{verification['NullSortOrderEntries']} entries with NULL SortOrder, "
-                   f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder, "
-                   f"{verification['NonPlaceholderResults']} non-placeholder results")
+                   f"{verification.get('PositiveSortOrderEntries', 0)} entries with model matches, "
+                   f"{verification.get('BrandMatchEntries', 0)} entries with brand matches only, "
+                   f"{verification.get('NoMatchEntries', 0)} entries with no matches, "
+                   f"{verification.get('NullSortOrderEntries', 0)} entries with NULL SortOrder, "
+                   f"{verification.get('UnexpectedSortOrderEntries', 0)} entries with unexpected SortOrder, "
+                   f"{verification.get('NonPlaceholderResults', 0)} non-placeholder results")
 
         result = {
             "results": results,
@@ -755,19 +771,13 @@ async def update_sort_order(
         return result
     except SQLAlchemyError as e:
         logger.error(f"Database error in batch SortOrder update for FileID: {file_id}: {e}", exc_info=True)
-        result = {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
-        logger.debug(f"Returning error result for FileID: {file_id}: {result}")
-        return result
+        return {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
     except ValueError as ve:
         logger.error(f"Invalid file_id format for FileID: {file_id}: {ve}", exc_info=True)
-        result = {"error": str(ve), "results": [], "success_count": 0, "failure_count": 0}
-        logger.debug(f"Returning error result for FileID: {file_id}: {result}")
-        return result
+        return {"error": str(ve), "results": [], "success_count": 0, "failure_count": 0}
     except Exception as e:
         logger.error(f"Unexpected error in batch SortOrder update for FileID: {file_id}: {e}", exc_info=True)
-        result = {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
-        logger.debug(f"Returning error result for FileID: {file_id}: {result}")
-        return result
+        return {"error": str(e), "results": [], "success_count": 0, "failure_count": 0}
     finally:
         try:
             await db_queue.stop()
