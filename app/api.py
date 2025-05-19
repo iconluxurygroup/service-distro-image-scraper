@@ -1098,7 +1098,7 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
 async def api_restart_search_all(
     file_id: str,
     entry_id: Optional[int] = None,
-    request_id: Optional[str] = Query(None),  # Add request_id for idempotency
+    request_id: Optional[str] = Query(None),
     background_tasks: BackgroundTasks = None
 ):
     logger, log_filename = setup_job_logger(job_id=file_id)
@@ -1108,7 +1108,9 @@ async def api_restart_search_all(
         # Check if job is already running
         if JOB_STATUS.get(file_id, {}).get("status") in ["queued", "running"]:
             logger.warning(f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
-            raise HTTPException(status_code=400, detail=f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
+            await asyncio.sleep(5)  # Wait 5 seconds
+            if JOB_STATUS.get(file_id, {}).get("status") in ["queued", "running"]:
+                raise HTTPException(status_code=400, detail=f"Job for FileID {file_id} is already {JOB_STATUS[file_id]['status']}")
         
         # Check for duplicate request_id
         if request_id and JOB_STATUS.get(file_id, {}).get("request_id") == request_id:
@@ -1131,7 +1133,8 @@ async def api_restart_search_all(
             "request_id": request_id
         }
         
-        result = await run_job_with_logging(
+        background_tasks.add_task(
+            run_job_with_logging,
             process_restart_batch,
             file_id,
             entry_id=entry_id,
@@ -1139,23 +1142,16 @@ async def api_restart_search_all(
             logger=logger
         )
         
-        if result["status_code"] != 200:
-            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
-            log_public_url = await upload_log_file(file_id, log_filename, logger)
-            raise HTTPException(status_code=result["status_code"], detail=result["message"])
-        
-        logger.info(f"Completed restart batch for FileID: {file_id}")
         return {
             "status": "success",
             "status_code": 200,
-            "message": f"Processing restart with all variations completed for FileID: {file_id}",
-            "data": result["data"]
+            "message": f"Processing restart with all variations queued for FileID: {file_id}",
+            "data": JOB_STATUS[file_id]
         }
     except Exception as e:
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
-
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
     file_id: str,
