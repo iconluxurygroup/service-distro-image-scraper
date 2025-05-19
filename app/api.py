@@ -293,6 +293,8 @@ async def process_results(
     return results
 
 
+
+
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -387,48 +389,20 @@ async def async_process_entry_search(
         logger.info(f"Filtered to {len(valid_results)} non-placeholder results for EntryID {entry_id}")
         if not valid_results:
             logger.warning(f"All results were placeholders for EntryID {entry_id}")
+            # Return placeholders to avoid retry
+            placeholder_result = [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"All results were placeholders for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results"
+            }]
+            await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
+            return placeholder_result
 
-        # Validate results using model and brand checks (relaxed)
-        from common import generate_aliases, validate_model, validate_brand
-        brand_rules = await fetch_brand_rules(logger=logger)
-        brand_aliases = []
-        for rule in brand_rules.get("brand_rules", []):
-            if rule.get("is_active", False) and brand.lower() in [name.lower() for name in rule.get("names", [])]:
-                brand_aliases.extend([clean_string(name).lower() for name in rule.get("names", [])])
-        model_aliases = generate_aliases(search_string)
-
-        filtered_results = []
-        for res in valid_results:
-            row = {
-                "ProductModel": search_string,
-                "ImageDesc": res["ImageDesc"],
-                "ImageSource": res["ImageSource"],
-                "ImageUrl": res["ImageUrl"],
-                "ResultID": f"{entry_id}_{hashlib.md5(res['ImageUrl'].encode()).hexdigest()[:8]}"
-            }
-            # Relax validation: accept results with either model or brand match, or partial matches
-            model_match = validate_model(row, model_aliases, row["ResultID"], logger)
-            brand_match = validate_brand(row, brand_aliases, row["ResultID"], logger=logger)
-            # Add fuzzy matching for partial matches
-            model_fuzzy_match = any(fuzz.partial_ratio(alias, row["ImageDesc"].lower()) > 70 or
-                                    fuzz.partial_ratio(alias, row["ImageSource"].lower()) > 70 or
-                                    fuzz.partial_ratio(alias, row["ImageUrl"].lower()) > 70
-                                    for alias in model_aliases)
-            brand_fuzzy_match = any(fuzz.partial_ratio(alias, row["ImageDesc"].lower()) > 70 or
-                                    fuzz.partial_ratio(alias, row["ImageSource"].lower()) > 70 or
-                                    fuzz.partial_ratio(alias, row["ImageUrl"].lower()) > 70
-                                    for alias in brand_aliases)
-            if model_match or brand_match or model_fuzzy_match or brand_fuzzy_match:
-                filtered_results.append(res)
-                logger.debug(f"Kept result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, "
-                             f"model_fuzzy_match={model_fuzzy_match}, brand_fuzzy_match={brand_fuzzy_match}, "
-                             f"ImageUrl={res['ImageUrl'][:100]}, ImageDesc={res['ImageDesc'][:50]}")
-            else:
-                logger.debug(f"Discarded result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, "
-                             f"model_fuzzy_match={model_fuzzy_match}, brand_fuzzy_match={brand_fuzzy_match}, "
-                             f"ImageUrl={res['ImageUrl'][:100]}, ImageDesc={res['ImageDesc'][:50]}")
-
-        logger.info(f"Filtered to {len(filtered_results)} validated results for EntryID {entry_id}")
+        # Skip validation for testing to confirm non-placeholder results
+        filtered_results = valid_results  # Temporarily bypass validation
+        logger.info(f"Skipped validation, retained {len(filtered_results)} results for EntryID {entry_id}")
 
         # Deduplicate results using a composite key
         deduplicated_results = []
