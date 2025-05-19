@@ -32,7 +32,6 @@ from config import BRAND_RULES_URL, VERSION
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from endpoint_utils import sync_get_endpoint
 from email_utils import send_message_email
 from utils import create_temp_dirs, cleanup_temp_dirs, process_and_tag_results
 from urllib.parse import urlparse
