@@ -183,8 +183,7 @@ async def insert_search_results(
                         inserted_count += result.rowcount
                 except SQLAlchemyError as e:
                     logger.error(f"Worker PID {process.pid}: Failed to process EntryID {param['entry_id']}: {e}")
-                    logger.debug(f"Row n/a
-data: {param}")
+                    logger.debug(f"Row data: {param}")
                     continue
 
             logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(parameters)} rows for FileID {file_id}")
