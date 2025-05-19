@@ -325,6 +325,27 @@ def is_connection_busy_error(exception):
             return "HY000" in str(orig) and "Connection is busy" in str(orig)
     return False
 
+from typing import Optional, Dict, Any, List
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncConnection
+import logging
+import aiofiles
+import json
+import psutil
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
+from pyodbc import Error as PyodbcError
+
+logger = logging.getLogger(__name__)
+process = psutil.Process()
+
+def is_connection_busy_error(exception):
+    if isinstance(exception, SQLAlchemyError):
+        orig = getattr(exception, "orig", None)
+        if isinstance(orig, PyodbcError):
+            return "HY000" in str(orig) and "Connection is busy" in str(orig)
+    return False
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -343,7 +364,7 @@ async def update_search_sort_order(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None,
-    db_queue: Optional[DatabaseQueue] = None
+    db_queue: Optional['DatabaseQueue'] = None
 ) -> Dict[str, Any]:
     logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
@@ -475,6 +496,53 @@ async def update_search_sort_order(
                 logger.error(f"Unexpected error in update_sort_order for EntryID {entry_id}: {e}", exc_info=True)
                 raise
 
+        # Commit sort order data to database
+        async def commit_sort_order_to_db(conn: AsyncConnection, params: List[Dict]) -> int:
+            try:
+                # Create temporary table
+                create_temp_table = text("""
+                    CREATE TABLE #TempSortOrder (
+                        ResultID INT,
+                        EntryID VARCHAR(50),
+                        SortOrder INT
+                    )
+                """)
+                await conn.execute(create_temp_table)
+
+                # Insert values into temp table
+                insert_temp = text("""
+                    INSERT INTO #TempSortOrder (ResultID, EntryID, SortOrder)
+                    VALUES (:result_id, :entry_id, :sort_order)
+                """)
+                for param in params:
+                    await conn.execute(insert_temp, {
+                        "result_id": param["result_id"],
+                        "entry_id": param["entry_id"],
+                        "sort_order": param["sort_order"]
+                    })
+
+                # Update main table from temp table
+                update_query = text("""
+                    UPDATE utb_ImageScraperResult
+                    SET SortOrder = t.SortOrder
+                    FROM utb_ImageScraperResult r
+                    INNER JOIN #TempSortOrder t
+                        ON r.ResultID = t.ResultID AND r.EntryID = t.EntryID
+                """)
+                result = await conn.execute(update_query)
+                row_count = result.rowcount
+                logger.debug(f"Worker PID {process.pid}: Bulk update raw row_count: {row_count}")
+
+                # Drop temp table
+                await conn.execute(text("DROP TABLE #TempSortOrder"))
+                return max(0, row_count)
+            except SQLAlchemyError as e:
+                logger.error(f"SQLAlchemy error in commit_sort_order_to_db for EntryID {entry_id}: {e}", exc_info=True)
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error in commit_sort_order_to_db for EntryID {entry_id}: {e}", exc_info=True)
+                raise
+
         update_params = []
         match_count = 0
         for res in sorted_results:
@@ -488,19 +556,32 @@ async def update_search_sort_order(
         if update_params:
             logger.debug(f"Worker PID {process.pid}: Update params: {update_params}")
             try:
-                row_count = await update_sort_order(update_params)
-                row_count = int(row_count or 0)
-                if row_count < 0:
-                    logger.error(f"Worker PID {process.pid}: Negative row_count {row_count} detected")
-                    row_count = 0
-                logger.info(f"Worker PID {process.pid}: Stored SortOrder for {row_count} rows for EntryID {entry_id}")
+                # Write to JSON file
+                row_count_file = await update_sort_order(update_params)
+                row_count_file = int(row_count_file or 0)
+                if row_count_file < 0:
+                    logger.error(f"Worker PID {process.pid}: Negative row_count {row_count_file} detected in file storage")
+                    row_count_file = 0
+                logger.info(f"Worker PID {process.pid}: Stored SortOrder for {row_count_file} rows for EntryID {entry_id} in file")
+
+                # Write to database
+                row_count_db = await db_queue.enqueue(
+                    commit_sort_order_to_db,
+                    update_params,
+                    connection_type="write"
+                )
+                row_count_db = int(row_count_db or 0)
+                if row_count_db < 0:
+                    logger.error(f"Worker PID {process.pid}: Negative row_count {row_count_db} detected in database update")
+                    row_count_db = 0
+                logger.info(f"Worker PID {process.pid}: Updated SortOrder for {row_count_db} rows for EntryID {entry_id} in database")
             except Exception as e:
-                logger.error(f"Failed to store sort order for EntryID {entry_id}: {e}", exc_info=True)
+                logger.error(f"Failed to process sort order for EntryID {entry_id}: {e}", exc_info=True)
                 return {"success": False, "error": str(e), "entry_id": entry_id}
         else:
-            logger.warning(f"Worker PID {process.pid}: No results to store SortOrder for EntryID {entry_id}")
+            logger.warning(f"Worker PID {process.pid}: No results to process SortOrder for EntryID {entry_id}")
 
-        logger.info(f"Worker PID {process.pid}: Successfully stored sort order for EntryID {entry_id}")
+        logger.info(f"Worker PID {process.pid}: Successfully processed sort order for EntryID {entry_id}")
         return {"success": True, "entry_id": entry_id}
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
