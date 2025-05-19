@@ -1187,10 +1187,9 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
             debug_info["log_url"] = None
 
 
-
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
-    logger, log_filename = await setup_job_logger(job_id=file_id, console_output=True)
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)  # Remove await
     try:
         result = await run_job_with_logging(update_sort_order, file_id)
     except Exception as e:
@@ -1243,7 +1242,6 @@ async def api_match_and_search_sort(file_id: str):
         "log_url": log_public_url,
         "debug_info": result.get("debug_info", {})
     }
-
     
 @router.get("/initial-sort/{file_id}", tags=["Sorting"])
 async def api_initial_sort(file_id: str):
