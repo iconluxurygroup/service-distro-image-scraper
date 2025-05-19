@@ -77,10 +77,10 @@ class SearchClient:
     async def close(self):
         pass  # aiohttp.ClientSession is managed per request
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError))
-    )
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError))
+)
     async def search(self, term: str, brand: str, entry_id: int) -> List[Dict]:
         async with self.semaphore:
             process = psutil.Process()
@@ -93,9 +93,11 @@ class SearchClient:
                         async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
                             body_text = await response.text()
                             body_preview = body_text[:200] if body_text else ""
-                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body={body_preview}")
+                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, "
+                                            f"headers={response.headers}, body={body_preview}")
                             if response.status in (429, 503):
-                                self.logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
+                                self.logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable "
+                                                f"(status {response.status}) for {fetch_endpoint}")
                                 raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
                             response.raise_for_status()
                             result = await response.json()
@@ -104,25 +106,34 @@ class SearchClient:
                                 self.logger.warning(f"Worker PID {process.pid}: No results for term '{term}' in region {region}")
                                 continue
                             results_html_bytes = results if isinstance(results, bytes) else results.encode("utf-8")
-                            formatted_results = process_search_result(results_html_bytes, results_html_bytes, entry_id, self.logger)
+                            formatted_results = process_search_result(results_html_bytes, results_html_bytes, entry_id,
+                                                                    self.logger)
+                            self.logger.debug(f"Worker PID {process.pid}: Parsed {len(formatted_results)} results for "
+                                            f"term '{term}' in region {region}: "
+                                            f"{[(res.get('image_url', ''), res.get('description', '')[:50]) for res in formatted_results]}")
                             if formatted_results:
-                                self.logger.info(f"Worker PID {process.pid}: Found {len(formatted_results)} results for term '{term}' in region {region}")
-                                return [
+                                self.logger.info(f"Worker PID {process.pid}: Found {len(formatted_results)} results for "
+                                                f"term '{term}' in region {region}")
+                                formatted_results_list = [
                                     {
-                                        "EntryID": entry_id,  # Use provided entry_id
+                                        "EntryID": entry_id,
                                         "ImageUrl": res.get("image_url", "placeholder://no-image"),
                                         "ImageDesc": res.get("description", ""),
                                         "ImageSource": res.get("source", "N/A"),
-                                        "ImageUrlThumbnail": res.get("thumbnail_url", res.get("image_url", "placeholder://no-thumbnail"))
+                                        "ImageUrlThumbnail": res.get("thumbnail_url",
+                                                                    res.get("image_url", "placeholder://no-thumbnail"))
                                     }
                                     for res in formatted_results
                                 ]
-                            self.logger.warning(f"Worker PID {process.pid}: Empty results for term '{term}' in region {region}")
-                except (aiohttp.ClientError, json.JSONDecodeError) as e:
-                    self.logger.warning(f"Worker PID {process.pid}: Failed for term '{term}' in region {region}: {e}")
-                    continue
-            self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
-            return []
+                                self.logger.debug(f"Worker PID {process.pid}: Formatted results for term '{term}': "
+                                                f"{[(res['ImageUrl'][:100], res['ImageDesc'][:50]) for res in formatted_results_list]}")
+                                return formatted_results_list
+                            self.logger.warning(f"Worker PID {process.pid}: Empty results for term unsh '{term}' in region {region}")
+                    except (aiohttp.ClientError, json.JSONDecodeError) as e:
+                        self.logger.warning(f"Worker PID {process.pid}: Failed for term '{term}' in region {region}: {e}")
+                        continue
+                self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
+                return []
 async def process_and_tag_results(
     search_string: str,
     brand: Optional[str] = None,
