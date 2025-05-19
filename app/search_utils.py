@@ -324,7 +324,7 @@ async def update_search_sort_order(
     brand_rules: Optional[Dict] = None,
     db_queue: Optional[DatabaseQueue] = None
 ) -> Dict[str, Any]:
-    logger = logger or logger
+    logger = logger or logging.getLogger(__name__)
     process = psutil.Process()
     db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
 
@@ -347,8 +347,12 @@ async def update_search_sort_order(
             fetch_results,
             {"entry_id": entry_id, "file_id": file_id},
             connection_type="read"
-        )
-        logger.debug(f"Worker PID {process.pid}: Fetched {len(rows)} rows for EntryID {entry_id}")
+        ) or (None, None)
+        logger.debug(f"Worker PID {process.pid}: Fetched {len(rows or [])} rows for EntryID {entry_id}")
+
+        if rows is None or columns is None:
+            logger.error(f"Worker PID {process.pid}: Queue returned None for fetch_results, EntryID {entry_id}")
+            return {"success": False, "error": "Queue operation failed", "entry_id": entry_id}
 
         results = [dict(zip(columns, row)) for row in rows]
 
@@ -375,7 +379,7 @@ async def update_search_sort_order(
                 connection_type="write"
             )
             logger.info(f"Worker PID {process.pid}: Inserted placeholder result with SortOrder = -1 for EntryID {entry_id}")
-            return True
+            return {"success": True, "entry_id": entry_id}
 
         # Process brand and model aliases
         brand_clean = clean_string(brand).lower() if brand else ""
@@ -413,160 +417,50 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Perform bulk update
+        # Perform bulk update using a temporary table
         async def update_sort_order(conn: AsyncConnection, params: List[Dict]):
-            query = text("""
-                UPDATE utb_ImageScraperResult
-                SET SortOrder = t.sort_order
-                FROM (VALUES :values) AS t(result_id, entry_id, sort_order)
-                WHERE utb_ImageScraperResult.ResultID = t.result_id AND utb_ImageScraperResult.EntryID = t.entry_id
-            """)
-            values = [(p["result_id"], p["entry_id"], p["sort_order"]) for p in params]
-            result = await conn.execute(query, {"values": values})
-            row_count = result.rowcount
-            logger.debug(f"Worker PID {process.pid}: Bulk update raw row_count: {row_count}")
-            return max(0, row_count)  # Ensure non-negative
+            try:
+                # Create temporary table
+                create_temp_table = text("""
+                    CREATE TABLE #TempSortOrder (
+                        ResultID INT,
+                        EntryID VARCHAR(50),
+                        SortOrder INT
+                    )
+                """)
+                await conn.execute(create_temp_table)
 
-        update_params = []
-        match_count = 0
-        for res in sorted_results:
-            sort_order = -2 if res["priority"] == 4 else (match_count := match_count + 1)
-            update_params.append({
-                "sort_order": sort_order,
-                "result_id": res["ResultID"],
-                "entry_id": entry_id
-            })
+                # Insert values into temp table
+                insert_temp = text("""
+                    INSERT INTO #TempSortOrder (ResultID, EntryID, SortOrder)
+                    VALUES (:result_id, :entry_id, :sort_order)
+                """)
+                for param in params:
+                    await conn.execute(insert_temp, {
+                        "result_id": param["result_id"],
+                        "entry_id": param["entry_id"],
+                        "sort_order": param["sort_order"]
+                    })
 
-        if update_params:
-            logger.debug(f"Worker PID {process.pid}: Update params: {update_params}")
-            row_count = await db_queue.enqueue(
-                update_sort_order,
-                update_params,
-                connection_type="write"
-            )
-            logger.debug(f"Worker PID {process.pid}: Bulk update raw row_count: {row_count}, type: {type(row_count)}")
-            row_count = int(row_count or 0)
-            if row_count < 0:
-                logger.error(f"Worker PID {process.pid}: Negative row_count {row_count} detected")
-                row_count = 0
-            logger.info(f"Worker PID {process.pid}: Bulk updated SortOrder for {row_count} rows for EntryID {entry_id}")
-        else:
-            logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
+                # Update main table from temp table
+                update_query = text("""
+                    UPDATE utb_ImageScraperResult
+                    SET SortOrder = t.SortOrder
+                    FROM utb_ImageScraperResult r
+                    INNER JOIN #TempSortOrder t
+                        ON r.ResultID = t.ResultID AND r.EntryID = t.EntryID
+                """)
+                result = await conn.execute(update_query)
+                row_count = result.rowcount
+                logger.debug(f"Worker PID {process.pid}: Bulk update raw row_count: {row_count}")
 
-        logger.info(f"Worker PID {process.pid}: Successfully updated sort order for EntryID {entry_id}")
-        return {"success": True, "entry_id": entry_id}
-    except SQLAlchemyError as e:
-        logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return {"success": False, "error": str(e), "entry_id": entry_id}
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return {"success": False, "error": str(e), "entry_id": entry_id}    
-    finally:
-        # Do not stop the queue here to allow reuse
-        pass
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError) | retry_if_exception(is_connection_busy_error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_sort_no_image_entry for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_sort_no_image_entry(
-    file_id: str,
-    logger: Optional[logging.Logger] = None,
-    db_queue: Optional[DatabaseQueue] = None
-) -> Optional[Dict]:
-    logger = logger or logger
-    db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
-    await db_queue.start()
-
-    try:
-        file_id = int(file_id)
-        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
-
-        async def fetch_entry_ids(conn: AsyncConnection, params: Dict[str, Any]):
-            query = text("""
-                SELECT EntryID 
-                FROM utb_ImageScraperRecords 
-                WHERE FileID = :file_id
-            """)
-            result = await conn.execute(query, params)
-            entry_ids = [row[0] for row in result.fetchall()]
-            result.close()
-            return entry_ids
-
-        entry_ids = await db_queue.enqueue(
-            fetch_entry_ids,
-            {"file_id": file_id},
-            connection_type="read"
-        )
-        logger.debug(f"Fetched {len(entry_ids)} EntryIDs for FileID {file_id}")
-
-        if not entry_ids:
-            logger.warning(f"No entries found for FileID {file_id}")
-            return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0}
-
-        async def count_null_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
-            query = text("""
-                SELECT COUNT(*) 
-                FROM utb_ImageScraperResult 
-                WHERE EntryID IN :entry_ids AND SortOrder IS NULL
-            """).bindparams(entry_ids=tuple(params["entry_ids"]))
-            result = await conn.execute(query, params)
-            count = result.scalar()
-            result.close()
-            return count
-
-        null_count = await db_queue.enqueue(
-            count_null_sort_order,
-            {"entry_ids": entry_ids},
-            connection_type="read"
-        )
-        logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
-
-        async def delete_placeholders(conn: AsyncConnection, params: Dict[str, Any]):
-            query = text("""
-                DELETE FROM utb_ImageScraperResult
-                WHERE EntryID IN :entry_ids AND ImageUrl = 'placeholder://no-results'
-            """).bindparams(entry_ids=tuple(params["entry_ids"]))
-            result = await conn.execute(query, params)
-            return result.rowcount
-
-        rows_deleted = await db_queue.enqueue(
-            delete_placeholders,
-            {"entry_ids": entry_ids},
-            connection_type="write"
-        )
-        logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
-
-        async def update_null_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
-            query = text("""
-                UPDATE utb_ImageScraperResult
-                SET SortOrder = -2
-                WHERE EntryID IN :entry_ids AND SortOrder IS NULL
-            """).bindparams(entry_ids=tuple(params["entry_ids"]))
-            result = await conn.execute(query, params)
-            return result.rowcount
-
-        rows_updated = await db_queue.enqueue(
-            update_null_sort_order,
-            {"entry_ids": entry_ids},
-            connection_type="write"
-        )
-        rows_updated = int(rows_updated or 0)
-        logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
-        return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
-
-    except SQLAlchemyError as e:
-        logger.error(f"Database error updating entries for FileID {file_id}: {e}", exc_info=True)
-        raise
-    except ValueError as ve:
-        logger.error(f"Invalid file_id format: {file_id}, error: {str(ve)}")
-        return {"error": str(ve)}
-    except Exception as e:
+                # Drop temp table
+                await conn.execute(text("DROP TABLE #TempSortOrder"))
+                return max(0, row_count)
+            except SQLAlchemyError as e:
+                logger.error(f"Worker PID {process.pid}: SQLAlchemy error in update_sort_order: {e}", exc_info=True)
+                raise
+            except Exception as e:
         logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
         return {"error": str(e)}
     finally:
