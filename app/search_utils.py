@@ -324,7 +324,6 @@ def is_connection_busy_error(exception):
         if isinstance(orig, PyodbcError):
             return "HY000" in str(orig) and "Connection is busy" in str(orig)
     return False
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -359,9 +358,11 @@ async def update_search_sort_order(
                 WHERE r.EntryID = :entry_id AND rec.FileID = :file_id
             """)
             result = await conn.execute(query, params)
-            rows = result.fetchall()
-            columns = result.keys()
-            result.close()
+            try:
+                rows = result.fetchall()
+                columns = result.keys()
+            finally:
+                result.close()  # Ensure cursor is closed
             return rows, columns
 
         try:
@@ -458,17 +459,19 @@ async def update_search_sort_order(
                 """)
                 await conn.execute(create_temp_table)
 
-                # Insert values into temp table
+                # Insert values into temp table with explicit cursor reset
                 insert_temp = text("""
                     INSERT INTO #TempSortOrder (ResultID, EntryID, SortOrder)
                     VALUES (:result_id, :entry_id, :sort_order)
                 """)
                 for param in params:
-                    await conn.execute(insert_temp, {
-                        "result_id": param["result_id"],
-                        "entry_id": param["entry_id"],
-                        "sort_order": param["sort_order"]
-                    })
+                    # Execute in a new connection context to avoid state issues
+                    async with async_engine.connect() as insert_conn:
+                        await insert_conn.execute(insert_temp, {
+                            "result_id": param["result_id"],
+                            "entry_id": param["entry_id"],
+                            "sort_order": param["sort_order"]
+                        })
 
                 # Update main table from temp table
                 update_query = text("""
@@ -529,7 +532,6 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return {"success": False, "error": str(e), "entry_id": entry_id}
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -666,8 +668,10 @@ async def update_sort_order(
                 WHERE FileID = :file_id
             """)
             result = await conn.execute(query, params)
-            entries = result.fetchall()
-            result.close()
+            try:
+                entries = result.fetchall()
+            finally:
+                result.close()
             logger.debug(f"Fetched {len(entries)} entries for FileID: {file_id}")
             return entries
 
@@ -720,7 +724,7 @@ async def update_sort_order(
                 results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
                 failure_count += 1
 
-        logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
+        logger.info(f"Completed batch SortOrder update for FileID: {file_id}: {success_count} entries successful, {failure_count} failed")
 
         async def verify_sort_order(conn: AsyncConnection, params: Dict[str, Any]):
             query = text("""
@@ -736,8 +740,10 @@ async def update_sort_order(
                 WHERE r.FileID = :file_id AND t.ImageUrl NOT LIKE 'placeholder://%'
             """)
             result = await conn.execute(query, params)
-            verification = dict(zip(result.keys(), result.fetchone()))
-            result.close()
+            try:
+                verification = dict(zip(result.keys(), result.fetchone()))
+            finally:
+                result.close()
             return verification
 
         entry_ids = tuple(e[0] for e in entries)
@@ -759,8 +765,10 @@ async def update_sort_order(
                 WHERE r.FileID = :file_id
             """)
             result = await conn.execute(query, params)
-            sort_orders = result.fetchall()
-            result.close()
+            try:
+                sort_orders = result.fetchall()
+            finally:
+                result.close()
             return sort_orders
 
         try:
