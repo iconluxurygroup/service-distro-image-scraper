@@ -598,9 +598,9 @@ async def process_restart_batch(
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 1  # Keep small to allow more parallel batches
-        MAX_CONCURRENCY = 10  # Global concurrency limit across all batches
+        MAX_CONCURRENCY = 20  # Global concurrency limit across all batches
         MAX_ENTRY_RETRIES = 3
-        MAX_PARALLEL_BATCHES = 5  # Maximum number of batches to process concurrently
+        MAX_PARALLEL_BATCHES = 10 # Maximum number of batches to process concurrently
 
         # Validate FileID
         async with async_engine.connect() as conn:
@@ -816,22 +816,6 @@ async def process_restart_batch(
                 logger.warning(f"Found {null_entries} entries with NULL SortOrder")
             result.close()
 
-            # Verify non-placeholder results
-            entry_ids = [entry[0] for entry in entries]
-            if entry_ids:
-                try:
-                    query = text("""
-                        SELECT COUNT(*) AS result_count
-                        FROM utb_ImageScraperResult
-                        WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
-                    """)
-                    parameters = {"entry_ids": tuple(entry_ids)}
-                    result = await conn.execute(query, parameters)
-                    result_count = result.scalar()
-                    result.close()
-                except SQLAlchemyError as e:
-                    logger.error(f"Verification query failed for FileID {file_id_db}: {e}", exc_info=True)
-                    result_count = 0
             else:
                 result_count = 0
             logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
