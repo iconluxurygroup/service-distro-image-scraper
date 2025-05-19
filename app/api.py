@@ -11,6 +11,9 @@ import datetime
 import urllib.parse
 import hashlib
 import time
+from sqlalchemy import bindparam
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.sql import text
 import httpx
 import aiohttp
 import pandas as pd
@@ -816,6 +819,27 @@ async def process_restart_batch(
                 logger.warning(f"Found {null_entries} entries with NULL SortOrder")
             result.close()
 
+            # Verify non-placeholder results
+            entry_ids = [entry[0] for entry in entries]  # e.g., [118744]
+            if entry_ids:
+                try:
+                    # Define the query with bindparam and expanding=True
+                    query = text("""
+                        SELECT COUNT(*) AS result_count
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID IN :entry_ids AND ImageUrl NOT LIKE 'placeholder://%'
+                    """).bindparams(bindparam('entry_ids', expanding=True))
+                    
+                    # Pass entry_ids as a list
+                    parameters = {"entry_ids": entry_ids}
+                    
+                    # Execute the query
+                    result = await conn.execute(query, parameters)
+                    result_count = result.scalar()
+                    result.close()
+                except SQLAlchemyError as e:
+                    logger.error(f"Verification query failed for FileID {file_id_db}: {e}", exc_info=True)
+                    result_count = 0
             else:
                 result_count = 0
             logger.info(f"Post-job verification: {result_count} non-placeholder results written for FileID {file_id_db}")
