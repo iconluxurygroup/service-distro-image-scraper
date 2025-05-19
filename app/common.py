@@ -207,7 +207,7 @@ async def generate_search_variations(
         logger.warning("Empty or invalid search string provided")
         return variations
     
-    search_string = clean_string(search_string).lower()
+    search_string = search_string.lower()
     brand = clean_string(brand).lower() if brand else None
     model = clean_string(model).lower() if model else search_string
     color = clean_string(color).lower() if color else None
