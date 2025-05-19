@@ -290,7 +290,6 @@ async def process_results(
 
     return results
 
-
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -302,7 +301,7 @@ async def async_process_entry_search(
 ) -> List[Dict]:
     logger.debug(f"Processing search for EntryID {entry_id}, FileID {file_id_db}, Use all variations: {use_all_variations}")
     
-    # Fix: Await the generate_search_variations call
+    # Generate search variations
     search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
     
     search_terms = []
@@ -311,14 +310,14 @@ async def async_process_entry_search(
         "no_color", "model_alias", "category_specific"
     ]
     
+    # Collect all search terms
     for variation_type in variation_types:
         if variation_type in search_terms_dict:
             search_terms.extend(search_terms_dict[variation_type])
-            if not use_all_variations:
-                break
     
-    search_terms = list(set(search_terms))
-    logger.info(f"Generated {len(search_terms)} search terms for EntryID {entry_id}")
+    # Normalize and deduplicate search terms
+    search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
+    logger.info(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
 
     if not search_terms:
         logger.warning(f"No search terms for EntryID {entry_id}")
@@ -343,6 +342,8 @@ async def async_process_entry_search(
         return all_results
     finally:
         await client.close()
+
+        
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
     try:
@@ -446,9 +447,6 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
     finally:
         log_memory_usage()
 
- 
-
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -492,7 +490,7 @@ async def process_restart_batch(
             if entry_id is not None:
                 async with async_engine.connect() as conn:
                     result = await conn.execute(
-                        text("SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = :file_id AND EntryID > :entry_id"),
+                        text("SELECT MIN(EntryID) FROM utb_ImageScraperRecords WHERE FileID = :file_id AND EntryID > :entry_id AND Step1 IS NULL"),
                         {"file_id": file_id_db_int, "entry_id": entry_id}
                     )
                     next_entry = result.fetchone()
@@ -505,20 +503,23 @@ async def process_restart_batch(
             logger.warning(f"No brand rules fetched")
             return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
-        # Use the primary endpoint directly
         endpoint = SEARCH_PROXY_API_URL
         logger.info(f"Using endpoint: {endpoint} with API key authentication")
 
         async with async_engine.connect() as conn:
             query = text("""
-                SELECT EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory 
-                FROM utb_ImageScraperRecords 
-                WHERE FileID = :file_id AND (:entry_id IS NULL OR EntryID >= :entry_id) 
-                ORDER BY EntryID
+                SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory 
+                FROM utb_ImageScraperRecords r
+                LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+                WHERE r.FileID = :file_id 
+                AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
+                AND r.Step1 IS NULL
+                AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.SortOrder <= 0)
+                ORDER BY r.EntryID
             """)
             result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
             entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
-            logger.info(f"Found {len(entries)} entries")
+            logger.info(f"Found {len(entries)} entries needing processing")
             result.close()
 
         if not entries:
@@ -577,6 +578,15 @@ async def process_restart_batch(
                         if update_result is None or not update_result:
                             logger.error(f"SortOrder update failed for EntryID {entry_id} on attempt {attempt}")
                             continue
+
+                        # Mark Step1 as complete
+                        async with async_engine.connect() as conn:
+                            await conn.execute(
+                                text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
+                                {"entry_id": entry_id}
+                            )
+                            await conn.commit()
+                            logger.info(f"Marked Step1 complete for EntryID {entry_id}")
 
                         return entry_id, True
                     except Exception as e:
