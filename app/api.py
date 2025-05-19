@@ -292,6 +292,8 @@ async def process_results(
 
     return results
 
+
+
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -359,6 +361,7 @@ async def async_process_entry_search(
             if not term_results:
                 logger.warning(f"No results for term '{term}' in EntryID {entry_id}")
                 continue
+            logger.debug(f"Raw results for term '{term}': {[(res['ImageUrl'], res['ImageDesc'][:50]) for res in term_results]}")
             all_results.extend(term_results)
             logger.info(f"Added {len(term_results)} results for term '{term}' in EntryID {entry_id}")
 
@@ -374,15 +377,64 @@ async def async_process_entry_search(
             await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
             return placeholder_result
 
-        # Deduplicate results
+        # Filter out placeholder results early
+        valid_results = [
+            res for res in all_results
+            if not res["ImageUrl"].startswith("placeholder://")
+        ]
+        logger.info(f"Filtered to {len(valid_results)} non-placeholder results for EntryID {entry_id}")
+
+        # Validate results using model and brand checks
+        from common import generate_aliases, validate_model, validate_brand
+        brand_rules = await fetch_brand_rules(logger=logger)
+        brand_aliases = []
+        for rule in brand_rules.get("brand_rules", []):
+            if rule.get("is_active", False) and brand.lower() in [name.lower() for name in rule.get("names", [])]:
+                brand_aliases.extend([clean_string(name).lower() for name in rule.get("names", [])])
+        model_aliases = generate_aliases(search_string)
+
+        filtered_results = []
+        for res in valid_results:
+            row = {
+                "ProductModel": search_string,
+                "ImageDesc": res["ImageDesc"],
+                "ImageSource": res["ImageSource"],
+                "ImageUrl": res["ImageUrl"],
+                "ResultID": f"{entry_id}_{hashlib.md5(res['ImageUrl'].encode()).hexdigest()[:8]}"
+            }
+            model_match = validate_model(row, model_aliases, row["ResultID"], logger)
+            brand_match = validate_brand(row, brand_aliases, row["ResultID"], logger=logger)
+            if model_match or brand_match:
+                filtered_results.append(res)
+                logger.debug(f"Kept result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, ImageUrl={res['ImageUrl']}")
+            else:
+                logger.debug(f"Discarded result for EntryID {entry_id}: model_match={model_match}, brand_match={brand_match}, ImageUrl={res['ImageUrl']}, ImageDesc={res['ImageDesc'][:100]}")
+
+        logger.info(f"Filtered to {len(filtered_results)} validated results for EntryID {entry_id}")
+
+        # Deduplicate results using a composite key
         deduplicated_results = []
-        seen_urls = set()
-        for res in all_results:
-            image_url = res["ImageUrl"]
-            if image_url not in seen_urls and image_url != "placeholder://no-results":
-                seen_urls.add(image_url)
+        seen_keys = set()
+        for res in filtered_results:
+            dedup_key = (res["ImageUrl"], res["ImageDesc"])
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
                 deduplicated_results.append(res)
+            else:
+                logger.debug(f"Discarded duplicate result for EntryID {entry_id}: ImageUrl={res['ImageUrl']}, ImageDesc={res['ImageDesc'][:100]}")
         logger.info(f"Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
+
+        if not deduplicated_results:
+            logger.warning(f"No valid deduplicated results for EntryID {entry_id}")
+            placeholder_result = [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No valid results after deduplication for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results"
+            }]
+            await insert_search_results(placeholder_result, logger=logger, file_id=str(file_id_db))
+            return placeholder_result
 
         return deduplicated_results
     except Exception as e:
@@ -398,7 +450,6 @@ async def async_process_entry_search(
         return placeholder_result
     finally:
         await client.close()
-
 
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
