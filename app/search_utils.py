@@ -310,7 +310,7 @@ async def update_search_sort_order(
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None,
     db_queue: Optional[DatabaseQueue] = None
-) -> Optional[bool]:
+) -> Dict[str, Any]:
     logger = logger or logger
     process = psutil.Process()
     db_queue = db_queue or global_db_queue or DatabaseQueue(logger=logger)
@@ -440,14 +440,14 @@ async def update_search_sort_order(
         else:
             logger.warning(f"Worker PID {process.pid}: No results to update SortOrder for EntryID {entry_id}")
 
-        return True
-
+        logger.info(f"Worker PID {process.pid}: Successfully updated sort order for EntryID {entry_id}")
+        return {"success": True, "entry_id": entry_id}
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return {"error": str(e)}
+        return {"success": False, "error": str(e), "entry_id": entry_id}
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return  {"error": str(e)}
+        return {"success": False, "error": str(e), "entry_id": entry_id}    
     finally:
         # Do not stop the queue here to allow reuse
         pass
@@ -621,12 +621,12 @@ async def update_sort_order(
                     logger=logger,
                     db_queue=db_queue
                 )
-                results.append({"EntryID": entry_id, "Success": bool(entry_results)})
-                if entry_results:
+                results.append({"EntryID": entry_id, "Success": entry_results["success"], "Error": entry_results.get("error")})
+                if entry_results["success"]:
                     success_count += 1
                 else:
                     failure_count += 1
-                    logger.warning(f"No results for EntryID {entry_id}")
+                    logger.warning(f"Failed to update EntryID {entry_id}: {entry_results.get('error', 'Unknown error')}")
             except Exception as e:
                 logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
                 results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
