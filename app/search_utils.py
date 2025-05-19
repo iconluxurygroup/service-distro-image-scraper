@@ -63,34 +63,56 @@ class DatabaseQueue:
             try:
                 operation, params, connection_type, future = await self.queue.get()
                 try:
-                    if connection_type == "read":
-                        async with async_engine.connect() as conn:
-                            if not await self._is_connection_healthy(conn):
-                                raise SQLAlchemyError("Connection unhealthy")
-                            result = await operation(conn, params)
-                            if not future.done():
-                                future.set_result(result)
+                    for attempt in range(3):  # Retry up to 3 times
+                        try:
+                            if connection_type == "read":
+                                async with async_engine.connect() as conn:
+                                    if not await self._is_connection_healthy(conn):
+                                        raise SQLAlchemyError("Connection unhealthy")
+                                    result = await operation(conn, params)
+                                    if not future.done():
+                                        future.set_result(result)
+                                    else:
+                                        self.logger.warning(f"Future already done for operation {operation.__name__}")
+                                    break
                             else:
-                                self.logger.warning(f"Future already done for operation {operation.__name__}")
+                                async with async_engine.begin() as conn:
+                                    if not await self._is_connection_healthy(conn):
+                                        raise SQLAlchemyError("Connection unhealthy")
+                                    result = await operation(conn, params)
+                                    await conn.commit()
+                                    if not future.done():
+                                        future.set_result(result)
+                                    else:
+                                        self.logger.warning(f"Future already done for operation {operation.__name__}")
+                                    break
+                        except SQLAlchemyError as e:
+                            if ("Connection is busy" in str(e) or "Communication link failure" in str(e)) and attempt < 2:
+                                self.logger.warning(f"Connection error, retrying attempt {attempt + 1}/3: {e}")
+                                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                                continue
+                            raise
                     else:
-                        async with async_engine.begin() as conn:
-                            if not await self._is_connection_healthy(conn):
-                                raise SQLAlchemyError("Connection unhealthy")
-                            result = await operation(conn, params)
-                            await conn.commit()
-                            if not future.done():
-                                future.set_result(result)
-                            else:
-                                self.logger.warning(f"Future already done for operation {operation.__name__}")
-                except Exception as e:
-                    self.logger.error(f"Error processing database task: {e}", exc_info=True)
+                        self.logger.error(f"Failed to execute operation {operation.__name__} after 3 attempts")
+                        if not future.done():
+                            try:
+                                future.set_exception(SQLAlchemyError("Max retries reached for connection error"))
+                            except asyncio.InvalidStateError:
+                                self.logger.error(f"Cannot set exception on future for operation {operation.__name__}: invalid state", exc_info=True)
+                except SQLAlchemyError as e:
+                    self.logger.error(f"SQLAlchemy error processing database task: {e}", exc_info=True)
                     if not future.done():
                         try:
                             future.set_exception(e)
                         except asyncio.InvalidStateError:
                             self.logger.error(f"Cannot set exception on future for operation {operation.__name__}: invalid state", exc_info=True)
-                    else:
-                        self.logger.warning(f"Future already done, cannot set exception for operation {operation.__name__}")
+                except Exception as e:
+                    self.logger.error(f"Unexpected error processing database task: {e}", exc_info=True)
+                    if not future.done():
+                        try:
+                            future.set_exception(e)
+                        except asyncio.InvalidStateError:
+                            self.logger.error(f"Cannot set exception on future for operation {operation.__name__}: invalid state", exc_info=True)
                 finally:
                     self.queue.task_done()
             except asyncio.CancelledError:
@@ -98,7 +120,6 @@ class DatabaseQueue:
                 break
             except Exception as e:
                 self.logger.error(f"Unexpected error in queue worker: {e}", exc_info=True)
-
     async def _is_connection_healthy(self, conn: AsyncConnection) -> bool:
         try:
             await conn.execute(text("SELECT 1"))
