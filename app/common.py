@@ -279,7 +279,7 @@ async def generate_search_variations(
                     break
 
     if no_color_string == search_string:
-        for delim in ['_', '-', ' ']:
+        for delim in ['_', '-', ' ', '/', '.']:
             if delim in search_string:
                 no_color_string = search_string.rsplit(delim, 1)[0]
                 logger.debug(f"Fallback no-color string: '{no_color_string}' using delimiter '{delim}'")
