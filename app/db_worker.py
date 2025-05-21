@@ -62,24 +62,34 @@ class RabbitMQConsumer:
         logger.info("Waiting for messages. To exit press CTRL+C")
         self.channel.start_consuming()
 
-    async def execute_update(self, sql: str, params: dict):
+    async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
         try:
             async with async_engine.begin() as conn:
                 result = await conn.execute(text(sql), params)
                 await conn.commit()
                 rowcount = result.rowcount if result.rowcount is not None else 0
-                logger.info(f"Executed SQL: {sql[:100]} with params: {params}, affected {rowcount} rows")
+                logger.info(
+                    f"TaskType: {task_type}, FileID: {file_id}, Executed SQL: {sql[:100]} "
+                    f"with params: {params}, affected {rowcount} rows"
+                )
                 return True
         except SQLAlchemyError as e:
-            logger.error(f"Database error executing SQL: {sql[:100]}, params: {params}, error: {e}", exc_info=True)
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, Database error executing SQL: {sql[:100]}, "
+                f"params: {params}, error: {e}",
+                exc_info=True
+            )
             return False
         except Exception as e:
-            logger.error(f"Unexpected error executing SQL: {sql[:100]}, params: {params}, error: {e}", exc_info=True)
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing SQL: {sql[:100]}, "
+                f"params: {params}, error: {e}",
+                exc_info=True
+            )
             return False
 
-    async def execute_sort_order_update(self, params: dict):
+    async def execute_sort_order_update(self, params: dict, file_id: str):
         try:
-            file_id = params.get("file_id")
             entry_id = params.get("entry_id")
             brand = params.get("brand")
             search_string = params.get("search_string")
@@ -127,28 +137,49 @@ class RabbitMQConsumer:
         try:
             message = body.decode()
             task = json.loads(message)
-            logger.info(f"Received task for FileID: {task.get('file_id')}, TaskType: {task.get('task_type')}")
+            file_id = task.get("file_id", "unknown")
+            task_type = task.get("task_type", "unknown")
+            logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {message[:200]}")
 
             sql = task.get("sql")
             params = task.get("params", {})
-            file_id = task.get("file_id")
-            task_type = task.get("task_type")
 
             loop = asyncio.get_event_loop()
             if task_type == "update_sort_order" and sql == "UPDATE_SORT_ORDER":
-                success = loop.run_until_complete(self.execute_sort_order_update(params))
+                success = loop.run_until_complete(self.execute_sort_order_update(params, file_id))
             else:
-                success = loop.run_until_complete(self.execute_update(sql, params))
+                success = loop.run_until_complete(self.execute_update(sql, params, task_type, file_id))
 
             if success:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
-                logger.info(f"Processed {task_type} for FileID: {file_id}")
+                logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
             else:
-                logger.warning(f"Failed {task_type} for FileID: {file_id}; re-queued")
+                logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
                 time.sleep(2)
         except Exception as e:
-            logger.error(f"Error processing message for FileID: {task.get('file_id', 'unknown')}: {e}", exc_info=True)
+            logger.error(
+                f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
+                exc_info=True
+            )
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
             time.sleep(2)
+
+    async def test_task(self, task: dict):
+        """Simulate processing a single task for testing purposes."""
+        file_id = task.get("file_id", "unknown")
+        task_type = task.get("task_type", "unknown")
+        sql = task.get("sql")
+        params = task.get("params", {})
+        
+        logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
+        if task_type == "update_sort_order" and sql == "UPDATE_SORT_ORDER":
+            success = await self.execute_sort_order_update(params, file_id)
+        else:
+            success = await self.execute_update(sql, params, task_type, file_id)
+        
+        logger.info(f"Test task result for FileID: {file_id}, TaskType: {task_type}: {'Success' if success else 'Failed'}")
+        return success
 
 def signal_handler(sig, frame):
     logger.info("Received SIGINT, shutting down gracefully...")
@@ -158,7 +189,8 @@ def signal_handler(sig, frame):
 if __name__ == "__main__":
     consumer = RabbitMQConsumer()
     signal.signal(signal.SIGINT, signal_handler)
-    try:
+    
+        # Then start consuming from queue
         consumer.connect()
         consumer.start_consuming()
     except KeyboardInterrupt:
