@@ -199,10 +199,10 @@ async def insert_search_results(
                 FROM utb_ImageScraperResult
                 WHERE EntryID IN ({placeholders})
             """
-            params = tuple(entry_ids)
+            params = {"ids": list(entry_ids)}
             await enqueue_db_update(
                 file_id=file_id,
-                sql=select_query,  # Pass as string, not TextClause
+                sql=select_query,
                 params=params,
                 background_tasks=background_tasks,
                 task_type="select_deduplication",
@@ -210,6 +210,7 @@ async def insert_search_results(
                 response_queue=response_queue
             )
             logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+
             # Wait for SELECT results
             consume_task = asyncio.create_task(consume_responses())
             try:
