@@ -98,6 +98,8 @@ async def load_config(
                 return fallback
     logger.error(f"Critical failure loading {config_name} from {url}, using fallback")
     return fallback
+
+
 async def preprocess_sku(
     search_string: str,
     brand_rules: Optional[Dict] = None,
@@ -127,9 +129,11 @@ async def preprocess_sku(
         with_color_length = expected_length.get("with_color", [base_length])[0]
         color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
 
+        # Check if SKU length is compatible
         if not (base_length - 2 <= len(search_string_clean) <= with_color_length + 2):
             continue
 
+        # Try splitting on color_separator
         if color_separator:
             parts = search_string_clean.rsplit(color_separator, 1)
             if len(parts) > 1:
@@ -146,6 +150,7 @@ async def preprocess_sku(
                     )
                     break
 
+        # Fallback: Match base length
         if abs(len(search_string_clean) - base_length) <= 2:
             brand = full_name
             model = search_string_clean
@@ -182,26 +187,26 @@ def generate_aliases(model: Any) -> List[str]:
     model = clean_string(model).lower()
     aliases = set()
     aliases.add(model)
-    
-    # Remove separators
-    separators = ['_', '-', ' ', '/', '.']
-    base_model = model
-    for sep in separators:
-        base_model = base_model.replace(sep, '')
-    aliases.add(base_model)
 
     # Digits-only
-    digits_only = re.sub(r'[^0-9]', '', base_model)
+    digits_only = re.sub(r'[^0-9]', '', model)
     if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
 
-    # Substring aliases (e.g., article or model parts)
-    if len(model) >= 10:  # Typical model length
-        # Split into potential article and model parts (e.g., 8+7 for Off-White)
-        for i in range(4, len(model) - 4):  # Avoid overly short or long splits
-            aliases.add(model[:i])
-            aliases.add(model[i:])
-    
+    # Delimiter variations
+    delimiters = ['-', '_', ' ']
+    for delim in delimiters:
+        # Add delimiters between potential parts (e.g., after 8 chars for Off-White article)
+        if len(model) >= 8:
+            alias = f"{model[:8]}{delim}{model[8:]}"
+            aliases.add(alias)
+        # Split on existing delimiters and rejoin with new ones
+        for sep in delimiters:
+            if sep in model:
+                parts = model.split(sep)
+                if len(parts) > 1:
+                    aliases.add(delim.join(parts))
+
     return [a for a in aliases if a and len(a) >= 4]
 
 async def fetch_brand_rules(
@@ -316,35 +321,6 @@ async def generate_search_variations(
         logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations: {brand_alias_variations}")
 
     no_color_string = model
-    if brand and brand_rules_data and "brand_rules" in brand_rules_data:
-        for rule in brand_rules_data["brand_rules"]:
-            if any(clean_string(brand).lower() in clean_string(name).lower() for name in rule.get("names", [])):
-                sku_format = rule.get("sku_format", {})
-                color_separator = sku_format.get("color_separator", "")
-                expected_length = rule.get("expected_length", {})
-                base_length = expected_length.get("base", [0])[0]
-                color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
-
-                logger.debug(f"Processing brand {brand} with color_separator '{color_separator}', base_length {base_length}")
-
-                if color_separator and color_separator in search_string:
-                    parts = search_string.rsplit(color_separator, 1)
-                    if len(parts) > 1:
-                        base_part = parts[0].strip()
-                        color_part = parts[1].strip()
-                        if (abs(len(base_part) - base_length) <= 2 and
-                            len(color_part) <= color_extension_length + 2):
-                            no_color_string = base_part
-                            logger.debug(
-                                f"Extracted no-color string: '{no_color_string}' using separator '{color_separator}', "
-                                f"color: '{color_part}'"
-                            )
-                            break
-                if abs(len(search_string) - base_length) <= 2:
-                    no_color_string = search_string
-                    logger.debug(f"No color suffix detected, using: '{no_color_string}'")
-                    break
-
     variations["no_color"].append(no_color_string)
     logger.debug(f"Added no-color variation: '{no_color_string}'")
 
