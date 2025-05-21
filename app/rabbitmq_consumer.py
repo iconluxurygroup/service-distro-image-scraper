@@ -86,20 +86,20 @@ class RabbitMQConsumer:
                 await conn.commit()
                 rowcount = result.rowcount if result.rowcount is not None else 0
                 logger.info(
-                    f"TaskType: {task_type}, FileID: {file_id}, Executed SQL: {sql[:100]} "
-                    f"with params: {params}, affected {rowcount} rows"
+                    f"TaskType: {task_type}, FileID: {file_id}, Executed SQL: {sql}, "
+                    f"params: {params}, affected {rowcount} rows"
                 )
                 return True
         except SQLAlchemyError as e:
             logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Database error executing SQL: {sql[:100]}, "
+                f"TaskType: {task_type}, FileID: {file_id}, Database error executing SQL: {sql}, "
                 f"params: {params}, error: {e}",
                 exc_info=True
             )
             return False
         except Exception as e:
             logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing SQL: {sql[:100]}, "
+                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing SQL: {sql}, "
                 f"params: {params}, error: {e}",
                 exc_info=True
             )
