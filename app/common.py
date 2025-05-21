@@ -98,7 +98,71 @@ async def load_config(
                 return fallback
     logger.error(f"Critical failure loading {config_name} from {url}, using fallback")
     return fallback
+async def preprocess_sku(
+    search_string: str,
+    brand_rules: Optional[Dict] = None,
+    logger: Optional[logging.Logger] = None
+) -> Tuple[str, Optional[str], Optional[str]]:
+    logger = logger or default_logger
+    brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
+    brand = None
+    model = search_string
+    color = None
 
+    if not search_string or not isinstance(search_string, str):
+        logger.warning(f"Invalid search string: {search_string}")
+        return search_string, None, search_string
+
+    search_string_clean = clean_string(search_string).lower()
+
+    for rule in brand_rules_data.get("brand_rules", []):
+        if not rule.get("is_active", False):
+            continue
+
+        full_name = rule.get("full_name", "")
+        sku_format = rule.get("sku_format", {})
+        color_separator = sku_format.get("color_separator", "")
+        expected_length = rule.get("expected_length", {})
+        base_length = expected_length.get("base", [0])[0]
+        with_color_length = expected_length.get("with_color", [base_length])[0]
+        color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
+
+        # Check if SKU matches brand's expected length (with or without color)
+        if not (base_length - 2 <= len(search_string_clean) <= with_color_length + 2):
+            continue
+
+        # Try to split on color_separator
+        if color_separator:
+            parts = search_string_clean.rsplit(color_separator, 1)
+            if len(parts) > 1:
+                base_part = parts[0].strip()
+                color_part = parts[1].strip()
+                # Validate base_part and color_part lengths
+                if (abs(len(base_part) - base_length) <= 2 and
+                    len(color_part) <= color_extension_length + 2):
+                    brand = full_name
+                    model = base_part
+                    color = color_part
+                    logger.debug(
+                        f"Preprocessed SKU '{search_string}' to brand '{brand}', "
+                        f"model '{model}', color '{color}' using separator '{color_separator}'"
+                    )
+                    break
+
+        # Fallback: Check if SKU matches base length (no color)
+        if abs(len(search_string_clean) - base_length) <= 2:
+            brand = full_name
+            model = search_string_clean
+            logger.debug(
+                f"Preprocessed SKU '{search_string}' to brand '{brand}', "
+                f"model '{model}' (no color separator)"
+            )
+            break
+
+    if not brand:
+        logger.debug(f"No brand matched for SKU '{search_string}'")
+
+    return search_string, brand, model
 def clean_string(s: str, preserve_url: bool = False) -> str:
     if not isinstance(s, str):
         return ''
@@ -203,15 +267,18 @@ async def generate_search_variations(
         logger.warning("Empty or invalid search string provided")
         return variations
     
-    search_string = search_string.lower()
+    search_string = clean_string(search_string).lower()
     brand = clean_string(brand).lower() if brand else None
     model = clean_string(model).lower() if model else search_string
     color = clean_string(color).lower() if color else None
     category = clean_string(category).lower() if category else None
 
+    brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
+
     variations["default"].append(search_string)
     logger.debug(f"Added default variation: '{search_string}'")
 
+    # Generate delimiter variations
     delimiters = [' ', '-', '_', '/', '.']
     delimiter_variations = []
     for delim in delimiters:
@@ -223,6 +290,7 @@ async def generate_search_variations(
     variations["delimiter_variations"] = list(set(delimiter_variations))
     logger.debug(f"Generated {len(delimiter_variations)} delimiter variations: {delimiter_variations}")
 
+    # Generate color variations
     if color:
         color_variations = [
             f"{search_string} {color}",
@@ -232,8 +300,8 @@ async def generate_search_variations(
         variations["color_variations"] = list(set(color_variations))
         logger.debug(f"Generated {len(color_variations)} color variations: {color_variations}")
 
+    # Generate brand aliases
     if brand:
-        brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
         predefined_aliases = {}
         for rule in brand_rules_data.get("brand_rules", []):
             if rule.get("is_active", False):
@@ -250,7 +318,8 @@ async def generate_search_variations(
         variations["brand_alias"] = list(set(brand_alias_variations))
         logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations: {brand_alias_variations}")
 
-    no_color_string = search_string
+    # Generate no-color variation
+    no_color_string = model  # Use pre-processed model
     if brand and brand_rules_data and "brand_rules" in brand_rules_data:
         for rule in brand_rules_data["brand_rules"]:
             if any(clean_string(brand).lower() in clean_string(name).lower() for name in rule.get("names", [])):
@@ -258,42 +327,36 @@ async def generate_search_variations(
                 color_separator = sku_format.get("color_separator", "")
                 expected_length = rule.get("expected_length", {})
                 base_length = expected_length.get("base", [0])[0]
-                with_color_length = expected_length.get("with_color", [base_length])[0]
+                color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
 
-                logger.debug(f"Processing brand {brand} with color_separator '{color_separator}', base_length {base_length}, with_color_length {with_color_length}")
+                logger.debug(f"Processing brand {brand} with color_separator '{color_separator}', base_length {base_length}")
 
-                if color_separator:
-                    parts = search_string.rsplit(color_separator, 1)  # Use rsplit to get the last occurrence
+                if color_separator and color_separator in search_string:
+                    parts = search_string.rsplit(color_separator, 1)
                     if len(parts) > 1:
                         base_part = parts[0].strip()
                         color_part = parts[1].strip()
-                        # Check if base_part length is close to base_length and total length is within with_color_length
                         if (abs(len(base_part) - base_length) <= 2 and
-                            len(search_string) <= with_color_length + 2):
+                            len(color_part) <= color_extension_length + 2):
                             no_color_string = base_part
-                            logger.debug(f"Extracted no-color string: '{no_color_string}' using separator '{color_separator}', color: '{color_part}'")
+                            logger.debug(
+                                f"Extracted no-color string: '{no_color_string}' using separator '{color_separator}', "
+                                f"color: '{color_part}'"
+                            )
                             break
-                # Fallback: if no color separator or length matches base_length
-                if len(search_string) <= base_length + 2:
+                if abs(len(search_string) - base_length) <= 2:
                     no_color_string = search_string
                     logger.debug(f"No color suffix detected, using: '{no_color_string}'")
                     break
 
-    if no_color_string == search_string:
-        for delim in ['_', '-', ' ']:
-            if delim in search_string:
-                no_color_string = search_string.rsplit(delim, 1)[0]
-                logger.debug(f"Fallback no-color string: '{no_color_string}' using delimiter '{delim}'")
-                break
-
     variations["no_color"].append(no_color_string)
     logger.debug(f"Added no-color variation: '{no_color_string}'")
 
+    # Generate model aliases
     if model:
         model_aliases = generate_aliases(model)
-        model_alias_variations = [alias for alias in model_aliases]
-        variations["model_alias"] = list(set(model_alias_variations))
-        logger.debug(f"Generated {len(model_alias_variations)} model alias variations: {model_alias_variations}")
+        variations["model_alias"] = list(set(model_aliases))
+        logger.debug(f"Generated {len(model_aliases)} model alias variations: {model_aliases}")
     
     for key in variations:
         variations[key] = list(set(variations[key]))
@@ -302,6 +365,7 @@ async def generate_search_variations(
     logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
     return variations
 
+    
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
     brand_clean = clean_string(brand).lower()
     if not brand_clean:
