@@ -234,22 +234,37 @@ class RabbitMQConsumer:
 
             loop = asyncio.get_event_loop()
             if task_type == "select_deduplication":
-                async def run_select():
-                    async with async_engine.connect() as conn:
-                        logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
+                async def run_select(self, task, conn, logger):
+                    file_id = task.get("file_id")
+                    response_queue = task.get("response_queue")
+
+                    try:
                         result = await self.execute_select(task, conn, logger)
+                        # Result is a list of dictionaries from execute_select
+                        logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(result)} rows for FileID: {file_id}")
+
+                        # Format the response as a dictionary
+                        response = {"file_id": file_id, "results": result}
+
+                        # Send response to RabbitMQ if response_queue is specified
                         if response_queue:
-                            response_message = json.dumps(result)
-                            ch.basic_publish(
-                                exchange="",
-                                routing_key=response_queue,
-                                body=response_message,
-                                properties=pika.BasicProperties(
-                                    correlation_id=properties.correlation_id
+                            # Assuming RabbitMQProducer is initialized elsewhere or needs to be passed
+                            producer = RabbitMQProducer()  # Initialize producer (fix for previous 'producer' error)
+                            try:
+                                producer.publish_message(
+                                    exchange="",
+                                    routing_key=response_queue,
+                                    body=json.dumps(response),
+                                    correlation_id=file_id
                                 )
-                            )
-                            logger.info(f"Sent {len(result['results'])} deduplication results to {response_queue} for FileID: {file_id}")
-                        return result
+                                logger.info(f"Sent {len(result)} deduplication results to {response_queue} for FileID: {file_id}")
+                            finally:
+                                producer.close()
+
+                        return response
+                    except Exception as e:
+                        logger.error(f"Error in run_select for FileID {file_id}: {e}", exc_info=True)
+                        raise
                 success = loop.run_until_complete(run_select())
             elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
                 success = loop.run_until_complete(self.execute_sort_order_update(task.get("params", {}), file_id))
