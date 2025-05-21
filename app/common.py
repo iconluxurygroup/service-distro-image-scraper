@@ -193,9 +193,9 @@ def generate_aliases(model: Any) -> List[str]:
     if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
 
-    # Delimiter variations (insert delimiters after article part)
+    # Delimiter variations (insert after article, e.g., 8 chars for Off-White)
     delimiters = ['-', '_', ' ']
-    article_length = 8  # Default for Off-White; can be adjusted dynamically if needed
+    article_length = 8  # Default; can be dynamic from sku_format
     if len(model) >= article_length:
         for delim in delimiters:
             alias = f"{model[:article_length]}{delim}{model[article_length:]}"
