@@ -133,8 +133,13 @@ class RabbitMQConsumer:
                 raise
 
     async def execute_select(self, task, conn, logger):
-        async with conn:
-            try:
+        try:
+            # Ensure connection is not already started
+            if hasattr(conn, '_connection') and conn._connection is not None:
+                await conn.close()  # Close any existing connection
+                logger.debug(f"Closed existing connection for FileID {task.get('file_id')} before starting new operation")
+            
+            async with conn:
                 file_id = task.get("file_id")
                 sql = task.get("sql")
                 params = task.get("params", {})
@@ -153,17 +158,16 @@ class RabbitMQConsumer:
                 logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
                 return {"results": results}
             
-            except SQLAlchemyError as e:
-                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                            f"Database error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
-                            exc_info=True)
-                raise
-            except Exception as e:
-                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                            f"Unexpected error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
-                            exc_info=True)
-                raise
-
+        except SQLAlchemyError as e:
+            logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                        f"Database error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
+                        exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                        f"Unexpected error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
+                        exc_info=True)
+            raise
     async def execute_sort_order_update(self, params: dict, file_id: str):
         try:
             entry_id = params.get("entry_id")
@@ -223,6 +227,7 @@ class RabbitMQConsumer:
                 async def run_select():
                     nonlocal conn
                     async with async_engine.connect() as conn:
+                        logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
                         result = await self.execute_select(task, conn, logger)
                         if response_queue:
                             response_message = json.dumps(result)
@@ -243,6 +248,7 @@ class RabbitMQConsumer:
                 async def run_update():
                     nonlocal conn
                     async with async_engine.begin() as conn:
+                        logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
                         result = await self.execute_update(task, conn, logger)
                         return result
                 success = loop.run_until_complete(run_update())
