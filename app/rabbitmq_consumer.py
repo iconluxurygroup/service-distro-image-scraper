@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import asyncio
+import psutil
 import signal
 import sys
 import datetime
