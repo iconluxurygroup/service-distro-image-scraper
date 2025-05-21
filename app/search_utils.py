@@ -120,6 +120,10 @@ async def insert_search_results(
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
             image_url_thumbnail = ""
 
+        # Filter irrelevant URLs for footwear
+        if category == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
+            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
+            continue
 
         data.append({
             "EntryID": entry_id,
@@ -140,46 +144,70 @@ async def insert_search_results(
 
     try:
         async with async_engine.begin() as conn:
-            # Perform bulk insert with update-on-duplicate logic
-            # Note: SQL Server doesn't support ON DUPLICATE KEY UPDATE, so we use a merge approach
-            temp_table = f"temp_utb_ImageScraperResult_{file_id}_{process.pid}"
-            create_temp_query = text(f"""
-                CREATE TABLE {temp_table} (
-                    EntryID INT,
-                    ImageUrl NVARCHAR(MAX),
-                    ImageDesc NVARCHAR(MAX),
-                    ImageSource NVARCHAR(MAX),
-                    ImageUrlThumbnail NVARCHAR(MAX),
-                    CreateTime DATETIME
+            # Step 1: Update existing rows
+            update_df = df[["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail", "CreateTime"]]
+            update_df = update_df.rename(columns={
+                "ImageDesc": "NewImageDesc",
+                "ImageSource": "NewImageSource",
+                "ImageUrlThumbnail": "NewImageUrlThumbnail",
+                "CreateTime": "NewCreateTime"
+            })
+            # Insert DataFrame into a temporary result set using a CTE
+            update_query = text("""
+                WITH UpdateData AS (
+                    SELECT :entry_id AS EntryID,
+                           CAST(:image_url AS NVARCHAR(MAX)) AS ImageUrl,
+                           CAST(:new_image_desc AS NVARCHAR(MAX)) AS NewImageDesc,
+                           CAST(:new_image_source AS NVARCHAR(MAX)) AS NewImageSource,
+                           CAST(:new_image_url_thumbnail AS NVARCHAR(MAX)) AS NewImageUrlThumbnail,
+                           :new_create_time AS NewCreateTime
                 )
+                UPDATE utb_ImageScraperResult
+                SET ImageDesc = ud.NewImageDesc,
+                    ImageSource = ud.NewImageSource,
+                    ImageUrlThumbnail = ud.NewImageUrlThumbnail,
+                    CreateTime = ud.NewCreateTime
+                FROM utb_ImageScraperResult r
+                INNER JOIN UpdateData ud ON r.EntryID = ud.EntryID AND r.ImageUrl = ud.ImageUrl
+                WHERE r.EntryID = :entry_id
             """)
-            await conn.execute(create_temp_query)
+            updated_count = 0
+            for _, row in update_df.iterrows():
+                result = await conn.execute(update_query, {
+                    "entry_id": row["EntryID"],
+                    "image_url": row["ImageUrl"],
+                    "new_image_desc": row["NewImageDesc"],
+                    "new_image_source": row["NewImageSource"],
+                    "new_image_url_thumbnail": row["NewImageUrlThumbnail"],
+                    "new_create_time": row["NewCreateTime"]
+                })
+                updated_count += result.rowcount
 
-            # Bulk insert into temporary table
-            df.to_sql(temp_table, conn.engine, if_exists='append', index=False, method='multi')
-            logger.debug(f"Worker PID {process.pid}: Inserted {len(df)} rows into temporary table {temp_table}")
-
-            # Merge into main table (update or insert)
-            merge_query = text(f"""
-                MERGE INTO utb_ImageScraperResult AS target
-                USING {temp_table} AS source
-                ON target.EntryID = source.EntryID AND target.ImageUrl = source.ImageUrl
-                WHEN MATCHED THEN
-                    UPDATE SET
-                        ImageDesc = source.ImageDesc,
-                        ImageSource = source.ImageSource,
-                        ImageUrlThumbnail = source.ImageUrlThumbnail,
-                        CreateTime = source.CreateTime
-                WHEN NOT MATCHED THEN
-                    INSERT (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
-                    VALUES (source.EntryID, source.ImageUrl, source.ImageDesc, source.ImageSource, source.ImageUrlThumbnail, source.CreateTime);
+            # Step 2: Insert new rows (excluding those already updated)
+            # Check existing rows
+            existing_query = text("""
+                SELECT EntryID, ImageUrl
+                FROM utb_ImageScraperResult
+                WHERE EntryID = :entry_id
             """)
-            result = await conn.execute(merge_query)
-            affected_rows = result.rowcount
-            logger.info(f"Worker PID {process.pid}: Merged {affected_rows} rows into utb_ImageScraperResult for FileID {file_id}")
+            result = await conn.execute(existing_query, {"entry_id": data[0]["EntryID"]})
+            existing_rows = {(row[0], row[1]) for row in result.fetchall()}
+            insert_df = df[~df[["EntryID", "ImageUrl"]].apply(tuple, axis=1).isin(existing_rows)]
+            
+            if not insert_df.empty:
+                insert_df.to_sql(
+                    "utb_ImageScraperResult",
+                    conn.engine,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=1000
+                )
+                inserted_count = len(insert_df)
+            else:
+                inserted_count = 0
 
-            # Drop temporary table
-            await conn.execute(text(f"DROP TABLE {temp_table}"))
+            logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(df)} rows for FileID {file_id}")
 
             # Verify insertion
             verify_query = text("""
@@ -188,10 +216,10 @@ async def insert_search_results(
                 WHERE EntryID = :entry_id AND ImageUrl NOT LIKE 'placeholder%'
             """)
             result = await conn.execute(verify_query, {"entry_id": data[0]["EntryID"]})
-            inserted_count = result.scalar()
-            logger.info(f"Worker PID {process.pid}: Verified {inserted_count} non-placeholder results for EntryID {data[0]['EntryID']}")
+            verified_count = result.scalar()
+            logger.info(f"Worker PID {process.pid}: Verified {verified_count} non-placeholder results for EntryID {data[0]['EntryID']}")
 
-            return inserted_count > 0
+            return inserted_count > 0 or updated_count > 0
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error inserting results for FileID {file_id}: {e}", exc_info=True)
@@ -199,13 +227,6 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
-    finally:
-        # Ensure temporary table is dropped even on failure
-        try:
-            async with async_engine.begin() as conn:
-                await conn.execute(text(f"DROP TABLE IF EXISTS {temp_table}"))
-        except Exception as e:
-            logger.warning(f"Worker PID {process.pid}: Failed to drop temporary table {temp_table}: {e}")
 
 @retry(
     stop=stop_after_attempt(3),
