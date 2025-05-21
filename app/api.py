@@ -1305,7 +1305,46 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
         logger.error(f"Error enqueuing Step1 reset for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error enqueuing Step1 reset for FileID {file_id}: {str(e)}")
-    
+@router.get("/monitor-queue/{file_id}", tags=["Monitoring"])
+async def api_monitor_queue(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    try:
+        # Check RabbitMQ queue
+        consumer = RabbitMQConsumer()
+        consumer.connect()
+        queue_info = consumer.channel.queue_declare(queue=consumer.queue_name, passive=True)
+        message_count = queue_info.method.message_count
+        consumer.close()
+
+        # Check recent database updates
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT TOP 5 EntryID, ResultID, SortOrder, CreateTime
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN (
+                        SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
+                    )
+                    ORDER BY CreateTime DESC
+                """),
+                {"file_id": int(file_id)}
+            )
+            recent_updates = [dict(row) for row in result.fetchall()]
+            result.close()
+
+        return {
+            "status_code": 200,
+            "message": f"Queue and database status for FileID: {file_id}",
+            "data": {
+                "queue_name": "db_update_queue",
+                "message_count": message_count,
+                "recent_updates": recent_updates
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error monitoring queue for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error monitoring queue: {str(e)}")    
 from contextlib import asynccontextmanager
 import signal
 import asyncio
