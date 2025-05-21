@@ -296,17 +296,16 @@ class RabbitMQConsumer:
     async def test_task(self, task: dict):
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
-        sql = task.get("sql")
-        params = task.get("params", {})
-        response_queue = task.get("response_queue")
         
         logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
         if task_type == "select_deduplication":
-            success = await self.execute_select(sql, params, task_type, file_id, response_queue)
-        elif task_type == "update_sort_order" and sql == "UPDATE_SORT_ORDER":
-            success = await self.execute_sort_order_update(params, file_id)
+            async with async_engine.connect() as conn:
+                success = await self.execute_select(task, conn, logger)
+        elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
+            success = await self.execute_sort_order_update(task.get("params", {}), file_id)
         else:
-            success = await self.execute_update(sql, params, task_type, file_id)
+            async with async_engine.begin() as conn:
+                success = await self.execute_update(task, conn, logger)
         
         logger.info(f"Test task result for FileID: {file_id}, TaskType: {task_type}: {'Success' if success else 'Failed'}")
         return success
