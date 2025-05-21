@@ -13,7 +13,7 @@ import psutil
 import pyodbc
 import re
 import urllib.parse
-
+import pandas as pd
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
