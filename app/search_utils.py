@@ -206,14 +206,14 @@ async def insert_search_results(
                 background_tasks=background_tasks,
                 task_type="select_deduplication",
                 producer=producer,
-                response_queue=response_queue  # Pass response queue
+                response_queue=response_queue
             )
             logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
 
             # Wait for SELECT results
             consume_task = asyncio.create_task(consume_responses())
             try:
-                await asyncio.wait_for(response_received.wait(), timeout=30)  # 30s timeout
+                await asyncio.wait_for(response_received.wait(), timeout=30)
                 existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
                 logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
             except asyncio.TimeoutError:
