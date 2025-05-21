@@ -865,18 +865,6 @@ async def process_restart_batch(
                                 if attempt < MAX_ENTRY_RETRIES:
                                     await asyncio.sleep(2 ** attempt)
                                 continue
-                        logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                        sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
-                        params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
-                        await enqueue_db_update(
-                            file_id=str(file_id_db),
-                            sql=sql,
-                            params=params,
-                            background_tasks=background_tasks,
-                            task_type="failed_entry",
-                            producer=producer,
-                        )
-                        return entry_id, False
                     except Exception as e:
                         logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
                         return entry_id, False
