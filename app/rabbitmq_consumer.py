@@ -145,11 +145,9 @@ class RabbitMQConsumer:
 
         logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql}, params: {params}")
 
-        # Remove the strict 'ids' check and validate params dynamically
+        # Validate params for named placeholders
         if not params:
             raise ValueError(f"No parameters provided for SELECT query: {select_sql}")
-
-        # Check if params contain named placeholders (e.g., id0, id1, ...)
         if any(k.startswith("id") for k in params.keys()):
             logger.debug(f"Detected named placeholder parameters: {params}")
         else:
@@ -166,16 +164,17 @@ class RabbitMQConsumer:
             results = [dict(zip(columns, row)) for row in rows]
             logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
 
-            # Send response to RabbitMQ
+            # Send response to RabbitMQ if response_queue is specified
             if response_queue:
-                response = {"file_id": file_id, "results": results}
-                self.producer.publish_message(
-                    exchange="",
-                    routing_key=response_queue,
-                    body=json.dumps(response),
-                    correlation_id=file_id
-                )
-                logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
+                # Create a temporary producer for publishing the response
+                producer = RabbitMQProducer(queue_name=response_queue)
+                try:
+                    producer.connect()
+                    response = {"file_id": file_id, "results": results}
+                    producer.publish_update(response)
+                    logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
+                finally:
+                    producer.close()
 
             return results
         except SQLAlchemyError as e:
