@@ -4,7 +4,6 @@ import json
 import logging
 import time
 import asyncio
-import psutil
 import signal
 import sys
 import datetime
@@ -12,6 +11,7 @@ from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import psutil
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ class RabbitMQConsumer:
                 self.close()
                 time.sleep(5)
 
-    async def execute_update(task, conn, logger):
+    async def execute_update(self, task, conn, logger):
         async with conn:
             try:
                 file_id = task.get("file_id")
@@ -131,6 +131,7 @@ class RabbitMQConsumer:
                             f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
                             exc_info=True)
                 raise
+
     async def execute_select(self, task, conn, logger):
         async with conn:
             try:
@@ -160,34 +161,6 @@ class RabbitMQConsumer:
             except Exception as e:
                 logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
                             f"Unexpected error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
-                            exc_info=True)
-                raise
-
-    async def execute_update(self, task, conn, logger):
-        async with conn:
-            try:
-                file_id = task.get("file_id")
-                sql = task.get("sql")
-                params = task.get("params", {})
-                
-                if not isinstance(params, dict):
-                    raise ValueError(f"Invalid params format: {params}, expected dict")
-                
-                logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
-                result = await conn.execute(text(sql), params)
-                await conn.commit()
-                rowcount = result.rowcount
-                logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
-                return {"rowcount": rowcount}
-            
-            except SQLAlchemyError as e:
-                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                            f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
-                            exc_info=True)
-                raise
-            except Exception as e:
-                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                            f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
                             exc_info=True)
                 raise
 
@@ -286,7 +259,6 @@ class RabbitMQConsumer:
                 f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
                 exc_info=True
             )
-            # Ensure connection is closed
             if conn is not None and not conn.closed:
                 loop.run_until_complete(conn.close())
                 logger.info(f"Closed database connection for FileID: {file_id}")
