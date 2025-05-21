@@ -58,13 +58,30 @@ class RabbitMQConsumer:
             logger.info("Closed RabbitMQ connection")
 
     def start_consuming(self):
-        self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
-        logger.info("Waiting for messages. To exit press CTRL+C")
-        self.channel.start_consuming()
+        try:
+            self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
+            logger.info("Waiting for messages. To exit press CTRL+C")
+            self.channel.start_consuming()
+        except pika.exceptions.AMQPConnectionError as e:
+            logger.error(f"AMQP connection error: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"Error starting consumer: {e}", exc_info=True)
+            raise
 
     async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
         try:
             async with async_engine.begin() as conn:
+                # Normalize CreateTime format if present
+                if "CreateTime" in params and params["CreateTime"]:
+                    try:
+                        params["CreateTime"] = datetime.datetime.strptime(
+                            params["CreateTime"], "%Y-%m-%d %H:%M:%S"
+                        )
+                    except ValueError as e:
+                        logger.warning(f"Invalid CreateTime format for FileID: {file_id}: {e}")
+                        params["CreateTime"] = datetime.datetime.now()
+
                 result = await conn.execute(text(sql), params)
                 await conn.commit()
                 rowcount = result.rowcount if result.rowcount is not None else 0
@@ -122,7 +139,7 @@ class RabbitMQConsumer:
                     positive_sort_count = result.scalar()
                     result.close()
                     if positive_sort_count == 0:
-                        logger.warning(f"No positive SortOrder for EntryID {entry_id}")
+                        logger.warning(f"No positive SortOrder for EntryID {file_id}")
                         return False
                     logger.info(f"Validated {positive_sort_count} positive SortOrder for EntryID {entry_id}")
                 return True
@@ -187,9 +204,33 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 if __name__ == "__main__":
+    import datetime
     consumer = RabbitMQConsumer()
     signal.signal(signal.SIGINT, signal_handler)
+
+    # Sample task from logs, updated to include CreateTime
+    sample_task = {
+        "file_id": "321",
+        "task_type": "insert_result",
+        "sql": """
+            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+            VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
+        """,
+        "params": {
+            "EntryID": 119061,
+            "ImageUrl": "https://image.goat.com/transform/v1/attachments/product_template_pictures/images/105/346/991/original/OMIA295F24FAB001_0145.png",
+            "ImageDesc": "Off-White Be Right Back 'White Blue' - OMIA295F24FAB001 0145 | The Home Depot Canada",
+            "ImageSource": "image.goat.com",
+            "ImageUrlThumbnail": "https://image.goat.com/transform/v1/attachments/product_template_pictures/images/105/346/991/original/OMIA295F24FAB001_0145.png",
+            "CreateTime": "2025-05-21 12:34:08"
+        },
+        "timestamp": "2025-05-21T12:34:08.307076"
+    }
+
     try:
+        # Test a single task first
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(consumer.test_task(sample_task))
         
         # Then start consuming from queue
         consumer.connect()
