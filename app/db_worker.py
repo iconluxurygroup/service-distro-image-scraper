@@ -190,6 +190,29 @@ if __name__ == "__main__":
     consumer = RabbitMQConsumer()
     signal.signal(signal.SIGINT, signal_handler)
     
+    sample_task = {
+        "file_id": "321",
+        "task_type": "insert_result",
+        "sql": """
+            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+            VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
+        """,
+        "params": {
+            "EntryID": 119061,
+            "ImageUrl": "https://images.carpages.ca/inventory/12373902.725311113",
+            "ImageDesc": "1930854.jpg",
+            "ImageSource": "images.carpages.ca",
+            "ImageUrlThumbnail": "https://images.carpages.ca/inventory/12373902.725311113",
+            "CreateTime": "2025-05-21 12:29:33"
+        },
+        "timestamp": "2025-05-21T12:29:33.669220"
+    }
+
+    try:
+        # Test a single task first
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(consumer.test_task(sample_task))
+        
         # Then start consuming from queue
         consumer.connect()
         consumer.start_consuming()
