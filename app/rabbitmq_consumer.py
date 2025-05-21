@@ -224,72 +224,34 @@ class RabbitMQConsumer:
             return False
 
     def callback(self, ch, method, properties, body):
+        logger = logging.getLogger(__name__)
+        loop = asyncio.get_event_loop()
+
         try:
-            message = body.decode()
-            task = json.loads(message)
-            file_id = task.get("file_id", "unknown")
+            task = json.loads(body.decode())
+            file_id = task.get("file_id")
             task_type = task.get("task_type", "unknown")
-            response_queue = task.get("response_queue")
-            logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {message[:200]}")
+            logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {task}")
 
-            loop = asyncio.get_event_loop()
-            if task_type == "select_deduplication":
-                async def run_select(self, task, conn, logger):
-                    file_id = task.get("file_id")
-                    response_queue = task.get("response_queue")
+            success = False
+            async with async_engine.connect() as conn:
+                if task_type == "select_deduplication":
+                    # Call run_select with required arguments
+                    success = loop.run_until_complete(self.run_select(self, task, conn, logger))
+                else:
+                    logger.warning(f"Unknown task type: {task_type} for FileID: {file_id}")
+                    success = False
 
-                    try:
-                        result = await self.execute_select(task, conn, logger)
-                        # Result is a list of dictionaries from execute_select
-                        logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(result)} rows for FileID: {file_id}")
+                if success:
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                else:
+                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
-                        # Format the response as a dictionary
-                        response = {"file_id": file_id, "results": result}
-
-                        # Send response to RabbitMQ if response_queue is specified
-                        if response_queue:
-                            # Assuming RabbitMQProducer is initialized elsewhere or needs to be passed
-                            producer = RabbitMQProducer()  # Initialize producer (fix for previous 'producer' error)
-                            try:
-                                producer.publish_message(
-                                    exchange="",
-                                    routing_key=response_queue,
-                                    body=json.dumps(response),
-                                    correlation_id=file_id
-                                )
-                                logger.info(f"Sent {len(result)} deduplication results to {response_queue} for FileID: {file_id}")
-                            finally:
-                                producer.close()
-
-                        return response
-                    except Exception as e:
-                        logger.error(f"Error in run_select for FileID {file_id}: {e}", exc_info=True)
-                        raise
-                success = loop.run_until_complete(run_select())
-            elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
-                success = loop.run_until_complete(self.execute_sort_order_update(task.get("params", {}), file_id))
-            else:
-                async def run_update():
-                    async with async_engine.begin() as conn:
-                        logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
-                        result = await self.execute_update(task, conn, logger)
-                        return result
-                success = loop.run_until_complete(run_update())
-
-            if success:
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
-            else:
-                logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                time.sleep(2)
         except Exception as e:
-            logger.error(
-                f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
-                exc_info=True
-            )
+            logger.error(f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {str(e)}", exc_info=True)
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            time.sleep(2)
+
+
     async def test_task(self, task: dict):
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
