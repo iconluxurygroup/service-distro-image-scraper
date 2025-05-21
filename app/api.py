@@ -62,7 +62,7 @@ class JobStatusResponse(BaseModel):
     timestamp: str = Field(..., description="ISO timestamp of the response")
 
 class SearchClient:
-    def __init__(self, endpoint: str, logger: logging.Logger, max_concurrency: int = 2):
+    def __init__(self, endpoint: str, logger: logging.Logger, max_concurrency: int = 10):
         self.endpoint = endpoint
         self.logger = logger
         self.semaphore = asyncio.Semaphore(max_concurrency)
@@ -597,55 +597,48 @@ async def process_restart_batch(
                 logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
                 return entry_id, False
 
-        for batch_idx, batch_entries in enumerate(entry_batches, 1):
-            logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
-            start_time = datetime.datetime.now()
+            for batch_idx, batch_entries in enumerate(entry_batches, 1):
+                    logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
+                    start_time = datetime.datetime.now()
 
-            results = await asyncio.gather(
-                *(process_entry(entry) for entry in batch_entries),
-                return_exceptions=True
-            )
+                    results = await asyncio.gather(
+                        *(process_entry(entry) for entry in batch_entries),
+                        return_exceptions=True
+                    )
 
-            for entry, result in zip(batch_entries, results):
-                entry_id = entry[0]
-                if isinstance(result, Exception):
-                    logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
-                    failed_entries += 1
-                    continue
-                entry_id_result, success = result
-                if success:
-                    successful_entries += 1
-                    last_entry_id_processed = entry_id
-                else:
-                    failed_entries += 1
+                    # Process results as before
+                    for entry, result in zip(batch_entries, results):
+                        entry_id = entry[0]
+                        if isinstance(result, Exception):
+                            logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
+                            failed_entries += 1
+                            continue
+                        entry_id_result, success = result
+                        if success:
+                            successful_entries += 1
+                            last_entry_id_processed = entry_id
+                        else:
+                            failed_entries += 1
 
-            elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-            logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
-            log_memory_usage()
+                    # Check if all entries are processed
+                    async with async_engine.connect() as conn:
+                        result = await conn.execute(
+                            text("""
+                                SELECT COUNT(*) 
+                                FROM utb_ImageScraperRecords 
+                                WHERE FileID = :file_id AND Step1 IS NULL
+                            """),
+                            {"file_id": file_id_db_int}
+                        )
+                        remaining_entries = result.fetchone()[0]
+                        result.close()
+                        if remaining_entries == 0:
+                            logger.info(f"All entries processed for FileID {file_id_db}. Exiting early.")
+                            break
 
-        async with async_engine.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT COUNT(DISTINCT t.EntryID), 
-                           SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                           SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                    FROM utb_ImageScraperResult t
-                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                    WHERE r.FileID = :file_id
-                """),
-                {"file_id": file_id_db_int}
-            )
-            row = result.fetchone()
-            total_entries = row[0] if row else 0
-            positive_entries = row[1] if row and row[1] is not None else 0
-            null_entries = row[2] if row and row[2] is not None else 0
-            logger.info(
-                f"Verification: {total_entries} total entries, "
-                f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
-            )
-            if null_entries > 0:
-                logger.warning(f"Found {null_entries} entries with NULL SortOrder")
-            result.close()
+                    elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                    logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
+                    log_memory_usage()
 
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
