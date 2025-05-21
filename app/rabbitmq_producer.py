@@ -115,4 +115,3 @@ async def enqueue_db_update(
     finally:
         if should_close:
             producer.close()
-    return producer
