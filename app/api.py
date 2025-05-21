@@ -323,20 +323,32 @@ async def async_process_entry_search(
     client = SearchClient(endpoint, logger)
     try:
         all_results = []
+        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
         for term in search_terms:
+            logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
             results = await client.search(term, brand, entry_id)
             if isinstance(results, Exception):
                 logger.error(f"Error for term '{term}' in EntryID {entry_id}: {results}")
                 continue
             if not results:
+                logger.debug(f"No results for term '{term}' in EntryID {entry_id}")
                 continue
             processed_results = await process_results(results, entry_id, brand, term, logger)
-            all_results.extend(processed_results)
-            # Stop if valid results are found and not using all variations
-            if processed_results and not use_all_variations:
-                logger.info(f"Stopping after successful results for term '{term}' in EntryID {entry_id}")
+            if not processed_results:
+                logger.debug(f"No valid processed results for term '{term}' in EntryID {entry_id}")
+                continue
+            # Validate results have required columns and non-placeholder URLs
+            valid_results = [
+                res for res in processed_results
+                if all(col in res for col in required_columns) and not res["ImageUrl"].startswith("placeholder://")
+            ]
+            all_results.extend(valid_results)
+            logger.info(f"Found {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
+            # Stop after valid results unless use_all_variations is True and more results are needed
+            if valid_results and (not use_all_variations or len(all_results) >= 10):  # Arbitrary threshold
+                logger.info(f"Stopping search after valid results for term '{term}' in EntryID {entry_id}")
                 break
-        logger.info(f"Processed {len(all_results)} results for EntryID {entry_id}")
+        logger.info(f"Processed {len(all_results)} total valid results for EntryID {entry_id}")
         return all_results
     finally:
         await client.close()
