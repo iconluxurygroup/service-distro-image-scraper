@@ -219,7 +219,7 @@ class RabbitMQConsumer:
             if task_type == "select_deduplication":
                 async def run_select():
                     async with async_engine.connect() as conn:
-                        result = await self.execute_select(task, conn, logger)
+                        result = await self.execute_select(task, conn, logger)  # Correct call
                         if response_queue:
                             # Publish results to response queue
                             response_message = json.dumps(result)
