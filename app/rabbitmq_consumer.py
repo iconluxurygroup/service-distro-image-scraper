@@ -155,7 +155,7 @@ class RabbitMQConsumer:
                     if not ids:  # Handle empty list
                         logger.debug(f"Empty ids list for FileID {file_id}, returning empty result")
                         return {"results": []}
-                    # Dynamically adjust SQL for IN clause
+                    # Dynamically adjust SQL and params for IN clause
                     if len(ids) == 1:
                         # For single value, use = instead of IN
                         sql = sql.replace("IN (?)", "= ?")
