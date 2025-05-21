@@ -194,11 +194,12 @@ async def insert_search_results(
         entry_ids = list(set(row["EntryID"] for row in data))  # Remove duplicates
         if entry_ids:
             placeholders = ",".join("?" * len(entry_ids))
-            select_query = f"""
+            select_query = text(f"""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
                 WHERE EntryID IN ({placeholders})
-            """
+            """)
+            # Ensure params is a tuple
             params = tuple(entry_ids)
             await enqueue_db_update(
                 file_id=file_id,
@@ -210,7 +211,6 @@ async def insert_search_results(
                 response_queue=response_queue
             )
             logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
-
             # Wait for SELECT results
             consume_task = asyncio.create_task(consume_responses())
             try:
