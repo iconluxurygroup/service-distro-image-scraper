@@ -7,7 +7,7 @@ from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
+from database_config import async_engine, sync_engine
 from common import clean_string, normalize_model, generate_aliases
 import psutil
 import pyodbc

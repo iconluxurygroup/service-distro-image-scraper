@@ -49,6 +49,6 @@ engine = create_engine(
     pool_recycle=3600,
     isolation_level="READ COMMITTED"
 )
-
+sync_engine = engine
 logger.info(f"Initialized async_engine with conn_str: {conn_str.split(';')[0]}...; MARS=True")
 logger.info(f"Initialized engine with conn_str: {conn_str.split(';')[0]}...; MARS=True")
