@@ -456,6 +456,139 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
     finally:
         log_memory_usage()
 
+async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
+    file_id_str = str(file_id)
+    logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
+    result = None
+    debug_info = {"memory_usage": {}, "log_file": log_file, "endpoint_errors": []}
+    
+    try:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.info(f"Starting job {func_name} for FileID: {file_id}")
+        
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
+        
+        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+            result = await job_func(file_id, **kwargs)
+        else:
+            result = job_func(file_id, **kwargs)
+        
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        if debug_info["memory_usage"]["after"] > 1000:
+            logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        
+        logger.info(f"Completed job {func_name} for FileID: {file_id}")
+        return {
+            "status_code": 200,
+            "message": f"Job {func_name} completed successfully for FileID: {file_id}",
+            "data": result,
+            "debug_info": debug_info
+        }
+    except Exception as e:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        debug_info["error_traceback"] = traceback.format_exc()
+        if "placeholder://error" in str(e):
+            debug_info["endpoint_errors"].append({"error": str(e), "timestamp": datetime.datetime.now().isoformat()})
+            logger.warning(f"Detected placeholder error in job {func_name} for FileID: {file_id}")
+        return {
+            "status_code": 500,
+            "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
+            "data": None,
+            "debug_info": debug_info
+        }
+    finally:
+        debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
+async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
+    try:
+        JOB_STATUS[file_id] = {
+            "status": "running",
+            "message": "Job is running",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+        result = await generate_download_file(int(file_id), background_tasks, logger=logger)
+        
+        if "error" in result:
+            JOB_STATUS[file_id] = {
+                "status": "failed",
+                "message": f"Error: {result['error']}",
+                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            logger.error(f"Job failed for FileID {file_id}: {result['error']}")
+            # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+        else:
+            JOB_STATUS[file_id] = {
+                "status": "completed",
+                "message": "Job completed successfully",
+                "public_url": result.get("public_url"),
+                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            logger.info(f"Job completed for FileID {file_id}")
+    except Exception as e:
+        logger.error(f"Unexpected error in job for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        JOB_STATUS[file_id] = {
+            "status": "failed",
+            "message": f"Unexpected error: {str(e)}",
+            "log_url": log_public_url or None,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
+
+async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        before_sleep=lambda retry_state: logger.info(
+            f"Retrying log upload for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
+        )
+    )
+    async def try_upload():
+        if not os.path.exists(log_filename):
+            logger.warning(f"Log file {log_filename} does not exist, skipping upload")
+            return None
+
+        file_hash = await asyncio.to_thread(hashlib.md5, open(log_filename, "rb").read())
+        file_hash = file_hash.hexdigest()
+        current_time = time.time()
+        key = (log_filename, file_id)
+
+        if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
+            logger.info(f"Skipping redundant upload for {log_filename}")
+            return LAST_UPLOAD[key]["url"]
+
+        try:
+            upload_url = await upload_file_to_space(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id}.log",
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            if not upload_url:
+                logger.error(f"S3 upload returned empty URL for {log_filename}")
+                raise ValueError("Empty upload URL")
+            await update_log_url_in_db(file_id, upload_url, logger)
+            LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
+            logger.info(f"Log uploaded to R2: {upload_url}")
+            return upload_url
+        except Exception as e:
+            logger.error(f"Failed to upload log for FileID {file_id}: {e}", exc_info=True)
+            raise
+
+    try:
+        return await try_upload()
+    except Exception as e:
+        logger.error(f"Failed to upload log for FileID {file_id} after retries: {e}", exc_info=True)
+        return None
 async def async_process_entry_search(
     search_string: str,
     brand: str,
@@ -501,17 +634,20 @@ async def async_process_entry_search(
                 continue
             processed_results = await process_results(results, entry_id, brand, term, logger)
             if not processed_results:
-                logger.debug(f"No valid processed results for term '{term}' in EntryID {entry_id}")
+                logger.debug(f"No processed results for term '{term}' in EntryID {entry_id}")
                 continue
-            # Validate results have required columns and non-placeholder URLs
+            # Validate results
             valid_results = [
                 res for res in processed_results
                 if all(col in res for col in required_columns) and not res["ImageUrl"].startswith("placeholder://")
             ]
+            if not valid_results:
+                logger.warning(f"No valid results for term '{term}' in EntryID {entry_id}. Sample result: {processed_results[0] if processed_results else 'None'}")
+                continue
             all_results.extend(valid_results)
             logger.info(f"Found {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
             # Stop after valid results unless use_all_variations is True and more results are needed
-            if valid_results and (not use_all_variations or len(all_results) >= 10):  # Arbitrary threshold
+            if valid_results:
                 logger.info(f"Stopping search after valid results for term '{term}' in EntryID {entry_id}")
                 break
         logger.info(f"Processed {len(all_results)} total valid results for EntryID {entry_id}")
@@ -627,7 +763,7 @@ async def process_restart_batch(
                             continue
 
                         if not all(all(col in res for col in required_columns) for res in results):
-                            logger.error(f"Missing columns for EntryID {entry_id} on attempt {attempt}")
+                            logger.error(f"Missing columns for EntryID {entry_id} on attempt {attempt}. Sample result: {results[0] if results else 'None'}")
                             continue
 
                         deduplicated_results = []
@@ -667,8 +803,8 @@ async def process_restart_batch(
                         update_result = await update_search_sort_order(
                             str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                         )
-                        if update_result is None or not update_result:
-                            logger.error(f"SortOrder update failed for EntryID {entry_id} on attempt {attempt}")
+                        if update_result is None or not any(r['SortOrder'] > 0 for r in update_result):
+                            logger.error(f"SortOrder update failed or no positive SortOrder for EntryID {entry_id} on attempt {attempt}")
                             continue
 
                         # Validate SortOrder
@@ -817,141 +953,7 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-
-async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
-    file_id_str = str(file_id)
-    logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
-    result = None
-    debug_info = {"memory_usage": {}, "log_file": log_file, "endpoint_errors": []}
-    
-    try:
-        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
-        logger.info(f"Starting job {func_name} for FileID: {file_id}")
         
-        process = psutil.Process()
-        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
-        logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
-        
-        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
-            result = await job_func(file_id, **kwargs)
-        else:
-            result = job_func(file_id, **kwargs)
-        
-        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
-        logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
-        if debug_info["memory_usage"]["after"] > 1000:
-            logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
-        
-        logger.info(f"Completed job {func_name} for FileID: {file_id}")
-        return {
-            "status_code": 200,
-            "message": f"Job {func_name} completed successfully for FileID: {file_id}",
-            "data": result,
-            "debug_info": debug_info
-        }
-    except Exception as e:
-        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
-        logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        debug_info["error_traceback"] = traceback.format_exc()
-        if "placeholder://error" in str(e):
-            debug_info["endpoint_errors"].append({"error": str(e), "timestamp": datetime.datetime.now().isoformat()})
-            logger.warning(f"Detected placeholder error in job {func_name} for FileID: {file_id}")
-        return {
-            "status_code": 500,
-            "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
-            "data": None,
-            "debug_info": debug_info
-        }
-    finally:
-        debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
-async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
-    try:
-        JOB_STATUS[file_id] = {
-            "status": "running",
-            "message": "Job is running",
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        
-        result = await generate_download_file(int(file_id), background_tasks, logger=logger)
-        
-        if "error" in result:
-            JOB_STATUS[file_id] = {
-                "status": "failed",
-                "message": f"Error: {result['error']}",
-                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
-                "timestamp": datetime.datetime.now().isoformat()
-            }
-            logger.error(f"Job failed for FileID {file_id}: {result['error']}")
-            # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-        else:
-            JOB_STATUS[file_id] = {
-                "status": "completed",
-                "message": "Job completed successfully",
-                "public_url": result.get("public_url"),
-                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
-                "timestamp": datetime.datetime.now().isoformat()
-            }
-            logger.info(f"Job completed for FileID {file_id}")
-    except Exception as e:
-        logger.error(f"Unexpected error in job for FileID {file_id}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(file_id, log_filename, logger)
-        JOB_STATUS[file_id] = {
-            "status": "failed",
-            "message": f"Unexpected error: {str(e)}",
-            "log_url": log_public_url or None,
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, file_id, logger)
-
-async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(Exception),
-        before_sleep=lambda retry_state: logger.info(
-            f"Retrying log upload for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
-        )
-    )
-    async def try_upload():
-        if not os.path.exists(log_filename):
-            logger.warning(f"Log file {log_filename} does not exist, skipping upload")
-            return None
-
-        file_hash = await asyncio.to_thread(hashlib.md5, open(log_filename, "rb").read())
-        file_hash = file_hash.hexdigest()
-        current_time = time.time()
-        key = (log_filename, file_id)
-
-        if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
-            logger.info(f"Skipping redundant upload for {log_filename}")
-            return LAST_UPLOAD[key]["url"]
-
-        try:
-            upload_url = await upload_file_to_space(
-                file_src=log_filename,
-                save_as=f"job_logs/job_{file_id}.log",
-                is_public=True,
-                logger=logger,
-                file_id=file_id
-            )
-            if not upload_url:
-                logger.error(f"S3 upload returned empty URL for {log_filename}")
-                raise ValueError("Empty upload URL")
-            await update_log_url_in_db(file_id, upload_url, logger)
-            LAST_UPLOAD[key] = {"hash": file_hash, "time": current_time, "url": upload_url}
-            logger.info(f"Log uploaded to R2: {upload_url}")
-            return upload_url
-        except Exception as e:
-            logger.error(f"Failed to upload log for FileID {file_id}: {e}", exc_info=True)
-            raise
-
-    try:
-        return await try_upload()
-    except Exception as e:
-        logger.error(f"Failed to upload log for FileID {file_id} after retries: {e}", exc_info=True)
-        return None
-
 @router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
