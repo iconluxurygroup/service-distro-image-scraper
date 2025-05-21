@@ -129,11 +129,11 @@ async def preprocess_sku(
         with_color_length = expected_length.get("with_color", [base_length])[0]
         color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
 
-        # Check if SKU length is compatible
+        # Check SKU length compatibility
         if not (base_length - 2 <= len(search_string_clean) <= with_color_length + 2):
             continue
 
-        # Try splitting on color_separator
+        # Split on color_separator to isolate base model
         if color_separator:
             parts = search_string_clean.rsplit(color_separator, 1)
             if len(parts) > 1:
@@ -150,7 +150,7 @@ async def preprocess_sku(
                     )
                     break
 
-        # Fallback: Match base length
+        # Fallback: Use SKU as model if it matches base length
         if abs(len(search_string_clean) - base_length) <= 2:
             brand = full_name
             model = search_string_clean
@@ -186,26 +186,20 @@ def generate_aliases(model: Any) -> List[str]:
     
     model = clean_string(model).lower()
     aliases = set()
-    aliases.add(model)
+    aliases.add(model)  # Full base model
 
     # Digits-only
     digits_only = re.sub(r'[^0-9]', '', model)
     if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
 
-    # Delimiter variations
+    # Delimiter variations (insert delimiters after article part)
     delimiters = ['-', '_', ' ']
-    for delim in delimiters:
-        # Add delimiters between potential parts (e.g., after 8 chars for Off-White article)
-        if len(model) >= 8:
-            alias = f"{model[:8]}{delim}{model[8:]}"
+    article_length = 8  # Default for Off-White; can be adjusted dynamically if needed
+    if len(model) >= article_length:
+        for delim in delimiters:
+            alias = f"{model[:article_length]}{delim}{model[article_length:]}"
             aliases.add(alias)
-        # Split on existing delimiters and rejoin with new ones
-        for sep in delimiters:
-            if sep in model:
-                parts = model.split(sep)
-                if len(parts) > 1:
-                    aliases.add(delim.join(parts))
 
     return [a for a in aliases if a and len(a) >= 4]
 
