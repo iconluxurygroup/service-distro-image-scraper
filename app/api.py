@@ -1288,12 +1288,12 @@ async def api_reset_step1(file_id: str):
 app.include_router(router, prefix="/api/v3")
 
 
-@app.on_event("startup")
+@app.lifespan("startup")
 async def startup_event():
     logger = default_logger
     logger.info("Starting up FastAPI application")
 
-@app.on_event("shutdown")
+@app.lifespan("shutdown")
 async def shutdown_event():
     logger = default_logger
     logger.info("Shutting down FastAPI application")
