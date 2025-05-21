@@ -99,7 +99,6 @@ async def load_config(
     logger.error(f"Critical failure loading {config_name} from {url}, using fallback")
     return fallback
 
-
 async def preprocess_sku(
     search_string: str,
     known_brand: Optional[str] = None,
@@ -118,14 +117,17 @@ async def preprocess_sku(
 
     search_string_clean = clean_string(search_string).lower()
 
-    # Strictly enforce known_brand
+    # Normalize known_brand
     if known_brand:
         known_brand_clean = clean_string(known_brand).lower()
         for rule in brand_rules_data.get("brand_rules", []):
             if not rule.get("is_active", False):
                 continue
             full_name = rule.get("full_name", "")
-            if clean_string(full_name).lower() == known_brand_clean:
+            full_name_clean = clean_string(full_name).lower()
+            # Check full_name and aliases
+            aliases = [clean_string(name).lower() for name in rule.get("names", [])]
+            if known_brand_clean == full_name_clean or known_brand_clean in aliases:
                 brand = full_name
                 sku_format = rule.get("sku_format", {})
                 color_separator = sku_format.get("color_separator", "")
@@ -233,6 +235,7 @@ async def preprocess_sku(
         brand = known_brand
 
     return search_string, brand, model, color
+
 
 
 def clean_string(s: str, preserve_url: bool = False) -> str:
