@@ -708,7 +708,7 @@ async def process_restart_batch(
         file_id_db_int = file_id_db
         BATCH_SIZE = 6
         MAX_CONCURRENCY = 15
-        MAX_ENTRY_RETRIES = 3
+        MAX_ENTRY_RETRIES = 5
 
         async with async_engine.connect() as conn:
             result = await conn.execute(
