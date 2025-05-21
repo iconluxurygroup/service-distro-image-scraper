@@ -572,12 +572,52 @@ async def process_restart_batch(
                             logger.error(f"Failed to insert results for EntryID {entry_id} on attempt {attempt}")
                             continue
 
+                        # Validate inserted results
+                        async with async_engine.connect() as conn:
+                            result = await conn.execute(
+                                text("""
+                                    SELECT COUNT(*) 
+                                    FROM utb_ImageScraperResult 
+                                    WHERE EntryID = :entry_id 
+                                    AND ImageUrl NOT LIKE 'placeholder%'
+                                """),
+                                {"entry_id": entry_id}
+                            )
+                            valid_result_count = result.scalar()
+                            result.close()
+
+                        if valid_result_count == 0:
+                            logger.warning(f"No valid results inserted for EntryID {entry_id} on attempt {attempt}")
+                            continue
+
+                        logger.info(f"Validated {valid_result_count} valid results for EntryID {entry_id}")
+
                         update_result = await update_search_sort_order(
                             str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                         )
                         if update_result is None or not update_result:
                             logger.error(f"SortOrder update failed for EntryID {entry_id} on attempt {attempt}")
                             continue
+
+                        # Validate SortOrder
+                        async with async_engine.connect() as conn:
+                            result = await conn.execute(
+                                text("""
+                                    SELECT COUNT(*) 
+                                    FROM utb_ImageScraperResult 
+                                    WHERE EntryID = :entry_id 
+                                    AND SortOrder > 0
+                                """),
+                                {"entry_id": entry_id}
+                            )
+                            positive_sort_count = result.scalar()
+                            result.close()
+
+                        if positive_sort_count == 0:
+                            logger.warning(f"No results with positive SortOrder for EntryID {entry_id} on attempt {attempt}")
+                            continue
+
+                        logger.info(f"Validated {positive_sort_count} results with positive SortOrder for EntryID {entry_id}")
 
                         async with async_engine.connect() as conn:
                             await conn.execute(
