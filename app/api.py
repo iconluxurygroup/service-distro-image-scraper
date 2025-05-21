@@ -301,7 +301,6 @@ async def async_process_entry_search(
 ) -> List[Dict]:
     logger.debug(f"Processing search for EntryID {entry_id}, FileID {file_id_db}, Use all variations: {use_all_variations}")
     
-    # Generate search variations
     search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
     
     search_terms = []
@@ -310,12 +309,10 @@ async def async_process_entry_search(
         "no_color", "model_alias", "category_specific"
     ]
     
-    # Collect all search terms
     for variation_type in variation_types:
         if variation_type in search_terms_dict:
             search_terms.extend(search_terms_dict[variation_type])
     
-    # Normalize and deduplicate search terms
     search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
     logger.info(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
 
@@ -325,24 +322,24 @@ async def async_process_entry_search(
 
     client = SearchClient(endpoint, logger)
     try:
-        tasks = [client.search(term, brand, entry_id) for term in search_terms]
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-
         all_results = []
-        for term, term_results in zip(search_terms, raw_results):
-            if isinstance(term_results, Exception):
-                logger.error(f"Error for term '{term}' in EntryID {entry_id}: {term_results}")
+        for term in search_terms:
+            results = await client.search(term, brand, entry_id)
+            if isinstance(results, Exception):
+                logger.error(f"Error for term '{term}' in EntryID {entry_id}: {results}")
                 continue
-            if not term_results:
+            if not results:
                 continue
-            results = await process_results(term_results, entry_id, brand, term, logger)
-            all_results.extend(results)
-
+            processed_results = await process_results(results, entry_id, brand, term, logger)
+            all_results.extend(processed_results)
+            # Stop if valid results are found and not using all variations
+            if processed_results and not use_all_variations:
+                logger.info(f"Stopping after successful results for term '{term}' in EntryID {entry_id}")
+                break
         logger.info(f"Processed {len(all_results)} results for EntryID {entry_id}")
         return all_results
     finally:
         await client.close()
-
         
 async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id}.log"
