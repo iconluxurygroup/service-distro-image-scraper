@@ -228,29 +228,62 @@ class RabbitMQConsumer:
         loop = asyncio.get_event_loop()
 
         try:
-            task = json.loads(body.decode())
-            file_id = task.get("file_id")
+            message = body.decode()
+            task = json.loads(message)
+            file_id = task.get("file_id", "unknown")
             task_type = task.get("task_type", "unknown")
-            logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {task}")
+            response_queue = task.get("response_queue")
+            logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {message[:200]}")
 
-            success = False
-            async with async_engine.connect() as conn:
+            async def process_task(task, logger):
                 if task_type == "select_deduplication":
-                    # Call run_select with required arguments
-                    success = loop.run_until_complete(self.run_select(self, task, conn, logger))
-                else:
-                    logger.warning(f"Unknown task type: {task_type} for FileID: {file_id}")
-                    success = False
+                    async with async_engine.connect() as conn:
+                        result = await self.execute_select(task, conn, logger)
+                        logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(result)} rows for FileID: {file_id}")
 
-                if success:
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
-                else:
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                        # Format the response as a dictionary
+                        response = {"file_id": file_id, "results": result}
 
+                        # Send response to RabbitMQ if response_queue is specified
+                        if response_queue:
+                            producer = RabbitMQProducer(
+                                host=self.host,
+                                port=self.port,
+                                username=self.credentials.username,
+                                password=self.credentials.password
+                            )
+                            try:
+                                producer.connect()
+                                producer.publish_update(response, routing_key=response_queue, correlation_id=file_id)
+                                logger.info(f"Sent {len(result)} deduplication results to {response_queue} for FileID: {file_id}")
+                            finally:
+                                producer.close()
+
+                        return response
+                elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
+                    return await self.execute_sort_order_update(task.get("params", {}), file_id)
+                else:
+                    async with async_engine.begin() as conn:
+                        logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
+                        result = await self.execute_update(task, conn, logger)
+                        return result
+
+            success = loop.run_until_complete(process_task(task, logger))
+
+            if success:
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
+            else:
+                logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                time.sleep(2)
         except Exception as e:
-            logger.error(f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {str(e)}", exc_info=True)
+            logger.error(
+                f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
+                exc_info=True
+            )
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-
+            time.sleep(2)
 
     async def test_task(self, task: dict):
         file_id = task.get("file_id", "unknown")
