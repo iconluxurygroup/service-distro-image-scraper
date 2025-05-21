@@ -14,6 +14,7 @@ import psutil
 import pyodbc
 import re
 import urllib.parse
+from rabbitmq_producer import RabbitMQProducer,enqueue_db_update
 import pandas as pd
 
 default_logger = logging.getLogger(__name__)
