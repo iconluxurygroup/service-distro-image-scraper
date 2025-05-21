@@ -93,7 +93,7 @@ class SearchClient:
                         async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
                             body_text = await response.text()
                             body_preview = body_text[:200] if body_text else ""
-                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body=body_preview}")
+                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body={body_preview}")
                             if response.status in (429, 503):
                                 self.logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
                                 raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
