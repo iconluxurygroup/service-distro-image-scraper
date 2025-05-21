@@ -669,7 +669,6 @@ async def process_restart_batch(
     background_tasks: BackgroundTasks = None,
 ) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id_db}.log"
-    producer = RabbitMQProducer()
     try:
         if logger is None:
             logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
@@ -750,211 +749,221 @@ async def process_restart_batch(
         last_entry_id_processed = entry_id or 0
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-        async def process_entry(entry):
-            entry_id, search_string, brand, color, category = entry
-            async with semaphore:
-                for attempt in range(1, MAX_ENTRY_RETRIES + 1):
+        # Initialize RabbitMQ producer
+        producer = RabbitMQProducer()
+        try:
+            semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+            async def process_entry(entry):
+                entry_id, search_string, brand, color, category = entry
+                async with semaphore:
                     try:
-                        logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
-                        search_string, brand, model, color = await preprocess_sku(
-                            search_string=search_string,
-                            known_brand=brand,
-                            brand_rules=brand_rules,
-                            logger=logger
-                        )
-                        results = await async_process_entry_search(
-                            search_string=search_string,
-                            brand=brand,
-                            endpoint=endpoint,
-                            entry_id=entry_id,
-                            use_all_variations=use_all_variations,
-                            file_id_db=file_id_db,
-                            logger=logger
-                        )
-                        if not results:
-                            logger.warning(f"No results for EntryID {entry_id} on attempt {attempt}")
-                            continue
+                        for attempt in range(1, MAX_ENTRY_RETRIES + 1):
+                            try:
+                                logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
+                                search_string, brand, model, color = await preprocess_sku(
+                                    search_string=search_string,
+                                    known_brand=brand,
+                                    brand_rules=brand_rules,
+                                    logger=logger
+                                )
+                                results = await async_process_entry_search(
+                                    search_string=search_string,
+                                    brand=brand,
+                                    endpoint=endpoint,
+                                    entry_id=entry_id,
+                                    use_all_variations=use_all_variations,
+                                    file_id_db=file_id_db,
+                                    logger=logger
+                                )
+                                if not results:
+                                    logger.warning(f"No results for EntryID {entry_id} on attempt {attempt}")
+                                    continue
 
-                        if not all(all(col in res for col in required_columns) for res in results):
-                            logger.error(f"Missing columns for EntryID {entry_id} on attempt {attempt}. Sample result: {results[0] if results else 'None'}")
-                            continue
+                                if not all(all(col in res for col in required_columns) for res in results):
+                                    logger.error(f"Missing columns for EntryID {entry_id} on attempt {attempt}. Sample result: {results[0] if results else 'None'}")
+                                    continue
 
-                        deduplicated_results = []
-                        seen = set()
-                        for res in results:
-                            key = (res['EntryID'], res['ImageUrl'])
-                            if key not in seen:
-                                seen.add(key)
-                                deduplicated_results.append(res)
-                        logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
+                                deduplicated_results = []
+                                seen = set()
+                                for res in results:
+                                    key = (res['EntryID'], res['ImageUrl'])
+                                    if key not in seen:
+                                        seen.add(key)
+                                        deduplicated_results.append(res)
+                                logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
-                        for res in deduplicated_results:
-                            sql = """
-                                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
-                                VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail)
-                            """
-                            params = {
-                                "EntryID": res["EntryID"],
-                                "ImageUrl": res["ImageUrl"],
-                                "ImageDesc": res["ImageDesc"],
-                                "ImageSource": res["ImageSource"],
-                                "ImageUrlThumbnail": res["ImageUrlThumbnail"],
-                            }
-                            producer = await enqueue_db_update(
-                                file_id=str(file_id_db),
-                                sql=sql,
-                                params=params,
-                                background_tasks=background_tasks,
-                                task_type="insert_result",
-                                producer=producer,
-                            )
+                                for res in deduplicated_results:
+                                    sql = """
+                                        INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
+                                        VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail)
+                                    """
+                                    params = {
+                                        "EntryID": res["EntryID"],
+                                        "ImageUrl": res["ImageUrl"],
+                                        "ImageDesc": res["ImageDesc"],
+                                        "ImageSource": res["ImageSource"],
+                                        "ImageUrlThumbnail": res["ImageUrlThumbnail"],
+                                    }
+                                    await enqueue_db_update(
+                                        file_id=str(file_id_db),
+                                        sql=sql,
+                                        params=params,
+                                        background_tasks=background_tasks,
+                                        task_type="insert_result",
+                                        producer=producer,
+                                    )
 
-                        sort_sql = "UPDATE_SORT_ORDER"
-                        sort_params = {
-                            "file_id": str(file_id_db),
-                            "entry_id": str(entry_id),
-                            "brand": brand,
-                            "search_string": search_string,
-                            "color": color,
-                            "category": category,
-                            "brand_rules": json.dumps(brand_rules)
-                        }
-                        producer = await enqueue_db_update(
-                            file_id=str(file_id_db),
-                            sql=sort_sql,
-                            params=sort_params,
-                            background_tasks=background_tasks,
-                            task_type="update_sort_order",
-                            producer=producer,
-                        )
+                                sort_sql = "UPDATE_SORT_ORDER"
+                                sort_params = {
+                                    "file_id": str(file_id_db),
+                                    "entry_id": str(entry_id),
+                                    "brand": brand,
+                                    "search_string": search_string,
+                                    "color": color,
+                                    "category": category,
+                                    "brand_rules": json.dumps(brand_rules)
+                                }
+                                await enqueue_db_update(
+                                    file_id=str(file_id_db),
+                                    sql=sort_sql,
+                                    params=sort_params,
+                                    background_tasks=background_tasks,
+                                    task_type="update_sort_order",
+                                    producer=producer,
+                                )
 
-                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                        params = {"entry_id": entry_id}
-                        producer = await enqueue_db_update(
+                                sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
+                                params = {"entry_id": entry_id}
+                                await enqueue_db_update(
+                                    file_id=str(file_id_db),
+                                    sql=sql,
+                                    params=params,
+                                    background_tasks=background_tasks,
+                                    task_type="update_step1",
+                                    producer=producer,
+                                )
+
+                                return entry_id, True
+                            except Exception as e:
+                                logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
+                                if attempt < MAX_ENTRY_RETRIES:
+                                    await asyncio.sleep(2 ** attempt)
+                                continue
+                        logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                        sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
+                        params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
+                        await enqueue_db_update(
                             file_id=str(file_id_db),
                             sql=sql,
                             params=params,
                             background_tasks=background_tasks,
-                            task_type="update_step1",
+                            task_type="failed_entry",
                             producer=producer,
                         )
-
-                        return entry_id, True
+                        return entry_id, False
                     except Exception as e:
-                        logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
-                        if attempt < MAX_ENTRY_RETRIES:
-                            await asyncio.sleep(2 ** attempt)
-                        continue
-                logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
-                params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
-                producer = await enqueue_db_update(
-                    file_id=str(file_id_db),
-                    sql=sql,
-                    params=params,
-                    background_tasks=background_tasks,
-                    task_type="failed_entry",
-                    producer=producer,
+                        logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
+                        return entry_id, False
+
+            for batch_idx, batch_entries in enumerate(entry_batches, 1):
+                logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
+                start_time = datetime.datetime.now()
+
+                results = await asyncio.gather(
+                    *(process_entry(entry) for entry in batch_entries),
+                    return_exceptions=True
                 )
-                return entry_id, False
 
-        for batch_idx, batch_entries in enumerate(entry_batches, 1):
-            logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
-            start_time = datetime.datetime.now()
+                for entry, result in zip(batch_entries, results):
+                    entry_id = entry[0]
+                    if isinstance(result, Exception):
+                        logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
+                        failed_entries += 1
+                        continue
+                    entry_id_result, success = result
+                    if success:
+                        successful_entries += 1
+                        last_entry_id_processed = entry_id
+                    else:
+                        failed_entries += 1
 
-            results = await asyncio.gather(
-                *(process_entry(entry) for entry in batch_entries),
-                return_exceptions=True
-            )
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(
+                        text("""
+                            SELECT COUNT(*) 
+                            FROM utb_ImageScraperRecords 
+                            WHERE FileID = :file_id AND Step1 IS NULL
+                        """),
+                        {"file_id": file_id_db_int}
+                    )
+                    remaining_entries = result.fetchone()[0]
+                    result.close()
+                    if remaining_entries == 0:
+                        logger.info(f"All entries processed for FileID {file_id_db}. Exiting early.")
+                        break
 
-            for entry, result in zip(batch_entries, results):
-                entry_id = entry[0]
-                if isinstance(result, Exception):
-                    logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
-                    failed_entries += 1
-                    continue
-                entry_id_result, success = result
-                if success:
-                    successful_entries += 1
-                    last_entry_id_processed = entry_id
-                else:
-                    failed_entries += 1
+                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
+                log_memory_usage()
 
             async with async_engine.connect() as conn:
                 result = await conn.execute(
                     text("""
-                        SELECT COUNT(*) 
-                        FROM utb_ImageScraperRecords 
-                        WHERE FileID = :file_id AND Step1 IS NULL
+                        SELECT COUNT(DISTINCT t.EntryID), 
+                               SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
+                               SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
+                        FROM utb_ImageScraperResult t
+                        INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                        WHERE r.FileID = :file_id
                     """),
                     {"file_id": file_id_db_int}
                 )
-                remaining_entries = result.fetchone()[0]
+                row = result.fetchone()
+                total_entries = row[0] if row else 0
+                positive_entries = row[1] if row and row[1] is not None else 0
+                null_entries = row[2] if row and row[2] is not None else 0
+                logger.info(
+                    f"Verification: {total_entries} total entries, "
+                    f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
+                )
+                if null_entries > 0:
+                    logger.warning(f"Found {null_entries} entries with NULL SortOrder")
                 result.close()
-                if remaining_entries == 0:
-                    logger.info(f"All entries processed for FileID {file_id_db}. Exiting early.")
-                    break
 
-            elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-            logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
-            log_memory_usage()
+            to_emails = await get_send_to_email(file_id_db, logger=logger)
+            if to_emails:
+                subject = f"Processing Completed for FileID: {file_id_db}"
+                message = (
+                    f"Processing for FileID {file_id_db} completed.\n"
+                    f"Successful entries: {successful_entries}/{len(entries)}\n"
+                    f"Failed entries: {failed_entries}\n"
+                    f"Last EntryID: {last_entry_id_processed}\n"
+                    f"Log file: {log_filename}\n"
+                    f"Used all variations: {use_all_variations}"
+                )
+                await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
-        async with async_engine.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT COUNT(DISTINCT t.EntryID), 
-                           SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS positive_count,
-                           SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS null_count
-                    FROM utb_ImageScraperResult t
-                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                    WHERE r.FileID = :file_id
-                """),
-                {"file_id": file_id_db_int}
+            log_public_url = await upload_file_to_space(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id_db}.log",
+                is_public=True,
+                logger=logger,
+                file_id=str(file_id_db)
             )
-            row = result.fetchone()
-            total_entries = row[0] if row else 0
-            positive_entries = row[1] if row and row[1] is not None else 0
-            null_entries = row[2] if row and row[2] is not None else 0
-            logger.info(
-                f"Verification: {total_entries} total entries, "
-                f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
-            )
-            if null_entries > 0:
-                logger.warning(f"Found {null_entries} entries with NULL SortOrder")
-            result.close()
-
-        to_emails = await get_send_to_email(file_id_db, logger=logger)
-        if to_emails:
-            subject = f"Processing Completed for FileID: {file_id_db}"
-            message = (
-                f"Processing for FileID {file_id_db} completed.\n"
-                f"Successful entries: {successful_entries}/{len(entries)}\n"
-                f"Failed entries: {failed_entries}\n"
-                f"Last EntryID: {last_entry_id_processed}\n"
-                f"Log file: {log_filename}\n"
-                f"Used all variations: {use_all_variations}"
-            )
-            await send_message_email(to_emails, subject=subject, message=message, logger=logger)
-
-        log_public_url = await upload_file_to_space(
-            file_src=log_filename,
-            save_as=f"job_logs/job_{file_id_db}.log",
-            is_public=True,
-            logger=logger,
-            file_id=str(file_id_db)
-        )
-        return {
-            "message": "Search processing completed",
-            "file_id": str(file_id_db),
-            "successful_entries": str(successful_entries),
-            "total_entries": str(len(entries)),
-            "failed_entries": str(failed_entries),
-            "log_filename": log_filename,
-            "log_public_url": log_public_url or "",
-            "last_entry_id": str(last_entry_id_processed),
-            "use_all_variations": str(use_all_variations)
-        }
+            return {
+                "message": "Search processing completed",
+                "file_id": str(file_id_db),
+                "successful_entries": str(successful_entries),
+                "total_entries": str(len(entries)),
+                "failed_entries": str(failed_entries),
+                "log_filename": log_filename,
+                "log_public_url": log_public_url or "",
+                "last_entry_id": str(last_entry_id_processed),
+                "use_all_variations": str(use_all_variations)
+            }
+        finally:
+            producer.close()
+            logger.info(f"Closed RabbitMQ producer for FileID {file_id_db}")
     except Exception as e:
         logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
         log_public_url = await upload_file_to_space(
@@ -966,7 +975,6 @@ async def process_restart_batch(
         )
         return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
-        producer.close()
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
@@ -1224,7 +1232,7 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
 
 @router.post("/reset-step1/{file_id}", tags=["Database"])
-async def api_reset_step1(file_id: str):
+async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     logger.info(f"Resetting Step1 for FileID: {file_id}")
     
@@ -1241,50 +1249,37 @@ async def api_reset_step1(file_id: str):
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
             result.close()
 
-        # Reset Step1 to NULL
-        async with async_engine.begin() as conn:
-            result = await conn.execute(
-                text("""
-                    UPDATE utb_ImageScraperRecords
-                    SET Step1 = NULL
-                    WHERE FileID = :file_id
-                """),
-                {"file_id": int(file_id)}
-            )
-            rows_affected = result.rowcount
-            logger.info(f"Reset Step1 for {rows_affected} entries for FileID: {file_id}")
+        # Enqueue Step1 reset
+        sql = """
+            UPDATE utb_ImageScraperRecords
+            SET Step1 = NULL
+            WHERE FileID = :file_id
+        """
+        params = {"file_id": int(file_id)}
+        await enqueue_db_update(
+            file_id=file_id,
+            sql=sql,
+            params=params,
+            background_tasks=background_tasks,
+            task_type="reset_step1",
+        )
+        logger.info(f"Enqueued Step1 reset for FileID: {file_id}")
 
-        # Verify the update
-        async with async_engine.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT COUNT(*) 
-                    FROM utb_ImageScraperRecords 
-                    WHERE FileID = :file_id AND Step1 IS NULL
-                """),
-                {"file_id": int(file_id)}
-            )
-            null_count = result.scalar()
-            logger.info(f"Verification: {null_count} entries with NULL Step1 for FileID: {file_id}")
-            result.close()
-
+        # Note: Verification is tricky since the update is queued and not immediately applied.
+        # We can skip verification or implement a separate mechanism to check queue processing status.
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         
         return {
             "status_code": 200,
-            "message": f"Successfully reset Step1 for {rows_affected} entries for FileID: {file_id}",
+            "message": f"Successfully enqueued Step1 reset for FileID: {file_id}",
             "log_url": log_public_url or None,
             "timestamp": datetime.datetime.now().isoformat()
         }
     
-    except SQLAlchemyError as e:
-        logger.error(f"Database error resetting Step1 for FileID {file_id}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error resetting Step1 for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Error enqueuing Step1 reset for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Error resetting Step1 for FileID {file_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error enqueuing Step1 reset for FileID {file_id}: {str(e)}")
     
 from contextlib import asynccontextmanager
 @asynccontextmanager
@@ -1296,5 +1291,5 @@ async def lifespan(app: FastAPI):
     default_logger.info("Shutting down FastAPI application")
     await async_engine.dispose()
     default_logger.info("Database engine disposed")
-    
+
 app.include_router(router, prefix="/api/v4")

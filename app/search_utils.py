@@ -61,7 +61,7 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
+    retry=retry_if_exception_type(Exception),  # Broadened to catch RabbitMQ errors
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -70,7 +70,8 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
-    file_id: str = None
+    file_id: str = None,
+    background_tasks: Optional[BackgroundTasks] = None
 ) -> bool:
     logger = logger or default_logger
     process = psutil.Process()
@@ -98,7 +99,7 @@ async def insert_search_results(
             deduped_results.append(res)
     logger.info(f"Worker PID {process.pid}: Deduplicated from {len(results)} to {len(deduped_results)} rows for FileID {file_id}")
 
-    # Prepare DataFrame
+    # Prepare data
     data = []
     for res in deduped_results:
         try:
@@ -138,51 +139,55 @@ async def insert_search_results(
         logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id}")
         return False
 
-    # Create DataFrame
-    df = pd.DataFrame(data)
-    logger.debug(f"Worker PID {process.pid}: Prepared DataFrame with {len(df)} rows for FileID {file_id}")
-
+    # Initialize RabbitMQ producer
+    producer = RabbitMQProducer()
     try:
-        async with async_engine.begin() as conn:
-            # Step 1: Update existing rows (using async engine)
-            update_df = df[["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail", "CreateTime"]]
-            update_df = update_df.rename(columns={
-                "ImageDesc": "NewImageDesc",
-                "ImageSource": "NewImageSource",
-                "ImageUrlThumbnail": "NewImageUrlThumbnail",
-                "CreateTime": "NewCreateTime"
-            })
-            update_query = text("""
-                WITH UpdateData AS (
-                    SELECT :entry_id AS EntryID,
-                           CAST(:image_url AS NVARCHAR(MAX)) AS ImageUrl,
-                           CAST(:new_image_desc AS NVARCHAR(MAX)) AS NewImageDesc,
-                           CAST(:new_image_source AS NVARCHAR(MAX)) AS NewImageSource,
-                           CAST(:new_image_url_thumbnail AS NVARCHAR(MAX)) AS NewImageUrlThumbnail,
-                           :new_create_time AS NewCreateTime
-                )
-                UPDATE utb_ImageScraperResult
-                SET ImageDesc = ud.NewImageDesc,
-                    ImageSource = ud.NewImageSource,
-                    ImageUrlThumbnail = ud.NewImageUrlThumbnail,
-                    CreateTime = ud.NewCreateTime
-                FROM utb_ImageScraperResult r
-                INNER JOIN UpdateData ud ON r.EntryID = ud.EntryID AND r.ImageUrl = ud.ImageUrl
-                WHERE r.EntryID = :entry_id
-            """)
-            updated_count = 0
-            for _, row in update_df.iterrows():
-                result = await conn.execute(update_query, {
-                    "entry_id": row["EntryID"],
-                    "image_url": row["ImageUrl"],
-                    "new_image_desc": row["NewImageDesc"],
-                    "new_image_source": row["NewImageSource"],
-                    "new_image_url_thumbnail": row["NewImageUrlThumbnail"],
-                    "new_create_time": row["NewCreateTime"]
-                })
-                updated_count += result.rowcount
+        # Step 1: Enqueue UPDATE operations
+        update_query = """
+            WITH UpdateData AS (
+                SELECT :entry_id AS EntryID,
+                       CAST(:image_url AS NVARCHAR(MAX)) AS ImageUrl,
+                       CAST(:new_image_desc AS NVARCHAR(MAX)) AS NewImageDesc,
+                       CAST(:new_image_source AS NVARCHAR(MAX)) AS NewImageSource,
+                       CAST(:new_image_url_thumbnail AS NVARCHAR(MAX)) AS NewImageUrlThumbnail,
+                       :new_create_time AS NewCreateTime
+            )
+            UPDATE utb_ImageScraperResult
+            SET ImageDesc = ud.NewImageDesc,
+                ImageSource = ud.NewImageSource,
+                ImageUrlThumbnail = ud.NewImageUrlThumbnail,
+                CreateTime = ud.NewCreateTime
+            FROM utb_ImageScraperResult r
+            INNER JOIN UpdateData ud ON r.EntryID = ud.EntryID AND r.ImageUrl = ud.ImageUrl
+            WHERE r.EntryID = :entry_id
+        """
+        updated_count = 0
+        for row in data:
+            params = {
+                "entry_id": row["EntryID"],
+                "image_url": row["ImageUrl"],
+                "new_image_desc": row["ImageDesc"],
+                "new_image_source": row["ImageSource"],
+                "new_image_url_thumbnail": row["ImageUrlThumbnail"],
+                "new_create_time": row["CreateTime"]
+            }
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=update_query,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="update_search_result",
+                producer=producer,
+            )
+            updated_count += 1  # Approximate, as actual rowcount is unavailable
 
-            # Step 2: Insert new rows (using synchronous engine for to_sql)
+        # Step 2: Enqueue INSERT operations
+        insert_query = """
+            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+            VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
+        """
+        inserted_count = 0
+        async with async_engine.connect() as conn:
             existing_query = text("""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
@@ -190,41 +195,39 @@ async def insert_search_results(
             """)
             result = await conn.execute(existing_query, {"entry_id": data[0]["EntryID"]})
             existing_rows = {(row[0], row[1]) for row in result.fetchall()}
-            insert_df = df[~df[["EntryID", "ImageUrl"]].apply(tuple, axis=1).isin(existing_rows)]
-            
-            if not insert_df.empty:
-                insert_df.to_sql(
-                    "utb_ImageScraperResult",
-                    sync_engine,  # Use synchronous engine
-                    if_exists="append",
-                    index=False,
-                    method="multi",
-                    chunksize=1000
-                )
-                inserted_count = len(insert_df)
-            else:
-                inserted_count = 0
+            insert_data = [row for row in data if (row["EntryID"], row["ImageUrl"]) not in existing_rows]
 
-            logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(df)} rows for FileID {file_id}")
+        for row in insert_data:
+            params = {
+                "EntryID": row["EntryID"],
+                "ImageUrl": row["ImageUrl"],
+                "ImageDesc": row["ImageDesc"],
+                "ImageSource": row["ImageSource"],
+                "ImageUrlThumbnail": row["ImageUrlThumbnail"],
+                "CreateTime": row["CreateTime"]
+            }
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=insert_query,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="insert_search_result",
+                producer=producer,
+            )
+            inserted_count += 1
 
-            # Verify insertion (using async engine)
-            verify_query = text("""
-                SELECT COUNT(*) 
-                FROM utb_ImageScraperResult 
-                WHERE EntryID = :entry_id AND ImageUrl NOT LIKE 'placeholder%'
-            """)
-            result = await conn.execute(verify_query, {"entry_id": data[0]["EntryID"]})
-            verified_count = result.scalar()
-            logger.info(f"Worker PID {process.pid}: Verified {verified_count} non-placeholder results for EntryID {data[0]['EntryID']}")
+        logger.info(f"Worker PID {process.pid}: Enqueued {inserted_count} inserts and {updated_count} updates for FileID {file_id}")
 
-            return inserted_count > 0 or updated_count > 0
+        # Note: Verification is skipped because updates are queued and not immediately applied.
+        # If verification is needed, implement a consumer callback or polling mechanism.
+        return inserted_count > 0 or updated_count > 0
 
-    except SQLAlchemyError as e:
-        logger.error(f"Worker PID {process.pid}: Database error inserting results for FileID {file_id}: {e}", exc_info=True)
-        raise
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         return False
+    finally:
+        producer.close()
+        logger.debug(f"Worker PID {process.pid}: Closed RabbitMQ producer for FileID {file_id}")
 
 @retry(
     stop=stop_after_attempt(3),
