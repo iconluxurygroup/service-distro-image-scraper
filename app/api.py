@@ -1290,10 +1290,12 @@ app.include_router(router, prefix="/api/v3")
 
 @app.on_event("startup")
 async def startup_event():
+    logger = default_logger
     logger.info("Starting up FastAPI application")
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    logger = default_logger
     logger.info("Shutting down FastAPI application")
     await async_engine.dispose()
     logger.info("Database engine disposed")

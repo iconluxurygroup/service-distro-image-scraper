@@ -1,7 +1,8 @@
 import pika
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import datetime
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
