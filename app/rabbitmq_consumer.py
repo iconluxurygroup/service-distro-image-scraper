@@ -111,7 +111,7 @@ class RabbitMQConsumer:
             result_id = params.get("result_id")
             sort_order = params.get("sort_order")
 
-            # Case 1: New direct UPDATE task
+            # Case 1: Direct UPDATE task for a single result
             if all([entry_id, result_id, sort_order is not None]):
                 sql = """
                     UPDATE utb_ImageScraperResult
@@ -136,17 +136,11 @@ class RabbitMQConsumer:
                     if rowcount == 0:
                         logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
                         return False
+                    return True
 
-            # Case 2: Old UPDATE_SORT_ORDER task
+            # Case 2: Legacy task requiring priority computation
             elif entry_id and params.get("brand") and params.get("search_string"):
-                # Call update_search_sort_order to compute sort orders
-                brand = params.get("brand")
-                search_string = params.get("search_string")
-                color = params.get("color")
-                category = params.get("category")
-                brand_rules = json.loads(params.get("brand_rules", "{}"))
-
-                # Fetch results and compute priorities (mimicking update_search_sort_order logic)
+                # Fetch results and compute priorities
                 async with async_engine.connect() as conn:
                     query = text("""
                         SELECT ResultID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
@@ -165,58 +159,42 @@ class RabbitMQConsumer:
                 results = [dict(zip(columns, row)) for row in rows]
 
                 # Process brand and model aliases
+                brand = params.get("brand")
+                search_string = params.get("search_string")
                 brand_clean = clean_string(brand).lower() if brand else ""
                 model_clean = normalize_model(search_string) if search_string else ""
-                brand_aliases = []
-                if brand_clean and brand_rules and "brand_rules" in brand_rules:
-                    for rule in brand_rules["brand_rules"]:
-                        if any(brand.lower() in name.lower() for name in rule.get("names", [])):
-                            brand_aliases = rule.get("names", [])
-                            break
-                if not brand_aliases and brand_clean:
-                    brand_aliases = [brand_clean, brand_clean.replace(" & ", " and "), brand_clean.replace(" ", "")]
-                brand_aliases = [clean_string(alias).lower() for alias in brand_aliases]
+                brand_aliases = [brand_clean, brand_clean.replace(" & ", " and "), brand_clean.replace(" ", "")] if brand_clean else []
                 model_aliases = generate_aliases(model_clean) if model_clean else []
-                if model_clean and not model_aliases:
-                    model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
 
-                # Assign priorities
+                # Assign priorities and update one at a time
                 for res in results:
                     image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
                     image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
                     image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
                     model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
                     brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
-                    if model_matched and brand_matched:
-                        res["priority"] = 1
-                    elif model_matched:
-                        res["priority"] = 2
-                    elif brand_matched:
-                        res["priority"] = 3
-                    else:
-                        res["priority"] = 4
+                    priority = 1 if model_matched and brand_matched else 2 if model_matched else 3 if brand_matched else 4
+                    res["priority"] = priority
 
-                # Sort and assign SortOrder
                 sorted_results = sorted(results, key=lambda x: x["priority"])
                 update_success = True
-                rows_affected = 0
 
-                async with async_engine.begin() as conn:
-                    for index, res in enumerate(sorted_results):
-                        sort_order = -2 if res["priority"] == 4 else (index + 1)
-                        sql = """
-                            UPDATE utb_ImageScraperResult
-                            SET SortOrder = :sort_order
-                            WHERE EntryID = :entry_id AND ResultID = :result_id
-                        """
-                        update_params = {
-                            "sort_order": sort_order,
-                            "entry_id": entry_id,
-                            "result_id": res["ResultID"]
-                        }
+                for index, res in enumerate(sorted_results):
+                    sort_order = -2 if res["priority"] == 4 else (index + 1)
+                    sql = """
+                        UPDATE utb_ImageScraperResult
+                        SET SortOrder = :sort_order
+                        WHERE EntryID = :entry_id AND ResultID = :result_id
+                    """
+                    update_params = {
+                        "sort_order": sort_order,
+                        "entry_id": entry_id,
+                        "result_id": res["ResultID"]
+                    }
+
+                    async with async_engine.begin() as conn:
                         result = await conn.execute(text(sql), update_params)
                         rowcount = result.rowcount if result.rowcount is not None else 0
-                        rows_affected += rowcount
                         if rowcount == 0:
                             logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {res['ResultID']}")
                             update_success = False
@@ -225,36 +203,31 @@ class RabbitMQConsumer:
                                 f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL: {sql}, "
                                 f"params: {update_params}, affected {rowcount} rows"
                             )
+                        await conn.commit()
 
-                    await conn.commit()
+                # Validate positive SortOrder values
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(
+                        text("""
+                            SELECT COUNT(*) 
+                            FROM utb_ImageScraperResult 
+                            WHERE EntryID = :entry_id 
+                            AND SortOrder > 0
+                        """),
+                        {"entry_id": entry_id}
+                    )
+                    positive_sort_count = result.scalar()
+                    result.close()
+                    if positive_sort_count == 0:
+                        logger.warning(f"No positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
+                    else:
+                        logger.info(f"Validated {positive_sort_count} positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
 
-                if not update_success:
-                    logger.warning(f"Some updates failed for FileID: {file_id}, EntryID: {entry_id}")
-                    return False
+                return update_success
 
             else:
                 logger.error(f"Invalid params for FileID: {file_id}, params: {params}")
                 return False
-
-            # Validate positive SortOrder values
-            async with async_engine.connect() as conn:
-                result = await conn.execute(
-                    text("""
-                        SELECT COUNT(*) 
-                        FROM utb_ImageScraperResult 
-                        WHERE EntryID = :entry_id 
-                        AND SortOrder > 0
-                    """),
-                    {"entry_id": entry_id}
-                )
-                positive_sort_count = result.scalar()
-                result.close()
-                if positive_sort_count == 0:
-                    logger.warning(f"No positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
-                else:
-                    logger.info(f"Validated {positive_sort_count} positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
-
-            return True
 
         except SQLAlchemyError as e:
             logger.error(f"Database error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
