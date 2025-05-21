@@ -105,32 +105,37 @@ class RabbitMQConsumer:
                 time.sleep(5)
 
     async def execute_update(self, task, conn, logger):
-        async with conn:
-            try:
-                file_id = task.get("file_id")
-                sql = task.get("sql")
-                params = task.get("params", {})
-                
-                if not isinstance(params, dict):
-                    raise ValueError(f"Invalid params format: {params}, expected dict")
-                
-                logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
-                result = await conn.execute(text(sql), params)
-                await conn.commit()
-                rowcount = result.rowcount
-                logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
-                return {"rowcount": rowcount}
+        try:
+            # Ensure connection is not already started
+            if hasattr(conn, '_connection') and conn._connection is not None:
+                await conn.close()  # Close any existing connection
+                logger.debug(f"Closed existing connection for FileID {task.get('file_id')} before starting new operation")
             
-            except SQLAlchemyError as e:
-                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                            f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
-                            exc_info=True)
-                raise
-            except Exception as e:
-                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                            f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
-                            exc_info=True)
-                raise
+            async with conn:
+                    file_id = task.get("file_id")
+                    sql = task.get("sql")
+                    params = task.get("params", {})
+                    
+                    if not isinstance(params, dict):
+                        raise ValueError(f"Invalid params format: {params}, expected dict")
+                    
+                    logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
+                    result = await conn.execute(text(sql), params)
+                    await conn.commit()
+                    rowcount = result.rowcount
+                    logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
+                    return {"rowcount": rowcount}
+                
+        except SQLAlchemyError as e:
+                    logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                                f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
+                                exc_info=True)
+                    raise
+        except Exception as e:
+                    logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                                f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
+                                exc_info=True)
+                    raise
 
     async def execute_select(self, task, conn, logger):
         try:
