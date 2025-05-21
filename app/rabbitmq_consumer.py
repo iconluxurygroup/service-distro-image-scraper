@@ -141,61 +141,115 @@ class RabbitMQConsumer:
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
         try:
-            async with async_engine.connect() as new_conn:
+            async with async_engine.begin() as new_conn:  # Use transaction
                 logger.debug(f"Created fresh connection for FileID {file_id}, TaskType: {task_type}")
                 sql = task.get("sql")
                 params = task.get("params", {})
 
-                # Prepare query parameters
-                query_params = params  # Default to params as-is
-                if isinstance(params, dict) and "ids" in params:
-                    if not isinstance(params["ids"], (list, tuple)):
-                        raise ValueError(f"params['ids'] must be a list or tuple, got: {type(params['ids'])}")
-                    ids = params["ids"]
-                    if not ids:  # Handle empty list
-                        logger.debug(f"Empty ids list for FileID {file_id}, returning empty result")
-                        return {"results": []}
-                    # Dynamically adjust SQL and params for IN clause
-                    if len(ids) == 1:
-                        # For single value, use = instead of IN
-                        sql = sql.replace("IN (?)", "= ?")
-                        query_params = [ids[0]]  # Pass single value as list for positional placeholder
-                    else:
-                        # For multiple values, generate ? placeholders
-                        placeholders = ", ".join("?" * len(ids))
-                        sql = sql.replace("IN (?)", f"IN ({placeholders})")
-                        query_params = list(ids)  # Pass list of values for positional placeholders
+                # Validate and prepare query parameters for SELECT
+                if not isinstance(params, dict) or "ids" not in params:
+                    raise ValueError(f"Expected 'ids' in params, got: {params}")
+                ids = params["ids"]
+                if not isinstance(ids, (list, tuple)):
+                    raise ValueError(f"params['ids'] must be a list or tuple, got: {type(ids)}")
+                if not ids:  # Handle empty list
+                    logger.debug(f"Empty ids list for FileID {file_id}, returning empty result")
+                    return {"results": []}
 
-                logger.debug(f"Executing SELECT for FileID {file_id}: {sql}, params: {query_params}")
-                result = await new_conn.execute(text(sql), query_params)
+                # Adjust SQL for IN clause with named placeholder
+                select_sql = """
+                    SELECT EntryID, ImageUrl
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN :ids
+                """
+                query_params = {"ids": tuple(ids)}  # Convert to tuple for SQLAlchemy
+
+                logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql}, params: {query_params}")
+                result = await new_conn.execute(text(select_sql), query_params)
                 rows = result.fetchall()
                 columns = result.keys()
                 results = [dict(zip(columns, row)) for row in rows]
                 logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
-                return {"results": results}
 
+                # Prepare SQL queries for UPDATE and INSERT
+                update_sql = """
+                    UPDATE utb_ImageScraperResult
+                    SET ImageDesc = :ImageDesc,
+                        ImageSource = :ImageSource,
+                        ImageUrlThumbnail = :ImageUrlThumbnail,
+                        CreateTime = :CreateTime
+                    WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
+                """
+                insert_sql = """
+                    INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+                    VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
+                """
+
+                # Process each result row
+                processed_count = 0
+                for row in results:
+                    entry_id = row["EntryID"]
+                    image_url = row["ImageUrl"]
+                    
+                    # Check if the row exists
+                    check_sql = """
+                        SELECT 1
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
+                    """
+                    check_params = {"EntryID": entry_id, "ImageUrl": image_url}
+                    check_result = await new_conn.execute(text(check_sql), check_params)
+                    exists = check_result.scalar() is not None
+
+                    # Prepare parameters (using defaults from insert_search_results logic)
+                    row_params = {
+                        "EntryID": entry_id,
+                        "ImageUrl": image_url,
+                        "ImageDesc": None,  # Default from insert_search_results
+                        "ImageSource": None,
+                        "ImageUrlThumbnail": None,
+                        "CreateTime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+
+                    # Execute UPDATE or INSERT
+                    try:
+                        if exists:
+                            await new_conn.execute(text(update_sql), row_params)
+                            logger.debug(f"Updated EntryID: {entry_id}, ImageUrl: {image_url} for FileID {file_id}")
+                        else:
+                            await new_conn.execute(text(insert_sql), row_params)
+                            logger.debug(f"Inserted EntryID: {entry_id}, ImageUrl: {image_url} for FileID {file_id}")
+                        processed_count += 1
+                    except SQLAlchemyError as e:
+                        logger.error(f"Failed to process EntryID: {entry_id}, ImageUrl: {image_url} for FileID {file_id}: {e}", exc_info=True)
+                        raise
+
+                # Commit the transaction
+                await new_conn.commit()
+                logger.info(f"Successfully processed {processed_count} rows into utb_ImageScraperResult for FileID {file_id}")
+
+                return {"results": results}
         except SQLAlchemyError as e:
             logger.error(
                 f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Database error executing SELECT: {sql}, params: {params}, error: {str(e)}",
+                f"Database error executing SELECT or INSERT/UPDATE: {sql}, params: {params}, error: {str(e)}",
                 exc_info=True
             )
             raise
         except ValueError as e:
             logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"TaskType: {task_type}, FileID {file_id}, "
                 f"Invalid parameters: {params}, error: {str(e)}",
                 exc_info=True
             )
             raise
         except Exception as e:
             logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Unexpected error executing SELECT: {sql}, params: {params}, error: {str(e)}",
+                f"TaskType: {task_type}, FileID {file_id}, "
+                f"Unexpected error: {sql}, params: {params}, error: {str(e)}",
                 exc_info=True
             )
             raise
-
 
 
     async def execute_sort_order_update(self, params: dict, file_id: str):
