@@ -83,13 +83,6 @@ class RabbitMQProducer:
             self.is_connected = False
             logger.info("Closed RabbitMQ connection")
 
-from typing import Dict, Any, Optional
-import logging
-from fastapi import BackgroundTasks
-from .rabbitmq_producer import RabbitMQProducer
-
-logger = logging.getLogger(__name__)
-
 async def enqueue_db_update(
     file_id: str,
     sql: str,
