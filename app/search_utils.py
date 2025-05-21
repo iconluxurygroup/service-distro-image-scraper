@@ -242,11 +242,8 @@ async def insert_search_results(
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
+    retry=retry_if_exception_type((SQLAlchemyError, pika.exceptions.AMQPError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(...)
 )
 async def update_search_sort_order(
     file_id: str,
