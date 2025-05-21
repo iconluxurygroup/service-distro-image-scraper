@@ -230,7 +230,7 @@ async def preprocess_sku(
 
     return search_string, brand, model, color
 
-    
+
 def clean_string(s: str, preserve_url: bool = False) -> str:
     if not isinstance(s, str):
         return ''
