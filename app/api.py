@@ -76,6 +76,7 @@ class SearchClient:
 
     async def close(self):
         pass  # aiohttp.ClientSession is managed per request
+    
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -100,12 +101,14 @@ class SearchClient:
                             response.raise_for_status()
                             result = await response.json()
                             results = result.get("result")
+                            self.logger.debug(f"Worker PID {process.pid}: API result: {results[:200] if results else 'None'}")
                             if not results:
                                 self.logger.warning(f"Worker PID {process.pid}: No results for term '{term}' in region {region}")
                                 continue
                             results_html_bytes = results if isinstance(results, bytes) else results.encode("utf-8")
                             formatted_results = process_search_result(results_html_bytes, results_html_bytes, entry_id, self.logger)
-                            if not formatted_results.empty:  # Fixed condition
+                            self.logger.debug(f"Worker PID {process.pid}: Formatted results: {formatted_results.to_dict() if not formatted_results.empty else 'Empty'}")
+                            if not formatted_results.empty:
                                 self.logger.info(f"Worker PID {process.pid}: Found {len(formatted_results)} results for term '{term}' in region {region}")
                                 return [
                                     {
@@ -655,7 +658,7 @@ async def async_process_entry_search(
     finally:
         await client.close()
 
-from rabbitmq_worker import enqueue_db_update
+from rabbitmq_worker import enqueue_db_update,RabbitMQProducer
 
 async def process_restart_batch(
     file_id_db: int,
@@ -665,6 +668,7 @@ async def process_restart_batch(
     background_tasks: BackgroundTasks = None,
 ) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id_db}.log"
+    producer = RabbitMQProducer()  # Create a single producer instance
     try:
         if logger is None:
             logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
@@ -803,18 +807,28 @@ async def process_restart_batch(
                                 params=params,
                                 background_tasks=background_tasks,
                                 task_type="insert_result",
+                                producer=producer,
                             )
 
-                        # Update sort order (still performed directly for simplicity; could also be enqueued)
-                        update_result = await update_search_sort_order(
-                            str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
+                        # Enqueue sort order update
+                        sort_sql = "UPDATE_SORT_ORDER"  # Special marker for sort order task
+                        sort_params = {
+                            "file_id": str(file_id_db),
+                            "entry_id": str(entry_id),
+                            "brand": brand,
+                            "search_string": search_string,
+                            "color": color,
+                            "category": category,
+                            "brand_rules": json.dumps(brand_rules)  # Serialize brand_rules
+                        }
+                        await enqueue_db_update(
+                            file_id=str(file_id_db),
+                            sql=sort_sql,
+                            params=sort_params,
+                            background_tasks=background_tasks,
+                            task_type="update_sort_order",
+                            producer=producer,
                         )
-                        if not isinstance(update_result, list):
-                            logger.error(f"Unexpected return type from update_search_sort_order for EntryID {entry_id}: {type(update_result)}")
-                            continue
-                        if not update_result or not any(isinstance(r, dict) and r.get('SortOrder', 0) > 0 for r in update_result):
-                            logger.error(f"SortOrder update failed or no positive SortOrder for EntryID {entry_id} on attempt {attempt}")
-                            continue
 
                         # Enqueue Step1 update
                         sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
@@ -825,6 +839,7 @@ async def process_restart_batch(
                             params=params,
                             background_tasks=background_tasks,
                             task_type="update_step1",
+                            producer=producer,
                         )
 
                         return entry_id, True
@@ -834,6 +849,17 @@ async def process_restart_batch(
                             await asyncio.sleep(2 ** attempt)
                         continue
                 logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                # Log to dead-letter queue
+                sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
+                params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
+                await enqueue_db_update(
+                    file_id=str(file_id_db),
+                    sql=sql,
+                    params=params,
+                    background_tasks=background_tasks,
+                    task_type="failed_entry",
+                    producer=producer,
+                )
                 return entry_id, False
 
         for batch_idx, batch_entries in enumerate(entry_batches, 1):
@@ -943,6 +969,7 @@ async def process_restart_batch(
         )
         return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
+        producer.close()  # Close producer connection
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
