@@ -235,6 +235,15 @@ async def insert_search_results(
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((pyodbc.Error, ValueError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -249,7 +258,8 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
-        async with async_engine.connect() as conn:
+        async with async_engine.begin() as conn:  # Use begin() for a transaction
+            # Fetch results
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
                 FROM utb_ImageScraperResult r
@@ -259,8 +269,9 @@ async def update_search_sort_order(
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
             columns = result.keys()
-            result.close()
-            await conn.commit()
+            result.close()  # Explicitly close the result
+            # Ensure cursor is fully closed
+            await conn.execute(text("SELECT 1"))  # Dummy query to clear cursor state
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
@@ -269,6 +280,7 @@ async def update_search_sort_order(
         results = [dict(zip(columns, row)) for row in rows]
         logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
+        # Process brand and model aliases
         brand_clean = clean_string(brand).lower() if brand else ""
         model_clean = normalize_model(model) if model else ""
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
@@ -287,6 +299,7 @@ async def update_search_sort_order(
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
+        # Assign priorities
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
@@ -310,24 +323,58 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
+        # Batch update SortOrder
         updated_results = []
         async with async_engine.begin() as conn:
-            for index, res in enumerate(sorted_results, 1):
-                try:
-                    sort_order = 1 if index == 1 else index
-                    await conn.execute(
-                        text("""
-                            UPDATE utb_ImageScraperResult
-                            SET SortOrder = :sort_order
-                            WHERE ResultID = :result_id AND EntryID = :entry_id
-                        """),
-                        {"sort_order": sort_order, "result_id": res["ResultID"], "entry_id": entry_id}
+            # Prepare data for batch update
+            update_data = [
+                {
+                    "sort_order": 1 if index == 0 else index + 1,
+                    "result_id": res["ResultID"],
+                    "entry_id": entry_id
+                }
+                for index, res in enumerate(sorted_results)
+            ]
+
+            if update_data:
+                # Use a single batch UPDATE with a temporary table or VALUES clause
+                update_query = text("""
+                    WITH UpdateData AS (
+                        SELECT ResultID, SortOrder
+                        FROM (
+                            VALUES
+                                {placeholders}
+                        ) AS t(ResultID, SortOrder)
                     )
-                    logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {sort_order} for ResultID {res['ResultID']}")
-                    updated_results.append({"ResultID": res["ResultID"], "EntryID": entry_id, "SortOrder": sort_order})
-                except SQLAlchemyError as e:
-                    logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, EntryID {entry_id}: {e}")
-                    continue
+                    UPDATE utb_ImageScraperResult
+                    SET SortOrder = ud.SortOrder
+                    FROM utb_ImageScraperResult r
+                    INNER JOIN UpdateData ud ON r.ResultID = ud.ResultID
+                    WHERE r.EntryID = :entry_id
+                """)
+                # Generate placeholders for VALUES clause
+                placeholders = ", ".join(
+                    f"(:result_id_{i}, :sort_order_{i})"
+                    for i in range(len(update_data))
+                )
+                update_query = update_query.text.replace("{placeholders}", placeholders)
+                
+                # Flatten parameters
+                params = {"entry_id": entry_id}
+                for i, data in enumerate(update_data):
+                    params[f"result_id_{i}"] = data["result_id"]
+                    params[f"sort_order_{i}"] = data["sort_order"]
+
+                result = await conn.execute(update_query, params)
+                updated_count = result.rowcount
+                logger.debug(f"Worker PID {process.pid}: Batch updated {updated_count} rows for EntryID {entry_id}")
+
+                # Log updated results
+                updated_results = [
+                    {"ResultID": data["result_id"], "EntryID": entry_id, "SortOrder": data["sort_order"]}
+                    for data in update_data
+                ]
+
             logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(updated_results)} rows for EntryID {entry_id}")
 
         return updated_results
