@@ -582,6 +582,7 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
         logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
         
         async with async_engine.begin() as conn:
+            # Count entries with NULL SortOrder
             result = await conn.execute(
                 text("""
                     SELECT COUNT(*) 
@@ -597,6 +598,7 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             null_count = result.scalar()
             logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
 
+            # Delete placeholder entries
             result = await conn.execute(
                 text("""
                     DELETE FROM utb_ImageScraperResult
@@ -611,10 +613,11 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
             rows_deleted = result.rowcount
             logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
 
+            # Update NULL SortOrder entries to -2 one at a time
             result = await conn.execute(
                 text("""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = -2
+                    SELECT ResultID, EntryID
+                    FROM utb_ImageScraperResult
                     WHERE EntryID IN (
                         SELECT r.EntryID
                         FROM utb_ImageScraperRecords r
@@ -623,8 +626,30 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                 """),
                 {"file_id": file_id}
             )
-            rows_updated = result.rowcount
-            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
+            rows = result.fetchall()
+            result.close()
+
+            rows_updated = 0
+            for row in rows:
+                result_id, entry_id = row
+                update_sql = """
+                    UPDATE utb_ImageScraperResult
+                    SET SortOrder = :sort_order
+                    WHERE ResultID = :result_id AND EntryID = :entry_id
+                """
+                update_params = {
+                    "sort_order": -2,
+                    "result_id": result_id,
+                    "entry_id": entry_id
+                }
+                result = await conn.execute(text(update_sql), update_params)
+                rowcount = result.rowcount if result.rowcount is not None else 0
+                rows_updated += rowcount
+                logger.debug(
+                    f"Updated SortOrder to -2 for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}, affected {rowcount} rows"
+                )
+
+            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID: {file_id}")
             
             return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
     
