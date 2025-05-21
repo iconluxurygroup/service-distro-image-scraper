@@ -138,48 +138,37 @@ class RabbitMQConsumer:
             )
             return False
 
-    async def execute_select(self, sql: str, params: dict, task_type: str, file_id: str, response_queue: str):
-        try:
-            async with async_engine.connect() as conn:
-                result = await conn.execute(text(sql), params)
-                rows = result.fetchall()
-                results = [{"EntryID": row[0], "ImageUrl": row[1]} for row in rows]
-                logger.info(
-                    f"TaskType: {task_type}, FileID: {file_id}, Executed SELECT, returned {len(results)} rows"
-                )
+    async def execute_select(task, conn, logger):
+        async with conn:
+            try:
+                file_id = task.get("file_id")
+                sql = task.get("sql")
+                params = task.get("params", {})
                 
-                # Publish results to response queue
-                response_message = {
-                    "file_id": file_id,
-                    "task_type": task_type,
-                    "results": results,
-                    "timestamp": datetime.datetime.now().isoformat()
-                }
-                self.channel.basic_publish(
-                    exchange="",
-                    routing_key=response_queue,
-                    body=json.dumps(response_message),
-                    properties=pika.BasicProperties(
-                        delivery_mode=pika.DeliveryMode.Transient,
-                        correlation_id=file_id
-                    )
-                )
-                logger.info(f"Published {len(results)} SELECT results to response queue: {response_queue}")
-                return True
-        except SQLAlchemyError as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Database error executing SELECT: {sql[:100]}, "
-                f"params: {params}, error: {e}",
-                exc_info=True
-            )
-            return False
-        except Exception as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing SELECT: {sql[:100]}, "
-                f"params: {params}, error: {e}",
-                exc_info=True
-            )
-            return False
+                # Extract ids from params and convert to tuple for IN clause
+                if isinstance(params, dict) and "ids" in params:
+                    query_params = tuple(params["ids"])
+                else:
+                    raise ValueError(f"Invalid params format: {params}, expected dict with 'ids' key")
+                
+                logger.debug(f"Executing SELECT for FileID {file_id}: {sql}, params: {query_params}")
+                result = await conn.execute(text(sql), query_params)
+                rows = result.fetchall()
+                columns = result.keys()
+                results = [dict(zip(columns, row)) for row in rows]
+                logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
+                return {"results": results}
+            
+            except SQLAlchemyError as e:
+                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                            f"Database error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
+                            exc_info=True)
+                raise
+            except Exception as e:
+                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                            f"Unexpected error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
+                            exc_info=True)
+                raise
 
     async def execute_sort_order_update(self, params: dict, file_id: str):
         try:

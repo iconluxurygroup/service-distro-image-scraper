@@ -101,16 +101,18 @@ async def enqueue_db_update(
 
     try:
         producer.connect()
+        # Ensure sql is a string
+        sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
         update_task = {
             "file_id": file_id,
             "task_type": task_type,
-            "sql": sql,
+            "sql": sql_str,
             "params": params,
             "timestamp": datetime.datetime.now().isoformat(),
             "response_queue": response_queue,
         }
         producer.publish_update(update_task)
-        logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql[:100]}")
+        logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
     except Exception as e:
         logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise
