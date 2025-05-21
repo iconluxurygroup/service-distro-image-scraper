@@ -7,7 +7,7 @@ from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
+from database_config import async_engine,engine
 from common import clean_string, normalize_model, generate_aliases
 import psutil
 import pyodbc
@@ -143,7 +143,7 @@ async def insert_search_results(
     logger.debug(f"Worker PID {process.pid}: Prepared DataFrame with {len(df)} rows for FileID {file_id}")
 
     try:
-        async with async_engine.begin() as conn:
+        async with engine.begin() as conn:
             # Step 1: Update existing rows
             update_df = df[["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail", "CreateTime"]]
             update_df = update_df.rename(columns={
