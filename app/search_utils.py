@@ -223,7 +223,7 @@ async def update_search_sort_order(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
     brand_rules: Optional[Dict] = None
-) -> Optional[bool]:
+) -> List[Dict]:
     logger = logger or default_logger
     process = psutil.Process()
     
@@ -243,7 +243,7 @@ async def update_search_sort_order(
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
-            return False
+            return []
 
         results = [dict(zip(columns, row)) for row in rows]
         logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
@@ -289,6 +289,7 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
+        updated_results = []
         async with async_engine.begin() as conn:
             for index, res in enumerate(sorted_results, 1):
                 try:
@@ -302,19 +303,20 @@ async def update_search_sort_order(
                         {"sort_order": sort_order, "result_id": res["ResultID"], "entry_id": entry_id}
                     )
                     logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {sort_order} for ResultID {res['ResultID']}")
+                    updated_results.append({"ResultID": res["ResultID"], "EntryID": entry_id, "SortOrder": sort_order})
                 except SQLAlchemyError as e:
                     logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}, EntryID {entry_id}: {e}")
-                    return False
-            logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(sorted_results)} rows for EntryID {entry_id}")
+                    continue
+            logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(updated_results)} rows for EntryID {entry_id}")
 
-        return True
+        return updated_results
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return False
+        return []
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return False
+        return []
 
 # @retry(    stop=stop_after_attempt(3),
 #     wait=wait_exponential(multiplier=1, min=2, max=10),
