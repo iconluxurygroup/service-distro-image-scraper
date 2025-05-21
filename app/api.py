@@ -658,7 +658,8 @@ async def async_process_entry_search(
     finally:
         await client.close()
 
-from rabbitmq_worker import enqueue_db_update,RabbitMQProducer
+from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
+import json
 
 async def process_restart_batch(
     file_id_db: int,
@@ -668,7 +669,7 @@ async def process_restart_batch(
     background_tasks: BackgroundTasks = None,
 ) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id_db}.log"
-    producer = RabbitMQProducer()  # Create a single producer instance
+    producer = RabbitMQProducer()
     try:
         if logger is None:
             logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
@@ -788,7 +789,6 @@ async def process_restart_batch(
                                 deduplicated_results.append(res)
                         logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
-                        # Enqueue insert of search results
                         for res in deduplicated_results:
                             sql = """
                                 INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
@@ -801,7 +801,7 @@ async def process_restart_batch(
                                 "ImageSource": res["ImageSource"],
                                 "ImageUrlThumbnail": res["ImageUrlThumbnail"],
                             }
-                            await enqueue_db_update(
+                            producer = await enqueue_db_update(
                                 file_id=str(file_id_db),
                                 sql=sql,
                                 params=params,
@@ -810,8 +810,7 @@ async def process_restart_batch(
                                 producer=producer,
                             )
 
-                        # Enqueue sort order update
-                        sort_sql = "UPDATE_SORT_ORDER"  # Special marker for sort order task
+                        sort_sql = "UPDATE_SORT_ORDER"
                         sort_params = {
                             "file_id": str(file_id_db),
                             "entry_id": str(entry_id),
@@ -819,9 +818,9 @@ async def process_restart_batch(
                             "search_string": search_string,
                             "color": color,
                             "category": category,
-                            "brand_rules": json.dumps(brand_rules)  # Serialize brand_rules
+                            "brand_rules": json.dumps(brand_rules)
                         }
-                        await enqueue_db_update(
+                        producer = await enqueue_db_update(
                             file_id=str(file_id_db),
                             sql=sort_sql,
                             params=sort_params,
@@ -830,10 +829,9 @@ async def process_restart_batch(
                             producer=producer,
                         )
 
-                        # Enqueue Step1 update
                         sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                         params = {"entry_id": entry_id}
-                        await enqueue_db_update(
+                        producer = await enqueue_db_update(
                             file_id=str(file_id_db),
                             sql=sql,
                             params=params,
@@ -849,10 +847,9 @@ async def process_restart_batch(
                             await asyncio.sleep(2 ** attempt)
                         continue
                 logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                # Log to dead-letter queue
                 sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
                 params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
-                await enqueue_db_update(
+                producer = await enqueue_db_update(
                     file_id=str(file_id_db),
                     sql=sql,
                     params=params,
@@ -969,7 +966,7 @@ async def process_restart_batch(
         )
         return {"error": str(e), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
     finally:
-        producer.close()  # Close producer connection
+        producer.close()
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
@@ -1289,3 +1286,14 @@ async def api_reset_step1(file_id: str):
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error resetting Step1 for FileID {file_id}: {str(e)}")
 app.include_router(router, prefix="/api/v3")
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting up FastAPI application")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down FastAPI application")
+    await async_engine.dispose()
+    logger.info("Database engine disposed")

@@ -10,9 +10,8 @@ from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from search_utils import update_search_sort_order  # Import the function
+from search_utils import update_search_sort_order
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,6 @@ class RabbitMQConsumer:
         ),
     )
     def connect(self):
-        """Connect to RabbitMQ and declare queue."""
         self.connection = pika.BlockingConnection(
             pika.ConnectionParameters(
                 host=self.host,
@@ -55,19 +53,16 @@ class RabbitMQConsumer:
         logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
 
     def close(self):
-        """Close the RabbitMQ connection."""
         if self.connection and not self.connection.is_closed:
             self.connection.close()
             logger.info("Closed RabbitMQ connection")
 
     def start_consuming(self):
-        """Start consuming messages."""
         self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
         logger.info("Waiting for messages. To exit press CTRL+C")
         self.channel.start_consuming()
 
     async def execute_update(self, sql: str, params: dict):
-        """Execute a database update asynchronously."""
         try:
             async with async_engine.connect() as conn:
                 result = await conn.execute(text(sql), params)
@@ -79,7 +74,6 @@ class RabbitMQConsumer:
             return False
 
     async def execute_sort_order_update(self, params: dict):
-        """Execute a sort order update task."""
         try:
             file_id = params.get("file_id")
             entry_id = params.get("entry_id")
@@ -87,21 +81,20 @@ class RabbitMQConsumer:
             search_string = params.get("search_string")
             color = params.get("color")
             category = params.get("category")
-            brand_rules = json.loads(params.get("brand_rules", "{}"))  # Deserialize brand_rules
+            brand_rules = json.loads(params.get("brand_rules", "{}"))
 
             result = await update_search_sort_order(
                 file_id=file_id,
                 entry_id=entry_id,
                 brand=brand,
-                model=search_string,  # Assuming search_string is the model
+                model=search_string,
                 color=color,
                 category=category,
                 logger=logger,
                 brand_rules=brand_rules
             )
             if result:
-                logger.info(f"Successfully updated SortOrder for FileID: {file_id}, EntryID: {entry_id}, {len(result)} rows affected")
-                # Validate SortOrder
+                logger.info(f"Updated SortOrder for FileID: {file_id}, EntryID: {entry_id}, {len(result)} rows")
                 async with async_engine.connect() as conn:
                     result = await conn.execute(
                         text("""
@@ -115,32 +108,28 @@ class RabbitMQConsumer:
                     positive_sort_count = result.scalar()
                     result.close()
                     if positive_sort_count == 0:
-                        logger.warning(f"No results with positive SortOrder for EntryID {entry_id}")
+                        logger.warning(f"No positive SortOrder for EntryID {entry_id}")
                         return False
-                    logger.info(f"Validated {positive_sort_count} results with positive SortOrder for EntryID {entry_id}")
+                    logger.info(f"Validated {positive_sort_count} positive SortOrder for EntryID {entry_id}")
                 return True
             else:
-                logger.warning(f"No results updated for SortOrder for FileID: {file_id}, EntryID: {entry_id}")
+                logger.warning(f"No SortOrder updated for FileID: {file_id}, EntryID: {entry_id}")
                 return False
         except Exception as e:
             logger.error(f"Error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
             return False
 
     def callback(self, ch, method, properties, body):
-        """Callback function to process messages from the queue."""
         try:
-            # Decode and parse the message
             message = body.decode()
             task = json.loads(message)
             logger.info(f"Received task for FileID: {task.get('file_id')}, TaskType: {task.get('task_type')}")
 
-            # Extract task details
             sql = task.get("sql")
             params = task.get("params", {})
             file_id = task.get("file_id")
             task_type = task.get("task_type")
 
-            # Execute the task
             loop = asyncio.get_event_loop()
             if task_type == "update_sort_order" and sql == "UPDATE_SORT_ORDER":
                 success = loop.run_until_complete(self.execute_sort_order_update(params))
@@ -148,19 +137,16 @@ class RabbitMQConsumer:
                 success = loop.run_until_complete(self.execute_update(sql, params))
 
             if success:
-                # Acknowledge the message
                 ch.basic_ack(delivery_tag=method.delivery_tag)
-                logger.info(f"Successfully processed {task_type} for FileID: {file_id}")
+                logger.info(f"Processed {task_type} for FileID: {file_id}")
             else:
-                # Do not acknowledge; message will be re-queued
-                logger.warning(f"Failed to process {task_type} for FileID: {file_id}; message will be re-queued")
+                logger.warning(f"Failed {task_type} for FileID: {file_id}; re-queued")
+                time.sleep(2)
         except Exception as e:
             logger.error(f"Error processing message for FileID: {task.get('file_id', 'unknown')}: {e}", exc_info=True)
-            # Do not acknowledge; message will be re-queued
-            time.sleep(2)  # Prevent rapid re-queue loops
+            time.sleep(2)
 
 def signal_handler(sig, frame):
-    """Handle SIGINT for graceful shutdown."""
     logger.info("Received SIGINT, shutting down gracefully...")
     consumer.close()
     sys.exit(0)
