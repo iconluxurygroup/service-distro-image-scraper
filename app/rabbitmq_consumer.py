@@ -103,41 +103,33 @@ class RabbitMQConsumer:
                 self.close()
                 time.sleep(5)
 
-    async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
-        try:
-            async with async_engine.begin() as conn:
-                if "CreateTime" in params and params["CreateTime"]:
-                    try:
-                        params["CreateTime"] = datetime.datetime.strptime(
-                            params["CreateTime"], "%Y-%m-%d %H:%M:%S"
-                        )
-                    except ValueError as e:
-                        logger.warning(f"Invalid CreateTime format for FileID: {file_id}: {e}")
-                        params["CreateTime"] = datetime.datetime.now()
-
+    async def execute_update(task, conn, logger):
+        async with conn:
+            try:
+                file_id = task.get("file_id")
+                sql = task.get("sql")
+                params = task.get("params", {})
+                
+                if not isinstance(params, dict):
+                    raise ValueError(f"Invalid params format: {params}, expected dict")
+                
+                logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
                 result = await conn.execute(text(sql), params)
                 await conn.commit()
-                rowcount = result.rowcount if result.rowcount is not None else 0
-                logger.info(
-                    f"TaskType: {task_type}, FileID: {file_id}, Executed SQL: {sql[:100]}, "
-                    f"params: {params}, affected {rowcount} rows"
-                )
-                return True
-        except SQLAlchemyError as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Database error executing SQL: {sql[:100]}, "
-                f"params: {params}, error: {e}",
-                exc_info=True
-            )
-            return False
-        except Exception as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing SQL: {sql[:100]}, "
-                f"params: {params}, error: {e}",
-                exc_info=True
-            )
-            return False
-
+                rowcount = result.rowcount
+                logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
+                return {"rowcount": rowcount}
+            
+            except SQLAlchemyError as e:
+                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                            f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
+                            exc_info=True)
+                raise
+            except Exception as e:
+                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                            f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
+                            exc_info=True)
+                raise
     async def execute_select(task, conn, logger):
         async with conn:
             try:
