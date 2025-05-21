@@ -17,7 +17,21 @@ import pika
 import urllib.parse
 from rabbitmq_producer import RabbitMQProducer,enqueue_db_update
 import pandas as pd
-
+from typing import List, Dict, Optional
+from fastapi import BackgroundTasks
+import logging
+import psutil
+import datetime
+import asyncio
+import pika
+import json
+import uuid
+from sqlalchemy.sql import text
+from .rabbitmq_producer import RabbitMQProducer
+from common import clean_string
+from search_utils import clean_url_string, validate_thumbnail_url
+from .config import async_engine
+from tenacity import retry, stop_after_attempt, wait_fixed
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -61,38 +75,6 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             return ""
     return cleaned
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
-
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, pika.exceptions.AMQPError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-from typing import List, Dict, Optional
-from fastapi import BackgroundTasks
-import logging
-import psutil
-import datetime
-import asyncio
-import pika
-import json
-import uuid
-from sqlalchemy.sql import text
-from .rabbitmq_producer import RabbitMQProducer
-from .utils import clean_url_string, clean_string, validate_thumbnail_url
-from .config import async_engine
-from tenacity import retry, stop_after_attempt, wait_fixed
-
-# Default logger setup
-default_logger = logging.getLogger(__name__)
 
 @retry(
     stop=stop_after_attempt(3),
