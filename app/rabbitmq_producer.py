@@ -63,7 +63,9 @@ class RabbitMQProducer:
         try:
             message = json.dumps(update_task)
             queue = routing_key or self.queue_name
-            self.channel.queue_declare(queue=queue, durable=False, exclusive=True)
+            # Only declare the queue if it's not the main db_update_queue
+            if queue != self.queue_name:
+                self.channel.queue_declare(queue=queue, durable=False, exclusive=True)
             self.channel.basic_publish(
                 exchange="",
                 routing_key=queue,
