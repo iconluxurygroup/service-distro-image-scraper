@@ -93,7 +93,7 @@ class SearchClient:
                         async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
                             body_text = await response.text()
                             body_preview = body_text[:200] if body_text else ""
-                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body={body_preview}")
+                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body=body_preview}")
                             if response.status in (429, 503):
                                 self.logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
                                 raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
@@ -105,17 +105,17 @@ class SearchClient:
                                 continue
                             results_html_bytes = results if isinstance(results, bytes) else results.encode("utf-8")
                             formatted_results = process_search_result(results_html_bytes, results_html_bytes, entry_id, self.logger)
-                            if formatted_results:
+                            if not formatted_results.empty:  # Fixed condition
                                 self.logger.info(f"Worker PID {process.pid}: Found {len(formatted_results)} results for term '{term}' in region {region}")
                                 return [
                                     {
-                                        "EntryID": entry_id,  # Use provided entry_id
-                                        "ImageUrl": res.get("image_url", "placeholder://no-image"),
-                                        "ImageDesc": res.get("description", ""),
-                                        "ImageSource": res.get("source", "N/A"),
-                                        "ImageUrlThumbnail": res.get("thumbnail_url", res.get("image_url", "placeholder://no-thumbnail"))
+                                        "EntryID": entry_id,
+                                        "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
+                                        "ImageDesc": res.get("ImageDesc", ""),
+                                        "ImageSource": res.get("ImageSource", "N/A"),
+                                        "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail"))
                                     }
-                                    for res in formatted_results
+                                    for _, res in formatted_results.iterrows()
                                 ]
                             self.logger.warning(f"Worker PID {process.pid}: Empty results for term '{term}' in region {region}")
                 except (aiohttp.ClientError, json.JSONDecodeError) as e:
@@ -953,7 +953,7 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-        
+
 @router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
