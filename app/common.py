@@ -127,17 +127,14 @@ async def preprocess_sku(
         with_color_length = expected_length.get("with_color", [base_length])[0]
         color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
 
-        # Check if SKU matches brand's expected length (with or without color)
         if not (base_length - 2 <= len(search_string_clean) <= with_color_length + 2):
             continue
 
-        # Try to split on color_separator
         if color_separator:
             parts = search_string_clean.rsplit(color_separator, 1)
             if len(parts) > 1:
                 base_part = parts[0].strip()
                 color_part = parts[1].strip()
-                # Validate base_part and color_part lengths
                 if (abs(len(base_part) - base_length) <= 2 and
                     len(color_part) <= color_extension_length + 2):
                     brand = full_name
@@ -149,7 +146,6 @@ async def preprocess_sku(
                     )
                     break
 
-        # Fallback: Check if SKU matches base length (no color)
         if abs(len(search_string_clean) - base_length) <= 2:
             brand = full_name
             model = search_string_clean
@@ -163,6 +159,8 @@ async def preprocess_sku(
         logger.debug(f"No brand matched for SKU '{search_string}'")
 
     return search_string, brand, model
+
+
 def clean_string(s: str, preserve_url: bool = False) -> str:
     if not isinstance(s, str):
         return ''
@@ -185,23 +183,26 @@ def generate_aliases(model: Any) -> List[str]:
     aliases = set()
     aliases.add(model)
     
+    # Remove separators
     separators = ['_', '-', ' ', '/', '.']
     base_model = model
     for sep in separators:
         base_model = base_model.replace(sep, '')
     aliases.add(base_model)
 
+    # Digits-only
     digits_only = re.sub(r'[^0-9]', '', base_model)
     if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
+
+    # Substring aliases (e.g., article or model parts)
+    if len(model) >= 10:  # Typical model length
+        # Split into potential article and model parts (e.g., 8+7 for Off-White)
+        for i in range(4, len(model) - 4):  # Avoid overly short or long splits
+            aliases.add(model[:i])
+            aliases.add(model[i:])
     
-    for sep in separators:
-        if sep in model:
-            base = model.split(sep)[0]
-            aliases.add(base)
-            break
-    
-    return [a for a in aliases if a and len(a) >= 4] 
+    return [a for a in aliases if a and len(a) >= 4]
 
 async def fetch_brand_rules(
     file_key: str = "brand_rules",
@@ -242,7 +243,6 @@ def normalize_model(model: Any) -> str:
         return str(model).strip().lower()
     return model.strip().lower()
 
-
 async def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
@@ -278,7 +278,6 @@ async def generate_search_variations(
     variations["default"].append(search_string)
     logger.debug(f"Added default variation: '{search_string}'")
 
-    # Generate delimiter variations
     delimiters = [' ', '-', '_', '/', '.']
     delimiter_variations = []
     for delim in delimiters:
@@ -290,7 +289,6 @@ async def generate_search_variations(
     variations["delimiter_variations"] = list(set(delimiter_variations))
     logger.debug(f"Generated {len(delimiter_variations)} delimiter variations: {delimiter_variations}")
 
-    # Generate color variations
     if color:
         color_variations = [
             f"{search_string} {color}",
@@ -300,7 +298,6 @@ async def generate_search_variations(
         variations["color_variations"] = list(set(color_variations))
         logger.debug(f"Generated {len(color_variations)} color variations: {color_variations}")
 
-    # Generate brand aliases
     if brand:
         predefined_aliases = {}
         for rule in brand_rules_data.get("brand_rules", []):
@@ -318,8 +315,7 @@ async def generate_search_variations(
         variations["brand_alias"] = list(set(brand_alias_variations))
         logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations: {brand_alias_variations}")
 
-    # Generate no-color variation
-    no_color_string = model  # Use pre-processed model
+    no_color_string = model
     if brand and brand_rules_data and "brand_rules" in brand_rules_data:
         for rule in brand_rules_data["brand_rules"]:
             if any(clean_string(brand).lower() in clean_string(name).lower() for name in rule.get("names", [])):
@@ -352,7 +348,6 @@ async def generate_search_variations(
     variations["no_color"].append(no_color_string)
     logger.debug(f"Added no-color variation: '{no_color_string}'")
 
-    # Generate model aliases
     if model:
         model_aliases = generate_aliases(model)
         variations["model_alias"] = list(set(model_aliases))
@@ -365,7 +360,6 @@ async def generate_search_variations(
     logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
     return variations
 
-    
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
     brand_clean = clean_string(brand).lower()
     if not brand_clean:
