@@ -27,10 +27,10 @@ import pika
 import json
 import uuid
 from sqlalchemy.sql import text
-from .rabbitmq_producer import RabbitMQProducer
+from rabbitmq_producer import RabbitMQProducer
 from common import clean_string
 from search_utils import clean_url_string, validate_thumbnail_url
-from .config import async_engine
+from config import async_engine
 from tenacity import retry, stop_after_attempt, wait_fixed
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
