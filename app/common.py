@@ -117,32 +117,26 @@ def generate_aliases(model: Any) -> List[str]:
     if not model or model.strip() == '':
         return []
     
-    # Normalize model to lowercase and clean it
     model = clean_string(model).lower()
-    aliases = set()  # Use set for deduplication
-    aliases.add(model)  # Add the cleaned model
+    aliases = set()
+    aliases.add(model)
     
     separators = ['_', '-', ' ', '/', '.']
-    
-    # Add version with all separators removed
     base_model = model
     for sep in separators:
         base_model = base_model.replace(sep, '')
     aliases.add(base_model)
 
-    # Add digits-only version
     digits_only = re.sub(r'[^0-9]', '', base_model)
     if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
     
-    # Add first part before separator
     for sep in separators:
         if sep in model:
             base = model.split(sep)[0]
             aliases.add(base)
             break
     
-    # Filter out empty or overly short aliases
     return [a for a in aliases if a and len(a) >= len(model) - 3]
 
 async def fetch_brand_rules(
@@ -243,24 +237,24 @@ async def generate_search_variations(
             if rule.get("is_active", False):
                 full_name = clean_string(rule.get("full_name", "")).lower()
                 if full_name:
-                    predefined_aliases[full_name] = [
-                        clean_string(name).lower() for name in rule.get("names", [])
+                    predefined_aliases[rule.get("full_name")] = [
+                        name for name in rule.get("names", [])
                         if clean_string(name).lower() != full_name
                     ]
-        brand_aliases = await generate_brand_aliases(brand, predefined_aliases) or await generate_aliases(brand)
+        brand_aliases = await generate_brand_aliases(brand, predefined_aliases)
         brand_alias_variations = [f"{alias} {model}" for alias in brand_aliases if model]
         variations["brand_alias"] = list(set(brand_alias_variations))
         logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations: {brand_alias_variations}")
 
     no_color_string = search_string
-    if brand and brand_rules and "brand_rules" in brand_rules:
-        for rule in brand_rules["brand_rules"]:
-            if any(brand in name.lower() for name in rule.get("names", [])):
+    if brand and brand_rules_data and "brand_rules" in brand_rules_data:
+        for rule in brand_rules_data["brand_rules"]:
+            if any(clean_string(brand).lower() in clean_string(name).lower() for name in rule.get("names", [])):
                 sku_format = rule.get("sku_format", {})
-                color_separator = sku_format.get("color_separator", "_")
+                color_separator = sku_format.get("color_separator", "")
                 expected_length = rule.get("expected_length", {})
-                base_length = expected_length.get("base", [6])[0]
-                with_color_length = expected_length.get("with_color", [10])[0]
+                base_length = expected_length.get("base", [0])[0]
+                with_color_length = expected_length.get("with_color", [0])[0]
 
                 if not color_separator:
                     logger.debug(f"No color separator for brand {brand}, using full search string")
@@ -268,7 +262,7 @@ async def generate_search_variations(
 
                 if color_separator in search_string:
                     parts = search_string.split(color_separator)
-                    base_part = parts[0]
+                    base_part = parts[0].strip()
                     if len(base_part) >= base_length and len(search_string) <= with_color_length:
                         no_color_string = base_part
                         logger.debug(f"Extracted no-color string: '{no_color_string}' using separator '{color_separator}'")
@@ -289,13 +283,13 @@ async def generate_search_variations(
     logger.debug(f"Added no-color variation: '{no_color_string}'")
 
     if model:
-        model_aliases = await generate_aliases(model) if asyncio.iscoroutinefunction(generate_aliases) else generate_aliases(model)
-        model_alias_variations = [alias for alias in model_aliases]  # Use model aliases directly, without brand prefix
+        model_aliases = generate_aliases(model)
+        model_alias_variations = [alias for alias in model_aliases]
         variations["model_alias"] = list(set(model_alias_variations))
         logger.debug(f"Generated {len(model_alias_variations)} model alias variations: {model_alias_variations}")
     
     for key in variations:
-        variations[key] = list(set(variations[key]))  # Ensure all categories are deduplicated
+        variations[key] = list(set(variations[key]))
     
     total_variations = sum(len(v) for v in variations.values())
     logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
@@ -306,34 +300,25 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
     if not brand_clean:
         return []
 
-    aliases = [brand_clean]
+    aliases = []
+    # Find the matching brand in predefined_aliases
     for key, alias_list in predefined_aliases.items():
-        if clean_string(key).lower() == brand_clean:
-            aliases.extend(clean_string(alias).lower() for alias in alias_list)
+        key_clean = clean_string(key).lower()
+        if key_clean == brand_clean:
+            # Add the full name (preserving original case)
+            aliases.append(key)
+            # Add any additional names from the "names" field
+            aliases.extend(clean_string(alias) for alias in alias_list if clean_string(alias).lower() != key_clean)
+            break
 
-    base_brand = brand_clean.replace('&', 'and').replace('  ', ' ')
-    variations = [
-        base_brand.replace(' ', ''),
-        base_brand.replace(' ', '-'),
-        re.sub(r'[^a-z0-9]', '', base_brand),
-    ]
-
-    words = base_brand.split()
-    if len(words) > 1:
-        abbreviation = ''.join(word[0] for word in words if word)
-        if len(abbreviation) >= 4:
-            variations.append(abbreviation)
-        variations.append(words[0])
-        variations.append(words[-1])
-
-    aliases.extend(variations)
+    # Deduplicate and filter short or invalid aliases
     seen = set()
     filtered_aliases = []
     for alias in aliases:
         alias_lower = alias.lower()
-        if len(alias_lower) >= 4 and alias_lower not in ["sas", "soda","s&s","scotch"] and alias_lower not in seen:
+        if len(alias_lower) >= 2 and alias_lower not in seen:  # Relaxed length check for short names like "DG"
             seen.add(alias_lower)
-            filtered_aliases.append(alias_lower)
+            filtered_aliases.append(alias)  # Preserve original case
 
     return filtered_aliases
 
