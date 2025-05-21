@@ -105,37 +105,37 @@ class RabbitMQConsumer:
                 time.sleep(5)
 
     async def execute_update(self, task, conn, logger):
+        file_id = task.get("file_id", "unknown")
+        task_type = task.get("task_type", "unknown")
         try:
-            # Ensure connection is not already started
-            if hasattr(conn, '_connection') and conn._connection is not None:
-                await conn.close()  # Close any existing connection
-                logger.debug(f"Closed existing connection for FileID {task.get('file_id')} before starting new operation")
-            
-            async with conn:
-                    file_id = task.get("file_id")
-                    sql = task.get("sql")
-                    params = task.get("params", {})
-                    
-                    if not isinstance(params, dict):
-                        raise ValueError(f"Invalid params format: {params}, expected dict")
-                    
-                    logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
-                    result = await conn.execute(text(sql), params)
-                    await conn.commit()
-                    rowcount = result.rowcount
-                    logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
-                    return {"rowcount": rowcount}
+            async with async_engine.begin() as new_conn:  # Use new connection with transaction
+                sql = task.get("sql")
+                params = task.get("params", {})
                 
+                if not isinstance(params, dict):
+                    raise ValueError(f"Invalid params format: {params}, expected dict")
+                
+                logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
+                result = await new_conn.execute(text(sql), params)
+                await new_conn.commit()
+                rowcount = result.rowcount
+                logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
+                return {"rowcount": rowcount}
+                    
         except SQLAlchemyError as e:
-                    logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                                f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
-                                exc_info=True)
-                    raise
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
+                exc_info=True
+            )
+            raise
         except Exception as e:
-                    logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
-                                f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
-                                exc_info=True)
-                    raise
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
+                exc_info=True
+            )
+            raise
 
     async def execute_select(self, task, conn, logger):
         file_id = task.get("file_id", "unknown")
@@ -243,7 +243,6 @@ class RabbitMQConsumer:
             return False
 
     def callback(self, ch, method, properties, body):
-        conn = None
         try:
             message = body.decode()
             task = json.loads(message)
@@ -255,7 +254,6 @@ class RabbitMQConsumer:
             loop = asyncio.get_event_loop()
             if task_type == "select_deduplication":
                 async def run_select():
-                    nonlocal conn
                     async with async_engine.connect() as conn:
                         logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
                         result = await self.execute_select(task, conn, logger)
@@ -276,7 +274,6 @@ class RabbitMQConsumer:
                 success = loop.run_until_complete(self.execute_sort_order_update(task.get("params", {}), file_id))
             else:
                 async def run_update():
-                    nonlocal conn
                     async with async_engine.begin() as conn:
                         logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
                         result = await self.execute_update(task, conn, logger)
@@ -295,12 +292,8 @@ class RabbitMQConsumer:
                 f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
                 exc_info=True
             )
-            if conn is not None and not conn.closed:
-                loop.run_until_complete(conn.close())
-                logger.info(f"Closed database connection for FileID: {file_id}")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
             time.sleep(2)
-
     async def test_task(self, task: dict):
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
