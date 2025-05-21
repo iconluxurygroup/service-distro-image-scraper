@@ -41,6 +41,8 @@ class RabbitMQConsumer:
         ),
     )
     def connect(self):
+        if self.connection and not self.connection.is_closed:
+            return
         self.connection = pika.BlockingConnection(
             pika.ConnectionParameters(
                 host=self.host,
@@ -69,22 +71,22 @@ class RabbitMQConsumer:
         self.is_consuming = False
 
     def purge_queue(self):
-        """Purge all messages from the queue. Use with caution."""
-        if not self.channel or self.channel.is_closed:
-            self.connect()
+        """Purge all messages from the queue for debugging. Use with caution."""
         try:
+            if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
+                self.connect()
             purge_count = self.channel.queue_purge(self.queue_name)
-            logger.info(f"Purged {purge_count} messages from queue: {self.queue_name}")
+            logger.info(f"Manually purged {purge_count} messages from queue: {self.queue_name}")
             return purge_count
         except Exception as e:
             logger.error(f"Error purging queue {self.queue_name}: {e}", exc_info=True)
             raise
 
     def start_consuming(self):
+        """Start consuming messages with automatic reconnection."""
         while True:
             try:
-                if not self.connection or self.connection.is_closed:
-                    self.connect()
+                self.connect()
                 self.is_consuming = True
                 self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
                 logger.info("Waiting for messages. To exit press CTRL+C")
@@ -106,7 +108,6 @@ class RabbitMQConsumer:
     async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
         try:
             async with async_engine.begin() as conn:
-                # Normalize CreateTime format if present
                 if "CreateTime" in params and params["CreateTime"]:
                     try:
                         params["CreateTime"] = datetime.datetime.strptime(
@@ -145,7 +146,6 @@ class RabbitMQConsumer:
             result_id = params.get("result_id")
             sort_order = params.get("sort_order")
 
-            # Validate required parameters
             if not all([entry_id, result_id, sort_order is not None]):
                 logger.error(
                     f"Invalid parameters for update_sort_order task, FileID: {file_id}. "
@@ -153,7 +153,6 @@ class RabbitMQConsumer:
                 )
                 return False
 
-            # Direct UPDATE task for a single result
             sql = """
                 UPDATE utb_ImageScraperResult
                 SET SortOrder = :sort_order
@@ -178,7 +177,6 @@ class RabbitMQConsumer:
                     logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
                     return False
                 return True
-
         except SQLAlchemyError as e:
             logger.error(f"Database error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
             return False
@@ -241,31 +239,25 @@ def signal_handler(consumer):
     return handler
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
+    parser.add_argument("--clear-queue", action="store_true", help="Manually clear the queue and exit")
+    args = parser.parse_args()
+
     consumer = RabbitMQConsumer()
     signal.signal(signal.SIGINT, signal_handler(consumer))
     signal.signal(signal.SIGTERM, signal_handler(consumer))
 
-    # Sample task for insert_result
-    insert_task = {
-        "file_id": "321",
-        "task_type": "insert_result",
-        "sql": """
-            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
-            VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
-        """,
-        "params": {
-            "EntryID": 119061,
-            "ImageUrl": "https://image.goat.com/transform/v1/attachments/product_template_pictures/images/105/346/991/original/OMIA295F24FAB001_0145.png",
-            "ImageDesc": "Off-White Be Right Back 'White Blue' - OMIA295F24FAB001 0145 | The Home Depot Canada",
-            "ImageSource": "image.goat.com",
-            "ImageUrlThumbnail": "https://image.goat.com/transform/v1/attachments/product_template_pictures/images/105/346/991/original/OMIA295F24FAB001_0145.png",
-            "CreateTime": "2025-05-21 12:34:08"
-        },
-        "timestamp": "2025-05-21T12:34:08.307076"
-    }
+    if args.clear_queue:
+        try:
+            consumer.purge_queue()
+            logger.info("Queue cleared successfully. Exiting.")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Failed to clear queue: {e}", exc_info=True)
+            sys.exit(1)
 
-    # Sample task for update_sort_order
-    sort_task = {
+    sample_task = {
         "file_id": "321",
         "task_type": "update_sort_order",
         "sql": "UPDATE_SORT_ORDER",
@@ -279,11 +271,7 @@ if __name__ == "__main__":
 
     try:
         loop = asyncio.get_event_loop()
-        # Test both tasks
-        loop.run_until_complete(consumer.test_task(insert_task))
-        loop.run_until_complete(consumer.test_task(sort_task))
-        
-        consumer.connect()
+        loop.run_until_complete(consumer.test_task(sample_task))
         consumer.start_consuming()
     except KeyboardInterrupt:
         consumer.close()
