@@ -686,7 +686,7 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        BATCH_SIZE = 1
+        BATCH_SIZE = 10
         MAX_CONCURRENCY = 4
         MAX_ENTRY_RETRIES = 3
 
