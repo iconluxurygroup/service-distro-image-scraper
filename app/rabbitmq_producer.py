@@ -55,22 +55,24 @@ class RabbitMQProducer:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
             raise
 
-    def publish_update(self, update_task: Dict[str, Any]):
+    def publish_update(self, update_task: Dict[str, Any], routing_key: str = None):
         """Publish an update task to the queue with persistent delivery."""
         if not self.is_connected or not self.connection or self.connection.is_closed:
             self.connect()
 
         try:
             message = json.dumps(update_task)
+            queue = routing_key or self.queue_name
+            self.channel.queue_declare(queue=queue, durable=False, exclusive=True)
             self.channel.basic_publish(
                 exchange="",
-                routing_key=self.queue_name,
+                routing_key=queue,
                 body=message,
                 properties=pika.BasicProperties(
                     delivery_mode=pika.DeliveryMode.Persistent
                 ),
             )
-            logger.info(f"Published update task to queue: {self.queue_name}, task: {message}")
+            logger.info(f"Published update task to queue: {queue}, task: {message}")
         except Exception as e:
             logger.error(f"Failed to publish update task: {e}", exc_info=True)
             self.is_connected = False
