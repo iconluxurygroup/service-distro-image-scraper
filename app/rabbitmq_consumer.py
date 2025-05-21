@@ -11,7 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from search_utils import update_search_sort_order
-
+from common import clean_string, normalize_model, generate_aliases
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
