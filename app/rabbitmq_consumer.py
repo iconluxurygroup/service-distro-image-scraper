@@ -289,7 +289,6 @@ class RabbitMQConsumer:
     async def test_task(self, task: dict):
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
-        
         logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
         if task_type == "select_deduplication":
             async with async_engine.connect() as conn:
