@@ -215,16 +215,33 @@ class RabbitMQConsumer:
             response_queue = task.get("response_queue")
             logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {message[:200]}")
 
-            sql = task.get("sql")
-            params = task.get("params", {})
-
             loop = asyncio.get_event_loop()
             if task_type == "select_deduplication":
-                success = loop.run_until_complete(self.execute_select(sql, params, task_type, file_id, response_queue))
-            elif task_type == "update_sort_order" and sql == "UPDATE_SORT_ORDER":
-                success = loop.run_until_complete(self.execute_sort_order_update(params, file_id))
+                async def run_select():
+                    async with async_engine.connect() as conn:
+                        result = await self.execute_select(task, conn, logger)
+                        if response_queue:
+                            # Publish results to response queue
+                            response_message = json.dumps(result)
+                            ch.basic_publish(
+                                exchange="",
+                                routing_key=response_queue,
+                                body=response_message,
+                                properties=pika.BasicProperties(
+                                    correlation_id=properties.correlation_id
+                                )
+                            )
+                            logger.info(f"Sent {len(result['results'])} deduplication results to {response_queue} for FileID: {file_id}")
+                        return result
+                success = loop.run_until_complete(run_select())
+            elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
+                success = loop.run_until_complete(self.execute_sort_order_update(task.get("params", {}), file_id))
             else:
-                success = loop.run_until_complete(self.execute_update(sql, params, task_type, file_id))
+                async def run_update():
+                    async with async_engine.begin() as conn:
+                        result = await self.execute_update(task, conn, logger)
+                        return result
+                success = loop.run_until_complete(run_update())
 
             if success:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
