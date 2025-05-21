@@ -118,13 +118,14 @@ async def preprocess_sku(
 
     search_string_clean = clean_string(search_string).lower()
 
-    # Prioritize known_brand
+    # Strictly enforce known_brand
     if known_brand:
+        known_brand_clean = clean_string(known_brand).lower()
         for rule in brand_rules_data.get("brand_rules", []):
             if not rule.get("is_active", False):
                 continue
             full_name = rule.get("full_name", "")
-            if clean_string(known_brand).lower() == clean_string(full_name).lower():
+            if clean_string(full_name).lower() == known_brand_clean:
                 brand = full_name
                 sku_format = rule.get("sku_format", {})
                 color_separator = sku_format.get("color_separator", "")
@@ -167,11 +168,14 @@ async def preprocess_sku(
                         f"model '{model}' (no color)"
                     )
                     return search_string, brand, model, None
-                logger.warning(
-                    f"Known brand '{known_brand}' matched, but SKU '{search_string}' "
-                    f"doesn't fit expected lengths (base: {base_length}, with_color: {with_color_length})"
+                # Return known brand even if SKU doesn't match
+                logger.debug(
+                    f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
+                    f"model '{model}', color '{color}' (forced brand match)"
                 )
-                break
+                return search_string, brand, model, color
+        logger.warning(f"Known brand '{known_brand}' not found in active brand rules")
+        return search_string, known_brand, model, color
 
     # Fallback: Try to match brand rules
     for rule in brand_rules_data.get("brand_rules", []):
