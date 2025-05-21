@@ -803,7 +803,10 @@ async def process_restart_batch(
                         update_result = await update_search_sort_order(
                             str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                         )
-                        if update_result is None or not any(r['SortOrder'] > 0 for r in update_result):
+                        if not isinstance(update_result, list):
+                            logger.error(f"Unexpected return type from update_search_sort_order for EntryID {entry_id}: {type(update_result)}")
+                            continue
+                        if not update_result or not any(isinstance(r, dict) and r.get('SortOrder', 0) > 0 for r in update_result):
                             logger.error(f"SortOrder update failed or no positive SortOrder for EntryID {entry_id} on attempt {attempt}")
                             continue
 
