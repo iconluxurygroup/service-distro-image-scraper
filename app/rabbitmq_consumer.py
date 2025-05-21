@@ -154,18 +154,15 @@ class RabbitMQConsumer:
         else:
             raise ValueError(f"Invalid parameters for SELECT query, expected named placeholders (e.g., id0), got: {params}")
 
-        # Execute the query
         try:
             result = await conn.execute(text(select_sql), params)
             rows = result.fetchall()
             columns = result.keys()
             result.close()
 
-            # Process results
             results = [dict(zip(columns, row)) for row in rows]
             logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
 
-            # Send response to RabbitMQ if response_queue is specified
             if response_queue:
                 producer = RabbitMQProducer(host=self.host, port=self.port, username=self.credentials.username, password=self.credentials.password)
                 try:
@@ -180,6 +177,7 @@ class RabbitMQConsumer:
         except SQLAlchemyError as e:
             logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
             raise
+
 
     async def execute_sort_order_update(self, params: dict, file_id: str):
         try:
