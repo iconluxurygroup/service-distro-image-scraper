@@ -7,7 +7,7 @@ from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine,engine
+from database_config import async_engine
 from common import clean_string, normalize_model, generate_aliases
 import psutil
 import pyodbc
@@ -143,8 +143,8 @@ async def insert_search_results(
     logger.debug(f"Worker PID {process.pid}: Prepared DataFrame with {len(df)} rows for FileID {file_id}")
 
     try:
-        async with engine.begin() as conn:
-            # Step 1: Update existing rows
+        async with async_engine.begin() as conn:
+            # Step 1: Update existing rows (using async engine)
             update_df = df[["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail", "CreateTime"]]
             update_df = update_df.rename(columns={
                 "ImageDesc": "NewImageDesc",
@@ -152,7 +152,6 @@ async def insert_search_results(
                 "ImageUrlThumbnail": "NewImageUrlThumbnail",
                 "CreateTime": "NewCreateTime"
             })
-            # Insert DataFrame into a temporary result set using a CTE
             update_query = text("""
                 WITH UpdateData AS (
                     SELECT :entry_id AS EntryID,
@@ -183,8 +182,7 @@ async def insert_search_results(
                 })
                 updated_count += result.rowcount
 
-            # Step 2: Insert new rows (excluding those already updated)
-            # Check existing rows
+            # Step 2: Insert new rows (using synchronous engine for to_sql)
             existing_query = text("""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
@@ -197,7 +195,7 @@ async def insert_search_results(
             if not insert_df.empty:
                 insert_df.to_sql(
                     "utb_ImageScraperResult",
-                    conn.engine,
+                    sync_engine,  # Use synchronous engine
                     if_exists="append",
                     index=False,
                     method="multi",
@@ -209,7 +207,7 @@ async def insert_search_results(
 
             logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(df)} rows for FileID {file_id}")
 
-            # Verify insertion
+            # Verify insertion (using async engine)
             verify_query = text("""
                 SELECT COUNT(*) 
                 FROM utb_ImageScraperResult 
