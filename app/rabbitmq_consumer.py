@@ -331,7 +331,6 @@ class RabbitMQConsumer:
             time.sleep(2)
 
     async def test_task(self, task: dict):
-        """Simulate processing a single task for testing purposes."""
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
         sql = task.get("sql")
@@ -346,17 +345,19 @@ class RabbitMQConsumer:
         logger.info(f"Test task result for FileID: {file_id}, TaskType: {task_type}: {'Success' if success else 'Failed'}")
         return success
 
-def signal_handler(sig, frame):
-    logger.info("Received SIGINT, shutting down gracefully...")
-    consumer.close()
-    sys.exit(0)
+def signal_handler(consumer):
+    def handler(sig, frame):
+        logger.info(f"Received signal {sig}, shutting down gracefully...")
+        consumer.close()
+        sys.exit(0)
+    return handler
 
 if __name__ == "__main__":
     import datetime
     consumer = RabbitMQConsumer()
-    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler(consumer))
+    signal.signal(signal.SIGTERM, signal_handler(consumer))
 
-    # Sample task from logs, updated to include CreateTime
     sample_task = {
         "file_id": "321",
         "task_type": "insert_result",
@@ -376,11 +377,9 @@ if __name__ == "__main__":
     }
 
     try:
-        # Test a single task first
         loop = asyncio.get_event_loop()
         loop.run_until_complete(consumer.test_task(sample_task))
         
-        # Then start consuming from queue
         consumer.connect()
         consumer.start_consuming()
     except KeyboardInterrupt:
