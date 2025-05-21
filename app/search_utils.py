@@ -243,7 +243,10 @@ async def insert_search_results(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
     retry=retry_if_exception_type((SQLAlchemyError, pika.exceptions.AMQPError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(...)
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_search_sort_order for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
 )
 async def update_search_sort_order(
     file_id: str,
@@ -328,24 +331,35 @@ async def update_search_sort_order(
         # Initialize RabbitMQ producer
         producer = RabbitMQProducer()
         try:
-            # Prepare and enqueue direct UPDATE tasks
+            # Prepare and enqueue direct UPDATE tasks for each record
             update_data = []
             for index, res in enumerate(sorted_results):
                 # Assign SortOrder: -2 for priority 4, positive values (1, 2, 3, ...) for priorities 1, 2, 3
                 sort_order = -2 if res["priority"] == 4 else (index + 1)
-                update_query = """
+                update_query = text("""
                     UPDATE utb_ImageScraperResult
                     SET SortOrder = :sort_order
                     WHERE EntryID = :entry_id AND ResultID = :result_id
-                """
+                """)
                 params = {
                     "sort_order": sort_order,
                     "entry_id": entry_id,
                     "result_id": res["ResultID"]
                 }
+                # Execute update directly for each record
+                async with async_engine.connect() as conn:
+                    try:
+                        result = await conn.execute(update_query, params)
+                        await conn.commit()
+                        logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {sort_order} for ResultID {res['ResultID']}, EntryID {entry_id}")
+                    except SQLAlchemyError as e:
+                        logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}: {e}")
+                        raise
+
+                # Enqueue for additional task tracking if needed
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=update_query,
+                    sql=str(update_query),
                     params=params,
                     background_tasks=background_tasks,
                     task_type="update_sort_order",
@@ -359,10 +373,10 @@ async def update_search_sort_order(
                 logger.debug(f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}")
 
             if update_data:
-                logger.info(f"Worker PID {process.pid}: Enqueued SortOrder updates for {len(update_data)} rows for EntryID {entry_id}")
+                logger.info(f"Worker PID {process.pid}: Processed SortOrder updates for {len(update_data)} rows for EntryID {entry_id}")
                 return update_data
             else:
-                logger.warning(f"Worker PID {process.pid}: No updates to enqueue for EntryID {entry_id}")
+                logger.warning(f"Worker PID {process.pid}: No updates processed for EntryID {entry_id}")
                 return []
 
         finally:
@@ -371,8 +385,7 @@ async def update_search_sort_order(
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return []
-
+        raise  # Let retry handle it
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
