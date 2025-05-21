@@ -239,11 +239,10 @@ async def insert_search_results(
     finally:
         producer.close()
         logger.debug(f"Worker PID {process.pid}: Closed RabbitMQ producer")
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(Exception),  # Broadened to catch RabbitMQ errors
+    retry=retry_if_exception_type(Exception),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -264,7 +263,7 @@ async def update_search_sort_order(
     process = psutil.Process()
     
     try:
-        # Fetch results (read-only, no queuing needed)
+        # Fetch results (read-only)
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
@@ -332,93 +331,39 @@ async def update_search_sort_order(
         # Initialize RabbitMQ producer
         producer = RabbitMQProducer()
         try:
-            # Prepare data for batch update
+            # Prepare and enqueue direct UPDATE tasks
             update_data = []
             for index, res in enumerate(sorted_results):
                 # Assign SortOrder: -2 for priority 4, positive values (1, 2, 3, ...) for priorities 1, 2, 3
-                sort_order = -2 if res["priority"] == 4 else (1 if index == 0 else index + 1)
-                update_data.append({
-                    "sort_order": sort_order,
-                    "result_id": res["ResultID"],
-                    "entry_id": entry_id
-                })
-
-            if update_data:
-                # Step 1: Enqueue CREATE TABLE
-                create_query = """
-                    CREATE TABLE #UpdateSortOrder (
-                        ResultID BIGINT,
-                        SortOrder INT
-                    )
-                """
-                await enqueue_db_update(
-                    file_id=file_id,
-                    sql=create_query,
-                    params={},
-                    background_tasks=background_tasks,
-                    task_type="create_temp_table",
-                    producer=producer,
-                )
-                logger.debug(f"Worker PID {process.pid}: Enqueued CREATE TABLE for EntryID {entry_id}")
-
-                # Step 2: Enqueue INSERT operations
-                insert_query = """
-                    INSERT INTO #UpdateSortOrder (ResultID, SortOrder)
-                    VALUES (:result_id, :sort_order)
-                """
-                for data in update_data:
-                    params = {
-                        "result_id": data["result_id"],
-                        "sort_order": data["sort_order"]
-                    }
-                    await enqueue_db_update(
-                        file_id=file_id,
-                        sql=insert_query,
-                        params=params,
-                        background_tasks=background_tasks,
-                        task_type="insert_temp_table",
-                        producer=producer,
-                    )
-                logger.debug(f"Worker PID {process.pid}: Enqueued {len(update_data)} INSERT operations for EntryID {entry_id}")
-
-                # Step 3: Enqueue UPDATE operation
+                sort_order = -2 if res["priority"] == 4 else (index + 1)
                 update_query = """
                     UPDATE utb_ImageScraperResult
-                    SET SortOrder = ud.SortOrder
-                    FROM utb_ImageScraperResult r
-                    INNER JOIN #UpdateSortOrder ud ON r.ResultID = ud.ResultID
-                    WHERE r.EntryID = :entry_id
+                    SET SortOrder = :sort_order
+                    WHERE EntryID = :entry_id AND ResultID = :result_id
                 """
+                params = {
+                    "sort_order": sort_order,
+                    "entry_id": entry_id,
+                    "result_id": res["ResultID"]
+                }
                 await enqueue_db_update(
                     file_id=file_id,
                     sql=update_query,
-                    params={"entry_id": entry_id},
+                    params=params,
                     background_tasks=background_tasks,
                     task_type="update_sort_order",
                     producer=producer,
                 )
-                logger.debug(f"Worker PID {process.pid}: Enqueued UPDATE for EntryID {entry_id}")
+                update_data.append({
+                    "ResultID": res["ResultID"],
+                    "EntryID": entry_id,
+                    "SortOrder": sort_order
+                })
+                logger.debug(f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}")
 
-                # Step 4: Enqueue DROP TABLE
-                drop_query = "DROP TABLE #UpdateSortOrder"
-                await enqueue_db_update(
-                    file_id=file_id,
-                    sql=drop_query,
-                    params={},
-                    background_tasks=background_tasks,
-                    task_type="drop_temp_table",
-                    producer=producer,
-                )
-                logger.debug(f"Worker PID {process.pid}: Enqueued DROP TABLE for EntryID {entry_id}")
-
-                # Log updated results (no rowcount available since updates are queued)
-                updated_results = [
-                    {"ResultID": data["result_id"], "EntryID": entry_id, "SortOrder": data["sort_order"]}
-                    for data in update_data
-                ]
-                logger.info(f"Worker PID {process.pid}: Enqueued SortOrder updates for {len(updated_results)} rows for EntryID {entry_id}")
-
-                return updated_results
+            if update_data:
+                logger.info(f"Worker PID {process.pid}: Enqueued SortOrder updates for {len(update_data)} rows for EntryID {entry_id}")
+                return update_data
             else:
                 logger.warning(f"Worker PID {process.pid}: No updates to enqueue for EntryID {entry_id}")
                 return []
@@ -430,7 +375,7 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return []
-    
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
