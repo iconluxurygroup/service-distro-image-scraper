@@ -235,31 +235,33 @@ class RabbitMQConsumer:
             response_queue = task.get("response_queue")
             logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {message[:200]}")
 
-            async def process_task(task, logger):
-                if task_type == "select_deduplication":
-                    async with async_engine.connect() as conn:
-                        result = await self.execute_select(task, conn, logger)
-                        logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(result)} rows for FileID: {file_id}")
+        async def process_task(task, logger):
+            if task_type == "select_deduplication":
+                async with async_engine.connect() as conn:
+                    result = await self.execute_select(task, conn, logger)
+                    logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(result)} rows for FileID: {file_id}")
 
-                        # Format the response as a dictionary
-                        response = {"file_id": file_id, "results": result}
+                    # Format the response as a dictionary
+                    response = {"file_id": file_id, "results": result}
 
-                        # Send response to RabbitMQ if response_queue is specified
-                        if response_queue:
-                            producer = RabbitMQProducer(
-                                host=self.host,
-                                port=self.port,
-                                username=self.credentials.username,
-                                password=self.credentials.password
-                            )
-                            try:
-                                producer.connect()
-                                producer.publish_update(response, routing_key=response_queue, correlation_id=file_id)
-                                logger.info(f"Sent {len(result)} deduplication results to {response_queue} for FileID: {file_id}")
-                            finally:
-                                producer.close()
+                    # Send response to RabbitMQ if response_queue is specified
+                    if response_queue:
+                        producer = RabbitMQProducer(
+                            host=self.host,
+                            port=self.port,
+                            username=self.credentials.username,
+                            password=self.credentials.password
+                        )
+                        try:
+                            producer.connect()
+                            # Use publish_message with correlation_id
+                            producer.publish_message(response, routing_key=response_queue, correlation_id=file_id)
+                            logger.info(f"Sent {len(result)} deduplication results to {response_queue} for FileID: {file_id}")
+                        finally:
+                            producer.close()
 
-                        return response
+                    return response
+            # ... rest of the function unchanged
                 elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
                     return await self.execute_sort_order_update(task.get("params", {}), file_id)
                 else:
