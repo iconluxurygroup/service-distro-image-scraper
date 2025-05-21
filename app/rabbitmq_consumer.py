@@ -131,7 +131,7 @@ class RabbitMQConsumer:
                             f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
                             exc_info=True)
                 raise
-    async def execute_select(task, conn, logger):
+    async def execute_select(self, task, conn, logger):
         async with conn:
             try:
                 file_id = task.get("file_id")
@@ -160,6 +160,34 @@ class RabbitMQConsumer:
             except Exception as e:
                 logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
                             f"Unexpected error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
+                            exc_info=True)
+                raise
+
+    async def execute_update(self, task, conn, logger):
+        async with conn:
+            try:
+                file_id = task.get("file_id")
+                sql = task.get("sql")
+                params = task.get("params", {})
+                
+                if not isinstance(params, dict):
+                    raise ValueError(f"Invalid params format: {params}, expected dict")
+                
+                logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
+                result = await conn.execute(text(sql), params)
+                await conn.commit()
+                rowcount = result.rowcount
+                logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
+                return {"rowcount": rowcount}
+            
+            except SQLAlchemyError as e:
+                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                            f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
+                            exc_info=True)
+                raise
+            except Exception as e:
+                logger.error(f"TaskType: {task.get('task_type')}, FileID: {file_id}, "
+                            f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
                             exc_info=True)
                 raise
 
