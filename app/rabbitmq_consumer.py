@@ -315,6 +315,9 @@ def signal_handler(consumer):
     def handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down gracefully...")
         consumer.close()
+        # Ensure async engine is disposed
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(async_engine.dispose())
         sys.exit(0)
     return handler
 
