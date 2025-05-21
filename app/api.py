@@ -1253,8 +1253,9 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
     logger.info(f"Resetting Step1 for FileID: {file_id}")
     
     try:
-        # Validate FileID exists
+        # Validate FileID exists and check image count
         async with async_engine.connect() as conn:
+            # Check if FileID exists
             result = await conn.execute(
                 text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
                 {"file_id": int(file_id)}
@@ -1265,7 +1266,29 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
             result.close()
 
-        # Enqueue Step1 reset
+            # Check for images (non-null Step1 records)
+            result = await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM utb_ImageScraperRecords "
+                    "WHERE FileID = :file_id AND Step1 IS NOT NULL"
+                ),
+                {"file_id": int(file_id)}
+            )
+            image_count = result.fetchone()[0]
+            result.close()
+            logger.info(f"Found {image_count} images for FileID: {file_id}")
+
+            # If images exist, return early (optional: proceed based on requirements)
+            if image_count > 0:
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                return {
+                    "status_code": 200,
+                    "message": f"No reset needed for FileID: {file_id}. Found {image_count} images.",
+                    "log_url": log_public_url or None,
+                    "timestamp": datetime.datetime.now().isoformat()
+                }
+
+        # Enqueue Step1 reset (only if 0 images)
         sql = """
             UPDATE utb_ImageScraperRecords
             SET Step1 = NULL
@@ -1281,13 +1304,11 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
         )
         logger.info(f"Enqueued Step1 reset for FileID: {file_id}")
 
-        # Note: Verification is tricky since the update is queued and not immediately applied.
-        # We can skip verification or implement a separate mechanism to check queue processing status.
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         
         return {
             "status_code": 200,
-            "message": f"Successfully enqueued Step1 reset for FileID: {file_id}",
+            "message": f"Successfully enqueued Step1 reset for FileID: {file_id} (0 images found)",
             "log_url": log_public_url or None,
             "timestamp": datetime.datetime.now().isoformat()
         }
@@ -1296,9 +1317,6 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
         logger.error(f"Error enqueuing Step1 reset for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error enqueuing Step1 reset for FileID {file_id}: {str(e)}")
-
-
-
 
 @router.get("/monitor-queue/{file_id}", tags=["Monitoring"])
 async def api_monitor_queue(file_id: str):
