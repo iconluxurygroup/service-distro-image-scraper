@@ -9,6 +9,7 @@ from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine, sync_engine
 from common import clean_string, normalize_model, generate_aliases
+from fastapi import BackgroundTasks
 import psutil
 import pyodbc
 import re
