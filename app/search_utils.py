@@ -76,13 +76,30 @@ if not default_logger.handlers:
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+from typing import List, Dict, Optional
+from fastapi import BackgroundTasks
+import logging
+import psutil
+import datetime
+import asyncio
+import pika
+import json
+import uuid
+from sqlalchemy.sql import text
+from .rabbitmq_producer import RabbitMQProducer
+from .utils import clean_url_string, clean_string, validate_thumbnail_url
+from .config import async_engine
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+# Default logger setup
+default_logger = logging.getLogger(__name__)
+
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, pika.exceptions.AMQPError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    wait=wait_fixed(4),
+    before_sleep=lambda retry_state: default_logger.info(
+        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
+        f"(attempt {retry_state.attempt_number}/3) after 4.0s"
     )
 )
 async def insert_search_results(
@@ -140,7 +157,7 @@ async def insert_search_results(
             logger.debug(f"Worker PID {process.pid}: {errors[-1]}")
             continue
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
-            image_url_thumbnail = None  # Set to None instead of empty string for SQL
+            image_url_thumbnail = None
 
         # Apply category-specific filters
         if category in category_filters and any(
@@ -155,7 +172,7 @@ async def insert_search_results(
             "ImageDesc": image_desc or None,
             "ImageSource": image_source or None,
             "ImageUrlThumbnail": image_url_thumbnail or None,
-            "CreateTime": datetime.datetime.now()
+            "CreateTime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
 
     if not data:
@@ -165,19 +182,69 @@ async def insert_search_results(
     # Initialize RabbitMQ producer
     producer = RabbitMQProducer()
     try:
-        # Fetch existing rows for deduplication
-        existing_keys = set()
-        async with async_engine.connect() as conn:
-            entry_ids = tuple(row["EntryID"] for row in data)
-            if entry_ids:
-                existing_query = text("""
-                    SELECT EntryID, ImageUrl
-                    FROM utb_ImageScraperResult
-                    WHERE EntryID IN :entry_ids
-                """)
-                result = await conn.execute(existing_query, {"entry_ids": entry_ids})
-                existing_keys = {(row[0], row[1]) for row in result.fetchall()}
-                result.close()
+        # Set up response queue for SELECT results
+        response_queue = f"select_response_{uuid.uuid4().hex}"
+        connection = pika.BlockingConnection(pika.ConnectionParameters(
+            host=producer.host,
+            port=producer.port,
+            credentials=producer.credentials
+        ))
+        channel = connection.channel()
+        channel.queue_declare(queue=response_queue, exclusive=True)
+        response_received = asyncio.Event()
+        response_data = []
+
+        def on_response(ch, method, properties, body):
+            if properties.correlation_id == file_id:
+                response_data.append(json.loads(body.decode()))
+                response_received.set()
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+
+        channel.basic_consume(queue=response_queue, on_message_callback=on_response)
+
+        # Start consuming responses in the background
+        async def consume_responses():
+            loop = asyncio.get_event_loop()
+            while not response_received.is_set():
+                connection.process_data_events(time_limit=1)
+                await asyncio.sleep(0.1)
+
+        # Enqueue deduplication SELECT query
+        entry_ids = list(set(row["EntryID"] for row in data))  # Remove duplicates
+        if entry_ids:
+            formatted_entry_ids = [(id,) for id in entry_ids]  # Fix TVP format
+            select_query = """
+                SELECT EntryID, ImageUrl
+                FROM utb_ImageScraperResult
+                WHERE EntryID IN :entry_ids
+            """
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=select_query,
+                params={"entry_ids": formatted_entry_ids},
+                background_tasks=background_tasks,
+                task_type="select_deduplication",
+                producer=producer,
+                response_queue=response_queue  # Pass response queue
+            )
+            logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+
+            # Wait for SELECT results
+            consume_task = asyncio.create_task(consume_responses())
+            try:
+                await asyncio.wait_for(response_received.wait(), timeout=30)  # 30s timeout
+                existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
+                logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+            except asyncio.TimeoutError:
+                logger.warning(f"Worker PID {process.pid}: Timeout waiting for SELECT results, proceeding without deduplication")
+                existing_keys = set()
+            finally:
+                consume_task.cancel()
+                channel.stop_consuming()
+                connection.close()
+
+        else:
+            existing_keys = set()
 
         # Prepare SQL queries
         update_query = text("""
@@ -235,10 +302,11 @@ async def insert_search_results(
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
-        raise  # Let retry handle it
+        raise
     finally:
         producer.close()
         logger.debug(f"Worker PID {process.pid}: Closed RabbitMQ producer")
+        
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
