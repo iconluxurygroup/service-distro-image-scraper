@@ -3,7 +3,7 @@ import json
 import logging
 from typing import Dict, Any
 from fastapi import BackgroundTasks
-
+import datetime
 logger = logging.getLogger(__name__)
 
 class RabbitMQProducer:
