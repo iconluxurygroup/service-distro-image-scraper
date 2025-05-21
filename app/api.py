@@ -41,7 +41,7 @@ from url_extract import extract_thumbnail_url
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-from rabbitmq_producer import RabbitMQProducer
+from rabbitmq_consumer import RabbitMQConsumer
 app = FastAPI(title="super_scraper", version=VERSION)
 
 default_logger = logging.getLogger(__name__)
