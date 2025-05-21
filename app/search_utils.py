@@ -420,6 +420,119 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return []
+    
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type(SQLAlchemyError),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_sort_order for FileID {retry_state.kwargs['file_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def update_sort_order(
+    file_id: str,
+    logger: Optional[logging.Logger] = None,
+    background_tasks: Optional[BackgroundTasks] = None
+) -> Optional[List[Dict]]:
+    logger = logger or default_logger
+    try:
+        file_id = int(file_id)
+        logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
+        
+        async with async_engine.connect() as conn:
+            query = text("""
+                SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
+                FROM utb_ImageScraperRecords 
+                WHERE FileID = :file_id
+            """)
+            logger.debug(f"Executing query: {query} with FileID: {file_id}")
+            result = await conn.execute(query, {"file_id": file_id})
+            entries = result.fetchall()
+            result.close()
+        
+        if not entries:
+            logger.warning(f"No entries found for FileID: {file_id}")
+            return []
+            
+        results = []
+        success_count = 0
+        failure_count = 0
+        
+        for entry in entries:
+            entry_id, brand, model, color, category = entry
+            logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
+            try:
+                entry_results = await update_search_sort_order(
+                    file_id=str(file_id),
+                    entry_id=str(entry_id),
+                    brand=brand,
+                    model=model,
+                    color=color,
+                    category=category,
+                    logger=logger,
+                    background_tasks=background_tasks  # Pass background_tasks
+                )
+                
+                if entry_results:
+                    results.append({"EntryID": entry_id, "Success": True})
+                    success_count += 1
+                else:
+                    results.append({"EntryID": entry_id, "Success": False})
+                    failure_count += 1
+                    logger.warning(f"No results for EntryID {entry_id}")
+            except Exception as e:
+                results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
+                failure_count += 1
+                logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
+        
+        logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
+        
+        # Verification remains read-only, no changes needed
+        async with async_engine.connect() as conn:
+            verification = {}
+            queries = [
+                ("PositiveSortOrderEntries", "t.SortOrder > 0"),
+                ("BrandMatchEntries", "t.SortOrder = 0"),
+                ("NoMatchEntries", "t.SortOrder < 0"),
+                ("NullSortOrderEntries", "t.SortOrder IS NULL"),
+                ("UnexpectedSortOrderEntries", "t.SortOrder = -1")
+            ]
+            for key, condition in queries:
+                query = text(f"""
+                    SELECT COUNT(DISTINCT t.EntryID)
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = :file_id AND {condition}
+                """)
+                result = await conn.execute(query, {"file_id": file_id})
+                verification[key] = result.scalar()
+                result.close()
+            
+            query = text("""
+                SELECT t.EntryID, t.SortOrder, t.ImageUrl
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE r.FileID = :file_id
+            """)
+            result = await conn.execute(query, {"file_id": file_id})
+            sort_orders = result.fetchall()
+            logger.info(f"SortOrder values for FileID {file_id}: {[(row[0], row[1], row[2][:50]) for row in sort_orders]}")
+            
+            logger.info(f"Verification for FileID {file_id}: "
+                       f"{verification['PositiveSortOrderEntries']} entries with model matches, "
+                       f"{verification['BrandMatchEntries']} entries with brand matches only, "
+                       f"{verification['NoMatchEntries']} entries with no matches, "
+                       f"{verification['NullSortOrderEntries']} entries with NULL SortOrder, "
+                       f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder")
+        
+        return results
+    except SQLAlchemyError as e:
+        logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        return None
 # @retry(    stop=stop_after_attempt(3),
 #     wait=wait_exponential(multiplier=1, min=2, max=10),
 #     retry=retry_if_exception_type(SQLAlchemyError),
@@ -497,112 +610,6 @@ async def update_search_sort_order(
 #     except Exception as e:
 #         logger.error(f"Error exporting DAI JSON for FileID {file_id}: {e}", exc_info=True)
 #         return ""
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_sort_order for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_sort_order(file_id: str, logger: Optional[logging.Logger] = None) -> Optional[List[Dict]]:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
-        
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
-                FROM utb_ImageScraperRecords 
-                WHERE FileID = :file_id
-            """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id}")
-            result = await conn.execute(query, {"file_id": file_id})
-            entries = result.fetchall()
-            result.close()
-        
-        if not entries:
-            logger.warning(f"No entries found for FileID: {file_id}")
-            return []
-            
-        results = []
-        success_count = 0
-        failure_count = 0
-        
-        for entry in entries:
-            entry_id, brand, model, color, category = entry
-            logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
-            try:
-                entry_results = await update_search_sort_order(
-                    file_id=str(file_id),
-                    entry_id=str(entry_id),
-                    brand=brand,
-                    model=model,
-                    color=color,
-                    category=category,
-                    logger=logger
-                )
-                
-                if entry_results:
-                    results.append({"EntryID": entry_id, "Success": True})
-                    success_count += 1
-                else:
-                    results.append({"EntryID": entry_id, "Success": False})
-                    failure_count += 1
-                    logger.warning(f"No results for EntryID {entry_id}")
-            except Exception as e:
-                results.append({"EntryID": entry_id, "Success": False, "Error": str(e)})
-                failure_count += 1
-                logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
-        
-        logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
-        
-        async with async_engine.connect() as conn:
-            verification = {}
-            queries = [
-                ("PositiveSortOrderEntries", "t.SortOrder > 0"),
-                ("BrandMatchEntries", "t.SortOrder = 0"),
-                ("NoMatchEntries", "t.SortOrder < 0"),
-                ("NullSortOrderEntries", "t.SortOrder IS NULL"),
-                ("UnexpectedSortOrderEntries", "t.SortOrder = -1")
-            ]
-            for key, condition in queries:
-                query = text(f"""
-                    SELECT COUNT(DISTINCT t.EntryID)
-                    FROM utb_ImageScraperResult t
-                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                    WHERE r.FileID = :file_id AND {condition}
-                """)
-                result = await conn.execute(query, {"file_id": file_id})
-                verification[key] = result.scalar()
-                result.close()
-            
-            query = text("""
-                SELECT t.EntryID, t.SortOrder, t.ImageUrl
-                FROM utb_ImageScraperResult t
-                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
-                WHERE r.FileID = :file_id
-            """)
-            result = await conn.execute(query, {"file_id": file_id})
-            sort_orders = result.fetchall()
-            logger.info(f"SortOrder values for FileID {file_id}: {[(row[0], row[1], row[2][:50]) for row in sort_orders]}")
-            
-            logger.info(f"Verification for FileID {file_id}: "
-                       f"{verification['PositiveSortOrderEntries']} entries with model matches, "
-                       f"{verification['BrandMatchEntries']} entries with brand matches only, "
-                       f"{verification['NoMatchEntries']} entries with no matches, "
-                       f"{verification['NullSortOrderEntries']} entries with NULL SortOrder, "
-                       f"{verification['UnexpectedSortOrderEntries']} entries with unexpected SortOrder")
-        
-        return results
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        return None
 
 @retry(
     stop=stop_after_attempt(3),

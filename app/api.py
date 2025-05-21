@@ -474,9 +474,9 @@ async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwa
         logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
         
         if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
-            result = await job_func(file_id, **kwargs)
+            result = await job_func(file_id, logger=logger, **kwargs)  # Pass kwargs including background_tasks
         else:
-            result = job_func(file_id, **kwargs)
+            result = job_func(file_id, logger=logger, **kwargs)
         
         debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
         logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
