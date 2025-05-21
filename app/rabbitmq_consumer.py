@@ -145,12 +145,15 @@ class RabbitMQConsumer:
                 logger.debug(f"Created fresh connection for FileID {file_id}, TaskType: {task_type}")
                 sql = task.get("sql")
                 params = task.get("params", {})
-                
+
+                # Prepare query parameters
                 if isinstance(params, dict) and "ids" in params:
-                    query_params = tuple(params["ids"])
+                    if not isinstance(params["ids"], (list, tuple)):
+                        raise ValueError(f"params['ids'] must be a list or tuple, got: {type(params['ids'])}")
+                    query_params = {"ids": tuple(params["ids"])}  # Convert to tuple for IN clause
                 else:
-                    raise ValueError(f"Invalid params format: {params}, expected dict with 'ids' key")
-                
+                    query_params = params  # Use params as-is for non-IN queries
+
                 logger.debug(f"Executing SELECT for FileID {file_id}: {sql}, params: {query_params}")
                 result = await new_conn.execute(text(sql), query_params)
                 rows = result.fetchall()
@@ -158,11 +161,24 @@ class RabbitMQConsumer:
                 results = [dict(zip(columns, row)) for row in rows]
                 logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
                 return {"results": results}
-            
+
         except SQLAlchemyError as e:
-            logger.error(f"TaskType: {task_type}, FileID: {file_id}, "
-                        f"Database error executing SELECT: {sql}, params: {params}, error: {str(e)}", 
-                        exc_info=True)
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"Database error executing SELECT: {sql}, params: {params}, error: {str(e)}"
+            )
+            raise
+        except ValueError as e:
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"Invalid parameters: {params}, error: {str(e)}"
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"Unexpected error executing SELECT: {sql}, params: {params}, error: {str(e)}"
+            )
             raise
     async def execute_sort_order_update(self, params: dict, file_id: str):
         try:
