@@ -129,11 +129,11 @@ async def preprocess_sku(
         with_color_length = expected_length.get("with_color", [base_length])[0]
         color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
 
-        # Check SKU length compatibility
+        # Check SKU length
         if not (base_length - 2 <= len(search_string_clean) <= with_color_length + 2):
             continue
 
-        # Split on color_separator to isolate base model
+        # Split on color_separator
         if color_separator:
             parts = search_string_clean.rsplit(color_separator, 1)
             if len(parts) > 1:
@@ -150,7 +150,7 @@ async def preprocess_sku(
                     )
                     break
 
-        # Fallback: Use SKU as model if it matches base length
+        # Fallback: Match base length
         if abs(len(search_string_clean) - base_length) <= 2:
             brand = full_name
             model = search_string_clean
