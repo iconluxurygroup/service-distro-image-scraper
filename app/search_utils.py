@@ -98,8 +98,8 @@ async def insert_search_results(
             deduped_results.append(res)
     logger.info(f"Worker PID {process.pid}: Deduplicated from {len(results)} to {len(deduped_results)} rows for FileID {file_id}")
 
-    # Prepare parameters with cleaned data
-    parameters = []
+    # Prepare DataFrame
+    data = []
     for res in deduped_results:
         try:
             entry_id = int(res["EntryID"])
@@ -120,90 +120,92 @@ async def insert_search_results(
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
             image_url_thumbnail = ""
 
-        # Filter irrelevant URLs for footwear
-        if category == "footwear" and any(keyword in image_url.lower() for keyword in ["appliance", "whirlpool", "parts"]):
-            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
-            continue
 
-        param = {
-            "entry_id": entry_id,
-            "image_url": image_url or None,
-            "image_desc": image_desc or None,
-            "image_source": image_source or None,
-            "image_url_thumbnail": image_url_thumbnail or None
-        }
-        parameters.append(param)
-        logger.debug(f"Worker PID {process.pid}: Prepared row for EntryID {entry_id}: {param}")
+        data.append({
+            "EntryID": entry_id,
+            "ImageUrl": image_url or None,
+            "ImageDesc": image_desc or None,
+            "ImageSource": image_source or None,
+            "ImageUrlThumbnail": image_url_thumbnail or None,
+            "CreateTime": datetime.datetime.now()
+        })
 
-    if not parameters:
+    if not data:
         logger.warning(f"Worker PID {process.pid}: No valid rows to insert for FileID {file_id}")
         return False
 
+    # Create DataFrame
+    df = pd.DataFrame(data)
+    logger.debug(f"Worker PID {process.pid}: Prepared DataFrame with {len(df)} rows for FileID {file_id}")
+
     try:
         async with async_engine.begin() as conn:
-            inserted_count = 0
-            updated_count = 0
-            for param in parameters:
-                try:
-                    # Try updating existing row
-                    update_query = text("""
-                        UPDATE utb_ImageScraperResult
-                        SET ImageDesc = :image_desc,
-                            ImageSource = :image_source,
-                            ImageUrlThumbnail = :image_url_thumbnail,
-                            CreateTime = CURRENT_TIMESTAMP
-                        WHERE EntryID = :entry_id AND ImageUrl = :image_url
-                    """)
-                    result = await conn.execute(
-                        update_query,
-                        {
-                            "entry_id": param["entry_id"],
-                            "image_url": param["image_url"],
-                            "image_desc": param["image_desc"],
-                            "image_source": param["image_source"],
-                            "image_url_thumbnail": param["image_url_thumbnail"]
-                        }
-                    )
-                    updated_count += result.rowcount
+            # Perform bulk insert with update-on-duplicate logic
+            # Note: SQL Server doesn't support ON DUPLICATE KEY UPDATE, so we use a merge approach
+            temp_table = f"temp_utb_ImageScraperResult_{file_id}_{process.pid}"
+            create_temp_query = text(f"""
+                CREATE TABLE {temp_table} (
+                    EntryID INT,
+                    ImageUrl NVARCHAR(MAX),
+                    ImageDesc NVARCHAR(MAX),
+                    ImageSource NVARCHAR(MAX),
+                    ImageUrlThumbnail NVARCHAR(MAX),
+                    CreateTime DATETIME
+                )
+            """)
+            await conn.execute(create_temp_query)
 
-                    if result.rowcount == 0:
-                        # Insert new row if no update occurred
-                        insert_query = text("""
-                            INSERT INTO utb_ImageScraperResult
-                            (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
-                            SELECT :entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, CURRENT_TIMESTAMP
-                            WHERE NOT EXISTS (
-                                SELECT 1 FROM utb_ImageScraperResult
-                                WHERE EntryID = :entry_id AND ImageUrl = :image_url
-                            )
-                        """)
-                        result = await conn.execute(
-                            insert_query,
-                            {
-                                "entry_id": param["entry_id"],
-                                "image_url": param["image_url"],
-                                "image_desc": param["image_desc"],
-                                "image_source": param["image_source"],
-                                "image_url_thumbnail": param["image_url_thumbnail"]
-                            }
-                        )
-                        inserted_count += result.rowcount
-                except SQLAlchemyError as e:
-                    logger.error(f"Worker PID {process.pid}: Failed to process EntryID {param['entry_id']}: {e}")
-                    logger.debug(f"Row data: {param}")
-                    continue
+            # Bulk insert into temporary table
+            df.to_sql(temp_table, conn.engine, if_exists='append', index=False, method='multi')
+            logger.debug(f"Worker PID {process.pid}: Inserted {len(df)} rows into temporary table {temp_table}")
 
-            logger.info(f"Worker PID {process.pid}: Inserted {inserted_count} and updated {updated_count} of {len(parameters)} rows for FileID {file_id}")
-            if inserted_count == 0 and updated_count == 0:
-                logger.warning(f"Worker PID {process.pid}: No rows inserted or updated for FileID {file_id}; likely all rows are duplicates")
-            return inserted_count > 0 or updated_count > 0
+            # Merge into main table (update or insert)
+            merge_query = text(f"""
+                MERGE INTO utb_ImageScraperResult AS target
+                USING {temp_table} AS source
+                ON target.EntryID = source.EntryID AND target.ImageUrl = source.ImageUrl
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        ImageDesc = source.ImageDesc,
+                        ImageSource = source.ImageSource,
+                        ImageUrlThumbnail = source.ImageUrlThumbnail,
+                        CreateTime = source.CreateTime
+                WHEN NOT MATCHED THEN
+                    INSERT (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+                    VALUES (source.EntryID, source.ImageUrl, source.ImageDesc, source.ImageSource, source.ImageUrlThumbnail, source.CreateTime);
+            """)
+            result = await conn.execute(merge_query)
+            affected_rows = result.rowcount
+            logger.info(f"Worker PID {process.pid}: Merged {affected_rows} rows into utb_ImageScraperResult for FileID {file_id}")
+
+            # Drop temporary table
+            await conn.execute(text(f"DROP TABLE {temp_table}"))
+
+            # Verify insertion
+            verify_query = text("""
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult 
+                WHERE EntryID = :entry_id AND ImageUrl NOT LIKE 'placeholder%'
+            """)
+            result = await conn.execute(verify_query, {"entry_id": data[0]["EntryID"]})
+            inserted_count = result.scalar()
+            logger.info(f"Worker PID {process.pid}: Verified {inserted_count} non-placeholder results for EntryID {data[0]['EntryID']}")
+
+            return inserted_count > 0
 
     except SQLAlchemyError as e:
         logger.error(f"Worker PID {process.pid}: Database error inserting results for FileID {file_id}: {e}", exc_info=True)
-        return False
+        raise
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error inserting results for FileID {file_id}: {e}", exc_info=True)
         return False
+    finally:
+        # Ensure temporary table is dropped even on failure
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(text(f"DROP TABLE IF EXISTS {temp_table}"))
+        except Exception as e:
+            logger.warning(f"Worker PID {process.pid}: Failed to drop temporary table {temp_table}: {e}")
 
 @retry(
     stop=stop_after_attempt(3),

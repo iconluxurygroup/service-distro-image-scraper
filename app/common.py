@@ -269,7 +269,7 @@ def generate_aliases(model: Any, article_length: int = 8, model_length: int = 7,
         aliases.add(digits_only)
 
     # Delimiter variations
-    delimiters = ['-', '_', ' ']
+    delimiters = ['-', '_', ' ', '.']
     if len(model) >= article_length + model_length:
         article = model[:article_length]
         model_part = model[article_length:article_length + model_length]
