@@ -167,12 +167,11 @@ class RabbitMQConsumer:
 
             # Send response to RabbitMQ if response_queue is specified
             if response_queue:
-                # Create a temporary producer for publishing the response
-                producer = RabbitMQProducer(queue_name=response_queue)
+                producer = RabbitMQProducer(host=self.host, port=self.port, username=self.credentials.username, password=self.credentials.password)
                 try:
                     producer.connect()
                     response = {"file_id": file_id, "results": results}
-                    producer.publish_update(response)
+                    producer.publish_update(response, routing_key=response_queue)
                     logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
                 finally:
                     producer.close()
