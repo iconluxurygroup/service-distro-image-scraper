@@ -13,6 +13,7 @@ from fastapi import BackgroundTasks
 import psutil
 import pyodbc
 import re
+import pika
 import urllib.parse
 from rabbitmq_producer import RabbitMQProducer,enqueue_db_update
 import pandas as pd
