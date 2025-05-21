@@ -83,6 +83,13 @@ class RabbitMQProducer:
             self.is_connected = False
             logger.info("Closed RabbitMQ connection")
 
+from typing import Dict, Any, Optional
+import logging
+from fastapi import BackgroundTasks
+from .rabbitmq_producer import RabbitMQProducer
+
+logger = logging.getLogger(__name__)
+
 async def enqueue_db_update(
     file_id: str,
     sql: str,
@@ -90,6 +97,7 @@ async def enqueue_db_update(
     background_tasks: BackgroundTasks,
     task_type: str = "db_update",
     producer: Optional[RabbitMQProducer] = None,
+    response_queue: Optional[str] = None,
 ):
     """Enqueue a database update task to RabbitMQ."""
     if producer is None:
@@ -106,9 +114,10 @@ async def enqueue_db_update(
             "sql": sql,
             "params": params,
             "timestamp": datetime.datetime.now().isoformat(),
+            "response_queue": response_queue,
         }
         producer.publish_update(update_task)
-        logger.info(f"Enqueued database update for FileID: {file_id}, SQL: {sql[:100]}")
+        logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql[:100]}")
     except Exception as e:
         logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise
