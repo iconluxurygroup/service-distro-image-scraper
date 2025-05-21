@@ -54,7 +54,32 @@ class RabbitMQProducer:
         except pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
             raise
+    def publish_message(self, message: Dict[str, Any], routing_key: str = None, correlation_id: Optional[str] = None):
+        """Publish a message to the queue with optional correlation_id."""
+        if not self.is_connected or not self.connection or self.connection.is_closed:
+            self.connect()
 
+        try:
+            message_body = json.dumps(message)
+            queue = routing_key or self.queue_name
+            # Only declare the queue if it's not db_update_queue or a response_queue
+            if queue != self.queue_name and not queue.startswith("select_response_"):
+                self.channel.queue_declare(queue=queue, durable=False, exclusive=True)
+            properties = pika.BasicProperties(
+                delivery_mode=pika.DeliveryMode.Persistent,
+                correlation_id=correlation_id if correlation_id else None
+            )
+            self.channel.basic_publish(
+                exchange="",
+                routing_key=queue,
+                body=message_body,
+                properties=properties
+            )
+            logger.info(f"Published message to queue: {queue}, correlation_id: {correlation_id}, task: {message_body}")
+        except Exception as e:
+            logger.error(f"Failed to publish message: {e}", exc_info=True)
+            self.is_connected = False
+            raise
     def publish_update(self, update_task: Dict[str, Any], routing_key: str = None):
         """Publish an update task to the queue with persistent delivery."""
         if not self.is_connected or not self.connection or self.connection.is_closed:
