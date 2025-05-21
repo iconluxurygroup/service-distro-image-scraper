@@ -1282,14 +1282,31 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Error enqueuing Step1 reset for FileID {file_id}: {str(e)}")
     
 from contextlib import asynccontextmanager
+import signal
+import asyncio
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic
     default_logger.info("Starting up FastAPI application")
-    yield
-    # Shutdown logic
-    default_logger.info("Shutting down FastAPI application")
-    await async_engine.dispose()
-    default_logger.info("Database engine disposed")
+
+    # Signal handlers
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def handle_shutdown(signal_type):
+        default_logger.info(f"Received {signal_type}, initiating graceful shutdown")
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, handle_shutdown, sig.name)
+
+    try:
+        yield
+    finally:
+        # Wait for shutdown signal or continue with cleanup
+        await asyncio.wait_for(shutdown_event.wait(), timeout=None)
+        default_logger.info("Shutting down FastAPI application")
+        await async_engine.dispose()
+        default_logger.info("Database engine disposed")
 
 app.include_router(router, prefix="/api/v4")

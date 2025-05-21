@@ -233,7 +233,7 @@ async def insert_search_results(
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((pyodbc.Error, ValueError)),
+    retry=retry_if_exception_type(Exception),  # Broadened to catch RabbitMQ errors
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -247,14 +247,15 @@ async def update_search_sort_order(
     color: Optional[str] = None,
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
-    brand_rules: Optional[Dict] = None
+    brand_rules: Optional[Dict] = None,
+    background_tasks: Optional[BackgroundTasks] = None
 ) -> List[Dict]:
     logger = logger or default_logger
     process = psutil.Process()
     
     try:
-        async with async_engine.begin() as conn:  # Use begin() for a transaction
-            # Fetch results
+        # Fetch results (read-only, no queuing needed)
+        async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
                 FROM utb_ImageScraperResult r
@@ -264,9 +265,8 @@ async def update_search_sort_order(
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
             columns = result.keys()
-            result.close()  # Explicitly close the result
-            # Ensure cursor is fully closed
-            await conn.execute(text("SELECT 1"))  # Dummy query to clear cursor state
+            result.close()
+            await conn.execute(text("SELECT 1"))  # Clear cursor state
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
@@ -315,73 +315,110 @@ async def update_search_sort_order(
                 res["priority"] = 4
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
+        # Sort results by priority
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Batch update SortOrder
-        updated_results = []
-        async with async_engine.begin() as conn:
+        # Initialize RabbitMQ producer
+        producer = RabbitMQProducer()
+        try:
             # Prepare data for batch update
-            update_data = [
-                {
-                    "sort_order": 1 if index == 0 else index + 1,
+            update_data = []
+            for index, res in enumerate(sorted_results):
+                # Assign SortOrder: -2 for priority 4, positive values (1, 2, 3, ...) for priorities 1, 2, 3
+                sort_order = -2 if res["priority"] == 4 else (1 if index == 0 else index + 1)
+                update_data.append({
+                    "sort_order": sort_order,
                     "result_id": res["ResultID"],
                     "entry_id": entry_id
-                }
-                for index, res in enumerate(sorted_results)
-            ]
+                })
 
             if update_data:
-                # Use a temporary table approach for batch update
-                # Step 1: Create a temporary table
-                await conn.execute(text("""
+                # Step 1: Enqueue CREATE TABLE
+                create_query = """
                     CREATE TABLE #UpdateSortOrder (
                         ResultID BIGINT,
                         SortOrder INT
                     )
-                """))
+                """
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=create_query,
+                    params={},
+                    background_tasks=background_tasks,
+                    task_type="create_temp_table",
+                    producer=producer,
+                )
+                logger.debug(f"Worker PID {process.pid}: Enqueued CREATE TABLE for EntryID {entry_id}")
 
-                # Step 2: Insert data into temporary table
-                insert_query = text("""
+                # Step 2: Enqueue INSERT operations
+                insert_query = """
                     INSERT INTO #UpdateSortOrder (ResultID, SortOrder)
                     VALUES (:result_id, :sort_order)
-                """)
+                """
                 for data in update_data:
-                    await conn.execute(insert_query, {
+                    params = {
                         "result_id": data["result_id"],
                         "sort_order": data["sort_order"]
-                    })
+                    }
+                    await enqueue_db_update(
+                        file_id=file_id,
+                        sql=insert_query,
+                        params=params,
+                        background_tasks=background_tasks,
+                        task_type="insert_temp_table",
+                        producer=producer,
+                    )
+                logger.debug(f"Worker PID {process.pid}: Enqueued {len(update_data)} INSERT operations for EntryID {entry_id}")
 
-                # Step 3: Perform batch update using temporary table
-                update_query = text("""
+                # Step 3: Enqueue UPDATE operation
+                update_query = """
                     UPDATE utb_ImageScraperResult
                     SET SortOrder = ud.SortOrder
                     FROM utb_ImageScraperResult r
                     INNER JOIN #UpdateSortOrder ud ON r.ResultID = ud.ResultID
                     WHERE r.EntryID = :entry_id
-                """)
-                result = await conn.execute(update_query, {"entry_id": entry_id})
-                updated_count = result.rowcount
-                logger.debug(f"Worker PID {process.pid}: Batch updated {updated_count} rows for EntryID {entry_id}")
+                """
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=update_query,
+                    params={"entry_id": entry_id},
+                    background_tasks=background_tasks,
+                    task_type="update_sort_order",
+                    producer=producer,
+                )
+                logger.debug(f"Worker PID {process.pid}: Enqueued UPDATE for EntryID {entry_id}")
 
-                # Step 4: Drop temporary table
-                await conn.execute(text("DROP TABLE #UpdateSortOrder"))
+                # Step 4: Enqueue DROP TABLE
+                drop_query = "DROP TABLE #UpdateSortOrder"
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=drop_query,
+                    params={},
+                    background_tasks=background_tasks,
+                    task_type="drop_temp_table",
+                    producer=producer,
+                )
+                logger.debug(f"Worker PID {process.pid}: Enqueued DROP TABLE for EntryID {entry_id}")
 
-                # Log updated results
+                # Log updated results (no rowcount available since updates are queued)
                 updated_results = [
                     {"ResultID": data["result_id"], "EntryID": entry_id, "SortOrder": data["sort_order"]}
                     for data in update_data
                 ]
+                logger.info(f"Worker PID {process.pid}: Enqueued SortOrder updates for {len(updated_results)} rows for EntryID {entry_id}")
 
-            logger.info(f"Worker PID {process.pid}: Updated SortOrder for {len(updated_results)} rows for EntryID {entry_id}")
+                return updated_results
+            else:
+                logger.warning(f"Worker PID {process.pid}: No updates to enqueue for EntryID {entry_id}")
+                return []
 
-        return updated_results
+        finally:
+            producer.close()
+            logger.debug(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
 
-    except SQLAlchemyError as e:
-        logger.error(f"Worker PID {process.pid}: Database error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        return []
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return []
 # @retry(    stop=stop_after_attempt(3),
 #     wait=wait_exponential(multiplier=1, min=2, max=10),
