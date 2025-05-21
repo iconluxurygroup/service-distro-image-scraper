@@ -655,11 +655,14 @@ async def async_process_entry_search(
     finally:
         await client.close()
 
+from rabbitmq_worker import enqueue_db_update
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    background_tasks: BackgroundTasks = None,
 ) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
@@ -749,10 +752,9 @@ async def process_restart_batch(
                 for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                     try:
                         logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
-                        # Preprocess SKU with known_brand from ProductBrand
                         search_string, brand, model, color = await preprocess_sku(
                             search_string=search_string,
-                            known_brand=brand,  # Use ProductBrand from database
+                            known_brand=brand,
                             brand_rules=brand_rules,
                             logger=logger
                         )
@@ -782,31 +784,28 @@ async def process_restart_batch(
                                 deduplicated_results.append(res)
                         logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
-                        insert_success = await insert_search_results(deduplicated_results, logger=logger, file_id=str(file_id_db))
-                        if not insert_success:
-                            logger.error(f"Failed to insert results for EntryID {entry_id} on attempt {attempt}")
-                            continue
-
-                        # Validate inserted results
-                        async with async_engine.connect() as conn:
-                            result = await conn.execute(
-                                text("""
-                                    SELECT COUNT(*) 
-                                    FROM utb_ImageScraperResult 
-                                    WHERE EntryID = :entry_id 
-                                    AND ImageUrl NOT LIKE 'placeholder%'
-                                """),
-                                {"entry_id": entry_id}
+                        # Enqueue insert of search results
+                        for res in deduplicated_results:
+                            sql = """
+                                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
+                                VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail)
+                            """
+                            params = {
+                                "EntryID": res["EntryID"],
+                                "ImageUrl": res["ImageUrl"],
+                                "ImageDesc": res["ImageDesc"],
+                                "ImageSource": res["ImageSource"],
+                                "ImageUrlThumbnail": res["ImageUrlThumbnail"],
+                            }
+                            await enqueue_db_update(
+                                file_id=str(file_id_db),
+                                sql=sql,
+                                params=params,
+                                background_tasks=background_tasks,
+                                task_type="insert_result",
                             )
-                            valid_result_count = result.scalar()
-                            result.close()
 
-                        if valid_result_count == 0:
-                            logger.warning(f"No valid results inserted for EntryID {entry_id} on attempt {attempt}")
-                            continue
-
-                        logger.info(f"Validated {valid_result_count} valid results for EntryID {entry_id}")
-
+                        # Update sort order (still performed directly for simplicity; could also be enqueued)
                         update_result = await update_search_sort_order(
                             str(file_id_db), str(entry_id), brand, search_string, color, category, logger, brand_rules=brand_rules
                         )
@@ -817,33 +816,16 @@ async def process_restart_batch(
                             logger.error(f"SortOrder update failed or no positive SortOrder for EntryID {entry_id} on attempt {attempt}")
                             continue
 
-                        # Validate SortOrder
-                        async with async_engine.connect() as conn:
-                            result = await conn.execute(
-                                text("""
-                                    SELECT COUNT(*) 
-                                    FROM utb_ImageScraperResult 
-                                    WHERE EntryID = :entry_id 
-                                    AND SortOrder > 0
-                                """),
-                                {"entry_id": entry_id}
-                            )
-                            positive_sort_count = result.scalar()
-                            result.close()
-
-                        if positive_sort_count == 0:
-                            logger.warning(f"No results with positive SortOrder for EntryID {entry_id} on attempt {attempt}")
-                            continue
-
-                        logger.info(f"Validated {positive_sort_count} results with positive SortOrder for EntryID {entry_id}")
-
-                        async with async_engine.connect() as conn:
-                            await conn.execute(
-                                text("UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"),
-                                {"entry_id": entry_id}
-                            )
-                            await conn.commit()
-                            logger.info(f"Marked Step1 complete for EntryID {entry_id}")
+                        # Enqueue Step1 update
+                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
+                        params = {"entry_id": entry_id}
+                        await enqueue_db_update(
+                            file_id=str(file_id_db),
+                            sql=sql,
+                            params=params,
+                            background_tasks=background_tasks,
+                            task_type="update_step1",
+                        )
 
                         return entry_id, True
                     except Exception as e:
