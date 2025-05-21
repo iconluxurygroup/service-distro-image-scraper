@@ -792,6 +792,7 @@ async def process_restart_batch(
                                         deduplicated_results.append(res)
                                 logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
+                                # Enqueue INSERT operations
                                 for res in deduplicated_results:
                                     sql = """
                                         INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
@@ -813,6 +814,7 @@ async def process_restart_batch(
                                         producer=producer,
                                     )
 
+                                # Enqueue sort order update
                                 sort_sql = "UPDATE_SORT_ORDER"
                                 sort_params = {
                                     "file_id": str(file_id_db),
@@ -832,6 +834,29 @@ async def process_restart_batch(
                                     producer=producer,
                                 )
 
+                                # Wait for sort order update to complete
+                                async with async_engine.connect() as conn:
+                                    for _ in range(10):  # Retry up to 10 times
+                                        result = await conn.execute(
+                                            text("""
+                                                SELECT COUNT(*) 
+                                                FROM utb_ImageScraperResult 
+                                                WHERE EntryID = :entry_id AND SortOrder IS NOT NULL
+                                            """),
+                                            {"entry_id": entry_id}
+                                        )
+                                        sort_count = result.scalar()
+                                        result.close()
+                                        if sort_count > 0:
+                                            logger.info(f"SortOrder updated for EntryID {entry_id} with {sort_count} rows")
+                                            break
+                                        logger.debug(f"Waiting for SortOrder update for EntryID {entry_id}")
+                                        await asyncio.sleep(2)
+                                    else:
+                                        logger.warning(f"SortOrder update not completed for EntryID {entry_id} after retries")
+                                        return entry_id, False
+
+                                # Enqueue Step1 update only after sort order is confirmed
                                 sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                                 params = {"entry_id": entry_id}
                                 await enqueue_db_update(
@@ -849,18 +874,18 @@ async def process_restart_batch(
                                 if attempt < MAX_ENTRY_RETRIES:
                                     await asyncio.sleep(2 ** attempt)
                                 continue
-                        logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                        sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
-                        params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
-                        await enqueue_db_update(
-                            file_id=str(file_id_db),
-                            sql=sql,
-                            params=params,
-                            background_tasks=background_tasks,
-                            task_type="failed_entry",
-                            producer=producer,
-                        )
-                        return entry_id, False
+                            logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                            sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
+                            params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
+                            await enqueue_db_update(
+                                file_id=str(file_id_db),
+                                sql=sql,
+                                params=params,
+                                background_tasks=background_tasks,
+                                task_type="failed_entry",
+                                producer=producer,
+                            )
+                            return entry_id, False
                     except Exception as e:
                         logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
                         return entry_id, False
