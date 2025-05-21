@@ -194,16 +194,15 @@ async def insert_search_results(
         entry_ids = list(set(row["EntryID"] for row in data))  # Remove duplicates
         if entry_ids:
             placeholders = ",".join("?" * len(entry_ids))
-            select_query = text(f"""
+            select_query = f"""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
                 WHERE EntryID IN ({placeholders})
-            """)
-            # Ensure params is a tuple
+            """
             params = tuple(entry_ids)
             await enqueue_db_update(
                 file_id=file_id,
-                sql=select_query,
+                sql=select_query,  # Pass as string, not TextClause
                 params=params,
                 background_tasks=background_tasks,
                 task_type="select_deduplication",
