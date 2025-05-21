@@ -749,6 +749,13 @@ async def process_restart_batch(
                 for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                     try:
                         logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
+                        # Preprocess SKU with known_brand from ProductBrand
+                        search_string, brand, model, color = await preprocess_sku(
+                            search_string=search_string,
+                            known_brand=brand,  # Use ProductBrand from database
+                            brand_rules=brand_rules,
+                            logger=logger
+                        )
                         results = await async_process_entry_search(
                             search_string=search_string,
                             brand=brand,
