@@ -456,6 +456,69 @@ async def generate_download_file(file_id: int, background_tasks: BackgroundTasks
     finally:
         log_memory_usage()
 
+async def async_process_entry_search(
+    search_string: str,
+    brand: str,
+    endpoint: str,
+    entry_id: int,
+    use_all_variations: bool,
+    file_id_db: int,
+    logger: logging.Logger
+) -> List[Dict]:
+    logger.debug(f"Processing search for EntryID {entry_id}, FileID {file_id_db}, Use all variations: {use_all_variations}")
+    
+    search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
+    
+    search_terms = []
+    variation_types = [
+        "default", "delimiter_variations", "color_variations", "brand_alias",
+        "no_color", "model_alias", "category_specific"
+    ]
+    
+    for variation_type in variation_types:
+        if variation_type in search_terms_dict:
+            search_terms.extend(search_terms_dict[variation_type])
+    
+    search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
+    logger.info(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
+
+    if not search_terms:
+        logger.warning(f"No search terms for EntryID {entry_id}")
+        return []
+
+    client = SearchClient(endpoint, logger)
+    try:
+        all_results = []
+        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+        for term in search_terms:
+            logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
+            results = await client.search(term, brand, entry_id)
+            if isinstance(results, Exception):
+                logger.error(f"Error for term '{term}' in EntryID {entry_id}: {results}")
+                continue
+            if not results:
+                logger.debug(f"No results for term '{term}' in EntryID {entry_id}")
+                continue
+            processed_results = await process_results(results, entry_id, brand, term, logger)
+            if not processed_results:
+                logger.debug(f"No valid processed results for term '{term}' in EntryID {entry_id}")
+                continue
+            # Validate results have required columns and non-placeholder URLs
+            valid_results = [
+                res for res in processed_results
+                if all(col in res for col in required_columns) and not res["ImageUrl"].startswith("placeholder://")
+            ]
+            all_results.extend(valid_results)
+            logger.info(f"Found {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
+            # Stop after valid results unless use_all_variations is True and more results are needed
+            if valid_results and (not use_all_variations or len(all_results) >= 10):  # Arbitrary threshold
+                logger.info(f"Stopping search after valid results for term '{term}' in EntryID {entry_id}")
+                break
+        logger.info(f"Processed {len(all_results)} total valid results for EntryID {entry_id}")
+        return all_results
+    finally:
+        await client.close()
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
