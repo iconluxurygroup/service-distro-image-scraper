@@ -81,19 +81,27 @@ class RabbitMQConsumer:
             raise
 
     def start_consuming(self):
-        try:
-            self.is_consuming = True
-            self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
-            logger.info("Waiting for messages. To exit press CTRL+C")
-            self.channel.start_consuming()
-        except pika.exceptions.AMQPConnectionError as e:
-            logger.error(f"AMQP connection error: {e}", exc_info=True)
-            self.is_consuming = False
-            raise
-        except Exception as e:
-            logger.error(f"Error starting consumer: {e}", exc_info=True)
-            self.is_consuming = False
-            raise
+        while True:
+            try:
+                if not self.connection or self.connection.is_closed:
+                    self.connect()
+                self.is_consuming = True
+                self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
+                logger.info("Waiting for messages. To exit press CTRL+C")
+                self.channel.start_consuming()
+            except pika.exceptions.AMQPConnectionError as e:
+                logger.error(f"AMQP connection error: {e}, reconnecting in 5 seconds", exc_info=True)
+                self.is_consuming = False
+                time.sleep(5)
+            except KeyboardInterrupt:
+                logger.info("Received KeyboardInterrupt, shutting down consumer")
+                self.close()
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error in consumer: {e}, reconnecting in 5 seconds", exc_info=True)
+                self.is_consuming = False
+                self.close()
+                time.sleep(5)
 
     async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
         try:
