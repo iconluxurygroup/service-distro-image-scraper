@@ -108,44 +108,61 @@ class RabbitMQConsumer:
     async def execute_sort_order_update(self, params: dict, file_id: str):
         try:
             entry_id = params.get("entry_id")
-            brand = params.get("brand")
-            search_string = params.get("search_string")
-            color = params.get("color")
-            category = params.get("category")
-            brand_rules = json.loads(params.get("brand_rules", "{}"))
+            result_id = params.get("result_id")
+            sort_order = params.get("sort_order")
 
-            result = await update_search_sort_order(
-                file_id=file_id,
-                entry_id=entry_id,
-                brand=brand,
-                model=search_string,
-                color=color,
-                category=category,
-                logger=logger,
-                brand_rules=brand_rules
-            )
-            if result:
-                logger.info(f"Updated SortOrder for FileID: {file_id}, EntryID: {entry_id}, {len(result)} rows")
-                async with async_engine.connect() as conn:
-                    result = await conn.execute(
-                        text("""
-                            SELECT COUNT(*) 
-                            FROM utb_ImageScraperResult 
-                            WHERE EntryID = :entry_id 
-                            AND SortOrder > 0
-                        """),
-                        {"entry_id": entry_id}
-                    )
-                    positive_sort_count = result.scalar()
-                    result.close()
-                    if positive_sort_count == 0:
-                        logger.warning(f"No positive SortOrder for EntryID {file_id}")
-                        return False
-                    logger.info(f"Validated {positive_sort_count} positive SortOrder for EntryID {entry_id}")
-                return True
-            else:
-                logger.warning(f"No SortOrder updated for FileID: {file_id}, EntryID: {entry_id}")
+            if not all([entry_id, result_id, sort_order is not None]):
+                logger.error(f"Missing required params for FileID: {file_id}, params: {params}")
                 return False
+
+            sql = """
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = :sort_order
+                WHERE EntryID = :entry_id AND ResultID = :result_id
+            """
+            update_params = {
+                "sort_order": sort_order,
+                "entry_id": entry_id,
+                "result_id": result_id
+            }
+
+            # Execute the UPDATE
+            async with async_engine.begin() as conn:
+                result = await conn.execute(text(sql), update_params)
+                await conn.commit()
+                rowcount = result.rowcount if result.rowcount is not None else 0
+                logger.info(
+                    f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL: {sql}, "
+                    f"params: {update_params}, affected {rowcount} rows"
+                )
+
+                if rowcount == 0:
+                    logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
+                    return False
+
+            # Validate positive SortOrder values
+            async with async_engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT COUNT(*) 
+                        FROM utb_ImageScraperResult 
+                        WHERE EntryID = :entry_id 
+                        AND SortOrder > 0
+                    """),
+                    {"entry_id": entry_id}
+                )
+                positive_sort_count = result.scalar()
+                result.close()
+                if positive_sort_count == 0:
+                    logger.warning(f"No positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
+                else:
+                    logger.info(f"Validated {positive_sort_count} positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
+
+            return True
+
+        except SQLAlchemyError as e:
+            logger.error(f"Database error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
+            return False
         except Exception as e:
             logger.error(f"Error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
             return False
