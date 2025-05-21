@@ -620,7 +620,13 @@ async def async_process_entry_search(
 
     if not search_terms:
         logger.warning(f"No search terms for EntryID {entry_id}")
-        return []
+        return [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://no-search-terms",
+            "ImageDesc": f"No search terms generated for {search_string}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://no-search-terms",
+        }]
 
     client = SearchClient(endpoint, logger)
     try:
@@ -639,7 +645,6 @@ async def async_process_entry_search(
             if not processed_results:
                 logger.debug(f"No processed results for term '{term}' in EntryID {entry_id}")
                 continue
-            # Validate results
             valid_results = [
                 res for res in processed_results
                 if all(col in res for col in required_columns) and not res["ImageUrl"].startswith("placeholder://")
@@ -649,10 +654,20 @@ async def async_process_entry_search(
                 continue
             all_results.extend(valid_results)
             logger.info(f"Found {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
-            # Stop after valid results unless use_all_variations is True and more results are needed
-            if valid_results:
+            if valid_results and (not use_all_variations or len(all_results) >= 10):
                 logger.info(f"Stopping search after valid results for term '{term}' in EntryID {entry_id}")
                 break
+        
+        if not all_results:
+            logger.error(f"No valid results found across all search terms for EntryID {entry_id}")
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No results found for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results",
+            }]
+        
         logger.info(f"Processed {len(all_results)} total valid results for EntryID {entry_id}")
         return all_results
     finally:
