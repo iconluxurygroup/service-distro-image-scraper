@@ -662,7 +662,45 @@ from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
 import json
 import uuid
 
-async def process_restart_batch(
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from pydantic import BaseModel, Field
+import logging
+import asyncio
+import os
+import json
+import traceback
+import psutil
+import datetime
+import urllib.parse
+import hashlib
+import time
+from typing import Optional, List, Dict, Any, Callable
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from tenacity import retry, stop_after_attempt, wait_exponential
+from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
+from common import generate_search_variations, fetch_brand_rules, preprocess_sku
+from logging_config import setup_job_logger
+from s3_utils import upload_file_to_space
+from db_utils import (
+    update_log_url_in_db,
+    get_send_to_email,
+    fetch_last_valid_entry,
+    update_file_generate_complete,
+    update_file_location_complete,
+)
+from search_utils import update_search_sort_order, insert_search_results
+from database_config import async_engine
+from config import BRAND_RULES_URL, SEARCH_PROXY_API_URL
+from email_utils import send_message_email
+import uuid
+
+# Assuming other imports and configurations (e.g., SearchClient, process_results) are already defined
+# as in the original code.
+
+router = APIRouter()
+
+async def process_restart_no_images(
     file_id_db: int,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False,
@@ -675,7 +713,7 @@ async def process_restart_batch(
             logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
         logger.setLevel(logging.DEBUG)
         process = psutil.Process()
-        logger.debug(f"Logger initialized")
+        logger.debug(f"Logger initialized for no-images processing")
 
         def log_memory_usage():
             mem_info = process.memory_info()
@@ -683,14 +721,15 @@ async def process_restart_batch(
             if mem_info.rss / 1024**2 > 1000:
                 logger.warning(f"High memory usage")
 
-        logger.info(f"Starting processing for FileID: {file_id_db}, Use all variations: {use_all_variations}")
+        logger.info(f"Starting no-images processing for FileID: {file_id_db}, Use all variations: {use_all_variations}")
         log_memory_usage()
 
         file_id_db_int = file_id_db
         BATCH_SIZE = 6
         MAX_CONCURRENCY = 15
-        MAX_ENTRY_RETRIES = 3
+        MAX_ENTRY_RETRIES = 6
 
+        # Validate FileID
         async with async_engine.connect() as conn:
             result = await conn.execute(
                 text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
@@ -701,6 +740,7 @@ async def process_restart_batch(
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
             result.close()
 
+        # Determine starting EntryID
         if entry_id is None:
             entry_id = await fetch_last_valid_entry(str(file_id_db_int), logger)
             if entry_id is not None:
@@ -714,6 +754,7 @@ async def process_restart_batch(
                     logger.info(f"Resuming from EntryID: {entry_id}")
                     result.close()
 
+        # Fetch brand rules
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched")
@@ -722,6 +763,7 @@ async def process_restart_batch(
         endpoint = SEARCH_PROXY_API_URL
         logger.info(f"Using endpoint: {endpoint} with API key authentication")
 
+        # Query entries with no images
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory 
@@ -730,17 +772,17 @@ async def process_restart_batch(
                 WHERE r.FileID = :file_id 
                 AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
                 AND r.Step1 IS NULL
-                AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.SortOrder <= 0)
+                AND t.EntryID IS NULL
                 ORDER BY r.EntryID
             """)
             result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
             entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
-            logger.info(f"Found {len(entries)} entries needing processing")
+            logger.info(f"Found {len(entries)} entries with no images needing processing")
             result.close()
 
         if not entries:
-            logger.warning(f"No valid EntryIDs found for FileID {file_id_db}")
-            return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
+            logger.warning(f"No entries with no images found for FileID {file_id_db}")
+            return {"error": "No entries with no images found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
         logger.info(f"Created {len(entry_batches)} batches")
@@ -865,17 +907,7 @@ async def process_restart_batch(
                                 if attempt < MAX_ENTRY_RETRIES:
                                     await asyncio.sleep(2 ** attempt)
                                 continue
-                        # logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                        # sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
-                        # params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
-                        # await enqueue_db_update(
-                        #     file_id=str(file_id_db),
-                        #     sql=sql,
-                        #     params=params,
-                        #     background_tasks=background_tasks,
-                        #     task_type="failed_entry",
-                        #     producer=producer,
-                        # )
+                        logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
                         return entry_id, False
                     except Exception as e:
                         logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
@@ -907,21 +939,23 @@ async def process_restart_batch(
                     result = await conn.execute(
                         text("""
                             SELECT COUNT(*) 
-                            FROM utb_ImageScraperRecords 
-                            WHERE FileID = :file_id AND Step1 IS NULL
+                            FROM utb_ImageScraperRecords r
+                            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+                            WHERE r.FileID = :file_id AND r.Step1 IS NULL AND t.EntryID IS NULL
                         """),
                         {"file_id": file_id_db_int}
                     )
                     remaining_entries = result.fetchone()[0]
                     result.close()
                     if remaining_entries == 0:
-                        logger.info(f"All entries processed for FileID {file_id_db}. Exiting early.")
+                        logger.info(f"All entries with no images processed for FileID {file_id_db}. Exiting early.")
                         break
 
                 elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
                 logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
                 log_memory_usage()
 
+            # Verify results
             async with async_engine.connect() as conn:
                 result = await conn.execute(
                     text("""
@@ -946,11 +980,12 @@ async def process_restart_batch(
                     logger.warning(f"Found {null_entries} entries with NULL SortOrder")
                 result.close()
 
+            # Send email notification
             to_emails = await get_send_to_email(file_id_db, logger=logger)
             if to_emails:
-                subject = f"Processing Completed for FileID: {file_id_db}"
+                subject = f"No-Images Processing Completed for FileID: {file_id_db}"
                 message = (
-                    f"Processing for FileID {file_id_db} completed.\n"
+                    f"No-images processing for FileID {file_id_db} completed.\n"
                     f"Successful entries: {successful_entries}/{len(entries)}\n"
                     f"Failed entries: {failed_entries}\n"
                     f"Last EntryID: {last_entry_id_processed}\n"
@@ -959,6 +994,7 @@ async def process_restart_batch(
                 )
                 await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
+            # Upload log
             log_public_url = await upload_file_to_space(
                 file_src=log_filename,
                 save_as=f"job_logs/job_{file_id_db}.log",
@@ -967,7 +1003,7 @@ async def process_restart_batch(
                 file_id=str(file_id_db)
             )
             return {
-                "message": "Search processing completed",
+                "message": "No-images processing completed",
                 "file_id": str(file_id_db),
                 "successful_entries": str(successful_entries),
                 "total_entries": str(len(entries)),
@@ -981,7 +1017,7 @@ async def process_restart_batch(
             producer.close()
             logger.info(f"Closed RabbitMQ producer for FileID {file_id_db}")
     except Exception as e:
-        logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
+        logger.error(f"Error processing no-images for FileID {file_id_db}: {e}", exc_info=True)
         log_public_url = await upload_file_to_space(
             file_src=log_filename,
             save_as=f"job_logs/job_{file_id_db}.log",
@@ -993,6 +1029,57 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
+
+@router.post("/restart-no-images/{file_id}", tags=["Processing"])
+async def api_restart_no_images(
+    file_id: str,
+    entry_id: Optional[int] = None,
+    background_tasks: BackgroundTasks = None
+):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing restart for entries with no images for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
+    
+    try:
+        if not entry_id:
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+        
+        result = await process_restart_no_images(
+            file_id_db=int(file_id),
+            logger=logger,
+            entry_id=entry_id,
+            use_all_variations=True,
+            background_tasks=background_tasks
+        )
+        
+        if "error" in result:
+            logger.error(f"Failed to process no-image restart for FileID {file_id}: {result['error']}")
+            log_public_url = await upload_file_to_space(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id}.log",
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        logger.info(f"Completed no-image restart for FileID: {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"No-images processing completed for FileID: {file_id}",
+            "data": result
+        }
+    except Exception as e:
+        logger.error(f"Error queuing no-image restart for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id}.log",
+            is_public=True,
+            logger=logger,
+            file_id=file_id
+        )
+        raise HTTPException(status_code=500, detail=f"Error restarting no-image batch for FileID {file_id}: {str(e)}")
 
 @router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
