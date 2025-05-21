@@ -12,6 +12,7 @@ from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from search_utils import update_search_sort_order
 from common import clean_string, normalize_model, generate_aliases
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class RabbitMQConsumer:
         self.queue_name = queue_name
         self.connection = None
         self.channel = None
+        self.is_consuming = False
 
     @retry(
         stop=stop_after_attempt(3),
@@ -53,22 +55,82 @@ class RabbitMQConsumer:
         logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
 
     def close(self):
+        if self.channel and not self.channel.is_closed:
+            if self.is_consuming:
+                try:
+                    self.channel.stop_consuming()
+                    logger.info("Stopped consuming messages")
+                except Exception as e:
+                    logger.error(f"Error stopping consumption: {e}", exc_info=True)
+            self.channel.close()
+            logger.info("Closed RabbitMQ channel")
         if self.connection and not self.connection.is_closed:
             self.connection.close()
             logger.info("Closed RabbitMQ connection")
+        self.is_consuming = False
+
+    def purge_queue(self):
+        """Purge all messages from the queue. Use with caution."""
+        if not self.channel or self.channel.is_closed:
+            self.connect()
+        try:
+            purge_count = self.channel.queue_purge(self.queue_name)
+            logger.info(f"Purged {purge_count} messages from queue: {self.queue_name}")
+            return purge_count
+        except Exception as e:
+            logger.error(f"Error purging queue {self.queue_name}: {e}", exc_info=True)
+            raise
 
     def start_consuming(self):
         try:
+            self.is_consuming = True
             self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
             logger.info("Waiting for messages. To exit press CTRL+C")
             self.channel.start_consuming()
         except pika.exceptions.AMQPConnectionError as e:
             logger.error(f"AMQP connection error: {e}", exc_info=True)
+            self.is_consuming = False
             raise
         except Exception as e:
             logger.error(f"Error starting consumer: {e}", exc_info=True)
+            self.is_consuming = False
             raise
 
+    async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
+        try:
+            async with async_engine.begin() as conn:
+                if "CreateTime" in params and params["CreateTime"]:
+                    try:
+                        params["CreateTime"] = datetime.datetime.strptime(
+                            params["CreateTime"], "%Y-%m-%d %H:%M:%S"
+                        )
+                    except ValueError as e:
+                        logger.warning(f"Invalid CreateTime format for FileID: {file_id}: {e}")
+                        params["CreateTime"] = datetime.datetime.now()
+
+                result = await conn.execute(text(sql), params)
+                await conn.commit()
+                rowcount = result.rowcount if result.rowcount is not None else 0
+                logger.info(
+                    f"TaskType: {task_type}, FileID: {file_id}, Executed SQL: {sql}, "
+                    f"params: {params}, affected {rowcount} rows"
+                )
+                return True
+        except SQLAlchemyError as e:
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, Database error executing SQL: {sql}, "
+                f"params: {params}, error: {e}",
+                exc_info=True
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing SQL: {sql}, "
+                f"params: {params}, error: {e}",
+                exc_info=True
+            )
+            return False
+        
     async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
         try:
             async with async_engine.begin() as conn:
