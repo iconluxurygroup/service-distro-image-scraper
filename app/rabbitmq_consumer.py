@@ -159,12 +159,12 @@ class RabbitMQConsumer:
                     if len(ids) == 1:
                         # For single value, use = instead of IN
                         sql = sql.replace("IN (?)", "= ?")
-                        query_params = {"ids": ids[0]}  # Pass single value
+                        query_params = [ids[0]]  # Pass single value as list for positional placeholder
                     else:
                         # For multiple values, generate ? placeholders
                         placeholders = ", ".join("?" * len(ids))
                         sql = sql.replace("IN (?)", f"IN ({placeholders})")
-                        query_params = {"ids": tuple(ids)}  # Pass tuple for multiple values
+                        query_params = list(ids)  # Pass list of values for positional placeholders
 
                 logger.debug(f"Executing SELECT for FileID {file_id}: {sql}, params: {query_params}")
                 result = await new_conn.execute(text(sql), query_params)
@@ -195,7 +195,6 @@ class RabbitMQConsumer:
                 exc_info=True
             )
             raise
-    
 
 
 
