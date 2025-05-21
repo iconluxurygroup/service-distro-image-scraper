@@ -59,17 +59,6 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             logger.debug(f"Invalid URL format: {cleaned}")
             return ""
     return cleaned
-
-import logging
-import datetime
-from typing import Optional, List, Dict
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from sqlalchemy.exc import SQLAlchemyError
-import pika.exceptions
-from fastapi import BackgroundTasks
-import psutil
-from database_config import async_engine
-from common import clean_string, validate_thumbnail_url
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 
 default_logger = logging.getLogger(__name__)
