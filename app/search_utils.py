@@ -190,43 +190,6 @@ async def insert_search_results(
                 connection.process_data_events(time_limit=1)
                 await asyncio.sleep(0.1)
 
-        # Enqueue deduplication SELECT query
-        entry_ids = list(set(row["EntryID"] for row in data))  # Remove duplicates
-        if entry_ids:
-            placeholders = ",".join("?" * len(entry_ids))
-            select_query = f"""
-                SELECT EntryID, ImageUrl
-                FROM utb_ImageScraperResult
-                WHERE EntryID IN ({placeholders})
-            """
-            params = {"ids": list(entry_ids)}
-            await enqueue_db_update(
-                file_id=file_id,
-                sql=select_query,
-                params=params,
-                background_tasks=background_tasks,
-                task_type="select_deduplication",
-                producer=producer,
-                response_queue=response_queue
-            )
-            logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
-
-            # Wait for SELECT results
-            consume_task = asyncio.create_task(consume_responses())
-            try:
-                await asyncio.wait_for(response_received.wait(), timeout=30)
-                existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
-                logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
-            except asyncio.TimeoutError:
-                logger.warning(f"Worker PID {process.pid}: Timeout waiting for SELECT results, proceeding without deduplication")
-                existing_keys = set()
-            finally:
-                consume_task.cancel()
-                channel.stop_consuming()
-                connection.close()
-        else:
-            existing_keys = set()
-
         # Prepare SQL queries
         update_query = """
             UPDATE utb_ImageScraperResult
