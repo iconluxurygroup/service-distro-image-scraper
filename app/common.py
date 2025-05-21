@@ -105,28 +105,81 @@ async def preprocess_sku(
     known_brand: Optional[str] = None,
     brand_rules: Optional[Dict] = None,
     logger: Optional[logging.Logger] = None
-) -> Tuple[str, Optional[str], Optional[str]]:
+) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     logger = logger or logging.getLogger(__name__)
     brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
-    brand = known_brand
+    brand = None
     model = search_string
     color = None
 
     if not search_string or not isinstance(search_string, str):
         logger.warning(f"Invalid search string: {search_string}")
-        return search_string, None, search_string
+        return search_string, None, search_string, None
 
     search_string_clean = clean_string(search_string).lower()
 
-    # Try to match brand rules
+    # Prioritize known_brand
+    if known_brand:
+        for rule in brand_rules_data.get("brand_rules", []):
+            if not rule.get("is_active", False):
+                continue
+            full_name = rule.get("full_name", "")
+            if clean_string(known_brand).lower() == clean_string(full_name).lower():
+                brand = full_name
+                sku_format = rule.get("sku_format", {})
+                color_separator = sku_format.get("color_separator", "")
+                expected_length = rule.get("expected_length", {})
+                base_length = expected_length.get("base", [0])[0]
+                with_color_length = expected_length.get("with_color", [base_length])[0]
+                color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
+
+                # Try splitting on color_separator
+                if color_separator and color_separator in search_string_clean:
+                    parts = search_string_clean.rsplit(color_separator, 1)
+                    if len(parts) > 1:
+                        base_part = parts[0].strip()
+                        color_part = parts[1].strip()
+                        if (abs(len(base_part) - base_length) <= 2 and
+                            len(color_part) <= color_extension_length + 2):
+                            model = base_part
+                            color = color_part
+                            logger.debug(
+                                f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
+                                f"model '{model}', color '{color}' using separator '{color_separator}'"
+                            )
+                            return search_string, brand, model, color
+                # Assume last color_extension_length chars are color
+                if len(search_string_clean) == with_color_length:
+                    base_part = search_string_clean[:-color_extension_length]
+                    color_part = search_string_clean[-color_extension_length:]
+                    if len(base_part) == base_length:
+                        model = base_part
+                        color = color_part
+                        logger.debug(
+                            f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
+                            f"model '{model}', color '{color}' (no separator, assumed color)"
+                        )
+                        return search_string, brand, model, color
+                # Match base length
+                if abs(len(search_string_clean) - base_length) <= 2:
+                    model = search_string_clean
+                    logger.debug(
+                        f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
+                        f"model '{model}' (no color)"
+                    )
+                    return search_string, brand, model, None
+                logger.warning(
+                    f"Known brand '{known_brand}' matched, but SKU '{search_string}' "
+                    f"doesn't fit expected lengths (base: {base_length}, with_color: {with_color_length})"
+                )
+                break
+
+    # Fallback: Try to match brand rules if no known_brand or known_brand didn't match
     for rule in brand_rules_data.get("brand_rules", []):
         if not rule.get("is_active", False):
             continue
 
         full_name = rule.get("full_name", "")
-        if known_brand and clean_string(known_brand).lower() != clean_string(full_name).lower():
-            continue  # Skip if known_brand doesn't match
-
         sku_format = rule.get("sku_format", {})
         color_separator = sku_format.get("color_separator", "")
         expected_length = rule.get("expected_length", {})
@@ -154,7 +207,7 @@ async def preprocess_sku(
                         f"model '{model}', color '{color}' using separator '{color_separator}'"
                     )
                     break
-        # Fallback: Assume last color_extension_length chars are color
+        # Assume last color_extension_length chars are color
         elif len(search_string_clean) == with_color_length:
             base_part = search_string_clean[:-color_extension_length]
             color_part = search_string_clean[-color_extension_length:]
@@ -179,10 +232,9 @@ async def preprocess_sku(
 
     if not brand:
         logger.warning(f"No brand matched for SKU '{search_string}'")
-        brand = known_brand  # Use known_brand if no match
+        brand = known_brand  # Use known_brand as fallback
 
     return search_string, brand, model, color
-
 
 def clean_string(s: str, preserve_url: bool = False) -> str:
     if not isinstance(s, str):
