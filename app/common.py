@@ -178,32 +178,35 @@ def clean_string(s: str, preserve_url: bool = False) -> str:
         s = re.sub(r'\s+', ' ', s)
     return s
 
-def generate_aliases(model: Any, article_length: int = 8) -> List[str]:
-    logger = default_logger
+def generate_aliases(model: Any, article_length: int = 8, model_length: int = 7, color: Optional[str] = None) -> List[str]:
+    logger = logging.getLogger(__name__)
     if not isinstance(model, str):
         model = str(model)
     if not model or model.strip() == '':
         return []
-    
+
     model = clean_string(model).lower()
-    aliases = set()
-    aliases.add(model)  # Full base model
+    aliases = set([model])
 
     # Digits-only
     digits_only = re.sub(r'[^0-9]', '', model)
     if digits_only and digits_only.isdigit():
         aliases.add(digits_only)
 
-    # Delimiter variations (insert after article_length)
+    # Delimiter variations between article and model
     delimiters = ['-', '_', ' ']
-    if len(model) >= article_length:
+    if len(model) >= article_length + model_length:
+        article = model[:article_length]
+        model_part = model[article_length:article_length + model_length]
         for delim in delimiters:
-            alias = f"{model[:article_length]}{delim}{model[article_length:]}"
+            alias = f"{article}{delim}{model_part}"
             aliases.add(alias)
+            if color:
+                for delim2 in delimiters:
+                    aliases.add(f"{article}{delim}{model_part}{delim2}{color}")
 
-    logger.debug(f"Generated aliases for model '{model}' with article_length={article_length}: {aliases}")
+    logger.debug(f"Generated aliases for model '{model}' with article_length={article_length}, color='{color}': {aliases}")
     return [a for a in aliases if a and len(a) >= 4]
-
 async def fetch_brand_rules(
     file_key: str = "brand_rules",
     max_attempts: int = 3,
@@ -243,6 +246,10 @@ def normalize_model(model: Any) -> str:
         return str(model).strip().lower()
     return model.strip().lower()
 
+import logging
+import re
+from typing import Dict, List, Optional
+
 async def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
@@ -252,94 +259,108 @@ async def generate_search_variations(
     brand_rules: Optional[Dict] = None,
     logger: Optional[logging.Logger] = None
 ) -> Dict[str, List[str]]:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
     variations = {
         "default": [],
         "delimiter_variations": [],
-        "color_variations": [],
         "brand_alias": [],
         "no_color": [],
-        "model_alias": [],
-        "category_specific": []
+        "model_alias": []
     }
 
     if not search_string or not isinstance(search_string, str):
         logger.warning("Empty or invalid search string provided")
         return variations
-    
+
     search_string = clean_string(search_string).lower()
     brand = clean_string(brand).lower() if brand else None
     model = clean_string(model).lower() if model else search_string
     color = clean_string(color).lower() if color else None
-    category = clean_string(category).lower() if category else None
-
     brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
-    logger.debug(f"Input: search_string='{search_string}', brand='{brand}', model='{model}'")
-
-    # Get article length for brand
-    article_length = 8  # Default
-    if brand:
-        for rule in brand_rules_data.get("brand_rules", []):
-            if rule.get("is_active", False) and clean_string(rule.get("full_name", "")).lower() == brand:
-                article_length = int(rule.get("sku_format", {}).get("base", {}).get("article", ["8"])[0])
-                logger.debug(f"Using article_length={article_length} for brand '{brand}'")
-                break
+    logger.debug(f"Input: search_string='{search_string}', brand='{brand}', model='{model}', color='{color}'")
 
     variations["default"].append(search_string)
     logger.debug(f"Added default variation: '{search_string}'")
 
-    delimiters = [' ', '-', '_', '/', '.']
-    delimiter_variations = []
-    for delim in delimiters:
-        if delim in search_string:
-            for new_delim in delimiters:
-                variation = search_string.replace(delim, new_delim)
-                if variation != search_string:
-                    delimiter_variations.append(variation)
-    variations["delimiter_variations"] = list(set(delimiter_variations))
-    logger.debug(f"Generated {len(delimiter_variations)} delimiter variations: {delimiter_variations}")
-
-    if color:
-        color_variations = [
-            f"{search_string} {color}",
-            f"{brand} {model} {color}" if brand and model else search_string,
-            f"{model} {color}" if model else search_string
-        ]
-        variations["color_variations"] = list(set(color_variations))
-        logger.debug(f"Generated {len(color_variations)} color variations: {color_variations}")
-
+    matched_rule = None
     if brand:
-        predefined_aliases = {}
         for rule in brand_rules_data.get("brand_rules", []):
-            if rule.get("is_active", False):
-                full_name = rule.get("full_name", "")
-                full_name_clean = clean_string(full_name).lower()
-                if full_name_clean:
-                    predefined_aliases[full_name] = [
-                        name for name in rule.get("names", [])
-                        if clean_string(name).lower() != full_name_clean
-                    ]
-        brand_aliases = await generate_brand_aliases(brand, predefined_aliases)
-        logger.debug(f"Brand aliases for {brand}: {brand_aliases}")
-        brand_alias_variations = [f"{alias} {model}" for alias in brand_aliases if model]
-        variations["brand_alias"] = list(set(brand_alias_variations))
-        logger.debug(f"Generated {len(brand_alias_variations)} brand alias variations: {brand_alias_variations}")
+            if rule.get("is_active", False) and clean_string(rule.get("full_name", "")).lower() == brand:
+                matched_rule = rule
+                break
 
-    no_color_string = model
-    variations["no_color"].append(no_color_string)
-    logger.debug(f"Added no-color variation: '{no_color_string}'")
+    delimiters = [' ', '-', '_']
+    if matched_rule:
+        sku_format = matched_rule["sku_format"]
+        article_length = int(sku_format["base"]["article"][0])
+        model_length = int(sku_format["base"]["model"][0])
+        color_length = int(sku_format["color_extension"][0])
+        color_separator = sku_format["color_separator"]
+        base = model if model else search_string
+        color_part = color if color else ""
 
-    if model:
-        model_aliases = generate_aliases(model, article_length=article_length)
-        variations["model_alias"] = list(set(model_aliases))
-        logger.debug(f"Generated {len(model_aliases)} model alias variations: {model_aliases}")
-    
+        # Split base and color if separator exists
+        if color_separator and color_separator in search_string and not color_part:
+            base, color_part = search_string.rsplit(color_separator, 1)
+            if len(color_part) > color_length + 2:
+                logger.warning(f"Color length mismatch: expected ~{color_length}, got {len(color_part)}")
+                base = search_string
+                color_part = ""
+
+        # No Color: Base only
+        variations["no_color"].append(base[:article_length + model_length])
+        logger.debug(f"Added no_color variation: '{base[:article_length + model_length]}'")
+
+        # Delimiter Variations: Replace color separator
+        if color_part and color_separator:
+            for delim in delimiters:
+                if delim != color_separator:
+                    variations["delimiter_variations"].append(f"{base}{delim}{color_part}")
+            logger.debug(f"Generated delimiter variations: {variations['delimiter_variations']}")
+
+        # Brand Alias: Full name only
+        variations["brand_alias"].append(f"{matched_rule['full_name'].lower()} {search_string}")
+        logger.debug(f"Added brand_alias: '{matched_rule['full_name'].lower()} {search_string}'")
+
+        # Model Alias: Delimiters between article, model, and color
+        article = base[:article_length]
+        model_part = base[article_length:article_length + model_length]
+        for delim1 in delimiters:
+            for delim2 in delimiters:
+                if color_part:
+                    variations["model_alias"].append(f"{article}{delim1}{model_part}{delim2}{color_part}")
+                else:
+                    variations["model_alias"].append(f"{article}{delim1}{model_part}")
+        logger.debug(f"Generated model_alias variations: {variations['model_alias']}")
+
+    else:
+        # Fallback: Split on detected delimiter
+        logger.warning(f"No brand matched for SKU: {search_string}. Using fallback.")
+        base = search_string
+        color_part = ""
+        for delim in delimiters:
+            if delim in search_string:
+                base, color_part = search_string.rsplit(delim, 1)
+                variations["no_color"].append(base)
+                for new_delim in delimiters:
+                    if new_delim != delim:
+                        variations["delimiter_variations"].append(f"{base}{new_delim}{color_part}")
+                break
+        if not variations["no_color"]:
+            variations["no_color"].append(search_string)
+        logger.debug(f"Fallback: no_color='{base}', delimiter_variations={variations['delimiter_variations']}")
+
+    # Remove duplicates and ensure default is included
     for key in variations:
         variations[key] = list(set(variations[key]))
-    
+        if key != "default" and search_string not in variations[key]:
+            variations[key].append(search_string)
+
     total_variations = sum(len(v) for v in variations.values())
     logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
     return variations
+
+
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
     brand_clean = clean_string(brand).lower()
     if not brand_clean:
