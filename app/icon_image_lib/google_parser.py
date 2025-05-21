@@ -2,6 +2,7 @@ import re
 import chardet
 from bs4 import BeautifulSoup
 import logging
+import pandas as pd
 
 # Assuming LR class is in icon_image_lib.LR; otherwise, include it directly here
 from icon_image_lib.LR import LR
@@ -120,8 +121,8 @@ def get_results_page_results(html_bytes, final_urls, final_descriptions, final_s
     logger.debug(f"Appended results from additional page. Total now: {len(final_urls)}")
     return final_urls, final_descriptions, final_sources, final_thumbs
 
-def process_search_result(image_html_bytes, results_html_bytes, entry_id: int, logger=None) -> list:
-    """Process search result HTML bytes and return a list of dictionaries with image data."""
+def process_search_result(image_html_bytes, results_html_bytes, entry_id: int, logger=None) -> pd.DataFrame:
+    """Process search result HTML bytes and return a DataFrame with image data."""
     logger = logger or logging.getLogger(__name__)
     
     final_urls, final_descriptions, final_sources, final_thumbs = get_original_images(image_html_bytes, logger)
@@ -139,16 +140,13 @@ def process_search_result(image_html_bytes, results_html_bytes, entry_id: int, l
         final_sources = final_sources[:min_length]
         final_thumbs = final_thumbs[:min_length]
 
-    results = [
-        {
-            'EntryID': entry_id,
-            'ImageUrl': final_urls[i],
-            'ImageDesc': final_descriptions[i],
-            'ImageSource': final_sources[i],
-            'ImageUrlThumbnail': final_thumbs[i]
-        }
-        for i in range(min_length)
-    ]
+    df = pd.DataFrame({
+        'EntryID': [entry_id] * min_length,
+        'ImageUrl': final_urls,
+        'ImageDesc': final_descriptions,
+        'ImageSource': final_sources,
+        'ImageUrlThumbnail': final_thumbs
+    })
     
-    logger.info(f"Processed EntryID {entry_id} with {len(results)} images")
-    return results
+    logger.info(f"Processed EntryID {entry_id} with {len(df)} images")
+    return df
