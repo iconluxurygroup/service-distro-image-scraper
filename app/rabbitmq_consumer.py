@@ -6,12 +6,11 @@ import time
 import asyncio
 import signal
 import sys
+import datetime
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from search_utils import update_search_sort_order
-from common import clean_string, normalize_model, generate_aliases
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -99,41 +98,6 @@ class RabbitMQConsumer:
     async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
         try:
             async with async_engine.begin() as conn:
-                if "CreateTime" in params and params["CreateTime"]:
-                    try:
-                        params["CreateTime"] = datetime.datetime.strptime(
-                            params["CreateTime"], "%Y-%m-%d %H:%M:%S"
-                        )
-                    except ValueError as e:
-                        logger.warning(f"Invalid CreateTime format for FileID: {file_id}: {e}")
-                        params["CreateTime"] = datetime.datetime.now()
-
-                result = await conn.execute(text(sql), params)
-                await conn.commit()
-                rowcount = result.rowcount if result.rowcount is not None else 0
-                logger.info(
-                    f"TaskType: {task_type}, FileID: {file_id}, Executed SQL: {sql}, "
-                    f"params: {params}, affected {rowcount} rows"
-                )
-                return True
-        except SQLAlchemyError as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Database error executing SQL: {sql}, "
-                f"params: {params}, error: {e}",
-                exc_info=True
-            )
-            return False
-        except Exception as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing SQL: {sql}, "
-                f"params: {params}, error: {e}",
-                exc_info=True
-            )
-            return False
-        
-    async def execute_update(self, sql: str, params: dict, task_type: str, file_id: str):
-        try:
-            async with async_engine.begin() as conn:
                 # Normalize CreateTime format if present
                 if "CreateTime" in params and params["CreateTime"]:
                     try:
@@ -173,123 +137,39 @@ class RabbitMQConsumer:
             result_id = params.get("result_id")
             sort_order = params.get("sort_order")
 
-            # Case 1: Direct UPDATE task for a single result
-            if all([entry_id, result_id, sort_order is not None]):
-                sql = """
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = :sort_order
-                    WHERE EntryID = :entry_id AND ResultID = :result_id
-                """
-                update_params = {
-                    "sort_order": sort_order,
-                    "entry_id": entry_id,
-                    "result_id": result_id
-                }
-
-                async with async_engine.begin() as conn:
-                    result = await conn.execute(text(sql), update_params)
-                    await conn.commit()
-                    rowcount = result.rowcount if result.rowcount is not None else 0
-                    logger.info(
-                        f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL: {sql}, "
-                        f"params: {update_params}, affected {rowcount} rows"
-                    )
-
-                    if rowcount == 0:
-                        logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
-                        return False
-                    return True
-
-            # Case 2: Legacy task requiring priority computation
-            elif entry_id and params.get("brand") and params.get("search_string"):
-                # Fetch results and compute priorities
-                async with async_engine.connect() as conn:
-                    query = text("""
-                        SELECT ResultID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail
-                        FROM utb_ImageScraperResult
-                        WHERE EntryID = :entry_id
-                    """)
-                    result = await conn.execute(query, {"entry_id": entry_id})
-                    rows = result.fetchall()
-                    columns = result.keys()
-                    result.close()
-
-                if not rows:
-                    logger.warning(f"No results found for FileID: {file_id}, EntryID: {entry_id}")
-                    return False
-
-                results = [dict(zip(columns, row)) for row in rows]
-
-                # Process brand and model aliases
-                brand = params.get("brand")
-                search_string = params.get("search_string")
-                brand_clean = clean_string(brand).lower() if brand else ""
-                model_clean = normalize_model(search_string) if search_string else ""
-                brand_aliases = [brand_clean, brand_clean.replace(" & ", " and "), brand_clean.replace(" ", "")] if brand_clean else []
-                model_aliases = generate_aliases(model_clean) if model_clean else []
-
-                # Assign priorities and update one at a time
-                for res in results:
-                    image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
-                    image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
-                    image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
-                    model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
-                    brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
-                    priority = 1 if model_matched and brand_matched else 2 if model_matched else 3 if brand_matched else 4
-                    res["priority"] = priority
-
-                sorted_results = sorted(results, key=lambda x: x["priority"])
-                update_success = True
-
-                for index, res in enumerate(sorted_results):
-                    sort_order = -2 if res["priority"] == 4 else (index + 1)
-                    sql = """
-                        UPDATE utb_ImageScraperResult
-                        SET SortOrder = :sort_order
-                        WHERE EntryID = :entry_id AND ResultID = :result_id
-                    """
-                    update_params = {
-                        "sort_order": sort_order,
-                        "entry_id": entry_id,
-                        "result_id": res["ResultID"]
-                    }
-
-                    async with async_engine.begin() as conn:
-                        result = await conn.execute(text(sql), update_params)
-                        rowcount = result.rowcount if result.rowcount is not None else 0
-                        if rowcount == 0:
-                            logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {res['ResultID']}")
-                            update_success = False
-                        else:
-                            logger.info(
-                                f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL: {sql}, "
-                                f"params: {update_params}, affected {rowcount} rows"
-                            )
-                        await conn.commit()
-
-                # Validate positive SortOrder values
-                async with async_engine.connect() as conn:
-                    result = await conn.execute(
-                        text("""
-                            SELECT COUNT(*) 
-                            FROM utb_ImageScraperResult 
-                            WHERE EntryID = :entry_id 
-                            AND SortOrder > 0
-                        """),
-                        {"entry_id": entry_id}
-                    )
-                    positive_sort_count = result.scalar()
-                    result.close()
-                    if positive_sort_count == 0:
-                        logger.warning(f"No positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
-                    else:
-                        logger.info(f"Validated {positive_sort_count} positive SortOrder for FileID: {file_id}, EntryID: {entry_id}")
-
-                return update_success
-
-            else:
-                logger.error(f"Invalid params for FileID: {file_id}, params: {params}")
+            # Validate required parameters
+            if not all([entry_id, result_id, sort_order is not None]):
+                logger.error(
+                    f"Invalid parameters for update_sort_order task, FileID: {file_id}. "
+                    f"Required: entry_id, result_id, sort_order. Got: {params}"
+                )
                 return False
+
+            # Direct UPDATE task for a single result
+            sql = """
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = :sort_order
+                WHERE EntryID = :entry_id AND ResultID = :result_id
+            """
+            update_params = {
+                "sort_order": sort_order,
+                "entry_id": entry_id,
+                "result_id": result_id
+            }
+
+            async with async_engine.begin() as conn:
+                result = await conn.execute(text(sql), update_params)
+                await conn.commit()
+                rowcount = result.rowcount if result.rowcount is not None else 0
+                logger.info(
+                    f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL: {sql}, "
+                    f"params: {update_params}, affected {rowcount} rows"
+                )
+
+                if rowcount == 0:
+                    logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
+                    return False
+                return True
 
         except SQLAlchemyError as e:
             logger.error(f"Database error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
@@ -353,12 +233,12 @@ def signal_handler(consumer):
     return handler
 
 if __name__ == "__main__":
-    import datetime
     consumer = RabbitMQConsumer()
     signal.signal(signal.SIGINT, signal_handler(consumer))
     signal.signal(signal.SIGTERM, signal_handler(consumer))
 
-    sample_task = {
+    # Sample task for insert_result
+    insert_task = {
         "file_id": "321",
         "task_type": "insert_result",
         "sql": """
@@ -376,9 +256,24 @@ if __name__ == "__main__":
         "timestamp": "2025-05-21T12:34:08.307076"
     }
 
+    # Sample task for update_sort_order
+    sort_task = {
+        "file_id": "321",
+        "task_type": "update_sort_order",
+        "sql": "UPDATE_SORT_ORDER",
+        "params": {
+            "entry_id": "119061",
+            "result_id": "1868277",
+            "sort_order": 1
+        },
+        "timestamp": "2025-05-21T12:34:08.307076"
+    }
+
     try:
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(consumer.test_task(sample_task))
+        # Test both tasks
+        loop.run_until_complete(consumer.test_task(insert_task))
+        loop.run_until_complete(consumer.test_task(sort_task))
         
         consumer.connect()
         consumer.start_consuming()
