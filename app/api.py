@@ -677,6 +677,10 @@ from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
 import json
 import uuid
 
+from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
+import json
+import uuid
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -793,6 +797,19 @@ async def process_restart_batch(
                                 )
                                 if not results:
                                     logger.warning(f"No results for EntryID {entry_id} on attempt {attempt}")
+                                    if attempt == MAX_ENTRY_RETRIES:
+                                        logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE EntryID = :entry_id"
+                                        params = {"entry_id": entry_id}
+                                        await enqueue_db_update(
+                                            file_id=str(file_id_db),
+                                            sql=sql,
+                                            params=params,
+                                            background_tasks=background_tasks,
+                                            task_type="reset_step1_failed",
+                                            producer=producer,
+                                        )
+                                        logger.info(f"Enqueued Step1 reset for EntryID {entry_id} due to no valid results")
                                     continue
 
                                 if not all(all(col in res for col in required_columns) for res in results):
@@ -880,17 +897,6 @@ async def process_restart_batch(
                                 if attempt < MAX_ENTRY_RETRIES:
                                     await asyncio.sleep(2 ** attempt)
                                 continue
-                        # logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                        # sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
-                        # params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
-                        # await enqueue_db_update(
-                        #     file_id=str(file_id_db),
-                        #     sql=sql,
-                        #     params=params,
-                        #     background_tasks=background_tasks,
-                        #     task_type="failed_entry",
-                        #     producer=producer,
-                        # )
                         return entry_id, False
                     except Exception as e:
                         logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
