@@ -156,13 +156,14 @@ class RabbitMQConsumer:
                     logger.debug(f"Empty ids list for FileID {file_id}, returning empty result")
                     return {"results": []}
 
-                # Adjust SQL for IN clause with named placeholder
-                select_sql = """
+                # Dynamically generate placeholders for IN clause
+                placeholders = ",".join("?" * len(ids))
+                select_sql = f"""
                     SELECT EntryID, ImageUrl
                     FROM utb_ImageScraperResult
-                    WHERE EntryID IN :ids
+                    WHERE EntryID IN ({placeholders})
                 """
-                query_params = {"ids": tuple(ids)}  # Convert to tuple for SQLAlchemy
+                query_params = list(ids)  # Pass flat list of IDs for positional placeholders
 
                 logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql}, params: {query_params}")
                 result = await new_conn.execute(text(select_sql), query_params)
@@ -171,68 +172,40 @@ class RabbitMQConsumer:
                 results = [dict(zip(columns, row)) for row in rows]
                 logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
 
-                # Prepare SQL queries for UPDATE and INSERT
-                update_sql = """
-                    UPDATE utb_ImageScraperResult
-                    SET ImageDesc = :ImageDesc,
-                        ImageSource = :ImageSource,
-                        ImageUrlThumbnail = :ImageUrlThumbnail,
-                        CreateTime = :CreateTime
-                    WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
-                """
+                # Prepare SQL query for INSERT into utb_ImageScraperResult
                 insert_sql = """
                     INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
                     VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
                 """
 
-                # Process each result row
-                processed_count = 0
+                # Insert each result row
+                inserted_count = 0
                 for row in results:
-                    entry_id = row["EntryID"]
-                    image_url = row["ImageUrl"]
-                    
-                    # Check if the row exists
-                    check_sql = """
-                        SELECT 1
-                        FROM utb_ImageScraperResult
-                        WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
-                    """
-                    check_params = {"EntryID": entry_id, "ImageUrl": image_url}
-                    check_result = await new_conn.execute(text(check_sql), check_params)
-                    exists = check_result.scalar() is not None
-
-                    # Prepare parameters (using defaults from insert_search_results logic)
                     row_params = {
-                        "EntryID": entry_id,
-                        "ImageUrl": image_url,
+                        "EntryID": row["EntryID"],
+                        "ImageUrl": row["ImageUrl"],
                         "ImageDesc": None,  # Default from insert_search_results
                         "ImageSource": None,
                         "ImageUrlThumbnail": None,
                         "CreateTime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
-
-                    # Execute UPDATE or INSERT
                     try:
-                        if exists:
-                            await new_conn.execute(text(update_sql), row_params)
-                            logger.debug(f"Updated EntryID: {entry_id}, ImageUrl: {image_url} for FileID {file_id}")
-                        else:
-                            await new_conn.execute(text(insert_sql), row_params)
-                            logger.debug(f"Inserted EntryID: {entry_id}, ImageUrl: {image_url} for FileID {file_id}")
-                        processed_count += 1
+                        await new_conn.execute(text(insert_sql), row_params)
+                        logger.debug(f"Inserted EntryID: {row['EntryID']}, ImageUrl: {row['ImageUrl']} for FileID {file_id}")
+                        inserted_count += 1
                     except SQLAlchemyError as e:
-                        logger.error(f"Failed to process EntryID: {entry_id}, ImageUrl: {image_url} for FileID {file_id}: {e}", exc_info=True)
+                        logger.error(f"Failed to insert EntryID: {row['EntryID']}, ImageUrl: {row['ImageUrl']} for FileID {file_id}: {e}", exc_info=True)
                         raise
 
                 # Commit the transaction
                 await new_conn.commit()
-                logger.info(f"Successfully processed {processed_count} rows into utb_ImageScraperResult for FileID {file_id}")
+                logger.info(f"Successfully inserted {inserted_count} rows into utb_ImageScraperResult for FileID {file_id}")
 
                 return {"results": results}
         except SQLAlchemyError as e:
             logger.error(
                 f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Database error executing SELECT or INSERT/UPDATE: {sql}, params: {params}, error: {str(e)}",
+                f"Database error executing SELECT or INSERT: {sql}, params: {params}, error: {str(e)}",
                 exc_info=True
             )
             raise
