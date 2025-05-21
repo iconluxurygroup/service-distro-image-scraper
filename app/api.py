@@ -660,6 +660,7 @@ async def async_process_entry_search(
 
 from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
 import json
+import uuid
 
 async def process_restart_batch(
     file_id_db: int,
@@ -792,51 +793,41 @@ async def process_restart_batch(
                                         deduplicated_results.append(res)
                                 logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
 
-                                # Enqueue INSERT operations
-                                for res in deduplicated_results:
-                                    sql = """
-                                        INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
-                                        VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail)
-                                    """
-                                    params = {
-                                        "EntryID": res["EntryID"],
-                                        "ImageUrl": res["ImageUrl"],
-                                        "ImageDesc": res["ImageDesc"],
-                                        "ImageSource": res["ImageSource"],
-                                        "ImageUrlThumbnail": res["ImageUrlThumbnail"],
-                                    }
-                                    await enqueue_db_update(
-                                        file_id=str(file_id_db),
-                                        sql=sql,
-                                        params=params,
-                                        background_tasks=background_tasks,
-                                        task_type="insert_result",
-                                        producer=producer,
-                                    )
-
-                                # Enqueue sort order update
-                                sort_sql = "UPDATE_SORT_ORDER"
-                                sort_params = {
-                                    "file_id": str(file_id_db),
-                                    "entry_id": str(entry_id),
-                                    "brand": brand,
-                                    "search_string": search_string,
-                                    "color": color,
-                                    "category": category,
-                                    "brand_rules": json.dumps(brand_rules)
-                                }
-                                await enqueue_db_update(
+                                # Insert results
+                                insert_success = await insert_search_results(
+                                    results=deduplicated_results,
+                                    logger=logger,
                                     file_id=str(file_id_db),
-                                    sql=sort_sql,
-                                    params=sort_params,
-                                    background_tasks=background_tasks,
-                                    task_type="update_sort_order",
-                                    producer=producer,
+                                    background_tasks=background_tasks
                                 )
+                                if not insert_success:
+                                    logger.warning(f"Failed to insert results for EntryID {entry_id} on attempt {attempt}")
+                                    continue
 
-                                # Wait for sort order update to complete
+                                # Update sort order
+                                correlation_id = str(uuid.uuid4())
+                                sort_results = await update_search_sort_order(
+                                    file_id=str(file_id_db),
+                                    entry_id=str(entry_id),
+                                    brand=brand,
+                                    model=search_string,
+                                    color=color,
+                                    category=category,
+                                    logger=logger,
+                                    brand_rules=brand_rules,
+                                    background_tasks=background_tasks
+                                )
+                                if not sort_results:
+                                    logger.warning(f"No sort order updates for EntryID {entry_id} on attempt {attempt}")
+                                    continue
+
+                                # Log enqueued sort tasks
+                                for sort_result in sort_results:
+                                    logger.debug(f"Enqueued sort order task for EntryID {entry_id}, CorrelationID: {correlation_id}, ResultID: {sort_result['ResultID']}, SortOrder: {sort_result['SortOrder']}")
+
+                                # Wait for sort order updates
                                 async with async_engine.connect() as conn:
-                                    for _ in range(10):  # Retry up to 10 times
+                                    for _ in range(10):
                                         result = await conn.execute(
                                             text("""
                                                 SELECT COUNT(*) 
@@ -856,7 +847,7 @@ async def process_restart_batch(
                                         logger.warning(f"SortOrder update not completed for EntryID {entry_id} after retries")
                                         return entry_id, False
 
-                                # Enqueue Step1 update only after sort order is confirmed
+                                # Enqueue Step1 update
                                 sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                                 params = {"entry_id": entry_id}
                                 await enqueue_db_update(
@@ -867,25 +858,25 @@ async def process_restart_batch(
                                     task_type="update_step1",
                                     producer=producer,
                                 )
-
+                                logger.info(f"Completed processing for EntryID {entry_id}, CorrelationID: {correlation_id}")
                                 return entry_id, True
                             except Exception as e:
                                 logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
                                 if attempt < MAX_ENTRY_RETRIES:
                                     await asyncio.sleep(2 ** attempt)
                                 continue
-                            logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                            sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
-                            params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
-                            await enqueue_db_update(
-                                file_id=str(file_id_db),
-                                sql=sql,
-                                params=params,
-                                background_tasks=background_tasks,
-                                task_type="failed_entry",
-                                producer=producer,
-                            )
-                            return entry_id, False
+                        logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                        sql = "INSERT INTO utb_FailedEntries (EntryID, FileID, Error) VALUES (:entry_id, :file_id, :error)"
+                        params = {"entry_id": entry_id, "file_id": file_id_db, "error": "No valid search results after 3 attempts"}
+                        await enqueue_db_update(
+                            file_id=str(file_id_db),
+                            sql=sql,
+                            params=params,
+                            background_tasks=background_tasks,
+                            task_type="failed_entry",
+                            producer=producer,
+                        )
+                        return entry_id, False
                     except Exception as e:
                         logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
                         return entry_id, False
