@@ -76,6 +76,15 @@ if not default_logger.handlers:
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((SQLAlchemyError, pika.exceptions.AMQPError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
@@ -98,7 +107,7 @@ async def insert_search_results(
             logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
             return False
 
-    # Deduplicate results efficiently
+    # Deduplicate results
     deduped_results = list(
         { (res["EntryID"], res.get("ImageUrl", "")): res for res in results }.values()
     )
@@ -120,10 +129,10 @@ async def insert_search_results(
             continue
 
         category = res.get("ProductCategory", "").lower()
-        image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True)
-        image_url_thumbnail = clean_string(res.get("ImageUrlThumbnail", ""), preserve_url=True)
+        image_url = clean_url_string(res.get("ImageUrl", ""))
+        image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""))
         image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False)
-        image_source = clean_string(res.get("ImageSource", ""), preserve_url=True)
+        image_source = clean_url_string(res.get("ImageSource", ""))
 
         # Validate URLs
         if not image_url or not validate_thumbnail_url(image_url, logger):
@@ -131,7 +140,7 @@ async def insert_search_results(
             logger.debug(f"Worker PID {process.pid}: {errors[-1]}")
             continue
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
-            image_url_thumbnail = ""
+            image_url_thumbnail = None  # Set to None instead of empty string for SQL
 
         # Apply category-specific filters
         if category in category_filters and any(
@@ -142,7 +151,7 @@ async def insert_search_results(
 
         data.append({
             "EntryID": entry_id,
-            "ImageUrl": image_url or None,
+            "ImageUrl": image_url,
             "ImageDesc": image_desc or None,
             "ImageSource": image_source or None,
             "ImageUrlThumbnail": image_url_thumbnail or None,
@@ -156,74 +165,52 @@ async def insert_search_results(
     # Initialize RabbitMQ producer
     producer = RabbitMQProducer()
     try:
-        # Fetch existing rows for insert deduplication
+        # Fetch existing rows for deduplication
         existing_keys = set()
         async with async_engine.connect() as conn:
-            existing_query = text("""
-                SELECT EntryID, ImageUrl
-                FROM utb_ImageScraperResult
-                WHERE EntryID IN :entry_ids
-            """)
             entry_ids = tuple(row["EntryID"] for row in data)
-            result = await conn.execute(existing_query, {"entry_ids": entry_ids})
-            existing_keys = {(row[0], row[1]) for row in result.fetchall()}
-            await conn.execute(text("SELECT 1"))  # Clear cursor state
+            if entry_ids:
+                existing_query = text("""
+                    SELECT EntryID, ImageUrl
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN :entry_ids
+                """)
+                result = await conn.execute(existing_query, {"entry_ids": entry_ids})
+                existing_keys = {(row[0], row[1]) for row in result.fetchall()}
+                result.close()
 
-        # Batch updates and inserts
-        update_query = """
-            WITH UpdateData AS (
-                SELECT :entry_id AS EntryID,
-                       CAST(:image_url AS NVARCHAR(MAX)) AS ImageUrl,
-                       CAST(:new_image_desc AS NVARCHAR(MAX)) AS NewImageDesc,
-                       CAST(:new_image_source AS NVARCHAR(MAX)) AS NewImageSource,
-                       CAST(:new_image_url_thumbnail AS NVARCHAR(MAX)) AS NewImageUrlThumbnail,
-                       :new_create_time AS NewCreateTime
-            )
+        # Prepare SQL queries
+        update_query = text("""
             UPDATE utb_ImageScraperResult
-            SET ImageDesc = ud.NewImageDesc,
-                ImageSource = ud.NewImageSource,
-                ImageUrlThumbnail = ud.NewImageUrlThumbnail,
-                CreateTime = ud.NewCreateTime
-            FROM utb_ImageScraperResult r
-            INNER JOIN UpdateData ud ON r.EntryID = ud.EntryID AND r.ImageUrl = ud.ImageUrl
-            WHERE r.EntryID = :entry_id
-        """
-        insert_query = """
+            SET ImageDesc = :ImageDesc,
+                ImageSource = :ImageSource,
+                ImageUrlThumbnail = :ImageUrlThumbnail,
+                CreateTime = :CreateTime
+            WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
+        """)
+        insert_query = text("""
             INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
             VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
-        """
+        """)
 
+        # Batch updates and inserts
         update_batch = []
         insert_batch = []
         for row in data:
             key = (row["EntryID"], row["ImageUrl"])
-            params = {
-                "entry_id": row["EntryID"],
-                "image_url": row["ImageUrl"],
-                "new_image_desc": row["ImageDesc"],
-                "new_image_source": row["ImageSource"],
-                "new_image_url_thumbnail": row["ImageUrlThumbnail"],
-                "new_create_time": row["CreateTime"],
-                "EntryID": row["EntryID"],
-                "ImageUrl": row["ImageUrl"],
-                "ImageDesc": row["ImageDesc"],
-                "ImageSource": row["ImageSource"],
-                "ImageUrlThumbnail": row["ImageUrlThumbnail"],
-                "CreateTime": row["CreateTime"]
-            }
             if key in existing_keys:
-                update_batch.append((update_query, params))
+                update_batch.append((update_query, row))
             else:
-                insert_batch.append((insert_query, params))
+                insert_batch.append((insert_query, row))
 
         # Enqueue batches
-        batch_size = 100  # Configurable batch size
+        batch_size = 100
         for i in range(0, len(update_batch), batch_size):
             batch = update_batch[i:i + batch_size]
             for sql, params in batch:
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=sql,
+                    sql=str(sql),
                     params=params,
                     background_tasks=background_tasks,
                     task_type="update_search_result",
@@ -236,7 +223,7 @@ async def insert_search_results(
             for sql, params in batch:
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=sql,
+                    sql=str(sql),
                     params=params,
                     background_tasks=background_tasks,
                     task_type="insert_search_result",
@@ -248,7 +235,7 @@ async def insert_search_results(
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
-        return False
+        raise  # Let retry handle it
     finally:
         producer.close()
         logger.debug(f"Worker PID {process.pid}: Closed RabbitMQ producer")
