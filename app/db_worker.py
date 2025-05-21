@@ -64,13 +64,17 @@ class RabbitMQConsumer:
 
     async def execute_update(self, sql: str, params: dict):
         try:
-            async with async_engine.connect() as conn:
+            async with async_engine.begin() as conn:
                 result = await conn.execute(text(sql), params)
                 await conn.commit()
-                logger.info(f"Executed SQL: {sql[:100]} with params: {params}")
+                rowcount = result.rowcount if result.rowcount is not None else 0
+                logger.info(f"Executed SQL: {sql[:100]} with params: {params}, affected {rowcount} rows")
                 return True
         except SQLAlchemyError as e:
             logger.error(f"Database error executing SQL: {sql[:100]}, params: {params}, error: {e}", exc_info=True)
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error executing SQL: {sql[:100]}, params: {params}, error: {e}", exc_info=True)
             return False
 
     async def execute_sort_order_update(self, params: dict):
