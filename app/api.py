@@ -1285,17 +1285,16 @@ async def api_reset_step1(file_id: str):
         logger.error(f"Error resetting Step1 for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error resetting Step1 for FileID {file_id}: {str(e)}")
-app.include_router(router, prefix="/api/v3")
-
-
-@app.lifespan("startup")
-async def startup_event():
-    logger = default_logger
-    logger.info("Starting up FastAPI application")
-
-@app.lifespan("shutdown")
-async def shutdown_event():
-    logger = default_logger
-    logger.info("Shutting down FastAPI application")
+    
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    default_logger.info("Starting up FastAPI application")
+    yield
+    # Shutdown logic
+    default_logger.info("Shutting down FastAPI application")
     await async_engine.dispose()
-    logger.info("Database engine disposed")
+    default_logger.info("Database engine disposed")
+    
+app.include_router(router, prefix="/api/v4")
