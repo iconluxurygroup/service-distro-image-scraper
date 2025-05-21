@@ -227,18 +227,18 @@ async def insert_search_results(
             existing_keys = set()
 
         # Prepare SQL queries
-        update_query = text("""
+        update_query = """
             UPDATE utb_ImageScraperResult
             SET ImageDesc = :ImageDesc,
                 ImageSource = :ImageSource,
                 ImageUrlThumbnail = :ImageUrlThumbnail,
                 CreateTime = :CreateTime
             WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
-        """)
-        insert_query = text("""
+        """
+        insert_query = """
             INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
             VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
-        """)
+        """
 
         # Batch updates and inserts
         update_batch = []
@@ -257,8 +257,8 @@ async def insert_search_results(
             for sql, params in batch:
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=str(sql),
-                    params=params,
+                    sql=sql,  # Pass as string
+                    params=params,  # Already a dict
                     background_tasks=background_tasks,
                     task_type="update_search_result",
                     producer=producer,
@@ -270,8 +270,8 @@ async def insert_search_results(
             for sql, params in batch:
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=str(sql),
-                    params=params,
+                    sql=sql,  # Pass as string
+                    params=params,  # Already a dict
                     background_tasks=background_tasks,
                     task_type="insert_search_result",
                     producer=producer,
