@@ -235,15 +235,6 @@ async def insert_search_results(
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((pyodbc.Error, ValueError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_search_sort_order for EntryID {retry_state.kwargs['entry_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -337,37 +328,40 @@ async def update_search_sort_order(
             ]
 
             if update_data:
-                # Use a single batch UPDATE with a temporary table or VALUES clause
-                update_query = text("""
-                    WITH UpdateData AS (
-                        SELECT ResultID, SortOrder
-                        FROM (
-                            VALUES
-                                {placeholders}
-                        ) AS t(ResultID, SortOrder)
+                # Use a temporary table approach for batch update
+                # Step 1: Create a temporary table
+                await conn.execute(text("""
+                    CREATE TABLE #UpdateSortOrder (
+                        ResultID BIGINT,
+                        SortOrder INT
                     )
+                """))
+
+                # Step 2: Insert data into temporary table
+                insert_query = text("""
+                    INSERT INTO #UpdateSortOrder (ResultID, SortOrder)
+                    VALUES (:result_id, :sort_order)
+                """)
+                for data in update_data:
+                    await conn.execute(insert_query, {
+                        "result_id": data["result_id"],
+                        "sort_order": data["sort_order"]
+                    })
+
+                # Step 3: Perform batch update using temporary table
+                update_query = text("""
                     UPDATE utb_ImageScraperResult
                     SET SortOrder = ud.SortOrder
                     FROM utb_ImageScraperResult r
-                    INNER JOIN UpdateData ud ON r.ResultID = ud.ResultID
+                    INNER JOIN #UpdateSortOrder ud ON r.ResultID = ud.ResultID
                     WHERE r.EntryID = :entry_id
                 """)
-                # Generate placeholders for VALUES clause
-                placeholders = ", ".join(
-                    f"(:result_id_{i}, :sort_order_{i})"
-                    for i in range(len(update_data))
-                )
-                update_query = update_query.text.replace("{placeholders}", placeholders)
-                
-                # Flatten parameters
-                params = {"entry_id": entry_id}
-                for i, data in enumerate(update_data):
-                    params[f"result_id_{i}"] = data["result_id"]
-                    params[f"sort_order_{i}"] = data["sort_order"]
-
-                result = await conn.execute(update_query, params)
+                result = await conn.execute(update_query, {"entry_id": entry_id})
                 updated_count = result.rowcount
                 logger.debug(f"Worker PID {process.pid}: Batch updated {updated_count} rows for EntryID {entry_id}")
+
+                # Step 4: Drop temporary table
+                await conn.execute(text("DROP TABLE #UpdateSortOrder"))
 
                 # Log updated results
                 updated_results = [
@@ -385,7 +379,6 @@ async def update_search_sort_order(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Unexpected error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         return []
-
 # @retry(    stop=stop_after_attempt(3),
 #     wait=wait_exponential(multiplier=1, min=2, max=10),
 #     retry=retry_if_exception_type(SQLAlchemyError),
