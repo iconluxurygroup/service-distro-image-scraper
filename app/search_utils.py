@@ -193,16 +193,17 @@ async def insert_search_results(
         # Enqueue deduplication SELECT query
         entry_ids = list(set(row["EntryID"] for row in data))  # Remove duplicates
         if entry_ids:
-            formatted_entry_ids = [(id,) for id in entry_ids]  # Fix TVP format
-            select_query = """
+            placeholders = ",".join("?" * len(entry_ids))
+            select_query = f"""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
-                WHERE EntryID IN :entry_ids
+                WHERE EntryID IN ({placeholders})
             """
+            params = tuple(entry_ids)
             await enqueue_db_update(
                 file_id=file_id,
                 sql=select_query,
-                params={"entry_ids": formatted_entry_ids},
+                params=params,
                 background_tasks=background_tasks,
                 task_type="select_deduplication",
                 producer=producer,
@@ -223,7 +224,6 @@ async def insert_search_results(
                 consume_task.cancel()
                 channel.stop_consuming()
                 connection.close()
-
         else:
             existing_keys = set()
 
