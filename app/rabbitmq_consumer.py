@@ -207,6 +207,7 @@ class RabbitMQConsumer:
             return False
 
     def callback(self, ch, method, properties, body):
+        conn = None
         try:
             message = body.decode()
             task = json.loads(message)
@@ -218,10 +219,10 @@ class RabbitMQConsumer:
             loop = asyncio.get_event_loop()
             if task_type == "select_deduplication":
                 async def run_select():
+                    nonlocal conn
                     async with async_engine.connect() as conn:
-                        result = await self.execute_select(task, conn, logger)  # Correct call
+                        result = await self.execute_select(task, conn, logger)
                         if response_queue:
-                            # Publish results to response queue
                             response_message = json.dumps(result)
                             ch.basic_publish(
                                 exchange="",
@@ -238,6 +239,7 @@ class RabbitMQConsumer:
                 success = loop.run_until_complete(self.execute_sort_order_update(task.get("params", {}), file_id))
             else:
                 async def run_update():
+                    nonlocal conn
                     async with async_engine.begin() as conn:
                         result = await self.execute_update(task, conn, logger)
                         return result
@@ -255,6 +257,10 @@ class RabbitMQConsumer:
                 f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
                 exc_info=True
             )
+            # Ensure connection is closed
+            if conn is not None and not conn.closed:
+                loop.run_until_complete(conn.close())
+                logger.info(f"Closed database connection for FileID: {file_id}")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
             time.sleep(2)
 
