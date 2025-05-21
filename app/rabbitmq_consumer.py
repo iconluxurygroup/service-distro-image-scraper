@@ -7,6 +7,7 @@ import asyncio
 import signal
 import sys
 import datetime
+from rabbitmq_producer import RabbitMQProducer
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
