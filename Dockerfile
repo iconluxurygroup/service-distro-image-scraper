@@ -26,11 +26,11 @@ RUN apt-get update
 
 
 
-RUN chmod +x install_sql_server.sh
-RUN bash install_sql_server.sh
+# RUN chmod +x install_sql_server.sh
+# RUN bash install_sql_server.sh
 RUN apt-get update
 RUN odbcinst -j
-LABEL "com.datadoghq.ad.logs"='[<LOGS_CONFIG>]'
+# LABEL "com.datadoghq.ad.logs"='[<LOGS_CONFIG>]'
 # Make port 8000 available to the world outside this container
 EXPOSE 8080
 
