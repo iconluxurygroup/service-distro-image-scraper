@@ -406,7 +406,6 @@ async def update_search_sort_order(
                 return []
 
         finally:
-            await producer.close()
             logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
 
     except Exception as e:
