@@ -52,7 +52,127 @@ async def cleanup_temp_dirs(directories):
     loop = asyncio.get_running_loop()  # Get the current loop directly
     for dir_path in directories:
         await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
+import logging
+from openpyxl import load_workbook
+from typing import Optional
 
+def find_header_row_index(excel_file: str, max_rows_to_check: int = 10) -> Optional[int]:
+    """
+    Identify the header row index in an Excel file based on header characteristics.
+    
+    Args:
+        excel_file (str): Path to the Excel file.
+        max_rows_to_check (int): Maximum number of rows to analyze to find the header.
+    
+    Returns:
+        Optional[int]: The 1-based row index of the header row, or None if not found.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Searching for header row in Excel file: {excel_file}")
+    
+    try:
+        # Load the workbook in read-only mode
+        wb = load_workbook(excel_file, read_only=True)
+        ws = wb.active
+        
+        if not ws:
+            logger.error("No active worksheet found in the Excel file.")
+            return None
+        
+        # Common header keywords (case-insensitive)
+        header_keywords = {'id', 'name', 'product', 'brand', 'sku', 'category', 'color', 'price', 'description'}
+        
+        best_header_row = None
+        best_header_score = 0
+        
+        # Iterate through the first few rows
+        for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_rows_to_check, values_only=True), start=1):
+            if row is None:
+                continue
+                
+            # Count non-empty text cells and unique values
+            text_cells = [
+                str(cell).strip().lower() for cell in row
+                if cell is not None and str(cell).strip() and not isinstance(cell, (int, float, bool))
+            ]
+            text_count = len(text_cells)
+            unique_count = len(set(text_cells))
+            
+            # Check for header keywords
+            keyword_count = sum(1 for cell in text_cells if any(keyword in cell for keyword in header_keywords))
+            
+            # Calculate a score for header likelihood
+            # - High text count: Headers typically fill most columns
+            # - High unique count: Headers usually have distinct labels
+            # - Keyword matches: Headers often contain specific terms
+            score = (text_count * 0.4) + (unique_count * 0.4) + (keyword_count * 0.2)
+            
+            logger.debug(f"Row {row_idx}: text_count={text_count}, unique_count={unique_count}, keyword_count={keyword_count}, score={score:.2f}")
+            
+            if score > best_header_score:
+                best_header_score = score
+                best_header_row = row_idx
+        
+        if best_header_row is None or best_header_score < 2.0:  # Arbitrary threshold for confidence
+            logger.warning("No reliable header row identified.")
+            return None
+        
+        logger.info(f"Header row identified: Row {best_header_row} (score={best_header_score:.2f})")
+        return best_header_row
+    
+    except Exception as e:
+        logger.error(f"Error finding header row in Excel file {excel_file}: {e}")
+        return None
+
+def find_row_with_most_text_columns(excel_file: str) -> int:
+    """
+    Identify the row with the most non-empty text-filled columns in an Excel file.
+    
+    Args:
+        excel_file (str): Path to the Excel file.
+    
+    Returns:
+        int: The 1-based row index with the most text-filled columns. Returns 0 if the file is empty or invalid.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Analyzing Excel file for row with most text columns: {excel_file}")
+    
+    try:
+        wb = load_workbook(excel_file, read_only=True)
+        ws = wb.active
+        
+        if not ws:
+            logger.error("No active worksheet found in the Excel file.")
+            return 0
+        
+        max_text_count = 0
+        max_text_row = 0
+        
+        for row_idx, row in enumerate(ws.iter_rows(min_row=1, values_only=True), start=1):
+            if row is None:
+                continue
+                
+            text_count = sum(
+                1 for cell in row
+                if cell is not None and str(cell).strip() and not isinstance(cell, (int, float, bool))
+            )
+            
+            logger.debug(f"Row {row_idx}: {text_count} text-filled columns")
+            
+            if text_count > max_text_count:
+                max_text_count = text_count
+                max_text_row = row_idx
+        
+        if max_text_row == 0:
+            logger.warning("No rows with text-filled columns found in the Excel file.")
+        else:
+            logger.info(f"Row {max_text_row} has the most text-filled columns: {max_text_count} columns")
+        
+        return max_text_row
+    
+    except Exception as e:
+        logger.error(f"Error analyzing Excel file {excel_file}: {e}")
+        return 0
 app = FastAPI()
 def insert_file_db (file_name,file_source):
     connection = pyodbc.connect(conn_str)
@@ -319,28 +439,32 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
 # Modified generate_download_file
 async def generate_download_file(file_id: str):
     preferred_image_method = 'append'
-    
     start_time = time.time()
     loop = asyncio.get_running_loop()
     
+    # Fetch images from database
     selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
     selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe, selected_images_df)
-    
     logger.info(f"Fetched {len(selected_image_list)} images for FileID: {file_id}")
     
+    # Get Excel file location
     provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id)
     file_name = provided_file_path.split('/')[-1]
     
+    # Create temporary directories
     temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
     local_filename = os.path.join(temp_excel_dir, file_name)
     
+    # Download images
     failed_img_urls = await download_all_images(selected_image_list, temp_images_dir)
     
+    # Set content type
     content_type, _ = mimetypes.guess_type(local_filename)
     if not content_type:
         content_type = 'application/octet-stream'
         logger.debug(f"Set Content-Type to {content_type} for {local_filename}")
     
+    # Download Excel file
     response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
     if response.status_code != 200:
         logger.error(f"Failed to download file: {response.status_code}")
@@ -350,13 +474,25 @@ async def generate_download_file(file_id: str):
     with open(local_filename, "wb") as file:
         file.write(response.content)
     
+    # Identify header row or fall back to text-rich row
+    header_row = await loop.run_in_executor(ThreadPoolExecutor(), find_header_row_index, local_filename)
+    if header_row is None:
+        logger.info("No header row identified. Falling back to text-rich row.")
+        header_row = await loop.run_in_executor(ThreadPoolExecutor(), find_row_with_most_text_columns, local_filename)
+        if header_row == 0:
+            logger.warning("No text-rich row found. Using no offset (header_row=0).")
+            header_row = 0
+    logger.info(f"Using header_row={header_row} for image placement")
+    
+    # Write images to Excel
     logger.info("Writing images to Excel")
-    failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
+    failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method, header_row)
     logger.info(f"Failed rows: {failed_rows}")
     
     if failed_img_urls:
         logger.warning(f"Failed to download images: {failed_img_urls}")
     
+    # Upload to R2
     logger.info(f"Uploading file to R2 for FileID: {file_id}")
     public_url = await upload_file_to_space(
         file_src=local_filename,
@@ -371,12 +507,14 @@ async def generate_download_file(file_id: str):
         await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
         return {"error": "Failed to upload file to R2."}
     
+    # Calculate execution time
     end_time = time.time()
     execution_time = end_time - start_time
     
+    # Send email notification
     if os.listdir(temp_images_dir):
         logger.info("Sending email notification")
-        message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}"
+        message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}"
         await send_email(
             to_emails='nik@iconluxurygroup.com',
             subject=f'File Processing Complete for {file_name}',
@@ -385,6 +523,7 @@ async def generate_download_file(file_id: str):
             logger=logger
         )
     
+    # Clean up
     logger.info("Cleaning up temporary directories")
     await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
     
@@ -393,7 +532,8 @@ async def generate_download_file(file_id: str):
     return {
         "message": "Processing completed successfully.",
         "results": "hardcoded result value",
-        "public_url": public_url
+        "public_url": public_url,
+        "header_row": header_row
     }
 
 
