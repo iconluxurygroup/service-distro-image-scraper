@@ -38,7 +38,6 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
     return True
 
 def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
-    logger = logger or default_logger
     if not value:
         return ""
     cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
@@ -152,12 +151,13 @@ async def insert_search_results(
         response_data = []
 
         async def consume_responses():
-            async for message in queue:
-                async with message.process():
-                    if message.correlation_id == file_id:
-                        response_data.append(json.loads(message.body.decode()))
-                        response_received.set()
-                        logger.debug(f"Worker PID {process.pid}: Received response for FileID {file_id}")
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process():
+                        if message.correlation_id == file_id:
+                            response_data.append(json.loads(message.body.decode()))
+                            response_received.set()
+                            logger.debug(f"Worker PID {process.pid}: Received response for FileID {file_id}")
 
         entry_ids = list(set(row["EntryID"] for row in data))
         existing_keys = set()
@@ -195,9 +195,9 @@ async def insert_search_results(
                 consume_task.cancel()
                 try:
                     await asyncio.sleep(0.5)  # Allow time for message processing
-                    await queue.cancel()  # Cancel consumer to ensure no active consumers
-                except aio_pika.exceptions.ChannelPreconditionFailed as e:
-                    logger.warning(f"Worker PID {process.pid}: Could not cancel consumer for queue {response_queue}: {e}")
+                    # No need to manually cancel consumer or delete queue; auto_delete=True handles cleanup
+                except Exception as e:
+                    logger.warning(f"Worker PID {process.pid}: Error during queue cleanup: {e}")
 
         update_query = """
             UPDATE utb_ImageScraperResult
