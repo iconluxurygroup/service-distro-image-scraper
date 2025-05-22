@@ -12,7 +12,7 @@ from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import psutil
 from typing import Optional, Dict, Any
-import aiormq.exceptions  # Import aiormq.exceptions for ChannelAccessRefused
+import aiormq.exceptions
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
