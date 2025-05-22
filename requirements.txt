@@ -19,3 +19,4 @@ chardet
 aiobotocore
 tenacity
 aiosmtplib
+aioodbc
