@@ -2,15 +2,11 @@ import aio_pika
 import json
 import logging
 from typing import Dict, Any, Optional
-import datetime
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import asyncio
-import psutil
-import sys
-import signal
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+import aiormq.exceptions  # Import aiormq.exceptions for ChannelAccessRefused
+import datetime
 logger = logging.getLogger(__name__)
 
 class RabbitMQProducer:
@@ -47,16 +43,35 @@ class RabbitMQProducer:
         except asyncio.TimeoutError:
             logger.error("Timeout connecting to RabbitMQ")
             raise
+        except aio_pika.exceptions.ProbableAuthenticationError as e:
+            logger.error(
+                f"Authentication error connecting to RabbitMQ: {e}. "
+                f"Check username, password, and virtual host in {self.amqp_url}.",
+                exc_info=True
+            )
+            raise
         except aio_pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+            raise
+        except aiormq.exceptions.ChannelAccessRefused as e:
+            logger.error(
+                f"Permissions error connecting to RabbitMQ: {e}. "
+                f"Ensure user has permissions on virtual host and default exchange.",
+                exc_info=True
+            )
             raise
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError)),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception_type((
+            aio_pika.exceptions.AMQPError,
+            aio_pika.exceptions.ChannelClosed,
+            aiormq.exceptions.ChannelAccessRefused,
+            asyncio.TimeoutError
+        )),
         before_sleep=lambda retry_state: logger.info(
-            f"Retrying RabbitMQ operation (attempt {retry_state.attempt_number}/3)"
+            f"Retrying RabbitMQ operation (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
         ),
     )
     async def publish_message(self, message: Dict[str, Any], routing_key: str = None, correlation_id: Optional[str] = None):
@@ -85,6 +100,20 @@ class RabbitMQProducer:
                     f"Published message to queue: {queue_name}, "
                     f"correlation_id: {correlation_id}, task: {message_body[:200]}"
                 )
+        except aio_pika.exceptions.ProbableAuthenticationError as e:
+            logger.error(
+                f"Authentication error publishing to queue {queue_name}: {e}. "
+                f"Check username, password, and virtual host in {self.amqp_url}.",
+                exc_info=True
+            )
+            raise
+        except aiormq.exceptions.ChannelAccessRefused as e:
+            logger.error(
+                f"Permissions error publishing to queue {queue_name}: {e}. "
+                f"Ensure user has write permissions on the default exchange.",
+                exc_info=True
+            )
+            raise
         except asyncio.TimeoutError:
             logger.error(f"Timeout publishing message to {queue_name}")
             raise
@@ -144,3 +173,4 @@ async def enqueue_db_update(
     finally:
         if should_close:
             await producer.close()
+            logger.info(f"Closed RabbitMQ producer for FileID: {file_id}")
