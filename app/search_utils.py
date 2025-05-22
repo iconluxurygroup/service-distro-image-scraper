@@ -38,6 +38,7 @@ def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] 
     return True
 
 def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
+    logger = default_logger
     if not value:
         return ""
     cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
