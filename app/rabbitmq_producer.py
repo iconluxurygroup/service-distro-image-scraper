@@ -5,8 +5,8 @@ from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import asyncio
-import aiormq.exceptions  # Import aiormq.exceptions for ChannelAccessRefused
-import datetime
+import aiormq.exceptions
+
 logger = logging.getLogger(__name__)
 
 class RabbitMQProducer:
@@ -86,8 +86,7 @@ class RabbitMQProducer:
                 if queue_name != self.queue_name and not queue_name.startswith("select_response_"):
                     await self.channel.declare_queue(queue_name, durable=False, exclusive=True)
                 
-                exchange = await self.channel.get_exchange("")
-                await exchange.publish(
+                await self.channel.default_exchange.publish(
                     aio_pika.Message(
                         body=message_body.encode(),
                         delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
