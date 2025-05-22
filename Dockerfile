@@ -18,6 +18,9 @@ RUN pip install -r requirements.txt
 # Now copy the rest of the application into the container
 COPY icon_image_lib/ icon_image_lib/
 COPY main.py .
+COPY app_config.py .
+COPY email_utils.py .
+COPY s3_utils.py .
 # Clean the apt cache and update with --fix-missing
 RUN apt-get clean && \
     apt-get update --fix-missing
