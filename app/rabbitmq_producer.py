@@ -1,12 +1,13 @@
 import aio_pika
 import json
 import logging
+import datetime
 from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import asyncio
 import aiormq.exceptions
-import datetime
+
 logger = logging.getLogger(__name__)
 
 class RabbitMQProducer:
@@ -84,7 +85,7 @@ class RabbitMQProducer:
                 message_body = json.dumps(message)
                 queue_name = routing_key or self.queue_name
                 if queue_name != self.queue_name and not queue_name.startswith("select_response_"):
-                    await self.channel.declare_queue(queue_name, durable=False, exclusive=True)
+                    await self.channel.declare_queue(queue_name, durable=False, exclusive=True, auto_delete=True)
                 
                 await self.channel.default_exchange.publish(
                     aio_pika.Message(
