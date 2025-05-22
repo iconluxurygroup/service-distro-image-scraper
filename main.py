@@ -947,52 +947,45 @@ def resize_image(image_path):
     except Exception as e:
         logging.error(f"Error resizing image: {e}, for image: {image_path}")
         return False               
-def write_excel_image(local_filename, temp_dir,preferred_image_method):
+def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method: str, header_row: int = 0) -> list:
+    logger.info(f"Processing images in {temp_dir} for Excel file {local_filename} with header_row={header_row}")
     failed_rows = []
-    # Load the workbook and select the active worksheet
-    wb = load_workbook(local_filename)
-    ws = wb.active
-    print(os.listdir(temp_dir))
-    
-    # Iterate through each file in the temporary directory
-    for image_file in os.listdir(temp_dir):
-        image_path = os.path.join(temp_dir, image_file)
-        # Extract row number or other identifier from the image file name
-        try:
-            # Assuming the file name can be directly converted to an integer row number
-            row_number = int(image_file.split('.')[0])
-            logging.info(f"Processing row {row_number}, image path: {image_path}")
-        except ValueError:
-            logging.warning(f"Skipping file {image_file}: does not match expected naming convention")
-            continue  # Skip files that do not match the expected naming convention
-        verify_image = verify_png_image_single(image_path)    
-        # Check if the image meets the criteria to be added
-        if verify_image:
-            logging.info('Inserting image')
-            img = openpyxl.drawing.image.Image(image_path)
-            # Determine the anchor point based on the preferred image method
-            if preferred_image_method in ["overwrite", "append"]:
-                anchor = "A" + str(row_number)
-                logging.info('Anchor assigned')
-            elif preferred_image_method == "NewColumn":
-                anchor = "B" + str(row_number)  # Example adjustment for a different method
+    try:
+        wb = load_workbook(local_filename)
+        ws = wb.active
+        for image_file in os.listdir(temp_dir):
+            image_path = os.path.join(temp_dir, image_file)
+            try:
+                row_number = int(image_file.split('.')[0])
+                logger.info(f"Processing row {row_number}, image path: {image_path}")
+            except ValueError:
+                logger.warning(f"Skipping file {image_file}: does not match expected naming convention")
+                continue
+            verify_image = verify_png_image_single(image_path)
+            if verify_image:
+                logger.info('Inserting image')
+                img = Image(image_path)
+                adjusted_row = row_number + header_row
+                if preferred_image_method in ["overwrite", "append"]:
+                    anchor = f"A{adjusted_row}"
+                elif preferred_image_method == "NewColumn":
+                    anchor = f"B{adjusted_row}"
+                else:
+                    logger.error(f'Unrecognized preferred image method: {preferred_image_method}')
+                    continue
+                img.anchor = anchor
+                ws.add_image(img)
+                logger.info(f'Image added at {anchor}')
             else:
-                logging.error(f'Unrecognized preferred image method: {preferred_image_method}')
-                continue  # Skip if the method is not recognized
-                
-            img.anchor = anchor
-            ws.add_image(img)
-            #wb.save(local_filename)
-            logging.info(f'Image saved at {anchor}')
-        else:
-            failed_rows.append(row_number)
-            logging.warning('Inserting image skipped due to verify_png_image_single failure.')   
-    # Finalize changes to the workbook
-    logging.info('Finished processing all images.')
-    wb.save(local_filename)
-    return failed_rows 
-
-
+                failed_rows.append(row_number)
+                logger.warning(f'Inserting image skipped for row {row_number} due to verify_png_image_single failure.')
+        logger.info('Finished processing all images.')
+        wb.save(local_filename)
+        return failed_rows
+    except Exception as e:
+        logger.error(f"Error writing images to Excel: {e}")
+        return failed_rows
+    
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server")
     print(os.environ)
