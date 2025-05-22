@@ -10,9 +10,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from sqlalchemy.exc import SQLAlchemyError
 import aiobotocore.session
 from aiobotocore.config import AioConfig
-from config import S3_CONFIG
+from app_config import S3_CONFIG
 from sqlalchemy.sql import text
-from config import async_engine, conn_str, engine
+from app_config import async_engine, conn_str, engine
 import pyodbc
 
 default_logger = logging.getLogger(__name__)

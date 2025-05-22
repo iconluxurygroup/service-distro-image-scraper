@@ -33,7 +33,7 @@ from sqlalchemy import create_engine
 import pyodbc
 
 import pandas as pd
-from config import engine, conn_str
+from app_config import engine, conn_str
 import base64,zlib
 from s3_utils import upload_file_to_space
 from email_utils import send_message_email,send_email
