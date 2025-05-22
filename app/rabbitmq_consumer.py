@@ -1,7 +1,6 @@
 import aio_pika
 import json
 import logging
-import time
 import asyncio
 import signal
 import sys
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 class RabbitMQConsumer:
     def __init__(
         self,
-        amqp_url: str = "amqp://guest:guest@localhost:5672/",
+        amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
@@ -52,6 +51,9 @@ class RabbitMQConsumer:
             raise
         except aio_pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+            raise
+        except aio_pika.exceptions.ChannelAccessRefused as e:
+            logger.error(f"Permissions error connecting to RabbitMQ: {e}. Check user permissions and virtual host.", exc_info=True)
             raise
 
     async def close(self):
