@@ -348,7 +348,7 @@ async def generate_search_variations(
     if not search_string or not isinstance(search_string, str):
         logger.warning("Empty or invalid search string provided")
         return variations
-
+    raw_search_string = search_string
     search_string = clean_string(search_string).lower()
     brand = clean_string(brand).lower() if brand else None
     model = clean_string(model).lower() if model else search_string
@@ -357,7 +357,7 @@ async def generate_search_variations(
     logger.debug(f"Input: search_string='{search_string}', brand='{brand}', model='{model}', color='{color}'")
 
     # Add default variation
-    variations["default"].append(search_string)
+    variations["default"].append(raw_search_string)
     all_variations.add(search_string)
     logger.debug(f"Added default variation: '{search_string}'")
 
