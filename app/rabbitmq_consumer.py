@@ -10,6 +10,14 @@ import asyncio
 import psutil
 import sys
 import signal
+from database_config import async_engine
+from rabbitmq_producer import RabbitMQProducer
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
 class RabbitMQConsumer:
     def __init__(
         self,
