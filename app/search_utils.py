@@ -13,7 +13,6 @@ from fastapi import BackgroundTasks
 import psutil
 import pyodbc
 import re
-import pika
 import urllib.parse
 from rabbitmq_producer import RabbitMQProducer,enqueue_db_update
 import pandas as pd
@@ -23,7 +22,6 @@ import logging
 import psutil
 import datetime
 import asyncio
-import pika
 import json
 import uuid
 from sqlalchemy.sql import text
@@ -74,13 +72,34 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             return ""
     return cleaned
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+import logging
+import datetime
+import json
+from typing import Optional, List, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import async_engine
+from fastapi import BackgroundTasks
+import psutil
+import uuid
+import aio_pika
+import asyncio
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+from common import clean_string
+
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_fixed(4),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
-        f"(attempt {retry_state.attempt_number}/3) after 4.0s"
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
 async def insert_search_results(
@@ -107,7 +126,7 @@ async def insert_search_results(
 
     # Deduplicate results
     deduped_results = list(
-        { (res["EntryID"], res.get("ImageUrl", "")): res for res in results }.values()
+        {(res["EntryID"], res.get("ImageUrl", "")): res for res in results}.values()
     )
     logger.info(f"Worker PID {process.pid}: Deduplicated from {len(results)} to {len(deduped_results)} rows")
 
@@ -163,39 +182,27 @@ async def insert_search_results(
     # Initialize RabbitMQ producer
     producer = RabbitMQProducer()
     try:
-        # Set up response queue for SELECT results
+        # Set up async response queue for SELECT results
         response_queue = f"select_response_{uuid.uuid4().hex}"
-        connection = pika.BlockingConnection(pika.ConnectionParameters(
-            host=producer.host,
-            port=producer.port,
-            credentials=producer.credentials
-        ))
-        channel = connection.channel()
-        channel.queue_declare(queue=response_queue, exclusive=True)
+        connection = await aio_pika.connect_robust(producer.amqp_url)
+        channel = await connection.channel()
+        queue = await channel.declare_queue(response_queue, exclusive=True)
         response_received = asyncio.Event()
         response_data = []
 
-        def on_response(ch, method, properties, body):
-            if properties.correlation_id == file_id:
-                response_data.append(json.loads(body.decode()))
-                response_received.set()
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-
-        channel.basic_consume(queue=response_queue, on_message_callback=on_response)
-
-        # Start consuming responses in the background
         async def consume_responses():
-            loop = asyncio.get_event_loop()
-            while not response_received.is_set():
-                connection.process_data_events(time_limit=1)
-                await asyncio.sleep(0.1)
+            async for message in queue:
+                async with message.process():
+                    if message.correlation_id == file_id:
+                        response_data.append(json.loads(message.body.decode()))
+                        response_received.set()
+                        logger.debug(f"Worker PID {process.pid}: Received response for FileID {file_id}")
 
         # Enqueue deduplication SELECT query
-        # Enqueue deduplication SELECT query
-        entry_ids = list(set(row["EntryID"] for row in data))  # Remove duplicates
-        existing_keys = set()  # Initialize early to avoid UnboundLocalError
+        entry_ids = list(set(row["EntryID"] for row in data))
+        existing_keys = set()
         if entry_ids:
-            placeholders = ",".join([":id" + str(i) for i in range(len(entry_ids))])
+            placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
             select_query = f"""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
@@ -216,20 +223,19 @@ async def insert_search_results(
             # Wait for SELECT results
             consume_task = asyncio.create_task(consume_responses())
             try:
-                await asyncio.wait_for(response_received.wait(), timeout=30)
+                async with asyncio.timeout(30):
+                    await response_received.wait()
                 if response_data:
                     existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
                     logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
                 else:
-                    logger.warning(f"Worker PID {process.pid}: No deduplication results received, proceeding without deduplication")
+                    logger.warning(f"Worker PID {process.pid}: No deduplication results received")
             except asyncio.TimeoutError:
-                logger.warning(f"Worker PID {process.pid}: Timeout waiting for SELECT results, proceeding without deduplication")
+                logger.warning(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
             finally:
                 consume_task.cancel()
-                channel.stop_consuming()
-                connection.close()
-        else:
-            logger.info(f"Worker PID {process.pid}: No EntryIDs to deduplicate, proceeding without deduplication")
+                await queue.delete()
+                await connection.close()
 
         # Prepare SQL queries
         update_query = """
@@ -262,8 +268,8 @@ async def insert_search_results(
             for sql, params in batch:
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=sql,  # Pass as string
-                    params=params,  # Already a dict
+                    sql=sql,
+                    params=params,
                     background_tasks=background_tasks,
                     task_type="update_search_result",
                     producer=producer,
@@ -275,8 +281,8 @@ async def insert_search_results(
             for sql, params in batch:
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=sql,  # Pass as string
-                    params=params,  # Already a dict
+                    sql=sql,
+                    params=params,
                     background_tasks=background_tasks,
                     task_type="insert_search_result",
                     producer=producer,
@@ -289,13 +295,13 @@ async def insert_search_results(
         logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         raise
     finally:
-        producer.close()
-        logger.debug(f"Worker PID {process.pid}: Closed RabbitMQ producer")
-        
+        await producer.close()
+        logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer")
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, pika.exceptions.AMQPError)),
+    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -361,7 +367,7 @@ async def update_search_sort_order(
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
             image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
-            logger.debug(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
+            logger penile dysfunction(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
 
             model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
@@ -384,32 +390,36 @@ async def update_search_sort_order(
         # Initialize RabbitMQ producer
         producer = RabbitMQProducer()
         try:
-            # Prepare and enqueue direct UPDATE tasks for each record
+            # Prepare and enqueue direct UPDATE tasks
             update_data = []
             for index, res in enumerate(sorted_results):
-                # Assign SortOrder: -2 for priority 4, positive values (1, 2, 3, ...) for priorities 1, 2, 3
                 sort_order = -2 if res["priority"] == 4 else (index + 1)
-                update_query = text("""
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = :sort_order
-                    WHERE EntryID = :entry_id AND ResultID = :result_id
-                """)
                 params = {
                     "sort_order": sort_order,
                     "entry_id": entry_id,
                     "result_id": res["ResultID"]
                 }
-                # Execute update directly for each record
+                # Direct update for immediate effect
                 async with async_engine.connect() as conn:
                     try:
+                        update_query = text("""
+                            UPDATE utb_ImageScraperResult
+                            SET SortOrder = :sort_order
+                            WHERE EntryID = :entry_id AND ResultID = :result_id
+                        """)
                         result = await conn.execute(update_query, params)
                         await conn.commit()
-                        logger.debug(f"Worker PID {process.pid}: Updated SortOrder to {sort_order} for ResultID {res['ResultID']}, EntryID {entry_id}")
+                        logger.debug(
+                            f"Worker PID {process.pid}: Updated SortOrder to {sort_order} "
+                            f"for ResultID {res['ResultID']}, EntryID {entry_id}"
+                        )
                     except SQLAlchemyError as e:
-                        logger.error(f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}: {e}")
+                        logger.error(
+                            f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}: {e}"
+                        )
                         raise
 
-                # Enqueue for additional task tracking if needed
+                # Enqueue for additional task tracking
                 await enqueue_db_update(
                     file_id=file_id,
                     sql=str(update_query),
@@ -423,22 +433,26 @@ async def update_search_sort_order(
                     "EntryID": entry_id,
                     "SortOrder": sort_order
                 })
-                logger.debug(f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}")
+                logger.debug(
+                    f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}"
+                )
 
             if update_data:
-                logger.info(f"Worker PID {process.pid}: Processed SortOrder updates for {len(update_data)} rows for EntryID {entry_id}")
+                logger.info(
+                    f"Worker PID {process.pid}: Processed SortOrder updates for {len(update_data)} rows for EntryID {entry_id}"
+                )
                 return update_data
             else:
                 logger.warning(f"Worker PID {process.pid}: No updates processed for EntryID {entry_id}")
                 return []
 
         finally:
-            producer.close()
-            logger.debug(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
+            await producer.close()
+            logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        raise  # Let retry handle it
+        raise
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
