@@ -18,18 +18,25 @@ RUN pip install -r requirements.txt
 # Now copy the rest of the application into the container
 COPY icon_image_lib/ icon_image_lib/
 COPY main.py .
-COPY install_sql_server.sh .
-RUN apt-get -y update; apt-get -y install curl
-RUN apt-get update && apt-get install -y lsb-release && apt-get clean all
-RUN yes | apt-get install unixodbc
-RUN apt-get update
+# Clean the apt cache and update with --fix-missing
+RUN apt-get clean && \
+    apt-get update --fix-missing
 
+# Install necessary packages
+RUN apt-get install -y apt-transport-https curl gnupg lsb-release unixodbc unixodbc-dev
+# Add Microsoft package repository and install msodbcsql17
+RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
+    curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
+    apt-get update --fix-missing && \
+    ACCEPT_EULA=Y apt-get install -y msodbcsql17 && \
+    ACCEPT_EULA=Y apt-get install -y mssql-tools
 
+# Set PATH to include mssql-tools
+ENV PATH="/opt/mssql-tools/bin:${PATH}"
 
-# RUN chmod +x install_sql_server.sh
-# RUN bash install_sql_server.sh
-RUN apt-get update
-RUN odbcinst -j
+# Verify installation of unixODBC
+RUN which odbcinst
+
 # LABEL "com.datadoghq.ad.logs"='[<LOGS_CONFIG>]'
 # Make port 8000 available to the world outside this container
 EXPOSE 8080
