@@ -404,15 +404,11 @@ async def update_search_sort_order(
             else:
                 logger.warning(f"Worker PID {process.pid}: No updates processed for EntryID {entry_id}")
                 return []
-        except aio_pika.exceptions.AMQPError as e:
-            logger.error(f"Worker PID {process.pid}: RabbitMQ error: {e}", exc_info=True)
-            raise
-        except asyncio.TimeoutError:
-            logger.error(f"Worker PID {process.pid}: Timeout error while processing results for EntryID {entry_id}", exc_info=True)
-            raise
-        except SQLAlchemyError as e:
-            logger.error(f"Worker PID {process.pid}: SQLAlchemy error: {e}", exc_info=True)
-            raise
+        finally:
+            if producer and producer.connection and not producer.connection.is_closed:
+                await producer.close()
+            logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
+
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         raise
