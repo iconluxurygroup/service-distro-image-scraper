@@ -9,9 +9,10 @@ from rabbitmq_producer import RabbitMQProducer
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
-from typing import Optional, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import psutil
+from typing import Optional, Dict, Any
+import aiormq.exceptions  # Import aiormq.exceptions for ChannelAccessRefused
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -46,16 +47,26 @@ class RabbitMQConsumer:
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=1)
                 await self.channel.declare_queue(self.queue_name, durable=True)
-                await self.channel.declare_exchange("", type="direct", passive=True)
                 logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
         except asyncio.TimeoutError:
             logger.error("Timeout connecting to RabbitMQ")
             raise
+        except aio_pika.exceptions.ProbableAuthenticationError as e:
+            logger.error(
+                f"Authentication error connecting to RabbitMQ: {e}. "
+                f"Check username, password, and virtual host in {self.amqp_url}.",
+                exc_info=True
+            )
+            raise
         except aio_pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
             raise
-        except aio_pika.exceptions.ChannelAccessRefused as e:
-            logger.error(f"Permissions error connecting to RabbitMQ: {e}. Check user permissions and virtual host.", exc_info=True)
+        except aiormq.exceptions.ChannelAccessRefused as e:
+            logger.error(
+                f"Permissions error connecting to RabbitMQ: {e}. "
+                f"Ensure user has permissions on virtual host and default exchange.",
+                exc_info=True
+            )
             raise
 
     async def close(self):
@@ -102,6 +113,24 @@ class RabbitMQConsumer:
             await self.close()
             await asyncio.sleep(5)
             await self.start_consuming()
+        except aio_pika.exceptions.ProbableAuthenticationError as e:
+            logger.error(
+                f"Authentication error: {e}. "
+                f"Check username, password, and virtual host in {self.amqp_url}.",
+                exc_info=True
+            )
+            self.is_consuming = False
+            await self.close()
+            raise
+        except aiormq.exceptions.ChannelAccessRefused as e:
+            logger.error(
+                f"Permissions error: {e}. "
+                f"Ensure user has permissions on virtual host and default exchange.",
+                exc_info=True
+            )
+            self.is_consuming = False
+            await self.close()
+            raise
         except KeyboardInterrupt:
             logger.info("Received KeyboardInterrupt, shutting down consumer")
             await self.close()
@@ -294,13 +323,18 @@ class RabbitMQConsumer:
             logger.error(f"Error testing task for FileID: {file_id}, TaskType: {task_type}: {e}", exc_info=True)
             return False
 
-def signal_handler(consumer: RabbitMQConsumer):
+async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
+    """Helper function to perform async shutdown."""
+    await consumer.close()
+    await async_engine.dispose()
+    loop.stop()
+    loop.run_until_complete(loop.shutdown_asyncgens())
+    loop.close()
+
+def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     def handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(consumer.close())
-        loop.run_until_complete(async_engine.dispose())
-        sys.exit(0)
+        asyncio.create_task(shutdown(consumer, loop))
     return handler
 
 if __name__ == "__main__":
@@ -310,12 +344,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     consumer = RabbitMQConsumer()
-    signal.signal(signal.SIGINT, signal_handler(consumer))
-    signal.signal(signal.SIGTERM, signal_handler(consumer))
+    loop = asyncio.get_event_loop()
+    signal.signal(signal.SIGINT, signal_handler(consumer, loop))
+    signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
 
     if args.clear_queue:
         try:
-            loop = asyncio.get_event_loop()
             loop.run_until_complete(consumer.purge_queue())
             logger.info("Queue cleared successfully. Exiting.")
             sys.exit(0)
@@ -336,11 +370,10 @@ if __name__ == "__main__":
     }
 
     try:
-        loop = asyncio.get_event_loop()
         loop.run_until_complete(consumer.test_task(sample_task))
         loop.run_until_complete(consumer.start_consuming())
     except KeyboardInterrupt:
-        loop.run_until_complete(consumer.close())
+        loop.run_until_complete(shutdown(consumer, loop))
     except Exception as e:
         logger.error(f"Error in consumer: {e}", exc_info=True)
-        loop.run_until_complete(consumer.close())
+        loop.run_until_complete(shutdown(consumer, loop))
