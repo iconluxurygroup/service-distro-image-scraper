@@ -517,7 +517,7 @@ async def generate_download_file(file_id: str):
         message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}"
         await send_email(
             to_emails='nik@iconluxurygroup.com',
-            subject=f'File Processing Complete for {file_name}',
+            subject=f'{file_name} - {file_id} - {execution_time:.2f}s',
             download_url=public_url,
             job_id=file_id,
             logger=logger
