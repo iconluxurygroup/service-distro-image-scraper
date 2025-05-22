@@ -268,6 +268,15 @@ async def insert_search_results(
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_search_sort_order for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
@@ -294,14 +303,17 @@ async def update_search_sort_order(
             rows = result.fetchall()
             columns = result.keys()
             result.close()
-            await conn.execute(text("SELECT 1"))
+            await conn.execute(text("SELECT 1"))  # Clear cursor state
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
             return []
 
         results = [dict(zip(columns, row)) for row in rows]
-        logger.debug(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
+        logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
+
+        # Log input parameters for debugging
+        logger.debug(f"Worker PID {process.pid}: Input - Brand: {brand}, Model: {model}, Category: {category}, Brand Rules: {brand_rules}")
 
         brand_clean = clean_string(brand).lower() if brand else ""
         model_clean = normalize_model(model) if model else ""
@@ -320,6 +332,9 @@ async def update_search_sort_order(
         if model_clean and not model_aliases:
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
+
+        if not brand_aliases and not model_aliases:
+            logger.warning(f"Worker PID {process.pid}: No valid aliases generated for EntryID {entry_id}")
 
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
@@ -363,7 +378,7 @@ async def update_search_sort_order(
                         """)
                         result = await conn.execute(update_query, params)
                         await conn.commit()
-                        logger.debug(
+                        logger.info(
                             f"Worker PID {process.pid}: Updated SortOrder to {sort_order} "
                             f"for ResultID {res['ResultID']}, EntryID {entry_id}"
                         )
