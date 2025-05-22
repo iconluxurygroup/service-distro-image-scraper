@@ -27,6 +27,23 @@ import uuid
 from sqlalchemy.sql import text
 from rabbitmq_producer import RabbitMQProducer
 from common import clean_string
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+import logging
+import datetime
+import json
+from typing import Optional, List, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import async_engine
+from fastapi import BackgroundTasks
+import psutil
+import uuid
+import aio_pika
+import asyncio
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+from common import clean_string
+
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 default_logger = logging.getLogger(__name__)
@@ -71,27 +88,6 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             logger.debug(f"Invalid URL format: {cleaned}")
             return ""
     return cleaned
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
-import logging
-import datetime
-import json
-from typing import Optional, List, Dict
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
-from fastapi import BackgroundTasks
-import psutil
-import uuid
-import aio_pika
-import asyncio
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
-from common import clean_string
-
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 @retry(
     stop=stop_after_attempt(3),
