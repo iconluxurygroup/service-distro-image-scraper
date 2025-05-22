@@ -55,7 +55,7 @@ async def cleanup_temp_dirs(directories):
 
 app = FastAPI()
 def insert_file_db (file_name,file_source):
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
     insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl) OUTPUT INSERTED.Id VALUES (?, ?)"
     values = (file_name, file_source)
@@ -97,7 +97,7 @@ def load_payload_db(rows, file_id):
 
     return df
 def get_endpoint():
-     connection = pyodbc.connect(engine)
+     connection = pyodbc.connect(conn_str)
      cursor = connection.cursor()
      sql_query = "Select top 1 EndpointURL from utb_Endpoints where EndpointIsBlocked = 0 Order by NewID() "
      cursor.execute(sql_query)
@@ -113,7 +113,7 @@ def get_endpoint():
          endpoint = "No EndpointURL"
      return endpoint
 def remove_endpoint(endpoint):
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
     sql_query = f"Update utb_Endpoints set EndpointIsBlocked = 1 where  EndpointURL  = '{endpoint}'"
     cursor.execute(sql_query)
@@ -181,7 +181,7 @@ async def process_search_row(search_string,endpoint,entry_id):
                                     sql_query = f"update utb_ImageScraperRecords set  Step1 = getdate() where EntryID = {entry_id}"
 
                                     # Create a cursor from the connection
-                                    connection = pyodbc.connect(engine)
+                                    connection = pyodbc.connect(conn_str)
                                     cursor = connection.cursor()
 
                                     # Execute the update query
@@ -207,7 +207,7 @@ async def process_search_row(search_string,endpoint,entry_id):
         
 def update_file_generate_complete(file_id):
     query = f'update utb_ImageScraperFiles set CreateFileCompleteTime = getdate() Where ID = {file_id}'       
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -220,7 +220,7 @@ def update_file_generate_complete(file_id):
         
 def get_file_location(file_id):
     query = f"Select FileLocationUrl from utb_ImageScraperFiles where ID = {file_id}"
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -241,7 +241,7 @@ def get_file_location(file_id):
 
 def update_file_location_complete(file_id,file_location):
     query = f"update utb_ImageScraperFiles set FileLocationURLComplete = '{file_location}' Where ID ={file_id}"
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -253,7 +253,7 @@ def update_file_location_complete(file_id,file_location):
     
 def get_images_excel_db(file_id):
     update_file_start_query = f"update utb_ImageScraperFiles set CreateFileStartTime = getdate() Where ID = {file_id}"
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -285,7 +285,7 @@ inner join utb_ImageScraperRecords r on r.EntryID = t.EntryID
 Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
 
     query = query.replace('$FileID$',str(file_id))
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -304,7 +304,7 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
     
     
     complete_query = f"update utb_ImageScraperFiles set ImageCompleteTime = getdate() Where ID = {file_id}"
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -400,7 +400,7 @@ async def generate_download_file(file_id: str):
 import asyncio
 def get_lm_products(file_id):
 
-    connection = pyodbc.connect(engine)
+    connection = pyodbc.connect(conn_str)
     cursor = connection.cursor()
     query = f"exec usp_ImageScrapergetMatchFromRetail {file_id}"
     print(query)
