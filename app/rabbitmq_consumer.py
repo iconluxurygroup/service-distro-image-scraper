@@ -46,6 +46,7 @@ class RabbitMQConsumer:
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=1)
                 await self.channel.declare_queue(self.queue_name, durable=True)
+                await self.channel.declare_exchange("", type="direct", passive=True)
                 logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
         except asyncio.TimeoutError:
             logger.error("Timeout connecting to RabbitMQ")
