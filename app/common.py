@@ -402,6 +402,8 @@ async def generate_search_variations(
 
         # Brand Alias: Full name only
         brand_alias_var = f"{matched_rule['full_name'].lower()} {search_string}"
+        if not brand_alias_var:
+            brand_alias_var = brand
         if brand_alias_var not in all_variations:
             variations["brand_alias"].append(brand_alias_var)
             all_variations.add(brand_alias_var)
