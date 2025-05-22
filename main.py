@@ -31,158 +31,12 @@ logger.error("Error message")
 from sqlalchemy import create_engine
 
 import pyodbc
-from dotenv import load_dotenv
+
 import pandas as pd
-load_dotenv()
+from config import engine, conn_str
 import base64,zlib
-def get_spaces_client():
-    logger.info("Creating spaces client")
-    session = boto3.session.Session()
-    client = session.client('s3',
-                            region_name='nyc3',
-                            endpoint_url=os.getenv('SPACES_ENDPOINT'),
-                            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
-    logger.info("Spaces client created successfully")
-    return client
-
-def upload_file_to_space(file_src, save_as, is_public, content_type, meta=None):
-    spaces_client = get_spaces_client()
-    space_name = 'iconluxurygroup-s3'  # Your space name
-    print('Content Type')
-    print(content_type)
-    if not content_type:
-        content_type_guess = mimetypes.guess_type(file_src)[0]
-        if not content_type_guess:
-            raise Exception("Content type could not be guessed. Please specify it directly.")
-        content_type = content_type_guess
-
-    extra_args = {'ACL': 'public-read' if is_public else 'private', 'ContentType': content_type}
-    if meta:
-        extra_args['Metadata'] = meta
-
-    spaces_client.upload_file(
-        Filename=file_src,
-        Bucket=space_name,
-        Key=save_as,
-        ExtraArgs=extra_args
-    )
-    print(f"File uploaded successfully to {space_name}/{save_as}")
-    # Generate and return the public URL if the file is public
-    if is_public:
-        upload_url = f"{str(os.getenv('SPACES_ENDPOINT'))}/{space_name}/{save_as}"
-        print(f"Public URL: {upload_url}")
-        return upload_url
-
-
-
-def send_email(to_emails, subject, download_url, excel_file_path,execution_time,message="Total Rows:\nFilename:\nBatch ID:\nLocation:\nUploaded File:"):
-    # Encode the URL if necessary (example shown, adjust as needed)
-    # from urllib.parse import quote
-    # download_url = quote(download_url, safe='')
-    execution_time_timedelta = datetime.timedelta(seconds=execution_time)
-
-
-
-    message_with_breaks = message.replace("\n", "<br>")
-
-    html_content = f"""
-<html>
-<body>
-<div class="container">
-    <p>Your file is ready for download.</p>
-    <p>Total Elapsed Time: {str(execution_time_timedelta)}</p>
-    <p>Message details:<br>{message_with_breaks}</p>
-    <a href="{download_url}" class="download-button">Download File</a>
-    <p>CMS:v1</p>
-</div>
-</body>
-</html>
-"""
-
-
-
-
-#     html_content = f"""
-# <html>
-# <body>
-# <div class="container">
-#     <p>Your file is ready for download.</p>
-#     <p>Total Elapsed Time: {str(execution_time_timedelta)}</p>
-#     <a href="{download_url}" class="download-button">Download File</a>
-# </div>
-# </body>
-# </html>
-# """
-    message = Mail(
-        from_email='distrotool@iconluxurygroup.com',
-        subject=subject,
-        html_content=html_content
-    )
-    # Read and encode the Excel file
-    with open(excel_file_path, 'rb') as f:
-        excel_data = f.read()
-    encoded_excel_data = b64encode(excel_data).decode()
-
-    attachment = Attachment(
-        FileContent(encoded_excel_data),
-        FileName(excel_file_path.split('/')[-1]),
-        FileType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
-        Disposition('attachment')
-    )
-    message.attachment = attachment
-    
-    cc_recipient = 'notifications@popovtech.com'
-    personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
-    personalization.add_to(To(to_emails))
-    message.add_personalization(personalization)
-    try:
-        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
-        response = sg.send(message)
-        print(response.status_code)
-        print(response.body)
-        print(response.headers)
-    except Exception as e:
-        print(e)
-        #raise
-        
-def send_message_email(to_emails, subject,message):
-    message_with_breaks = message.replace("\n", "<br>")
-
-    html_content = f"""
-<html>
-<body>
-<div class="container">
-    <!-- Use the modified message with <br> for line breaks -->
-    <p>Message details:<br>{message_with_breaks}</p>
-    <p>CMS:v1</p>
-</div>
-</body>
-</html>
-"""
-    message = Mail(
-        from_email='distrotool@iconluxurygroup.com',
-        subject=subject,
-        html_content=html_content
-    )
-    
-    cc_recipient = 'notifications@popovtech.com'
-    personalization = Personalization()
-    personalization.add_cc(Cc(cc_recipient))
-    personalization.add_to(To(to_emails))
-    message.add_personalization(personalization)
-    try:
-        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
-        response = sg.send(message)
-        print(response.status_code)
-        print(response.body)
-        print(response.headers)
-    except Exception as e:
-        print(e)
-        #raise
-        
-        
+from s3_utils import upload_file_to_space
+from email_utils import send_message_email,send_email
 async def create_temp_dirs(unique_id):
     loop = asyncio.get_running_loop()  # Get the current loop directly
     base_dir = os.path.join(os.getcwd(), 'temp_files')
@@ -199,15 +53,9 @@ async def cleanup_temp_dirs(directories):
     for dir_path in directories:
         await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
 
-pwd_value = str(os.environ.get('MSSQLS_PWD'))
-pwd_str =f"Pwd={pwd_value};"
-global conn
-conn = "DRIVER={ODBC Driver 17 for SQL Server};Server=35.172.243.170;Database=luxurymarket_p4;Uid=luxurysitescraper;" + pwd_str
-global engine
-engine = create_engine("mssql+pyodbc:///?odbc_connect=%s" % conn)
 app = FastAPI()
 def insert_file_db (file_name,file_source):
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
     insert_query = "INSERT INTO utb_ImageScraperFiles (FileName, FileLocationUrl) OUTPUT INSERTED.Id VALUES (?, ?)"
     values = (file_name, file_source)
@@ -249,7 +97,7 @@ def load_payload_db(rows, file_id):
 
     return df
 def get_endpoint():
-     connection = pyodbc.connect(conn)
+     connection = pyodbc.connect(engine)
      cursor = connection.cursor()
      sql_query = "Select top 1 EndpointURL from utb_Endpoints where EndpointIsBlocked = 0 Order by NewID() "
      cursor.execute(sql_query)
@@ -265,7 +113,7 @@ def get_endpoint():
          endpoint = "No EndpointURL"
      return endpoint
 def remove_endpoint(endpoint):
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
     sql_query = f"Update utb_Endpoints set EndpointIsBlocked = 1 where  EndpointURL  = '{endpoint}'"
     cursor.execute(sql_query)
@@ -333,7 +181,7 @@ async def process_search_row(search_string,endpoint,entry_id):
                                     sql_query = f"update utb_ImageScraperRecords set  Step1 = getdate() where EntryID = {entry_id}"
 
                                     # Create a cursor from the connection
-                                    connection = pyodbc.connect(conn)
+                                    connection = pyodbc.connect(engine)
                                     cursor = connection.cursor()
 
                                     # Execute the update query
@@ -359,7 +207,7 @@ async def process_search_row(search_string,endpoint,entry_id):
         
 def update_file_generate_complete(file_id):
     query = f'update utb_ImageScraperFiles set CreateFileCompleteTime = getdate() Where ID = {file_id}'       
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -372,7 +220,7 @@ def update_file_generate_complete(file_id):
         
 def get_file_location(file_id):
     query = f"Select FileLocationUrl from utb_ImageScraperFiles where ID = {file_id}"
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -393,7 +241,7 @@ def get_file_location(file_id):
 
 def update_file_location_complete(file_id,file_location):
     query = f"update utb_ImageScraperFiles set FileLocationURLComplete = '{file_location}' Where ID ={file_id}"
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -405,7 +253,7 @@ def update_file_location_complete(file_id,file_location):
     
 def get_images_excel_db(file_id):
     update_file_start_query = f"update utb_ImageScraperFiles set CreateFileStartTime = getdate() Where ID = {file_id}"
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -437,7 +285,7 @@ inner join utb_ImageScraperRecords r on r.EntryID = t.EntryID
 Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
 
     query = query.replace('$FileID$',str(file_id))
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -456,7 +304,7 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
     
     
     complete_query = f"update utb_ImageScraperFiles set ImageCompleteTime = getdate() Where ID = {file_id}"
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
 
     # Execute the update query
@@ -468,163 +316,91 @@ Where r.FileID = $FileID$ ) update toupdate set SortOrder = seqnum;"""
     # Close the connection
     connection.close()
 
-async def generate_download_file(file_id):
+# Modified generate_download_file
+async def generate_download_file(file_id: str):
     preferred_image_method = 'append'
     
     start_time = time.time()
     loop = asyncio.get_running_loop()
     
     selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
-    selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe,selected_images_df )
+    selected_image_list = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_download_dataframe, selected_images_df)
     
-    print(selected_images_df.head())
-    print(selected_image_list)
+    logger.info(f"Fetched {len(selected_image_list)} images for FileID: {file_id}")
     
-    provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location,file_id )
+    provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id)
     file_name = provided_file_path.split('/')[-1]
+    
     temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
     local_filename = os.path.join(temp_excel_dir, file_name)
+    
     failed_img_urls = await download_all_images(selected_image_list, temp_images_dir)
-    contenttype = os.path.splitext(local_filename)[1]
+    
+    content_type, _ = mimetypes.guess_type(local_filename)
+    if not content_type:
+        content_type = 'application/octet-stream'
+        logger.debug(f"Set Content-Type to {content_type} for {local_filename}")
+    
     response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
     if response.status_code != 200:
         logger.error(f"Failed to download file: {response.status_code}")
+        await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
         return {"error": "Failed to download the provided file."}
+    
     with open(local_filename, "wb") as file:
         file.write(response.content)
-        
+    
     logger.info("Writing images to Excel")
     failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-    print(f"failed rows: {failed_rows}")
-    #if failed_rows != []:
-    # if failed_img_urls:
-    #     print(failed_img_urls)
-    #     #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-    #     #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
-    #     logger.error(f"Failed to write images for rows: {failed_rows}")
-        # logger.error(f"Failed rows added to excel: {fail_rows_written})")
-        
-    logger.info("Uploading file to space")
-    #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
-    is_public = True
-    public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, local_filename,is_public,contenttype)  
-    await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
-    await loop.run_in_executor(ThreadPoolExecutor(), update_file_generate_complete, file_id)
+    logger.info(f"Failed rows: {failed_rows}")
+    
+    if failed_img_urls:
+        logger.warning(f"Failed to download images: {failed_img_urls}")
+    
+    logger.info(f"Uploading file to R2 for FileID: {file_id}")
+    public_url = await upload_file_to_space(
+        file_src=local_filename,
+        save_as=local_filename,
+        is_public=True,
+        logger=logger,
+        file_id=file_id
+    )
+    
+    if not public_url:
+        logger.error(f"Failed to upload file to R2 for FileID: {file_id}")
+        await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
+        return {"error": "Failed to upload file to R2."}
     
     end_time = time.time()
     execution_time = end_time - start_time
-    #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, 'Your File Is Ready', public_url, local_filename)
-    if os.listdir(temp_images_dir) !=[]:
-        logger.info("Sending email")
-        #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, f'Started {file_name}', public_url, local_filename,execution_time,'')
-    #await send_email(send_to_email, 'Your File Is Ready', public_url, local_filename)
+    
+    if os.listdir(temp_images_dir):
+        logger.info("Sending email notification")
+        message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}"
+        await send_email(
+            to_emails='nik@iconluxurygroup.com',
+            subject=f'File Processing Complete for {file_name}',
+            download_url=public_url,
+            job_id=file_id,
+            logger=logger
+        )
+    
     logger.info("Cleaning up temporary directories")
     await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
     
-    logger.info("Processing completed successfully")
+    logger.info(f"Processing completed successfully for FileID: {file_id}")
     
-    return {"message": "Processing completed successfully.", "results": 'hardcoded result value', "public_url": public_url}
-    
-# async def process_image_batch(payload: dict):
-#     start_time = time.time()
-#     # Your existing logic here
-#     # Include all steps from processing start to finish,
-#     # such as downloading images, writing images to Excel, etc.
-#
-#     logger.info(f"Processing started for payload: {payload}")
-#     rows = payload.get('rowData', [])
-#     provided_file_path = payload.get('filePath')
-#     logger.info("Received request to process image batch")
-#     file_name = provided_file_path.split('/')[-1]
-#     send_to_email = payload.get('sendToEmail', 'nik@iconluxurygroup.com')
-#     preferred_image_method = payload.get('preferredImageMethod', 'append')
-#     file_id_db = insert_file_db(file_name, provided_file_path)
-#     print(file_id_db)
-#     load_payload_db(rows, file_id_db)
-#     search_df = get_records_to_search(file_id_db, engine)
-#     print(search_df)
-#
-#     semaphore = asyncio.Semaphore(int(os.environ.get('MAX_THREAD')))  # Limit concurrent tasks to avoid overloading
-#     loop = asyncio.get_running_loop()
-#     print(rows)
-#     try:
-#     #    # Create a temporary directory to save downloaded images
-#     #
-#     #
-#          await loop.run_in_executor(ThreadPoolExecutor(), send_message_email, send_to_email, f'Started {file_name}', f'Total Rows: {len(rows)}\nFilename: {file_name}\nDB_file_id: {file_id_db}\nUploaded File: {provided_file_path}')
-#     #
-#          tasks = [process_with_semaphore(row, semaphore,file_id_db) for _, row in search_df.iterrows()]
-#          await asyncio.gather(*tasks, return_exceptions=True)
-#
-#          await loop.run_in_executor(ThreadPoolExecutor(), update_sort_order,file_id_db)
-#     #
-#          #if any(isinstance(result, Exception) for result in results):
-#              #logger.error("Error occurred during image processing.")
-#              #return {"error": "An error occurred during processing."}
-#          #print(results)
-#
-#          # logger.info("Downloading images")
-#          #
-#          # #clean_results = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_downloadV2, results,send_to_email)
-#          # clean_results = await loop.run_in_executor(ThreadPoolExecutor(), prepare_images_for_downloadV2, results)
-#          # if clean_results == []:
-#          #     send_message_email(send_to_email,f'Started {file_name}','No images found\nPlease make sure correct column values are provided\nIf api is disabled this reponse will be sent')
-#          # print(clean_results)
-#          # logger.info("clean_results: {}".format(clean_results))
-#
-#
-#
-#     # #
-#     # #     #d_complete_ = await loop.run_in_executor(ThreadPoolExecutor(), download_all_images, clean_results, temp_images_dir)
-#     #      failed_img_urls = await download_all_images(clean_results, temp_images_dir)
-#     # #
-#     #      contenttype = os.path.splitext(local_filename)[1]
-#     #      logger.info("Downloading Excel from web")
-#     #      response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
-#     #      if response.status_code != 200:
-#     #          logger.error(f"Failed to download file: {response.status_code}")
-#     #          return {"error": "Failed to download the provided file."}
-#     #      with open(local_filename, "wb") as file:
-#     #          file.write(response.content)
-#
-#     #     logger.info("Writing images to Excel")
-#     #     failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, preferred_image_method)
-#     #     print(f"failed rows: {failed_rows}")
-#     #     #if failed_rows != []:
-#     #     if failed_img_urls:
-#     #         print(failed_img_urls)
-#     #         #fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_img_urls, local_filename, clean_results,failed_rows)
-#     #         fail_rows_written = await loop.run_in_executor(ThreadPoolExecutor(), write_failed_downloads_to_excel, failed_img_urls,local_filename)
-#     #         logger.error(f"Failed to write images for rows: {failed_rows}")
-#     #         logger.error(f"Failed rows added to excel: {fail_rows_written})")
-#     #
-#     #     logger.info("Uploading file to space")
-#     #     #public_url = upload_file_to_space(local_filename, local_filename, is_public=True)
-#     #     is_public = True
-#     #     public_url = await loop.run_in_executor(ThreadPoolExecutor(), upload_file_to_space, local_filename, local_filename,is_public,contenttype)
-#     #     end_time = time.time()
-#     #     execution_time = end_time - start_time
-#     #     #await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, 'Your File Is Ready', public_url, local_filename)
-#     #     if os.listdir(temp_images_dir) !=[]:
-#     #         logger.info("Sending email")
-#     #         await loop.run_in_executor(ThreadPoolExecutor(), send_email, send_to_email, f'Started {file_name}', public_url, local_filename,execution_time,'')
-#     #     #await send_email(send_to_email, 'Your File Is Ready', public_url, local_filename)
-#     #     logger.info("Cleaning up temporary directories")
-#     #     await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
-#     #
-#     #     logger.info("Processing completed successfully")
-#     #
-#     #     return {"message": "Processing completed successfully.", "results": results, "public_url": public_url}
-#     #
-#     except Exception as e:
-#          logger.exception("An unexpected error occurred during processing: %s", e)
-#          await loop.run_in_executor(ThreadPoolExecutor(), send_message_email, send_to_email, f'Started {file_name}', f"An unexpected error occurred during processing.\nError: {str(e)}")
-#          return {"error": f"An unexpected error occurred during processing. Error: {e}"}
-#
+    return {
+        "message": "Processing completed successfully.",
+        "results": "hardcoded result value",
+        "public_url": public_url
+    }
+
+
 import asyncio
 def get_lm_products(file_id):
 
-    connection = pyodbc.connect(conn)
+    connection = pyodbc.connect(engine)
     cursor = connection.cursor()
     query = f"exec usp_ImageScrapergetMatchFromRetail {file_id}"
     print(query)

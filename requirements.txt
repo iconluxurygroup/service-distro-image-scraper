@@ -16,3 +16,6 @@ pyodbc
 sqlalchemy
 pandas
 chardet
+aiobotocore
+tenacity
+aiosmtplib
