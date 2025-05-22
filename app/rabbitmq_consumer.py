@@ -1,22 +1,20 @@
-
 import aio_pika
 import json
 import logging
-from typing import Dict, Any, Optional
-import datetime
-from fastapi import BackgroundTasks
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import time
 import asyncio
-import psutil
-import sys
 import signal
-from database_config import async_engine
+import sys
+import datetime
 from rabbitmq_producer import RabbitMQProducer
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import async_engine
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import psutil
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 class RabbitMQConsumer:
     def __init__(
@@ -93,7 +91,7 @@ class RabbitMQConsumer:
             queue = await self.channel.get_queue(self.queue_name)
             await queue.consume(self.callback)
             logger.info("Started consuming messages. To exit press CTRL+C")
-            await asyncio.Event().wait()  # Keep running until interrupted
+            await asyncio.Event().wait()
         except (aio_pika.exceptions.AMQPConnectionError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError) as e:
             logger.error(f"Connection error: {e}, reconnecting in 5 seconds", exc_info=True)
             self.is_consuming = False
@@ -110,8 +108,109 @@ class RabbitMQConsumer:
             await asyncio.sleep(5)
             await self.start_consuming()
 
+    async def execute_update(self, task, conn, logger):
+        file_id = task.get("file_id", "unknown")
+        task_type = task.get("task_type", "unknown")
+        try:
+            sql = task.get("sql")
+            params = task.get("params", {})
+            if not isinstance(params, dict):
+                raise ValueError(f"Invalid params format: {params}, expected dict")
+            logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
+            result = await conn.execute(text(sql), params)
+            await conn.commit()
+            rowcount = result.rowcount
+            logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
+            return {"rowcount": rowcount}
+        except SQLAlchemyError as e:
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}",
+                exc_info=True
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, "
+                f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}",
+                exc_info=True
+            )
+            raise
+
+    async def execute_select(self, task, conn, logger):
+        file_id = task.get("file_id")
+        select_sql = task.get("sql")
+        params = task.get("params", {})
+        response_queue = task.get("response_queue")
+        logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql}, params: {params}")
+        if not params:
+            raise ValueError(f"No parameters provided for SELECT query: {select_sql}")
+        if any(k.startswith("id") for k in params.keys()):
+            logger.debug(f"Detected named placeholder parameters: {params}")
+        else:
+            raise ValueError(f"Invalid parameters for SELECT query, expected named placeholders (e.g., id0), got: {params}")
+        try:
+            result = await conn.execute(text(select_sql), params)
+            rows = result.fetchall()
+            columns = result.keys()
+            result.close()
+            results = [dict(zip(columns, row)) for row in rows]
+            logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
+            if response_queue:
+                producer = RabbitMQProducer(amqp_url=self.amqp_url)
+                try:
+                    await producer.connect()
+                    response = {"file_id": file_id, "results": results}
+                    await producer.publish_message(response, routing_key=response_queue, correlation_id=file_id)
+                    logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
+                finally:
+                    await producer.close()
+            return results
+        except SQLAlchemyError as e:
+            logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
+            raise
+
+    async def execute_sort_order_update(self, params: dict, file_id: str):
+        try:
+            entry_id = params.get("entry_id")
+            result_id = params.get("result_id")
+            sort_order = params.get("sort_order")
+            if not all([entry_id, result_id, sort_order is not None]):
+                logger.error(
+                    f"Invalid parameters for update_sort_order task, FileID: {file_id}. "
+                    f"Required: entry_id, result_id, sort_order. Got: {params}"
+                )
+                return False
+            sql = """
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = :sort_order
+                WHERE EntryID = :entry_id AND ResultID = :result_id
+            """
+            update_params = {
+                "sort_order": sort_order,
+                "entry_id": entry_id,
+                "result_id": result_id
+            }
+            async with async_engine.begin() as conn:
+                result = await conn.execute(text(sql), update_params)
+                await conn.commit()
+                rowcount = result.rowcount if result.rowcount is not None else 0
+                logger.info(
+                    f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL: {sql[:100]}, "
+                    f"params: {update_params}, affected {rowcount} rows"
+                )
+                if rowcount == 0:
+                    logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
+                    return False
+                return True
+        except SQLAlchemyError as e:
+            logger.error(f"Database error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
+            return False
+        except Exception as e:
+            logger.error(f"Error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
+            return False
+
     async def callback(self, message: aio_pika.IncomingMessage):
-        """Process incoming messages asynchronously."""
         async with message.process(requeue=True, ignore_processed=True):
             try:
                 task = json.loads(message.body.decode())
@@ -122,7 +221,6 @@ class RabbitMQConsumer:
                     f"Received task for FileID: {file_id}, TaskType: {task_type}, "
                     f"CorrelationID: {message.correlation_id}, Task: {json.dumps(task)[:200]}"
                 )
-
                 async with asyncio.timeout(self.operation_timeout):
                     if task_type == "select_deduplication":
                         async with async_engine.connect() as conn:
@@ -150,7 +248,6 @@ class RabbitMQConsumer:
                         async with async_engine.begin() as conn:
                             result = await self.execute_update(task, conn, logger)
                             success = True
-
                 if success:
                     await message.ack()
                     logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
@@ -170,28 +267,28 @@ class RabbitMQConsumer:
                 await message.nack(requeue=True)
                 await asyncio.sleep(2)
 
-async def test_task(consumer: RabbitMQConsumer, task: dict):
-    file_id = task.get("file_id", "unknown")
-    task_type = task.get("task_type", "unknown")
-    logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
-    try:
-        async with asyncio.timeout(consumer.operation_timeout):
-            if task_type == "select_deduplication":
-                async with async_engine.connect() as conn:
-                    success = await consumer.execute_select(task, conn, logger)
-            elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
-                success = await consumer.execute_sort_order_update(task.get("params", {}), file_id)
-            else:
-                async with async_engine.begin() as conn:
-                    success = await consumer.execute_update(task, conn, logger)
-            logger.info(f"Test task result for FileID: {file_id}, TaskType: {task_type}: {'Success' if success else 'Failed'}")
-            return success
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout testing task for FileID: {file_id}, TaskType: {task_type}")
-        return False
-    except Exception as e:
-        logger.error(f"Error testing task for FileID: {file_id}, TaskType: {task_type}: {e}", exc_info=True)
-        return False
+    async def test_task(self, task: dict):
+        file_id = task.get("file_id", "unknown")
+        task_type = task.get("task_type", "unknown")
+        logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
+        try:
+            async with asyncio.timeout(self.operation_timeout):
+                if task_type == "select_deduplication":
+                    async with async_engine.connect() as conn:
+                        success = await self.execute_select(task, conn, logger)
+                elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
+                    success = await self.execute_sort_order_update(task.get("params", {}), file_id)
+                else:
+                    async with async_engine.begin() as conn:
+                        success = await self.execute_update(task, conn, logger)
+                logger.info(f"Test task result for FileID: {file_id}, TaskType: {task_type}: {'Success' if success else 'Failed'}")
+                return success
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout testing task for FileID: {file_id}, TaskType: {task_type}")
+            return False
+        except Exception as e:
+            logger.error(f"Error testing task for FileID: {file_id}, TaskType: {task_type}: {e}", exc_info=True)
+            return False
 
 def signal_handler(consumer: RabbitMQConsumer):
     def handler(sig, frame):
@@ -236,7 +333,7 @@ if __name__ == "__main__":
 
     try:
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(test_task(consumer, sample_task))
+        loop.run_until_complete(consumer.test_task(sample_task))
         loop.run_until_complete(consumer.start_consuming())
     except KeyboardInterrupt:
         loop.run_until_complete(consumer.close())
