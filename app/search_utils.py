@@ -258,9 +258,6 @@ async def insert_search_results(
             await connection.close()
         await producer.close()
         logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer")
-
-# Remaining functions (update_search_sort_order, update_sort_order, update_sort_no_image_entry)
-# are unchanged from the provided code
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
