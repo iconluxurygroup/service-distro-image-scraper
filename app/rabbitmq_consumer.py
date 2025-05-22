@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class RabbitMQConsumer:
     def __init__(
         self,
-        amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
+        amqp_url: str = "amqp://guest:guest@localhost:5672/",
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
