@@ -1,116 +1,114 @@
-import pika
+import aio_pika
 import json
 import logging
 from typing import Dict, Any, Optional
 import datetime
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import asyncio
+import psutil
+import sys
+import signal
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 class RabbitMQProducer:
     def __init__(
         self,
-        host: str = "localhost",
-        port: int = 5672,
-        username: str = "guest",
-        password: str = "guest",
+        amqp_url: str = "amqp://guest:guest@localhost:5672/",
         queue_name: str = "db_update_queue",
+        connection_timeout: float = 10.0,
+        operation_timeout: float = 5.0,
     ):
-        self.host = host
-        self.port = port
-        self.credentials = pika.PlainCredentials(username, password)
+        self.amqp_url = amqp_url
         self.queue_name = queue_name
-        self.connection = None
-        self.channel = None
+        self.connection_timeout = connection_timeout
+        self.operation_timeout = operation_timeout
+        self.connection: Optional[aio_pika.RobustConnection] = None
+        self.channel: Optional[aio_pika.Channel] = None
         self.is_connected = False
+
+    async def connect(self):
+        """Establish an async robust connection to RabbitMQ and declare a durable queue."""
+        if self.is_connected and self.connection and not self.connection.is_closed:
+            return
+        try:
+            async with asyncio.timeout(self.connection_timeout):
+                self.connection = await aio_pika.connect_robust(
+                    self.amqp_url,
+                    connection_attempts=3,
+                    retry_delay=5,
+                )
+                self.channel = await self.connection.channel()
+                await self.channel.declare_queue(self.queue_name, durable=True)
+                self.is_connected = True
+                logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
+        except asyncio.TimeoutError:
+            logger.error("Timeout connecting to RabbitMQ")
+            raise
+        except aio_pika.exceptions.AMQPConnectionError as e:
+            logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(pika.exceptions.AMQPConnectionError),
+        retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError)),
         before_sleep=lambda retry_state: logger.info(
-            f"Retrying RabbitMQ connection (attempt {retry_state.attempt_number}/3)"
+            f"Retrying RabbitMQ operation (attempt {retry_state.attempt_number}/3)"
         ),
     )
-    def connect(self):
-        """Establish connection to RabbitMQ and declare a durable queue."""
-        if self.is_connected:
-            return
-        try:
-            self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=self.host,
-                    port=self.port,
-                    credentials=self.credentials,
-                    connection_attempts=3,
-                    retry_delay=5,
-                )
-            )
-            self.channel = self.connection.channel()
-            self.channel.queue_declare(queue=self.queue_name, durable=True)
-            self.is_connected = True
-            logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
-        except pika.exceptions.AMQPConnectionError as e:
-            logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-            raise
-    def publish_message(self, message: Dict[str, Any], routing_key: str = None, correlation_id: Optional[str] = None):
+    async def publish_message(self, message: Dict[str, Any], routing_key: str = None, correlation_id: Optional[str] = None):
         """Publish a message to the queue with optional correlation_id."""
         if not self.is_connected or not self.connection or self.connection.is_closed:
-            self.connect()
+            await self.connect()
 
         try:
-            message_body = json.dumps(message)
-            queue = routing_key or self.queue_name
-            # Only declare the queue if it's not db_update_queue or a response_queue
-            if queue != self.queue_name and not queue.startswith("select_response_"):
-                self.channel.queue_declare(queue=queue, durable=False, exclusive=True)
-            properties = pika.BasicProperties(
-                delivery_mode=pika.DeliveryMode.Persistent,
-                correlation_id=correlation_id if correlation_id else None
-            )
-            self.channel.basic_publish(
-                exchange="",
-                routing_key=queue,
-                body=message_body,
-                properties=properties
-            )
-            logger.info(f"Published message to queue: {queue}, correlation_id: {correlation_id}, task: {message_body}")
+            async with asyncio.timeout(self.operation_timeout):
+                message_body = json.dumps(message)
+                queue_name = routing_key or self.queue_name
+                if queue_name != self.queue_name and not queue_name.startswith("select_response_"):
+                    await self.channel.declare_queue(queue_name, durable=False, exclusive=True)
+                
+                exchange = await self.channel.get_exchange("")
+                await exchange.publish(
+                    aio_pika.Message(
+                        body=message_body.encode(),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                        correlation_id=correlation_id,
+                        content_type="application/json",
+                    ),
+                    routing_key=queue_name,
+                )
+                logger.info(
+                    f"Published message to queue: {queue_name}, "
+                    f"correlation_id: {correlation_id}, task: {message_body[:200]}"
+                )
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout publishing message to {queue_name}")
+            raise
         except Exception as e:
-            logger.error(f"Failed to publish message: {e}", exc_info=True)
+            logger.error(f"Failed to publish message to {queue_name}: {e}", exc_info=True)
             self.is_connected = False
             raise
-    def publish_update(self, update_task: Dict[str, Any], routing_key: str = None):
+
+    async def publish_update(self, update_task: Dict[str, Any], routing_key: str = None):
         """Publish an update task to the queue with persistent delivery."""
-        if not self.is_connected or not self.connection or self.connection.is_closed:
-            self.connect()
+        await self.publish_message(update_task, routing_key)
 
+    async def close(self):
+        """Close the RabbitMQ connection and channel."""
         try:
-            message = json.dumps(update_task)
-            queue = routing_key or self.queue_name
-            # Only declare the queue if it's not db_update_queue or a response_queue
-            if queue != self.queue_name and not queue.startswith("select_response_"):
-                self.channel.queue_declare(queue=queue, durable=False, exclusive=True)
-            self.channel.basic_publish(
-                exchange="",
-                routing_key=queue,
-                body=message,
-                properties=pika.BasicProperties(
-                    delivery_mode=pika.DeliveryMode.Persistent
-                ),
-            )
-            logger.info(f"Published update task to queue: {queue}, task: {message}")
+            if self.channel and not self.channel.is_closed:
+                await self.channel.close()
+                logger.info("Closed RabbitMQ channel")
+            if self.connection and not self.connection.is_closed:
+                await self.connection.close()
+                logger.info("Closed RabbitMQ connection")
+            self.is_connected = False
         except Exception as e:
-            logger.error(f"Failed to publish update task: {e}", exc_info=True)
-            self.is_connected = False
-            raise
-
-    def close(self):
-        """Close the RabbitMQ connection."""
-        if self.connection and not self.connection.is_closed:
-            self.connection.close()
-            self.is_connected = False
-            logger.info("Closed RabbitMQ connection")
+            logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
 
 async def enqueue_db_update(
     file_id: str,
@@ -122,15 +120,13 @@ async def enqueue_db_update(
     response_queue: Optional[str] = None,
 ):
     """Enqueue a database update task to RabbitMQ."""
+    should_close = False
     if producer is None:
         producer = RabbitMQProducer()
         should_close = True
-    else:
-        should_close = False
 
     try:
-        producer.connect()
-        # Ensure sql is a string
+        await producer.connect()
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
         update_task = {
             "file_id": file_id,
@@ -140,11 +136,11 @@ async def enqueue_db_update(
             "timestamp": datetime.datetime.now().isoformat(),
             "response_queue": response_queue,
         }
-        producer.publish_update(update_task)
+        await producer.publish_update(update_task)
         logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
     except Exception as e:
         logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise
     finally:
         if should_close:
-            producer.close()
+            await producer.close()

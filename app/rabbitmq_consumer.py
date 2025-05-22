@@ -1,313 +1,195 @@
-#!/usr/bin/env python
-import pika
+
+import aio_pika
 import json
 import logging
-import time
-import asyncio
-import signal
-import sys
+from typing import Dict, Any, Optional
 import datetime
-from rabbitmq_producer import RabbitMQProducer
-from sqlalchemy.sql import text
-from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine
+from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import asyncio
 import psutil
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
+import sys
+import signal
 class RabbitMQConsumer:
     def __init__(
         self,
-        host: str = "localhost",
-        port: int = 5672,
-        username: str = "guest",
-        password: str = "guest",
+        amqp_url: str = "amqp://guest:guest@localhost:5672/",
         queue_name: str = "db_update_queue",
+        connection_timeout: float = 10.0,
+        operation_timeout: float = 5.0,
     ):
-        self.host = host
-        self.port = port
-        self.credentials = pika.PlainCredentials(username, password)
+        self.amqp_url = amqp_url
         self.queue_name = queue_name
-        self.connection = None
-        self.channel = None
+        self.connection_timeout = connection_timeout
+        self.operation_timeout = operation_timeout
+        self.connection: Optional[aio_pika.RobustConnection] = None
+        self.channel: Optional[aio_pika.Channel] = None
         self.is_consuming = False
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(pika.exceptions.AMQPConnectionError),
-        before_sleep=lambda retry_state: logger.info(
-            f"Retrying RabbitMQ connection (attempt {retry_state.attempt_number}/3)"
-        ),
-    )
-    def connect(self):
+    async def connect(self):
+        """Establish an async robust connection to RabbitMQ."""
         if self.connection and not self.connection.is_closed:
             return
-        self.connection = pika.BlockingConnection(
-            pika.ConnectionParameters(
-                host=self.host,
-                port=self.port,
-                credentials=self.credentials,
-            )
-        )
-        self.channel = self.connection.channel()
-        self.channel.queue_declare(queue=self.queue_name, durable=True)
-        self.channel.basic_qos(prefetch_count=1)
-        logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
+        try:
+            async with asyncio.timeout(self.connection_timeout):
+                self.connection = await aio_pika.connect_robust(
+                    self.amqp_url,
+                    connection_attempts=3,
+                    retry_delay=5,
+                )
+                self.channel = await self.connection.channel()
+                await self.channel.set_qos(prefetch_count=1)
+                await self.channel.declare_queue(self.queue_name, durable=True)
+                logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
+        except asyncio.TimeoutError:
+            logger.error("Timeout connecting to RabbitMQ")
+            raise
+        except aio_pika.exceptions.AMQPConnectionError as e:
+            logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+            raise
 
-    def close(self):
-        if self.channel and not self.channel.is_closed:
+    async def close(self):
+        """Close the RabbitMQ connection and channel."""
+        try:
             if self.is_consuming:
-                try:
-                    self.channel.stop_consuming()
-                    logger.info("Stopped consuming messages")
-                except Exception as e:
-                    logger.error(f"Error stopping consumption: {e}", exc_info=True)
-            self.channel.close()
-            logger.info("Closed RabbitMQ channel")
-        if self.connection and not self.connection.is_closed:
-            self.connection.close()
-            logger.info("Closed RabbitMQ connection")
+                self.is_consuming = False
+                logger.info("Stopped consuming messages")
+            if self.channel and not self.channel.is_closed:
+                await self.channel.close()
+                logger.info("Closed RabbitMQ channel")
+            if self.connection and not self.connection.is_closed:
+                await self.connection.close()
+                logger.info("Closed RabbitMQ connection")
+        except Exception as e:
+            logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
         self.is_consuming = False
 
-    def purge_queue(self):
+    async def purge_queue(self):
+        """Purge all messages from the queue."""
         try:
             if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
-                self.connect()
-            purge_count = self.channel.queue_purge(self.queue_name)
-            logger.info(f"Manually purged {purge_count} messages from queue: {self.queue_name}")
+                await self.connect()
+            queue = await self.channel.get_queue(self.queue_name)
+            purge_count = await queue.purge()
+            logger.info(f"Purged {purge_count} messages from queue: {self.queue_name}")
             return purge_count
         except Exception as e:
             logger.error(f"Error purging queue {self.queue_name}: {e}", exc_info=True)
             raise
 
-    def start_consuming(self):
-        while True:
+    async def start_consuming(self):
+        """Start consuming messages with robust reconnection."""
+        try:
+            await self.connect()
+            self.is_consuming = True
+            queue = await self.channel.get_queue(self.queue_name)
+            await queue.consume(self.callback)
+            logger.info("Started consuming messages. To exit press CTRL+C")
+            await asyncio.Event().wait()  # Keep running until interrupted
+        except (aio_pika.exceptions.AMQPConnectionError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError) as e:
+            logger.error(f"Connection error: {e}, reconnecting in 5 seconds", exc_info=True)
+            self.is_consuming = False
+            await self.close()
+            await asyncio.sleep(5)
+            await self.start_consuming()
+        except KeyboardInterrupt:
+            logger.info("Received KeyboardInterrupt, shutting down consumer")
+            await self.close()
+        except Exception as e:
+            logger.error(f"Unexpected error in consumer: {e}, reconnecting in 5 seconds", exc_info=True)
+            self.is_consuming = False
+            await self.close()
+            await asyncio.sleep(5)
+            await self.start_consuming()
+
+    async def callback(self, message: aio_pika.IncomingMessage):
+        """Process incoming messages asynchronously."""
+        async with message.process(requeue=True, ignore_processed=True):
             try:
-                self.connect()
-                self.is_consuming = True
-                self.channel.basic_consume(queue=self.queue_name, on_message_callback=self.callback)
-                logger.info("Waiting for messages. To exit press CTRL+C")
-                self.channel.start_consuming()
-            except pika.exceptions.AMQPConnectionError as e:
-                logger.error(f"AMQP connection error: {e}, reconnecting in 5 seconds", exc_info=True)
-                self.is_consuming = False
-                time.sleep(5)
-            except KeyboardInterrupt:
-                logger.info("Received KeyboardInterrupt, shutting down consumer")
-                self.close()
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error in consumer: {e}, reconnecting in 5 seconds", exc_info=True)
-                self.is_consuming = False
-                self.close()
-                time.sleep(5)
-
-    async def execute_update(self, task, conn, logger):
-        file_id = task.get("file_id", "unknown")
-        task_type = task.get("task_type", "unknown")
-        try:
-            async with async_engine.begin() as new_conn:  # Use new connection with transaction
-                sql = task.get("sql")
-                params = task.get("params", {})
-                
-                if not isinstance(params, dict):
-                    raise ValueError(f"Invalid params format: {params}, expected dict")
-                
-                logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, params: {params}")
-                result = await new_conn.execute(text(sql), params)
-                await new_conn.commit()
-                rowcount = result.rowcount
-                logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
-                return {"rowcount": rowcount}
-                    
-        except SQLAlchemyError as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Database error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
-                exc_info=True
-            )
-            raise
-        except Exception as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Unexpected error executing UPDATE/INSERT: {sql}, params: {params}, error: {str(e)}", 
-                exc_info=True
-            )
-            raise
-
-    async def execute_select(self, task, conn, logger):
-        file_id = task.get("file_id")
-        select_sql = task.get("sql")
-        params = task.get("params", {})
-        response_queue = task.get("response_queue")
-
-        logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql}, params: {params}")
-
-        # Validate params for named placeholders
-        if not params:
-            raise ValueError(f"No parameters provided for SELECT query: {select_sql}")
-        if any(k.startswith("id") for k in params.keys()):
-            logger.debug(f"Detected named placeholder parameters: {params}")
-        else:
-            raise ValueError(f"Invalid parameters for SELECT query, expected named placeholders (e.g., id0), got: {params}")
-
-        try:
-            result = await conn.execute(text(select_sql), params)
-            rows = result.fetchall()
-            columns = result.keys()
-            result.close()
-
-            results = [dict(zip(columns, row)) for row in rows]
-            logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
-
-            if response_queue:
-                producer = RabbitMQProducer(host=self.host, port=self.port, username=self.credentials.username, password=self.credentials.password)
-                try:
-                    producer.connect()
-                    response = {"file_id": file_id, "results": results}
-                    producer.publish_update(response, routing_key=response_queue)
-                    logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
-                finally:
-                    producer.close()
-
-            return results
-        except SQLAlchemyError as e:
-            logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
-            raise
-
-
-    async def execute_sort_order_update(self, params: dict, file_id: str):
-        try:
-            entry_id = params.get("entry_id")
-            result_id = params.get("result_id")
-            sort_order = params.get("sort_order")
-
-            if not all([entry_id, result_id, sort_order is not None]):
-                logger.error(
-                    f"Invalid parameters for update_sort_order task, FileID: {file_id}. "
-                    f"Required: entry_id, result_id, sort_order. Got: {params}"
-                )
-                return False
-
-            sql = """
-                UPDATE utb_ImageScraperResult
-                SET SortOrder = :sort_order
-                WHERE EntryID = :entry_id AND ResultID = :result_id
-            """
-            update_params = {
-                "sort_order": sort_order,
-                "entry_id": entry_id,
-                "result_id": result_id
-            }
-
-            async with async_engine.begin() as conn:
-                result = await conn.execute(text(sql), update_params)
-                await conn.commit()
-                rowcount = result.rowcount if result.rowcount is not None else 0
+                task = json.loads(message.body.decode())
+                file_id = task.get("file_id", "unknown")
+                task_type = task.get("task_type", "unknown")
+                response_queue = task.get("response_queue")
                 logger.info(
-                    f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL: {sql[:100]}, "
-                    f"params: {update_params}, affected {rowcount} rows"
+                    f"Received task for FileID: {file_id}, TaskType: {task_type}, "
+                    f"CorrelationID: {message.correlation_id}, Task: {json.dumps(task)[:200]}"
                 )
 
-                if rowcount == 0:
-                    logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
-                    return False
-                return True
-        except SQLAlchemyError as e:
-            logger.error(f"Database error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
-            return False
-        except Exception as e:
-            logger.error(f"Error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
-            return False
+                async with asyncio.timeout(self.operation_timeout):
+                    if task_type == "select_deduplication":
+                        async with async_engine.connect() as conn:
+                            result = await self.execute_select(task, conn, logger)
+                            response = {"file_id": file_id, "results": result}
+                            if response_queue:
+                                producer = RabbitMQProducer(amqp_url=self.amqp_url)
+                                try:
+                                    await producer.connect()
+                                    await producer.publish_message(
+                                        response,
+                                        routing_key=response_queue,
+                                        correlation_id=file_id,
+                                    )
+                                    logger.info(
+                                        f"Sent {len(result)} deduplication results to {response_queue} "
+                                        f"for FileID: {file_id}"
+                                    )
+                                finally:
+                                    await producer.close()
+                        success = True
+                    elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
+                        success = await self.execute_sort_order_update(task.get("params", {}), file_id)
+                    else:
+                        async with async_engine.begin() as conn:
+                            result = await self.execute_update(task, conn, logger)
+                            success = True
 
-    def callback(self, ch, method, properties, body):
-        logger = logging.getLogger(__name__)
-        loop = asyncio.get_event_loop()
-
-        try:
-            message = body.decode()
-            task = json.loads(message)
-            file_id = task.get("file_id", "unknown")
-            task_type = task.get("task_type", "unknown")
-            response_queue = task.get("response_queue")
-            logger.info(f"Received task for FileID: {file_id}, TaskType: {task_type}, Task: {message[:200]}")
-
-            async def process_task(task, logger):
-                if task_type == "select_deduplication":
-                    async with async_engine.connect() as conn:
-                        result = await self.execute_select(task, conn, logger)
-                        logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(result)} rows for FileID: {file_id}")
-
-                        # Format the response as a dictionary
-                        response = {"file_id": file_id, "results": result}
-
-                        # Send response to RabbitMQ if response_queue is specified
-                        if response_queue:
-                            producer = RabbitMQProducer(
-                                host=self.host,
-                                port=self.port,
-                                username=self.credentials.username,
-                                password=self.credentials.password
-                            )
-                            try:
-                                producer.connect()
-                                # Use publish_message with correlation_id
-                                producer.publish_message(response, routing_key=response_queue, correlation_id=file_id)
-                                logger.info(f"Sent {len(result)} deduplication results to {response_queue} for FileID: {file_id}")
-                            finally:
-                                producer.close()
-
-                        return response
-                elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
-                    return await self.execute_sort_order_update(task.get("params", {}), file_id)
+                if success:
+                    await message.ack()
+                    logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
                 else:
-                    async with async_engine.begin() as conn:
-                        logger.debug(f"Created new connection for FileID {file_id}, TaskType: {task_type}")
-                        result = await self.execute_update(task, conn, logger)
-                        return result
+                    logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
+                    await message.nack(requeue=True)
+                    await asyncio.sleep(2)
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout processing message for FileID: {file_id}, TaskType: {task_type}")
+                await message.nack(requeue=True)
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(
+                    f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
+                    exc_info=True
+                )
+                await message.nack(requeue=True)
+                await asyncio.sleep(2)
 
-            success = loop.run_until_complete(process_task(task, logger))
-
-            if success:
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
+async def test_task(consumer: RabbitMQConsumer, task: dict):
+    file_id = task.get("file_id", "unknown")
+    task_type = task.get("task_type", "unknown")
+    logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
+    try:
+        async with asyncio.timeout(consumer.operation_timeout):
+            if task_type == "select_deduplication":
+                async with async_engine.connect() as conn:
+                    success = await consumer.execute_select(task, conn, logger)
+            elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
+                success = await consumer.execute_sort_order_update(task.get("params", {}), file_id)
             else:
-                logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                time.sleep(2)
-        except Exception as e:
-            logger.error(
-                f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
-                exc_info=True
-            )
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            time.sleep(2)
+                async with async_engine.begin() as conn:
+                    success = await consumer.execute_update(task, conn, logger)
+            logger.info(f"Test task result for FileID: {file_id}, TaskType: {task_type}: {'Success' if success else 'Failed'}")
+            return success
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout testing task for FileID: {file_id}, TaskType: {task_type}")
+        return False
+    except Exception as e:
+        logger.error(f"Error testing task for FileID: {file_id}, TaskType: {task_type}: {e}", exc_info=True)
+        return False
 
-    async def test_task(self, task: dict):
-        file_id = task.get("file_id", "unknown")
-        task_type = task.get("task_type", "unknown")
-        logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
-        if task_type == "select_deduplication":
-            async with async_engine.connect() as conn:
-                success = await self.execute_select(task, conn, logger)
-        elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
-            success = await self.execute_sort_order_update(task.get("params", {}), file_id)
-        else:
-            async with async_engine.begin() as conn:
-                success = await self.execute_update(task, conn, logger)
-        
-        logger.info(f"Test task result for FileID: {file_id}, TaskType: {task_type}: {'Success' if success else 'Failed'}")
-        return success
-
-def signal_handler(consumer):
+def signal_handler(consumer: RabbitMQConsumer):
     def handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        consumer.close()
-        # Ensure async engine is disposed
         loop = asyncio.get_event_loop()
+        loop.run_until_complete(consumer.close())
         loop.run_until_complete(async_engine.dispose())
         sys.exit(0)
     return handler
@@ -324,7 +206,8 @@ if __name__ == "__main__":
 
     if args.clear_queue:
         try:
-            consumer.purge_queue()
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(consumer.purge_queue())
             logger.info("Queue cleared successfully. Exiting.")
             sys.exit(0)
         except Exception as e:
@@ -345,10 +228,10 @@ if __name__ == "__main__":
 
     try:
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(consumer.test_task(sample_task))
-        consumer.start_consuming()
+        loop.run_until_complete(test_task(consumer, sample_task))
+        loop.run_until_complete(consumer.start_consuming())
     except KeyboardInterrupt:
-        consumer.close()
+        loop.run_until_complete(consumer.close())
     except Exception as e:
         logger.error(f"Error in consumer: {e}", exc_info=True)
-        consumer.close()
+        loop.run_until_complete(consumer.close())
