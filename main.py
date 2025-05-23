@@ -30,7 +30,44 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+import logging
+import os
+import datetime
+from pathlib import Path
 
+def setup_logging(file_id: str, timestamp: str) -> logging.Logger:
+    """Configure logging to save logs to a file in jobs/{file_id}/{timestamp}/logs/."""
+    # Create log directory
+    log_dir = os.path.join('jobs', file_id, timestamp, 'logs')
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Define log file path
+    log_file = os.path.join(log_dir, f'job_{file_id}_{timestamp}.log')
+    
+    # Configure logging
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # Create file handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # Define log format
+    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(log_format)
+    console_handler.setFormatter(log_format)
+    
+    # Add handlers to logger
+    logger.handlers = []  # Clear existing handlers to avoid duplicates
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    logger.info(f"Logging initialized for FileID: {file_id}, Timestamp: {timestamp}")
+    return logger
 # Constants
 MAX_THREADS = int(os.environ.get('MAX_THREADS', 10))
 FALLBACK_FORMATS = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
@@ -463,6 +500,10 @@ async def generate_download_file(file_id: str) -> dict:
     try:
         # Generate timestamp for this generation run
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        
+        # Setup logging
+        global logger
+        logger = setup_logging(file_id, timestamp)
         
         # Fetch images and file metadata
         selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
