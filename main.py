@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Optional, List, Tuple
 from uuid import uuid4
-
+import datetime
 import aiohttp
 import pandas as pd
 import pyodbc
@@ -461,6 +461,9 @@ async def generate_download_file(file_id: str) -> dict:
     loop = asyncio.get_running_loop()
     
     try:
+        # Generate timestamp for this generation run
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        
         # Fetch images and file metadata
         selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
         selected_image_list = [(row.ExcelRowID, row.ImageUrl, row.ImageUrlThumbnail) for row in selected_images_df.itertuples(index=False)]
@@ -496,16 +499,31 @@ async def generate_download_file(file_id: str) -> dict:
         failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', header_row)
         
         # Upload images to R2 for archiving
-        image_urls = await upload_file_to_space(temp_images_dir, file_id, logger)
+        image_urls = []
+        for image_file in os.listdir(temp_images_dir):
+            image_path = os.path.join(temp_images_dir, image_file)
+            save_as = f"iconluxurygroup/super_scraper/jobs/{file_id}/{timestamp}/images/{image_file}"
+            public_url = await upload_file_to_space(
+                file_src=image_path,
+                save_as=save_as,
+                is_public=True,
+                logger=logger,
+                file_id=None  # Avoid database updates for images
+            )
+            if public_url:
+                image_urls.append(public_url)
+                logger.info(f"Successfully uploaded image to R2: {public_url}")
+            else:
+                logger.error(f"Failed to upload image to R2: {image_file}")
         
         # Upload Excel to R2 with specific path
-        s3_path = f"iconluxurygroup/super_scraper/jobs/{file_id}/{file_name}"
+        s3_path = f"iconluxurygroup/super_scraper/jobs/{file_id}/{timestamp}/{file_name}"
         public_url = await upload_file_to_space(
             file_src=local_filename,
             save_as=s3_path,
             is_public=True,
             logger=logger,
-            file_id=file_id
+            file_id=file_id  # Trigger database updates for Excel
         )
         
         if not public_url:
@@ -518,7 +536,7 @@ async def generate_download_file(file_id: str) -> dict:
         
         # Send email notifications
         execution_time = time.time() - start_time
-        message = f"Excel SuperScraper v{VERSION}\nTotal Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}"
+        message = f"Excel SuperScraper v{VERSION}\nTotal Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
         
         # Email for Excel processing
         await send_email(
@@ -531,7 +549,7 @@ async def generate_download_file(file_id: str) -> dict:
         )
         
         # Email for image archiving status
-        archive_message = f"Excel SuperScraper v{VERSION}\nImage Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2"
+        archive_message = f"Excel SuperScraper v{VERSION}\nImage Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2\nTimestamp: {timestamp}"
         await send_email(
             to_emails='nik@luxurymarket.com',
             subject=f'Excel SuperScraper v{VERSION} - Image Archive Status - {file_id}',
@@ -545,14 +563,14 @@ async def generate_download_file(file_id: str) -> dict:
             "message": "Processing completed successfully.",
             "public_url": public_url,
             "header_row": header_row,
-            "archived_images": len(image_urls)
+            "archived_images": len(image_urls),
+            "timestamp": timestamp
         }
     except Exception as e:
         logger.error(f"Error in generate_download_file: {e}")
         return {"error": str(e)}
     finally:
         await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
-
 
 @app.post("/generate-download-file/")
 async def process_file(background_tasks: BackgroundTasks, file_id: int):
