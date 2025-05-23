@@ -5,7 +5,6 @@ openpyxl
 uvicorn
 Pillow
 boto3
-sendgrid
 httpx
 tldextract
 aiohttp
