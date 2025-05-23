@@ -55,7 +55,157 @@ async def cleanup_temp_dirs(directories):
 import logging
 from openpyxl import load_workbook
 from typing import Optional
+async def validate_image_response(response, url, image_name):
+    """Validate the HTTP response to ensure it contains valid image content."""
+    logger.info(f"Validating response for URL: {url} Img: {image_name}")
+    
+    # Check status code
+    if response.status != 200:
+        logger.error(f"Invalid status code {response.status} for URL: {url}")
+        return False, "Invalid status code"
 
+    # Check Content-Type
+    content_type = response.headers.get('Content-Type', '').lower()
+    valid_image_types = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp', 'image/avif', 'image/tiff', 'image/x-icon']
+    if not any(content_type.startswith(img_type) for img_type in valid_image_types):
+        logger.error(f"Invalid Content-Type {content_type} for URL: {url}")
+        return False, f"Invalid Content-Type: {content_type}"
+
+    # Check Content-Length
+    content_length = int(response.headers.get('Content-Length', 0))
+    if content_length < 1000:  # Arbitrary threshold for minimum image size
+        logger.error(f"Content too small ({content_length} bytes) for URL: {url}")
+        return False, "Content too small"
+
+    # Log first few bytes for debugging
+    data = await response.read()
+    logger.debug(f"First 10 bytes: {data[:10]}")
+    return True, data
+
+async def image_download(semaphore, url, thumbnail, image_name, save_path, session, fallback_formats=None):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    async with semaphore:
+        # Ensure fallback_formats is a list
+        if fallback_formats is None or not isinstance(fallback_formats, (list, tuple)):
+            fallback_formats = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
+            logger.debug(f"Set default fallback_formats: {fallback_formats}")
+
+        logger.info(f"Initiating download for URL: {url} Img: {image_name}")
+        try:
+            async with session.get(url, headers=headers) as response:
+                logger.info(f"Requesting URL: {url} with stream=True")
+                logger.info(f"Received response: {response.status} for URL: {url}")
+
+                # Validate response
+                is_valid, result = await validate_image_response(response, url, image_name)
+                if not is_valid:
+                    logger.error(f"Validation failed: {result}")
+                    # Attempt thumbnail download
+                    if thumbnail and thumbnail != url:
+                        logger.info(f"Attempting thumbnail download for {image_name}")
+                        return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
+                    return False
+
+                # Process image data
+                image_data = BytesIO(result)
+                try:
+                    logger.info(f"Attempting to open image stream and save as PNG for {image_name}")
+                    with IMG2.open(image_data) as img:
+                        final_image_path = os.path.join(save_path, f"{image_name}.png")
+                        img.save(final_image_path)
+                        logger.info(f"Successfully saved: {final_image_path}")
+                        return True
+                except UnidentifiedImageError as e:
+                    logger.error(f"Image file type unidentified for {image_name}: {e}")
+                    for fmt in fallback_formats:
+                        image_data.seek(0)  # Reset stream position
+                        try:
+                            logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
+                            with IMG2.open(image_data) as img:
+                                final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
+                                img.save(final_image_path)
+                                logger.info(f"Successfully saved with fallback format {fmt}: {final_image_path}")
+                                return True
+                        except Exception as fallback_exc:
+                            logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                    # Attempt thumbnail download if all formats fail
+                    if thumbnail and thumbnail != url:
+                        logger.info(f"Attempting thumbnail download for {image_name}")
+                        return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
+                    return False
+
+        except TimeoutError as exc:
+            logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
+            if thumbnail and thumbnail != url:
+                logger.info(f"Attempting thumbnail download for {image_name}")
+                return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
+            return exc
+       GOOD
+        except Exception as exc:
+            logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
+            if thumbnail and thumbnail != url:
+                logger.info(f"Attempting thumbnail download for {image_name}")
+                return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
+            return exc
+
+async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    async with semaphore:
+        # Ensure fallback_formats is a list
+        if fallback_formats is None or not isinstance(fallback_formats, (list, tuple)):
+            fallback_formats = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
+            logger.debug(f"Set default fallback_formats: {fallback_formats}")
+
+        logger.info(f"Initiating thumbnail download for URL: {url} Img: {image_name}")
+        try:
+            async with session.get(url, headers=headers) as response:
+                logger.info(f"Requesting URL: {url} with stream=True")
+                logger.info(f"Received response: {response.status} for URL: {url}")
+
+                # Validate response
+                is_valid, result = await validate_image_response(response, url, image_name)
+                if not is_valid:
+                    logger.error(f"Thumbnail validation failed: {result}")
+                    return False
+
+                # Process image data
+                image_data = BytesIO(result)
+                try:
+                    logger.info(f"Attempting to open thumbnail stream and save as PNG for {image_name}")
+                    with IMG2.open(image_data) as img:
+                        final_image_path = os.path.join(save_path, f"{image_name}.png")
+                        img.save(final_image_path)
+                        logger.info(f"Successfully saved thumbnail: {final_image_path}")
+                        return True
+                except UnidentifiedImageError as e:
+                    logger.error(f"Thumbnail file type unidentified for {image_name}: {e}")
+                    for fmt in fallback_formats:
+                        image_data.seek(0)  # Reset stream position
+                        try:
+                            logger.info(f"Trying to save thumbnail with fallback format {fmt} for {image_name}")
+                            with IMG2.open(image_data) as img:
+                                final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
+                                img.save(final_image_path)
+                                logger.info(f"Successfully saved thumbnail with fallback format {fmt}: {final_image_path}")
+                                return True
+                        except Exception as fallback_exc:
+                            logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                    return False
+
+        except TimeoutError:
+            logger.error(f"Timeout occurred while downloading thumbnail {url} Image: {image_name}")
+            return False
+        except Exception as exc:
+            logger.error(f"Exception occurred during thumbnail download for URL: {url}: {exc}", exc_info=True)
+            return False
 def find_header_row_index(excel_file: str, max_rows_to_check: int = 10) -> Optional[int]:
     """
     Identify the header row index in an Excel file based on header characteristics.
@@ -793,6 +943,33 @@ async def download_all_images(data, save_path):
     return failed_downloads
 
 
+async def validate_image_response(response, url, image_name):
+    """Validate the HTTP response to ensure it contains valid image content."""
+    logger.info(f"Validating response for URL: {url} Img: {image_name}")
+    
+    # Check status code
+    if response.status != 200:
+        logger.error(f"Invalid status code {response.status} for URL: {url}")
+        return False, "Invalid status code"
+
+    # Check Content-Type
+    content_type = response.headers.get('Content-Type', '').lower()
+    valid_image_types = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp', 'image/avif', 'image/tiff', 'image/x-icon']
+    if not any(content_type.startswith(img_type) for img_type in valid_image_types):
+        logger.error(f"Invalid Content-Type {content_type} for URL: {url}")
+        return False, f"Invalid Content-Type: {content_type}"
+
+    # Check Content-Length
+    content_length = int(response.headers.get('Content-Length', 0))
+    if content_length < 1000:  # Arbitrary threshold for minimum image size
+        logger.error(f"Content too small ({content_length} bytes) for URL: {url}")
+        return False, "Content too small"
+
+    # Log first few bytes for debugging
+    data = await response.read()
+    logger.debug(f"First 10 bytes: {data[:10]}")
+    return True, data
+
 async def image_download(semaphore, url, thumbnail, image_name, save_path, session, fallback_formats=None):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
@@ -800,57 +977,123 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
         "Accept-Language": "en-US,en;q=0.9",
     }
     async with semaphore:
-        if fallback_formats is None:
+        # Ensure fallback_formats is a list
+        if fallback_formats is None or not isinstance(fallback_formats, (list, tuple)):
             fallback_formats = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
+            logger.debug(f"Set default fallback_formats: {fallback_formats}")
 
         logger.info(f"Initiating download for URL: {url} Img: {image_name}")
         try:
             async with session.get(url, headers=headers) as response:
                 logger.info(f"Requesting URL: {url} with stream=True")
-                # response = session.get(url, stream=True)
                 logger.info(f"Received response: {response.status} for URL: {url}")
 
-                if response.status == 200:
-                    logger.info(f"Processing content from URL: {url}")
-                    data = await response.read()
-                    image_data = BytesIO(data)
-                    try:
-                        logger.info(f"Attempting to open image stream and save as PNG for {image_name}")
-                        with IMG2.open(image_data) as img:
-                            final_image_path = os.path.join(save_path, f"{image_name}.png")
-                            img.save(final_image_path)
-                            logger.info(f"Successfully saved: {final_image_path}")
-                            return True
-                    except UnidentifiedImageError as e:
-                        logger.error(f"Image file type unidentified, trying fallback formats for {image_name}: {e}")
-                        for fmt in fallback_formats:
-                            image_data.seek(0)  # Reset stream position
-                            try:
-                                logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
-                                with IMG2.open(image_data) as img:
-                                    final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
-                                    img.save(final_image_path)
-                                    logger.info(f"Successfully saved with fallback format {fmt}: {final_image_path}")
-                                    return True
-                            except Exception as fallback_exc:
-                                logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
-                else:
-                    logger.error(f"Download failed with status code {response.status} for URL: {url}")
-                    await thumbnail_download(semaphore, thumbnail, image_name, save_path, session,
-                                             fallback_formats=None)
+                # Validate response
+                is_valid, result = await validate_image_response(response, url, image_name)
+                if not is_valid:
+                    logger.error(f"Validation failed: {result}")
+                    # Attempt thumbnail download
+                    if thumbnail and thumbnail != url:
+                        logger.info(f"Attempting thumbnail download for {image_name}")
+                        return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
+                    return False
+
+                # Process image data
+                image_data = BytesIO(result)
+                try:
+                    logger.info(f"Attempting to open image stream and save as PNG for {image_name}")
+                    with IMG2.open(image_data) as img:
+                        final_image_path = os.path.join(save_path, f"{image_name}.png")
+                        img.save(final_image_path)
+                        logger.info(f"Successfully saved: {final_image_path}")
+                        return True
+                except UnidentifiedImageError as e:
+                    logger.error(f"Image file type unidentified for {image_name}: {e}")
+                    for fmt in fallback_formats:
+                        image_data.seek(0)  # Reset stream position
+                        try:
+                            logger.info(f"Trying to save image with fallback format {fmt} for {image_name}")
+                            with IMG2.open(image_data) as img:
+                                final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
+                                img.save(final_image_path)
+                                logger.info(f"Successfully saved with fallback format {fmt}: {final_image_path}")
+                                return True
+                        except Exception as fallback_exc:
+                            logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                    # Attempt thumbnail download if all formats fail
+                    if thumbnail and thumbnail != url:
+                        logger.info(f"Attempting thumbnail download for {image_name}")
+                        return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
+                    return False
 
         except TimeoutError as exc:
-            # Handle the timeout specifically
             logger.error(f"Timeout occurred while downloading {url} Image: {image_name}")
-            print('timeout error inside the downlaod function')
-            # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
-            # return False
+            if thumbnail and thumbnail != url:
+                logger.info(f"Attempting thumbnail download for {image_name}")
+                return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
             return exc
+       GOOD
         except Exception as exc:
             logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
-            # await thumbnail_download(semaphore, thumbnail ,image_name, save_path, session, fallback_formats=None)
-            # return False
+            if thumbnail and thumbnail != url:
+                logger.info(f"Attempting thumbnail download for {image_name}")
+                return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
             return exc
+
+async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    async with semaphore:
+        # Ensure fallback_formats is a list
+        if fallback_formats is None or not isinstance(fallback_formats, (list, tuple)):
+            fallback_formats = ['png', 'jpeg', 'gif', 'bmp', 'webp', 'avif', 'tiff', 'ico']
+            logger.debug(f"Set default fallback_formats: {fallback_formats}")
+
+        logger.info(f"Initiating thumbnail download for URL: {url} Img: {image_name}")
+        try:
+            async with session.get(url, headers=headers) as response:
+                logger.info(f"Requesting URL: {url} with stream=True")
+                logger.info(f"Received response: {response.status} for URL: {url}")
+
+                # Validate response
+                is_valid, result = await validate_image_response(response, url, image_name)
+                if not is_valid:
+                    logger.error(f"Thumbnail validation failed: {result}")
+                    return False
+
+                # Process image data
+                image_data = BytesIO(result)
+                try:
+                    logger.info(f"Attempting to open thumbnail stream and save as PNG for {image_name}")
+                    with IMG2.open(image_data) as img:
+                        final_image_path = os.path.join(save_path, f"{image_name}.png")
+                        img.save(final_image_path)
+                        logger.info(f"Successfully saved thumbnail: {final_image_path}")
+                        return True
+                except UnidentifiedImageError as e:
+                    logger.error(f"Thumbnail file type unidentified for {image_name}: {e}")
+                    for fmt in fallback_formats:
+                        image_data.seek(0)  # Reset stream position
+                        try:
+                            logger.info(f"Trying to save thumbnail with fallback format {fmt} for {image_name}")
+                            with IMG2.open(image_data) as img:
+                                final_image_path = os.path.join(save_path, f"{image_name}.{fmt}")
+                                img.save(final_image_path)
+                                logger.info(f"Successfully saved thumbnail with fallback format {fmt}: {final_image_path}")
+                                return True
+                        except Exception as fallback_exc:
+                            logger.error(f"Failed with fallback format {fmt} for {image_name}: {fallback_exc}")
+                    return False
+
+        except TimeoutError:
+            logger.error(f"Timeout occurred while downloading thumbnail {url} Image: {image_name}")
+            return False
+        except Exception as exc:
+            logger.error(f"Exception occurred during thumbnail download for URL: {url}: {exc}", exc_info=True)
+            return False
 async def thumbnail_download(semaphore, url, image_name, save_path, session, fallback_formats=None):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
