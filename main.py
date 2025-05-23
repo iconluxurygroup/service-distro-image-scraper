@@ -533,7 +533,7 @@ async def generate_download_file(file_id: str) -> dict:
         
         # Send email notifications
         execution_time = time.time() - start_time
-        email_message = f"Excel SuperScraper v{VERSION}\nTotal Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
+        email_message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
         
         # Email for Excel processing
         await send_email(
@@ -545,10 +545,10 @@ async def generate_download_file(file_id: str) -> dict:
         )
         
         # Email for image archiving status
-        archive_message = f"Excel SuperScraper v{VERSION}\nImage Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2\nTimestamp: {timestamp}"
+        archive_message = f"Image Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2\nTimestamp: {timestamp}"
         await send_message_email(
             to_emails='nik@luxurymarket.com',
-            subject=f'Excel SuperScraper v{VERSION} - Image Archive Status - {file_id}',
+            subject=f'Image Archive Status - {file_id}',
             message=archive_message,
             logger=logger
         )
