@@ -144,7 +144,6 @@ async def image_download(semaphore, url, thumbnail, image_name, save_path, sessi
                 logger.info(f"Attempting thumbnail download for {image_name}")
                 return await thumbnail_download(semaphore, thumbnail, image_name, save_path, session, fallback_formats)
             return exc
-       GOOD
         except Exception as exc:
             logger.error(f"Exception occurred during download or processing for URL: {url}: {exc}", exc_info=True)
             if thumbnail and thumbnail != url:
