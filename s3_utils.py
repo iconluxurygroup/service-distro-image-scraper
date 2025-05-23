@@ -12,7 +12,7 @@ import aiobotocore.session
 from aiobotocore.config import AioConfig
 from app_config import S3_CONFIG
 from sqlalchemy.sql import text
-from app_config import async_engine, conn_str, engine
+from app_config import async_engine, conn_str
 import pyodbc
 
 default_logger = logging.getLogger(__name__)
@@ -59,13 +59,9 @@ def double_encode_plus(filename, logger=None):
 
 def generate_unique_filename(original_filename, logger=None):
     logger = logger or default_logger
-    # Generate 8-letter random alphanumeric code
-    code = secrets.token_hex(4).lower()[:8]  # 4 bytes = 8 hex chars
-    # Get timestamp in YYYYMMDDHHMMSS format
+    code = secrets.token_hex(4).lower()[:8]
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    # Get file extension
     _, ext = os.path.splitext(original_filename)
-    # Create new filename: code_timestamp.ext
     new_filename = f"{code}_{timestamp}{ext}"
     logger.debug(f"Generated unique filename: {new_filename} from {original_filename}")
     return new_filename
@@ -135,12 +131,6 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         logger.error(f"Local file does not exist: {file_src}")
         raise FileNotFoundError(f"Local file does not exist: {file_src}")
 
-    # Handle Excel files: generate unique filename and set save_as
-    if file_src.endswith('.xlsx'):
-        unique_filename = generate_unique_filename(os.path.basename(file_src), logger)
-        save_as = f"excel_files/{file_id}/{unique_filename}"
-        logger.info(f"Excel file detected. Setting save_as to: {save_as}")
-
     content_type, _ = mimetypes.guess_type(file_src)
     if not content_type:
         content_type = 'application/octet-stream'
@@ -162,6 +152,12 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                         ACL='public-read' if is_public else 'private',
                         ContentType=content_type
                     )
+                # Verify file size post-upload
+                response = await r2_client.head_object(Bucket=S3_CONFIG['r2_bucket_name'], Key=save_as)
+                s3_size = response['ContentLength']
+                if s3_size != file_size:
+                    logger.error(f"File size mismatch for {save_as}: local={file_size}, S3={s3_size}")
+                    return None
                 double_encoded_key = double_encode_plus(save_as, logger=logger)
                 r2_url = f"{S3_CONFIG['r2_custom_domain']}/{double_encoded_key}"
                 if len(r2_url) > 255:
@@ -181,9 +177,7 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
     if is_public and result_urls.get('r2'):
         if file_id:
             try:
-                # Update FileLocationURLComplete with the latest URL
                 await update_file_location_complete_async(file_id, result_urls['r2'], logger)
-                # Mark file generation complete
                 await update_file_generate_complete(file_id, logger)
                 logger.info(f"Successfully updated FileLocationURLComplete and marked generation complete for FileID: {file_id}")
                 return result_urls['r2']
@@ -191,6 +185,6 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                 logger.error(f"Failed to update database for FileID {file_id}: {e}", exc_info=True)
                 return None
         else:
-            logger.error(f"No file_id provided for database update")
+            logger.debug(f"No file_id provided for database update, skipping for public upload")
             return result_urls['r2']
     return None
