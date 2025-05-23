@@ -21,7 +21,7 @@ from PIL import Image as PILImage
 from PIL import UnidentifiedImageError
 from tldextract import tldextract
 
-from app_config import engine, conn_str
+from app_config import engine, conn_str,VERSION
 from email_utils import send_email
 from s3_utils import upload_file_to_space
 
@@ -495,10 +495,14 @@ async def generate_download_file(file_id: str) -> dict:
         # Write images to Excel
         failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', header_row)
         
-        # Upload to R2
+        # Upload images to R2 for archiving
+        image_urls = await upload_images_to_r2(temp_images_dir, file_id, logger)
+        
+        # Upload Excel to R2 with specific path
+        s3_path = f"iconluxurygroup/super_scraper/jobs/{file_id}/{file_name}"
         public_url = await upload_file_to_space(
             file_src=local_filename,
-            save_as=local_filename,
+            save_as=s3_path,
             is_public=True,
             logger=logger,
             file_id=file_id
@@ -512,21 +516,36 @@ async def generate_download_file(file_id: str) -> dict:
         # Update database
         await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
         
-        # Send email notification
+        # Send email notifications
         execution_time = time.time() - start_time
-        message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}"
+        message = f"Excel SuperScraper v{VERSION}\nTotal Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}"
+        
+        # Email for Excel processing
         await send_email(
             to_emails='nik@iconluxurygroup.com',
-            subject=f'{file_name} - {file_id} - {execution_time:.2f}s',
+            subject=f'Excel SuperScraper v{VERSION} - {file_name} - {file_id} - {execution_time:.2f}s',
             download_url=public_url,
             job_id=file_id,
-            logger=logger
+            logger=logger,
+            message=message
+        )
+        
+        # Email for image archiving status
+        archive_message = f"Excel SuperScraper v{VERSION}\nImage Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2"
+        await send_email(
+            to_emails='nik@luxurymarket.com',
+            subject=f'Excel SuperScraper v{VERSION} - Image Archive Status - {file_id}',
+            download_url=None,
+            job_id=file_id,
+            logger=logger,
+            message=archive_message
         )
         
         return {
             "message": "Processing completed successfully.",
             "public_url": public_url,
-            "header_row": header_row
+            "header_row": header_row,
+            "archived_images": len(image_urls)
         }
     except Exception as e:
         logger.error(f"Error in generate_download_file: {e}")
