@@ -502,7 +502,7 @@ async def generate_download_file(file_id: str) -> dict:
         image_urls = []
         for image_file in os.listdir(temp_images_dir):
             image_path = os.path.join(temp_images_dir, image_file)
-            save_as = f"iconluxurygroup/super_scraper/jobs/{file_id}/{timestamp}/images/{image_file}"
+            save_as = f"super_scraper/jobs/{file_id}/{timestamp}/images/{image_file}"
             public_url = await upload_file_to_space(
                 file_src=image_path,
                 save_as=save_as,
@@ -517,7 +517,7 @@ async def generate_download_file(file_id: str) -> dict:
                 logger.error(f"Failed to upload image to R2: {image_file}")
         
         # Upload Excel to R2 with specific path
-        s3_path = f"iconluxurygroup/super_scraper/jobs/{file_id}/{timestamp}/{file_name}"
+        s3_path = f"super_scraper/jobs/{file_id}/{timestamp}/{file_name}"
         public_url = await upload_file_to_space(
             file_src=local_filename,
             save_as=s3_path,
