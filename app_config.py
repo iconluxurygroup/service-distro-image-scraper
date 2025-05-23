@@ -13,7 +13,7 @@ S3_CONFIG = {
     "r2_bucket_name": "iconluxurygroup",
     "r2_custom_domain": "https://iconluxury.group",
 }
-VERSION="3.8.2"
+VERSION="3.8.6"
 SENDER_EMAIL="nik@luxurymarket.com"
 SENDER_PASSWORD="wvug kynd dfhd xrjh"
 SENDER_NAME='superscraper'
