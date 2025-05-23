@@ -531,9 +531,6 @@ async def generate_download_file(file_id: str) -> dict:
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
             return {"error": "Failed to upload file to R2."}
         
-        # Update database
-        await loop.run_in_executor(ThreadPoolExecutor(), update_file_location_complete, file_id, public_url)
-        
         # Send email notifications
         execution_time = time.time() - start_time
         message = f"Excel SuperScraper v{VERSION}\nTotal Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
