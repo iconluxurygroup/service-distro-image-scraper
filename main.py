@@ -22,7 +22,7 @@ from PIL import UnidentifiedImageError
 from tldextract import tldextract
 
 from app_config import engine, conn_str,VERSION
-from email_utils import send_email
+from email_utils import send_email, send_message_email
 from s3_utils import upload_file_to_space
 
 # Configure logging
@@ -533,27 +533,24 @@ async def generate_download_file(file_id: str) -> dict:
         
         # Send email notifications
         execution_time = time.time() - start_time
-        email_body = f"Excel SuperScraper v{VERSION}\nTotal Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
+        email_message = f"Excel SuperScraper v{VERSION}\nTotal Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
         
         # Email for Excel processing
         await send_email(
             to_emails='nik@iconluxurygroup.com',
-            subject=f'Excel SuperScraper v{VERSION} - {file_name} - {file_id} - {execution_time:.2f}s',
+            subject=f'{file_name} - {file_id} - {execution_time:.2f}s',
             download_url=public_url,
             job_id=file_id,
-            logger=logger,
-            body=email_body
+            logger=logger
         )
         
         # Email for image archiving status
-        archive_body = f"Excel SuperScraper v{VERSION}\nImage Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2\nTimestamp: {timestamp}"
-        await send_email(
+        archive_message = f"Excel SuperScraper v{VERSION}\nImage Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2\nTimestamp: {timestamp}"
+        await send_message_email(
             to_emails='nik@luxurymarket.com',
             subject=f'Excel SuperScraper v{VERSION} - Image Archive Status - {file_id}',
-            download_url=None,
-            job_id=file_id,
-            logger=logger,
-            body=archive_body
+            message=archive_message,
+            logger=logger
         )
         
         return {
