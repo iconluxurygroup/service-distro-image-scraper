@@ -496,7 +496,7 @@ async def generate_download_file(file_id: str) -> dict:
         failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', header_row)
         
         # Upload images to R2 for archiving
-        image_urls = await upload_images_to_r2(temp_images_dir, file_id, logger)
+        image_urls = await upload_file_to_space(temp_images_dir, file_id, logger)
         
         # Upload Excel to R2 with specific path
         s3_path = f"iconluxurygroup/super_scraper/jobs/{file_id}/{file_name}"
