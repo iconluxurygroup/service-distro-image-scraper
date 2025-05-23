@@ -23,7 +23,6 @@ from tldextract import tldextract
 
 from app_config import engine, conn_str
 from email_utils import send_email
-from icon_image_lib.google_parser import get_original_images as parse_google_images
 from s3_utils import upload_file_to_space
 
 # Configure logging
