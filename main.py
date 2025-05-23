@@ -455,61 +455,6 @@ def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method
         logger.error(f"Error writing images to Excel: {e}")
         return failed_rows
 
-# Core Processing Functions
-async def process_search_row(search_string: str, endpoint: str, entry_id: int) -> None:
-    """Process a search row by querying an endpoint and storing results."""
-    search_url = f"{endpoint}?query={search_string}"
-    logger.info(f"Querying: {search_url}")
-    
-    try:
-        response = requests.get(search_url, timeout=60)
-        if response.status_code != 200 or not response.json().get('body'):
-            logger.warning(f"Invalid response from {endpoint}. Retrying with new endpoint.")
-            remove_endpoint(endpoint)
-            new_endpoint = get_endpoint()
-            return await process_search_row(search_string, new_endpoint, entry_id)
-        
-        result = response.json().get('body')
-        if not result:
-            logger.warning(f"No body in response from {endpoint}. Retrying with new endpoint.")
-            remove_endpoint(endpoint)
-            new_endpoint = get_endpoint()
-            return await process_search_row(search_string, new_endpoint, entry_id)
-        
-        unpacked_html = result  # Assume unpack_content is handled in parse_google_images
-        parsed_data = parse_google_images(unpacked_html)
-        
-        if not parsed_data or parsed_data[0][0] == 'No start_tag or end_tag':
-            logger.warning(f"Invalid parsed data from {endpoint}. Retrying with new endpoint.")
-            remove_endpoint(endpoint)
-            new_endpoint = get_endpoint()
-            return await process_search_row(search_string, new_endpoint, entry_id)
-        
-        image_url, image_desc, image_source, image_thumb = parsed_data[0], parsed_data[1], parsed_data[2], parsed_data[3]
-        if image_url:
-            df = pd.DataFrame({
-                'EntryId': [entry_id],
-                'ImageUrl': [image_url],
-                'ImageDesc': [image_desc],
-                'ImageSource': [image_source],
-                'ImageUrlThumbnail': [image_thumb],
-            })
-            df.to_sql(name='utb_ImageScraperResult', con=engine, index=False, if_exists='append')
-            
-            with pyodbc.connect(conn_str) as connection:
-                cursor = connection.cursor()
-                cursor.execute(f"UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = ?", (entry_id,))
-                connection.commit()
-        else:
-            logger.warning(f"No image URL found. Retrying with new endpoint.")
-            remove_endpoint(endpoint)
-            new_endpoint = get_endpoint()
-            return await process_search_row(search_string, new_endpoint, entry_id)
-    except requests.RequestException as e:
-        logger.error(f"Request error: {e}. Retrying with new endpoint.")
-        remove_endpoint(endpoint)
-        new_endpoint = get_endpoint()
-        return await process_search_row(search_string, new_endpoint, entry_id)
 
 async def generate_download_file(file_id: str) -> dict:
     """Generate and upload a processed Excel file with images."""
