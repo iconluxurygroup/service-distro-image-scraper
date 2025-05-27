@@ -49,7 +49,7 @@ COPY pyproject.toml /app/
 COPY uv.lock /app/
 # Copy the rest of the application
 COPY app/ /app/
-
+COPY rabbitmq/ /app/rabbitmq/
 # Generate or update uv.lock based on pyproject.toml
 RUN uv lock
 

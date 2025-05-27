@@ -14,19 +14,20 @@ import psutil
 from typing import Optional, Dict, Any
 from async_timeout import timeout  # Use async-timeout
 import aiormq.exceptions
-
+import os
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 class RabbitMQConsumer:
     def __init__(
         self,
-        amqp_url: str = "amqp://app_user:app_password@rabbit:5672/app_vhost",
+        rb_user: str = os.getenv("RABBITMQ_USER", "app_user"),
+        rb_password: str = os.getenv("RABBITMQ_PASSWORD", "app_password"),
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
     ):
-        self.amqp_url = amqp_url
+        self.amqp_url = f"amqp://{rb_user}:{rb_password}@rabbit:5672/app_vhost"
         self.queue_name = queue_name
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout

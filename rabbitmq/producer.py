@@ -8,18 +8,19 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import asyncio
 from async_timeout import timeout  # Use async-timeout instead of asyncio.timeout
 import aiormq.exceptions
-
+import os
 logger = logging.getLogger(__name__)
 
 class RabbitMQProducer:
     def __init__(
         self,
-        amqp_url: str = "amqp://app_user:app_password@rabbit:5672/app_vhost",
+        rb_user: str = os.getenv("RABBITMQ_USER", "app_user"),
+        rb_password: str = os.getenv("RABBITMQ_PASSWORD", "app_password"),
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
     ):
-        self.amqp_url = amqp_url
+        self.amqp_url = f"amqp://{rb_user}:{rb_password}@rabbit:5672/app_vhost"
         self.queue_name = queue_name
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
