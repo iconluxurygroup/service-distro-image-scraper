@@ -4,8 +4,8 @@ services:
     environment:
       - RABBITMQ_NODENAME=rabbit
     ports:
-      - "5672:5672"  # AMQP port
-      - "15672:15672"  # Management UI
+      - "5672:5672"
+      - "15672:15672"
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
       - ./rabbitmq/rabbitmq-setup.sh:/rabbitmq-setup.sh
@@ -15,7 +15,7 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
-      start_period: 60s
+      start_period: 120s
     networks:
       - app-network
 
@@ -46,6 +46,10 @@ services:
       - RABBITMQ_USER=app_user
       - RABBITMQ_PASSWORD=app_password
       - RABBITMQ_VHOST=app_vhost
+      - DB_SERVER=<sql-server-host>
+      - DB_NAME=<database-name>
+      - DB_USER=<db-user>
+      - DB_PASSWORD=<db-password>
     command: ["uv", "run", "python", "/app/rabbitmq/consumer.py"]
     networks:
       - app-network

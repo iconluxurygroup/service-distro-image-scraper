@@ -575,10 +575,6 @@ from rabbitmq.producer import enqueue_db_update, RabbitMQProducer
 import json
 import uuid
 
-from rabbitmq.producer import enqueue_db_update, RabbitMQProducer
-import json
-import uuid
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
