@@ -14,9 +14,6 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
-    networks:
-      - app-network
-
     app:
       image: nikiconluxury/super-scraper:v4.1.5
       ports:
