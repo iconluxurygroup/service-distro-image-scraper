@@ -477,7 +477,7 @@ async def write_excel_image(local_filename: str, temp_dir: str, preferred_image_
             if verify_png_image_single(image_path):
                 img = Image(image_path)
                 # Adjust row with header_row and offset
-                adjusted_row = row_number + header_row + offset
+                adjusted_row = row_number + offset
                 anchor = f"A{adjusted_row}" if preferred_image_method in ["overwrite", "append"] else f"B{adjusted_row}"
                 img.anchor = anchor
                 ws.add_image(img)
