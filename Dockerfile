@@ -45,12 +45,12 @@ RUN pip install --no-cache-dir uv
 # Copy dependency files
 COPY pyproject.toml /app/
 COPY uv.lock /app/
-
+# Copy the entrypoint script
+COPY entrypoint.sh /app/
 # Copy the rest of the application
 COPY app/ /app/
 
-# Copy the entrypoint script
-COPY entrypoint.sh /app/
+
 
 # Make the entrypoint script executable
 RUN chmod +x /app/entrypoint.sh
@@ -65,4 +65,4 @@ RUN uv lock
 RUN uv sync
 
 # Set the entrypoint
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["./app/entrypoint.sh"]
