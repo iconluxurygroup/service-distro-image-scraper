@@ -32,6 +32,7 @@ services:
       - RABBITMQ_USER=app_user
       - RABBITMQ_PASSWORD=app_password
       - RABBITMQ_VHOST=app_vhost
+      - PORT=8080 
     command: >
       /bin/bash -c "
         rabbitmqctl -n rabbit@localhost wait -q /var/lib/rabbitmq/mnesia/rabbit@localhost.pid ||
