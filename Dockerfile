@@ -17,7 +17,7 @@ RUN apt-get update --fix-missing && \
         build-essential \
         libopencv-dev \
         rabbitmq-server \
-        && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Clean the apt cache and update with --fix-missing
 RUN apt-get clean && \
@@ -25,6 +25,7 @@ RUN apt-get clean && \
 
 # Install necessary packages
 RUN apt-get install -y apt-transport-https curl gnupg lsb-release unixodbc unixodbc-dev
+
 # Add Microsoft package repository and install msodbcsql17
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
     curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
@@ -48,25 +49,20 @@ COPY uv.lock /app/
 # Copy the rest of the application
 COPY app/ /app/
 
-# Configure RabbitMQ
-RUN rabbitmq-plugins enable rabbitmq_management && \
-    rabbitmqctl add_user app_user app_password && \
-    rabbitmqctl add_vhost app_vhost && \
-    rabbitmqctl set_user_tags app_user administrator && \
-    rabbitmqctl set_permissions -p app_vhost app_user ".*" ".*" ".*"
+# Copy the entrypoint script
+COPY entrypoint.sh /app/
 
-# Expose ports for RabbitMQ (AMQP and Management UI)
-EXPOSE 5672
-EXPOSE 15672
-# Existing ports
-EXPOSE 8080
+# Make the entrypoint script executable
+RUN chmod +x /app/entrypoint.sh
+
+# Expose ports for RabbitMQ (AMQP and Management UI) and application
+EXPOSE 5672 15672 8080
 
 # Generate or update uv.lock based on pyproject.toml
-RUN ["uv", "lock"]
+RUN uv lock
 
 # Synchronize the virtual environment with uv.lock
-RUN ["uv", "sync"]
+RUN uv sync
 
-# Start RabbitMQ in the background and keep it running
-CMD service rabbitmq-server start && \
-    uv run python main.py
+# Set the entrypoint
+ENTRYPOINT ["/app/entrypoint.sh"]
