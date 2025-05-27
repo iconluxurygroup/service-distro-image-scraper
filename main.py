@@ -14,7 +14,7 @@ import pyodbc
 import requests
 from aiohttp import ClientTimeout
 from aiohttp_retry import RetryClient, ExponentialRetry
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Query
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image
 from PIL import Image as PILImage
@@ -610,15 +610,20 @@ async def generate_download_file(file_id: str, offset: int = 0) -> dict:
 
 from pydantic import BaseModel
 
+
 class ProcessFileRequest(BaseModel):
     file_id: int
-    offset: int = 0
+    offset: int = 5
 
 @app.post("/generate-download-file/")
-async def process_file(background_tasks: BackgroundTasks, request: ProcessFileRequest):
-    """Generate and upload a processed Excel file with an optional offset."""
-    logger.info(f"Received request to generate download file for FileID: {request.file_id} with offset: {request.offset}")
-    background_tasks.add_task(generate_download_file, str(request.file_id), request.offset)
+async def process_file(
+    background_tasks: BackgroundTasks,
+    file_id: int = Query(...),  # Required query parameter
+    offset: int = Query(5)      # Optional query parameter, default 5
+):
+    """Generate and upload a processed Excel file with an optional offset (default offset=5)."""
+    logger.info(f"Received request to generate download file for FileID: {file_id} with offset: {offset}")
+    background_tasks.add_task(generate_download_file, str(file_id), offset)
     return {"message": "Processing started successfully. You will be notified upon completion."}
 
 if __name__ == "__main__":
