@@ -457,9 +457,9 @@ def resize_image(image_path: str) -> bool:
         logger.error(f"Error resizing image: {e}, for image: {image_path}")
         return False
 
-def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method: str, header_row: int = 0) -> List[int]:
-    """Write images to an Excel file."""
-    logger.info(f"Processing images in {temp_dir} for Excel file {local_filename} with header_row={header_row}")
+async def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method: str, header_row: int = 0, offset: int = 0) -> List[int]:
+    """Write images to an Excel file with an offset for row insertion."""
+    logger.info(f"Processing images in {temp_dir} for Excel file {local_filename} with header_row={header_row}, offset={offset}")
     failed_rows = []
     
     try:
@@ -476,7 +476,8 @@ def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method
                 
             if verify_png_image_single(image_path):
                 img = Image(image_path)
-                adjusted_row = row_number + header_row
+                # Adjust row with header_row and offset
+                adjusted_row = row_number + header_row + offset
                 anchor = f"A{adjusted_row}" if preferred_image_method in ["overwrite", "append"] else f"B{adjusted_row}"
                 img.anchor = anchor
                 ws.add_image(img)
@@ -491,9 +492,8 @@ def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method
         logger.error(f"Error writing images to Excel: {e}")
         return failed_rows
 
-
-async def generate_download_file(file_id: str) -> dict:
-    """Generate and upload a processed Excel file with images."""
+async def generate_download_file(file_id: str, offset: int = 0) -> dict:
+    """Generate and upload a processed Excel file with images, applying an offset."""
     start_time = time.time()
     loop = asyncio.get_running_loop()
     
@@ -536,8 +536,8 @@ async def generate_download_file(file_id: str) -> dict:
                 logger.warning("No text-rich row found. Using no offset.")
                 header_row = 0
         
-        # Write images to Excel
-        failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', header_row)
+        # Write images to Excel with offset
+        failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', header_row, offset)
         
         # Upload images to R2 for archiving
         image_urls = []
@@ -574,7 +574,7 @@ async def generate_download_file(file_id: str) -> dict:
         
         # Send email notifications
         execution_time = time.time() - start_time
-        email_message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
+        email_message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nOffset: {offset}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
         
         # Email for Excel processing
         await send_email(
@@ -598,6 +598,7 @@ async def generate_download_file(file_id: str) -> dict:
             "message": "Processing completed successfully.",
             "public_url": public_url,
             "header_row": header_row,
+            "offset": offset,
             "archived_images": len(image_urls),
             "timestamp": timestamp
         }
@@ -607,11 +608,17 @@ async def generate_download_file(file_id: str) -> dict:
     finally:
         await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
 
+from pydantic import BaseModel
+
+class ProcessFileRequest(BaseModel):
+    file_id: int
+    offset: int = 0
+
 @app.post("/generate-download-file/")
-async def process_file(background_tasks: BackgroundTasks, file_id: int):
-    """Generate and upload a processed Excel file."""
-    logger.info(f"Received request to generate download file for FileID: {file_id}")
-    background_tasks.add_task(generate_download_file, str(file_id))
+async def process_file(background_tasks: BackgroundTasks, request: ProcessFileRequest):
+    """Generate and upload a processed Excel file with an optional offset."""
+    logger.info(f"Received request to generate download file for FileID: {request.file_id} with offset: {request.offset}")
+    background_tasks.add_task(generate_download_file, str(request.file_id), request.offset)
     return {"message": "Processing started successfully. You will be notified upon completion."}
 
 if __name__ == "__main__":
