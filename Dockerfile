@@ -54,18 +54,11 @@ RUN uv lock
 # Synchronize the virtual environment with uv.lock
 RUN uv sync
 
-# Set hostname for RabbitMQ to avoid dynamic hostname issues
-RUN echo "NODENAME=rabbit@localhost" > /etc/rabbitmq/rabbitmq-env.conf && \
-    echo "127.0.0.1 localhost" >> /etc/hosts
+# Set RabbitMQ node name to avoid dynamic hostname issues
+RUN echo "NODENAME=rabbit@localhost" > /etc/rabbitmq/rabbitmq-env.conf
 
 # Expose ports for RabbitMQ (AMQP and Management UI) and application
 EXPOSE 5672 15672 8080
 
 # Start RabbitMQ if not running, configure it, and run the Python application
-CMD (rabbitmqctl status >/dev/null 2>&1 || (service rabbitmq-server start && timeout 60 rabbitmqctl wait -q /var/lib/rabbitmq/mnesia/rabbit@localhost.pid || { echo "RabbitMQ failed to start"; rabbitmqctl status; exit 1; })) && \
-    rabbitmq-plugins enable rabbitmq_management || echo "Failed to enable rabbitmq_management plugin" && \
-    rabbitmqctl add_user app_user app_password || echo "User already exists" && \
-    rabbitmqctl add_vhost app_vhost || echo "Vhost already exists" && \
-    rabbitmqctl set_user_tags app_user administrator && \
-    rabbitmqctl set_permissions -p app_vhost app_user ".*" ".*" ".*" || echo "Failed to set permissions" && \
-    uv run python main.py
+CMD ["/bin/bash", "-c", "rabbitmqctl status >/dev/null 2>&1 || (service rabbitmq-server start && timeout 60 rabbitmqctl wait -q /var/lib/rabbitmq/mnesia/rabbit@localhost.pid || { echo 'RabbitMQ failed to start'; rabbitmqctl status; exit 1; }) && rabbitmq-plugins enable rabbitmq_management || echo 'Failed to enable rabbitmq_management plugin' && rabbitmqctl add_user app_user app_password || echo 'User already exists' && rabbitmqctl add_vhost app_vhost || echo 'Vhost already exists' && rabbitmqctl set_user_tags app_user administrator && rabbitmqctl set_permissions -p app_vhost app_user '.*' '.*' '.*' || echo 'Failed to set permissions' && uv run python main.py"]
