@@ -5,7 +5,7 @@ import asyncio
 import signal
 import sys
 import datetime
-from rabbitmq_producer import RabbitMQProducer
+from rabbitmq.producer import RabbitMQProducer
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
@@ -345,7 +345,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     consumer = RabbitMQConsumer()
-    
+
     loop = asyncio.get_event_loop()
     signal.signal(signal.SIGINT, signal_handler(consumer, loop))
     signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
