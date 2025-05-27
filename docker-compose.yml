@@ -14,14 +14,17 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
-    app:
-      image: nikiconluxury/super-scraper:v4.1.5
-      ports:
-        - "8007:8080"
-      depends_on:
-        rabbitmq:
-          condition: service_healthy
-      environment:
+    networks:
+      - app-network
+
+  app:
+    image: nikiconluxury/super-scraper:v4.1.5
+    ports:
+      - "8007:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
       - RABBITMQ_HOST=rabbit
       - RABBITMQ_USER=app_user
       - RABBITMQ_PASSWORD=app_password
