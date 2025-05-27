@@ -356,108 +356,6 @@ async def async_process_entry_search(
     finally:
         await client.close()
         
-async def generate_download_file(file_id: int, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None) -> Dict[str, str]:
-    log_filename = f"job_logs/job_{file_id}.log"
-    try:
-        if logger is None:
-            logger, log_filename = setup_job_logger(job_id=str(file_id), log_dir="job_logs", console_output=True)
-        logger.setLevel(logging.DEBUG)
-        process = psutil.Process()
-        logger.debug(f"Logger initialized for generate_download_file")
-
-        def log_memory_usage():
-            mem_info = process.memory_info()
-            logger.info(f"Memory: RSS={mem_info.rss / 1024**2:.2f} MB")
-            if mem_info.rss / 1024**2 > 1000:
-                logger.warning(f"High memory usage")
-        logger.info(f"Generating download file for FileID: {file_id}")
-        log_memory_usage()
-
-        results_df = await get_images_excel_db(str(file_id), logger)
-        if results_df.empty:
-            logger.error(f"No data found for FileID {file_id}")
-            # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
-            return {"error": f"No data found for FileID {file_id}", "log_filename": log_filename}
-
-        temp_dir = f"temp_excel_{file_id}"
-        os.makedirs(temp_dir, exist_ok=True)
-        excel_filename = os.path.join(temp_dir, f"image_results_{file_id}.xlsx")
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Image Results"
-
-        headers = [
-            "EntryID", "ProductBrand", "ProductModel", "ProductColor", "ProductCategory",
-            "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail", "SortOrder"
-        ]
-        for col, header in enumerate(headers, 1):
-            ws[f"{get_column_letter(col)}1"] = header
-            ws[f"{get_column_letter(col)}1"].fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
-
-        for row_idx, row in results_df.iterrows():
-            for col_idx, header in enumerate(headers):
-                ws[f"{get_column_letter(col_idx + 1)}{row_idx + 2}"] = row.get(header, "")
-
-        for col in ws.columns:
-            max_length = 0
-            column = col[0].column_letter
-            for cell in col:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 50)
-            ws.column_dimensions[column].width = adjusted_width
-
-        wb.save(excel_filename)
-        logger.info(f"Excel file generated: {excel_filename}")
-
-        logger.debug(f"Checking if Excel file exists: {excel_filename}")
-        if not os.path.exists(excel_filename):
-            logger.error(f"Excel file {excel_filename} does not exist for upload for FileID {file_id}")
-            return {"error": f"Excel file {excel_filename} not found", "log_filename": log_filename}
-        logger.debug(f"Uploading to R2: file_src={excel_filename}, save_as=excel_results/image_results_{file_id}.xlsx, is_public=True")
-        try:
-            public_url = await upload_file_to_space(
-                file_src=excel_filename,
-                save_as=f"excel_results/image_results_{file_id}.xlsx",
-                is_public=True,
-                logger=logger,
-                file_id=str(file_id)
-            )
-            logger.debug(f"Upload result: public_url={public_url}")
-            if not public_url:
-                logger.error(f"Failed to upload Excel file for FileID {file_id}")
-                return {"error": "Failed to upload Excel file", "log_filename": log_filename}
-        except Exception as upload_error:
-            logger.error(f"Upload error for FileID {file_id}: {upload_error}", exc_info=True)
-            return {"error": f"Upload failed: {str(upload_error)}", "log_filename": log_filename}
-
-        await update_file_location_complete(str(file_id), public_url, logger)
-        await update_file_generate_complete(str(file_id), logger)
-
-        try:
-            os.remove(excel_filename)
-            os.rmdir(temp_dir)
-            logger.debug(f"Cleaned up temporary directory: {temp_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e}")
-
-        logger.info(f"Download file generated and uploaded for FileID: {file_id}: {public_url}")
-        return {
-            "message": "Download file generated successfully",
-            "file_id": str(file_id),
-            "public_url": public_url,
-            "log_filename": log_filename
-        }
-    except Exception as e:
-        logger.error(f"Error generating download file for FileID {file_id}: {e}", exc_info=True)
-        # Removed: background_tasks.add_task(monitor_and_resubmit_failed_jobs, str(file_id), logger)
-        return {"error": str(e), "log_filename": log_filename}
-    finally:
-        log_memory_usage()
 
 async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
     file_id_str = str(file_id)
@@ -979,7 +877,7 @@ async def process_restart_batch(
                     f"Used all variations: {use_all_variations}"
                 )
                 await send_message_email(to_emails, subject=subject, message=message, logger=logger)
-
+            await update_image_complete_time(file_id_db, logger)
             log_public_url = await upload_file_to_space(
                 file_src=log_filename,
                 save_as=f"job_logs/job_{file_id_db}.log",
@@ -1014,53 +912,31 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-
-@router.post("/generate-download-file/{file_id}", tags=["Export"], response_model=JobStatusResponse)
-async def api_generate_download_file(file_id: str, background_tasks: BackgroundTasks):
-    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    logger.info(f"Received request to generate download file for FileID: {file_id}")
-    
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(pyodbc.Error),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying update_image_complete_time for FileID {retry_state.kwargs['file_id']} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def update_image_complete_time(file_id: int, logger: Optional[logging.Logger] = None) -> None:
+    logger = logger or default_logger
     try:
-        async with async_engine.connect() as conn:
-            result = await conn.execute(
-                text("SELECT FileName FROM utb_ImageScraperFiles WHERE ID = :file_id"),
-                {"file_id": int(file_id)}
-            )
-            if not result.fetchone():
-                logger.error(f"Invalid FileID: {file_id}")
-                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
-        
-        JOB_STATUS[file_id] = {
-            "status": "queued",
-            "message": "Job queued for processing",
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        
-        background_tasks.add_task(run_generate_download_file, file_id, logger, log_filename, background_tasks)
-        
-        send_to_email = await get_send_to_email(int(file_id), is_admin=True, logger=logger)
-        if send_to_email:
-            await send_message_email(
-                to_emails=send_to_email,
-                subject=f"Job Queued for FileID: {file_id}",
-                message=f"Excel file generation for FileID {file_id} has been queued.",
-                logger=logger
-            )
-        
-        return JobStatusResponse(
-            status="queued",
-            message=f"Download file generation queued for FileID: {file_id}",
-            timestamp=datetime.datetime.now().isoformat()
-        )
-    except SQLAlchemyError as e:
-        logger.error(f"Database error for FileID {file_id}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error queuing download file for FileID {file_id}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Error queuing job: {str(e)}")
-
+        file_id = int(file_id)
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE utb_ImageScraperFiles SET ImageCompleteTime = GETDATE() WHERE ID = ?", (file_id,))
+            conn.commit()
+            cursor.close()
+            logger.info(f"Marked ImageCompleteTime for FileID: {file_id}")
+    except pyodbc.Error as e:
+        logger.error(f"Database error in update_image_complete_time: {e}", exc_info=True)
+        raise
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        raise
 @router.get("/job-status/{file_id}", tags=["Export"], response_model=JobStatusResponse)
 async def api_get_job_status(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
