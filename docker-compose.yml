@@ -8,17 +8,19 @@ services:
       - "15672:15672"  # Management UI
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+      - ./rabbitmq/rabbitmq-setup.sh:/rabbitmq-setup.sh
+    entrypoint: ["/bin/bash", "/rabbitmq-setup.sh"]
     healthcheck:
       test: ["CMD", "rabbitmqctl", "status"]
       interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
     networks:
       - app-network
 
   app:
-    image: nikiconluxury/super-scraper:latest
+    image: nikiconluxury/super-scraper:v4.1.5
     ports:
       - "8007:8080"
     depends_on:
@@ -29,19 +31,8 @@ services:
       - RABBITMQ_USER=app_user
       - RABBITMQ_PASSWORD=app_password
       - RABBITMQ_VHOST=app_vhost
-      - PORT=8080  # Inform main.py to bind to container port 8080
-    command: >
-      /bin/bash -c "
-        rabbitmqctl -n rabbit@localhost wait -q /var/lib/rabbitmq/mnesia/rabbit@localhost.pid ||
-          { echo 'RabbitMQ not available'; exit 1; } &&
-        rabbitmqctl -n rabbit@localhost add_user app_user app_password ||
-          echo 'User already exists' &&
-        rabbitmqctl -n rabbit@localhost add_vhost app_vhost ||
-          echo 'Vhost already exists' &&
-        rabbitmqctl -n rabbit@localhost set_user_tags app_user administrator &&
-        rabbitmqctl -n rabbit@localhost set_permissions -p app_vhost app_user '.*' '.*' '.*' ||
-          echo 'Failed to set permissions' &&
-        uv run python main.py"
+      - PORT=8080
+    command: ["uv", "run", "python", "main.py"]
     networks:
       - app-network
 
