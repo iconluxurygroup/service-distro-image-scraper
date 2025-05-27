@@ -20,7 +20,7 @@ services:
   app:
     build:
       context: .
-      dockerfile: nikiconluxury/super-scraper:latest
+      dockerfile: nikiconluxury/super-scraper:v4.1.5
     ports:
       - "8007:8080"  # Application port: host 8007 -> container 8080
     depends_on:
