@@ -2,7 +2,7 @@ services:
   rabbitmq:
     image: rabbitmq:3-management
     environment:
-      - RABBITMQ_NODENAME=rabbit@localhost
+      - RABBITMQ_NODENAME=rabbit
     ports:
       - "5672:5672"  # AMQP port
       - "15672:15672"  # Management UI
