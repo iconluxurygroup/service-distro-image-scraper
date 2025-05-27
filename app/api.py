@@ -1143,7 +1143,58 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
+@router.post("/update-image-complete-time/{file_id}", tags=["Database"], response_model=JobStatusResponse)
+async def api_update_image_complete_time(file_id: str, background_tasks: BackgroundTasks):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Received request to update ImageCompleteTime for FileID: {file_id}")
+    
+    try:
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id} does not exist")
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
 
+        # Update ImageCompleteTime
+        await update_image_complete_time(int(file_id), logger)
+
+        # Upload log file to S3
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+
+        # Send notification email
+        send_to_email = await get_send_to_email(int(file_id), is_admin=True, logger=logger)
+        if send_to_email:
+            await send_message_email(
+                to_emails=send_to_email,
+                subject=f"ImageCompleteTime Updated for FileID: {file_id}",
+                message=f"ImageCompleteTime has been updated to GETDATE() for FileID {file_id}.",
+                logger=logger
+            )
+
+        return JobStatusResponse(
+            status="completed",
+            message=f"ImageCompleteTime updated successfully for FileID: {file_id}",
+            log_url=log_public_url or None,
+            timestamp=datetime.datetime.now().isoformat()
+        )
+    except SQLAlchemyError as e:
+        logger.error(f"Database error updating ImageCompleteTime for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Invalid file_id format: {e}")
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=400, detail=f"Invalid file_id format: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error updating ImageCompleteTime for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error updating ImageCompleteTime: {str(e)}")
 @router.post("/reset-step1/{file_id}", tags=["Database"])
 async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
