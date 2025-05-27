@@ -533,7 +533,6 @@ async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
             if header_row == 0:
                 logger.warning("No text-rich row found. Using no offset.")
                 header_row = 0
-        header_row += row_offset  # Apply row_offset to header_row
         
         # Write images to Excel
         failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', header_row, row_offset)
