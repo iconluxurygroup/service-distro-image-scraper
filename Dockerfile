@@ -16,6 +16,7 @@ RUN apt-get update --fix-missing && \
         libpq-dev \
         build-essential \
         libopencv-dev \
+        rabbitmq-server \
         && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Clean the apt cache and update with --fix-missing
@@ -40,16 +41,25 @@ RUN which odbcinst && odbcinst -j
 # Install uv
 RUN pip install --no-cache-dir uv
 
-COPY pyproject.toml /app/ 
 # Copy dependency files
+COPY pyproject.toml /app/
 COPY uv.lock /app/
 
 # Copy the rest of the application
 COPY app/ /app/
 
-# Expose ports
+# Configure RabbitMQ
+RUN rabbitmq-plugins enable rabbitmq_management && \
+    rabbitmqctl add_user app_user app_password && \
+    rabbitmqctl add_vhost app_vhost && \
+    rabbitmqctl set_user_tags app_user administrator && \
+    rabbitmqctl set_permissions -p app_vhost app_user ".*" ".*" ".*"
+
+# Expose ports for RabbitMQ (AMQP and Management UI)
+EXPOSE 5672
+EXPOSE 15672
+# Existing ports
 EXPOSE 8080
-EXPOSE 8265
 
 # Generate or update uv.lock based on pyproject.toml
 RUN ["uv", "lock"]
@@ -57,8 +67,6 @@ RUN ["uv", "lock"]
 # Synchronize the virtual environment with uv.lock
 RUN ["uv", "sync"]
 
-# Set the entrypoint to use uv run for all commands
-ENTRYPOINT ["uv", "run"]
-
-# Default command to run main.py
-CMD ["python", "main.py"]
+# Start RabbitMQ in the background and keep it running
+CMD service rabbitmq-server start && \
+    uv run python main.py
