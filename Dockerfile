@@ -17,12 +17,16 @@ RUN apt-get update --fix-missing && \
         libopencv-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Clean the apt cache and update with --fix-missing
-RUN apt-get clean && \
-    apt-get update --fix-missing
-
 # Install necessary packages
-RUN apt-get install -y apt-transport-https curl gnupg lsb-release unixodbc unixodbc-dev
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
+        apt-transport-https \
+        curl \
+        gnupg \
+        lsb-release \
+        unixodbc \
+        unixodbc-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Add Microsoft package repository and install msodbcsql17
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
@@ -39,11 +43,6 @@ RUN which odbcinst && odbcinst -j
 
 # Install uv
 RUN pip install --no-cache-dir uv
-
-# Install rabbitmqctl for configuration
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends rabbitmq-server && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files
 COPY pyproject.toml /app/
