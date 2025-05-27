@@ -27,7 +27,7 @@ class RabbitMQConsumer:
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
     ):
-        self.amqp_url = f"amqp://{rb_user}:{rb_password}@rabbit:5672/app_vhost"
+        self.amqp_url = f"amqp://{rb_user}:{rb_password}@localhost:5672/app_vhost"
         self.queue_name = queue_name
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
