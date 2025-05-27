@@ -571,7 +571,7 @@ async def async_process_entry_search(
     finally:
         await client.close()
 
-from rabbitmq.producer import enqueue_db_update, RabbitMQProducer
+from app.producer import enqueue_db_update, RabbitMQProducer
 import json
 import uuid
 

@@ -14,7 +14,7 @@ import psutil
 import pyodbc
 import re
 import urllib.parse
-from rabbitmq.producer import RabbitMQProducer, enqueue_db_update
+from app.producer import RabbitMQProducer, enqueue_db_update
 import pandas as pd
 import asyncio
 import uuid
