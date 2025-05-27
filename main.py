@@ -20,7 +20,7 @@ from openpyxl.drawing.image import Image
 from PIL import Image as PILImage
 from PIL import UnidentifiedImageError
 from tldextract import tldextract
-
+import urllib.parse
 from app_config import engine, conn_str, VERSION
 from email_utils import send_email, send_message_email
 from s3_utils import upload_file_to_space
@@ -505,7 +505,8 @@ async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
         selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
         selected_image_list = [(row.ExcelRowID, row.ImageUrl, row.ImageUrlThumbnail) for row in selected_images_df.itertuples(index=False)]
         provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id)
-        file_name = provided_file_path.split('/')[-1]
+        file_name = urllib.parse.unquote(provided_file_path.split('/')[-1])  # Decode URL-encoded filename
+
         
         # Create temporary directories
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
