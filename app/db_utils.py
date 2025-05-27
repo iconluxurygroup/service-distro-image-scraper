@@ -200,9 +200,12 @@ async def update_file_generate_complete(file_id: str, logger: Optional[logging.L
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-async def get_send_to_email(file_id: int, logger: Optional[logging.Logger] = None) -> str:
+async def get_send_to_email(file_id: int, is_admin: bool = False, logger: Optional[logging.Logger] = None) -> str:
     logger = logger or default_logger
     try:
+        if is_admin:
+            logger.info(f"Admin flag is True for FileID {file_id}, returning admin email")
+            return "nik@luxurymarket.com"
         file_id = int(file_id)
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()

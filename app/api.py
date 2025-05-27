@@ -967,7 +967,7 @@ async def process_restart_batch(
                     logger.warning(f"Found {null_entries} entries with NULL SortOrder")
                 result.close()
 
-            to_emails = await get_send_to_email(file_id_db, logger=logger)
+            to_emails = await get_send_to_email(file_id_db, is_admin=True, logger=logger)
             if to_emails:
                 subject = f"Processing Completed for FileID: {file_id_db}"
                 message = (
@@ -1038,7 +1038,7 @@ async def api_generate_download_file(file_id: str, background_tasks: BackgroundT
         
         background_tasks.add_task(run_generate_download_file, file_id, logger, log_filename, background_tasks)
         
-        send_to_email = await get_send_to_email(int(file_id), logger=logger)
+        send_to_email = await get_send_to_email(int(file_id), is_admin=True, logger=logger)
         if send_to_email:
             await send_message_email(
                 to_emails=send_to_email,
@@ -1237,7 +1237,7 @@ async def get_send_to_email_endpoint(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Retrieving email for FileID: {file_id}")
     try:
-        result = await get_send_to_email(int(file_id), logger)
+        result = await get_send_to_email(int(file_id),is_admin=False, logger=logger)
         return {"status_code": 200, "message": f"Retrieved email successfully for FileID: {file_id}", "data": result}
     except Exception as e:
         logger.error(f"Error retrieving email for FileID {file_id}: {e}", exc_info=True)
