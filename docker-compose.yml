@@ -46,7 +46,7 @@ services:
       - RABBITMQ_USER=app_user
       - RABBITMQ_PASSWORD=app_password
       - RABBITMQ_VHOST=app_vhost
-    command: ["uv", "run", "python", "/rabbitmq/consumer.py"]
+    command: ["uv", "run", "python", "/app/rabbitmq/consumer.py"]
     networks:
       - app-network
 
