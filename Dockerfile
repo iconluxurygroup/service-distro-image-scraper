@@ -1,4 +1,3 @@
-# Use an official Python runtime as a parent image
 FROM python:3.10-slim
 
 # Set the working directory
@@ -16,7 +15,6 @@ RUN apt-get update --fix-missing && \
         libpq-dev \
         build-essential \
         libopencv-dev \
-        rabbitmq-server \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Clean the apt cache and update with --fix-missing
@@ -42,6 +40,11 @@ RUN which odbcinst && odbcinst -j
 # Install uv
 RUN pip install --no-cache-dir uv
 
+# Install rabbitmqctl for configuration
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends rabbitmq-server && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Copy dependency files
 COPY pyproject.toml /app/
 COPY uv.lock /app/
@@ -54,11 +57,8 @@ RUN uv lock
 # Synchronize the virtual environment with uv.lock
 RUN uv sync
 
-# Set RabbitMQ node name to avoid dynamic hostname issues
-RUN echo "NODENAME=rabbit@localhost" > /etc/rabbitmq/rabbitmq-env.conf
+# Expose port for the application
+EXPOSE 8080
 
-# Expose ports for RabbitMQ (AMQP and Management UI) and application
-EXPOSE 5672 15672 8080
-
-# Start RabbitMQ if not running, configure it, and run the Python application
-CMD ["/bin/bash", "-c", "rabbitmqctl status >/dev/null 2>&1 || (service rabbitmq-server start && timeout 60 rabbitmqctl wait -q /var/lib/rabbitmq/mnesia/rabbit@localhost.pid || { echo 'RabbitMQ failed to start'; rabbitmqctl status; exit 1; }) && rabbitmq-plugins enable rabbitmq_management || echo 'Failed to enable rabbitmq_management plugin' && rabbitmqctl add_user app_user app_password || echo 'User already exists' && rabbitmqctl add_vhost app_vhost || echo 'Vhost already exists' && rabbitmqctl set_user_tags app_user administrator && rabbitmqctl set_permissions -p app_vhost app_user '.*' '.*' '.*' || echo 'Failed to set permissions' && uv run python main.py"]
+# Command will be overridden by docker-compose.yml
+CMD ["uv", "run", "python", "main.py"]
