@@ -65,4 +65,4 @@ RUN uv lock
 RUN uv sync
 
 # Set the entrypoint
-ENTRYPOINT ["./app/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
