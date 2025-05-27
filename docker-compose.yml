@@ -1,3 +1,4 @@
+
 version: '3.8'
 services:
   rabbitmq:
@@ -23,16 +24,16 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8007:8080"
+      - "8007:8080"  # Application port: host 8007 -> container 8080
     depends_on:
       rabbitmq:
         condition: service_healthy
     environment:
-      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_HOST=rabbit
       - RABBITMQ_USER=app_user
       - RABBITMQ_PASSWORD=app_password
       - RABBITMQ_VHOST=app_vhost
-      - PORT=8080 
+      - PORT=8080  # Inform main.py to bind to container port 8080
     command: >
       /bin/bash -c "
         rabbitmqctl -n rabbit@localhost wait -q /var/lib/rabbitmq/mnesia/rabbit@localhost.pid ||
