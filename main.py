@@ -24,6 +24,7 @@ import urllib.parse
 from app_config import engine, conn_str, VERSION
 from email_utils import send_email, send_message_email
 from s3_utils import upload_file_to_space
+from pathlib import Path  # Moved import to module level
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
