@@ -45,18 +45,8 @@ RUN pip install --no-cache-dir uv
 # Copy dependency files
 COPY pyproject.toml /app/
 COPY uv.lock /app/
-# Copy the entrypoint script
-COPY entrypoint.sh /app/
 # Copy the rest of the application
 COPY app/ /app/
-
-
-
-# Make the entrypoint script executable
-RUN chmod +x /app/entrypoint.sh
-
-# Expose ports for RabbitMQ (AMQP and Management UI) and application
-EXPOSE 5672 15672 8080
 
 # Generate or update uv.lock based on pyproject.toml
 RUN uv lock
@@ -64,5 +54,15 @@ RUN uv lock
 # Synchronize the virtual environment with uv.lock
 RUN uv sync
 
-# Set the entrypoint
-ENTRYPOINT ["/app/entrypoint.sh"]
+# Expose ports for RabbitMQ (AMQP and Management UI) and application
+EXPOSE 5672 15672 8080
+
+# Start RabbitMQ, configure it, and run the Python application
+CMD service rabbitmq-server start && \
+    timeout 30 rabbitmqctl wait -q /var/lib/rabbitmq/mnesia/rabbit@`hostname`.pid || { echo "RabbitMQ failed to start"; exit 1; } && \
+    rabbitmq-plugins enable rabbitmq_management || echo "Failed to enable rabbitmq_management plugin" && \
+    rabbitmqctl add_user app_user app_password || echo "User already exists" && \
+    rabbitmqctl add_vhost app_vhost || echo "Vhost already exists" && \
+    rabbitmqctl set_user_tags app_user administrator && \
+    rabbitmqctl set_permissions -p app_vhost app_user ".*" ".*" ".*" || echo "Failed to set permissions" && \
+    uv run python main.py
