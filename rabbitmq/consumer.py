@@ -12,6 +12,7 @@ from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import psutil
 from typing import Optional, Dict, Any
+from async_timeout import timeout  # Use async-timeout
 import aiormq.exceptions
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 class RabbitMQConsumer:
     def __init__(
         self,
-        amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
+        amqp_url: str = "amqp://app_user:app_password@rabbit:5672/app_vhost",
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
@@ -38,7 +39,7 @@ class RabbitMQConsumer:
         if self.connection and not self.connection.is_closed:
             return
         try:
-            async with asyncio.timeout(self.connection_timeout):
+            async with timeout(self.connection_timeout):  # Use async_timeout.timeout
                 self.connection = await aio_pika.connect_robust(
                     self.amqp_url,
                     connection_attempts=3,
@@ -254,7 +255,7 @@ class RabbitMQConsumer:
                     f"Received task for FileID: {file_id}, TaskType: {task_type}, "
                     f"CorrelationID: {message.correlation_id}, Task: {json.dumps(task)[:200]}"
                 )
-                async with asyncio.timeout(self.operation_timeout):
+                async with timeout(self.operation_timeout):  # Use async_timeout.timeout
                     if task_type == "select_deduplication":
                         async with async_engine.connect() as conn:
                             result = await self.execute_select(task, conn, logger)
@@ -305,7 +306,7 @@ class RabbitMQConsumer:
         task_type = task.get("task_type", "unknown")
         logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
         try:
-            async with asyncio.timeout(self.operation_timeout):
+            async with timeout(self.operation_timeout):  # Use async_timeout.timeout
                 if task_type == "select_deduplication":
                     async with async_engine.connect() as conn:
                         success = await self.execute_select(task, conn, logger)
@@ -344,6 +345,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     consumer = RabbitMQConsumer()
+    
     loop = asyncio.get_event_loop()
     signal.signal(signal.SIGINT, signal_handler(consumer, loop))
     signal.signal(signal.SIGTERM, signal_handler(consumer, loop))

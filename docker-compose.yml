@@ -36,6 +36,20 @@ services:
     networks:
       - app-network
 
+  consumer:
+    image: nikiconluxury/super-scraper:latest
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RABBITMQ_HOST=rabbit
+      - RABBITMQ_USER=app_user
+      - RABBITMQ_PASSWORD=app_password
+      - RABBITMQ_VHOST=app_vhost
+    command: ["uv", "run", "python", "/rabbitmq/consumer.py"]
+    networks:
+      - app-network
+
 volumes:
   rabbitmq-data:
 

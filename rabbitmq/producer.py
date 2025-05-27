@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import asyncio
+from async_timeout import timeout  # Use async-timeout instead of asyncio.timeout
 import aiormq.exceptions
 
 logger = logging.getLogger(__name__)
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 class RabbitMQProducer:
     def __init__(
         self,
-        amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
+        amqp_url: str = "amqp://app_user:app_password@rabbit:5672/app_vhost",
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
@@ -31,7 +32,7 @@ class RabbitMQProducer:
         if self.is_connected and self.connection and not self.connection.is_closed:
             return
         try:
-            async with asyncio.timeout(self.connection_timeout):
+            async with timeout(self.connection_timeout):  # Use async_timeout.timeout
                 self.connection = await aio_pika.connect_robust(
                     self.amqp_url,
                     connection_attempts=3,
@@ -81,7 +82,7 @@ class RabbitMQProducer:
             await self.connect()
 
         try:
-            async with asyncio.timeout(self.operation_timeout):
+            async with timeout(self.operation_timeout):  # Use async_timeout.timeout
                 message_body = json.dumps(message)
                 queue_name = routing_key or self.queue_name
                 if queue_name != self.queue_name and not queue_name.startswith("select_response_"):
