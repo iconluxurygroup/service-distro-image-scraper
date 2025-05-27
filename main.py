@@ -457,7 +457,7 @@ def resize_image(image_path: str) -> bool:
         logger.error(f"Error resizing image: {e}, for image: {image_path}")
         return False
 
-async def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method: str, header_row: int = 0, offset: int = 0) -> List[int]:
+async def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method: str, header_row: int = 0, offset: int = 5) -> List[int]:
     """Write images to an Excel file with an offset for row insertion."""
     logger.info(f"Processing images in {temp_dir} for Excel file {local_filename} with header_row={header_row}, offset={offset}")
     failed_rows = []
