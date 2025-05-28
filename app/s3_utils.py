@@ -59,9 +59,13 @@ def double_encode_plus(filename, logger=None):
 
 def generate_unique_filename(original_filename, logger=None):
     logger = logger or default_logger
-    code = secrets.token_hex(4).lower()[:8]
+    # Generate 8-letter random alphanumeric code
+    code = secrets.token_hex(4).lower()[:8]  # 4 bytes = 8 hex chars
+    # Get timestamp in YYYYMMDDHHMMSS format
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    # Get file extension
     _, ext = os.path.splitext(original_filename)
+    # Create new filename: code_timestamp.ext
     new_filename = f"{code}_{timestamp}{ext}"
     logger.debug(f"Generated unique filename: {new_filename} from {original_filename}")
     return new_filename
@@ -85,7 +89,7 @@ async def update_file_location_complete_async(file_id: str, file_location: str, 
                 {"url": file_location, "file_id": file_id}
             )
             await conn.commit()
-            logger.info(f"Updated FileLocationURLComplete for FileID: {file_id} with result file URL: {file_location}")
+            logger.info(f"Updated FileLocationURLComplete for FileID: {file_id} with URL: {file_location}")
     except SQLAlchemyError as e:
         logger.error(f"Database error in update_file_location_complete_async: {e}", exc_info=True)
         raise
@@ -120,30 +124,22 @@ async def update_file_generate_complete(file_id: str, logger: Optional[logging.L
         raise
 
 async def upload_file_to_space(file_src, save_as, is_public=True, public=None, logger=None, file_id=None):
-    logger = logger or default_logger
     if public is not None:
         is_public = public
-        logger.warning("Deprecated 'public' parameter used; use 'is_public' instead")
+        logger.warning("Use of 'public' parameter is deprecated; use 'is_public' instead")
+    logger = logger or default_logger
+
+    result_urls = {}
 
     if not os.path.exists(file_src):
         logger.error(f"Local file does not exist: {file_src}")
         raise FileNotFoundError(f"Local file does not exist: {file_src}")
 
-    # Warn if save_as suggests a log file path
-    if 'job_logs' in save_as.lower():
-        logger.warning(f"Potential log file path detected in save_as: {save_as}. Ensure this is not a result file.")
-
-    # Determine file type for logging
-    file_type = 'result'
-    if file_src.endswith(('.xlsx', '.json')):
-        file_type = 'result (Excel/JSON)'
-    logger.info(f"Processing {file_type} file: {file_src}")
-
     # Handle Excel files: generate unique filename and set save_as
     if file_src.endswith('.xlsx'):
         unique_filename = generate_unique_filename(os.path.basename(file_src), logger)
         save_as = f"excel_files/{file_id}/{unique_filename}"
-        logger.info(f"Excel {file_type} detected. Setting save_as to: {save_as}")
+        logger.info(f"Excel file detected. Setting save_as to: {save_as}")
 
     content_type, _ = mimetypes.guess_type(file_src)
     if not content_type:
@@ -151,14 +147,13 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         logger.debug(f"Set Content-Type to {content_type} for {file_src}")
 
     file_size = os.path.getsize(file_src)
-    logger.info(f"Uploading {file_type} file: {file_src}, size: {file_size / 1024:.2f} KB, save_as: {save_as}")
+    logger.info(f"Uploading file: {file_src}, size: {file_size / 1024:.2f} KB, save_as: {save_as}")
 
-    result_urls = {}
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
             async with await get_s3_client(service='r2', logger=logger, file_id=file_id) as r2_client:
-                logger.info(f"Uploading {file_type} file {file_src} to R2: {S3_CONFIG['r2_bucket_name']}/{save_as}")
+                logger.info(f"Uploading {file_src} to R2: {S3_CONFIG['r2_bucket_name']}/{save_as}")
                 with open(file_src, 'rb') as file:
                     await r2_client.put_object(
                         Bucket=S3_CONFIG['r2_bucket_name'],
@@ -172,28 +167,30 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
                 if len(r2_url) > 255:
                     logger.error(f"R2 URL length exceeds 255 characters for FileID {file_id}: {len(r2_url)}")
                     return None
-                logger.info(f"Uploaded {file_type} file {file_src} to R2: {r2_url} with Content-Type: {content_type}")
+                logger.info(f"Uploaded {file_src} to R2: {r2_url} with Content-Type: {content_type}")
                 result_urls['r2'] = r2_url
                 break
         except Exception as e:
             if attempt < max_attempts - 1 and 'SignatureDoesNotMatch' in str(e):
-                logger.warning(f"SignatureDoesNotMatch on attempt {attempt + 1} for {file_type} file, retrying...")
+                logger.warning(f"SignatureDoesNotMatch on attempt {attempt + 1}, retrying after delay...")
                 await asyncio.sleep(2 ** attempt)
                 continue
-            logger.error(f"Failed to upload {file_type} file {file_src} to R2: {e}", exc_info=True)
+            logger.error(f"Failed to upload {file_src} to R2: {e}", exc_info=True)
             return None
 
     if is_public and result_urls.get('r2'):
         if file_id:
             try:
+                # Update FileLocationURLComplete with the latest URL
                 await update_file_location_complete_async(file_id, result_urls['r2'], logger)
+                # Mark file generation complete
                 await update_file_generate_complete(file_id, logger)
-                logger.info(f"Updated database for {file_type} file with FileID: {file_id}")
+                logger.info(f"Successfully updated FileLocationURLComplete and marked generation complete for FileID: {file_id}")
                 return result_urls['r2']
             except Exception as e:
-                logger.error(f"Failed to update database for {file_type} file with FileID {file_id}: {e}", exc_info=True)
+                logger.error(f"Failed to update database for FileID {file_id}: {e}", exc_info=True)
                 return None
         else:
-            logger.error(f"No file_id provided for database update of {file_type} file")
+            logger.error(f"No file_id provided for database update")
             return result_urls['r2']
     return None
