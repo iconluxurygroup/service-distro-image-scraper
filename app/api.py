@@ -846,7 +846,28 @@ async def process_restart_batch(
                 elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
                 logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
                 log_memory_usage()
-
+# Update ImageCompleteTime at file level if any entries were successfully processed
+            if successful_entries > 0:
+                logger.info(f"Updating ImageCompleteTime for FileID {file_id_db}")
+                sql = """
+                    UPDATE utb_ImageScraperFiles
+                    SET ImageCompleteTime = GETDATE()
+                    WHERE ID = :file_id
+                """
+                params = {"file_id": file_id_db_int}
+                try:
+                    await enqueue_db_update(
+                        file_id=str(file_id_db),
+                        sql=sql,
+                        params=params,
+                        background_tasks=background_tasks,
+                        task_type="update_file_image_complete_time",
+                        producer=producer,
+                    )
+                    logger.info(f"Enqueued ImageCompleteTime update for FileID {file_id_db}")
+                except Exception as e:
+                    logger.error(f"Failed to enqueue ImageCompleteTime update for FileID {file_id_db}: {e}", exc_info=True)
+                    # Continue processing even if this fails, but log the error
             async with async_engine.connect() as conn:
                 result = await conn.execute(
                     text("""
