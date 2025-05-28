@@ -182,9 +182,9 @@ async def upload_file_to_space(file_src, save_as, is_public=True, public=None, l
         if file_id:
             try:
                 # Update FileLocationURLComplete with the latest URL
-                await update_file_location_complete_async(file_id, result_urls['r2'], logger)
+                # await update_file_location_complete_async(file_id, result_urls['r2'], logger)
                 # Mark file generation complete
-                await update_file_generate_complete(file_id, logger)
+                # await update_file_generate_complete(file_id, logger)
                 logger.info(f"Successfully updated FileLocationURLComplete and marked generation complete for FileID: {file_id}")
                 return result_urls['r2']
             except Exception as e:
