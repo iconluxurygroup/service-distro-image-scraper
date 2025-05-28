@@ -988,8 +988,6 @@ async def process_restart_batch(
                 file_id=str(file_id_db)
             )
 
-            # --- BEGIN NEW CODE ---
-            # Step 1: Run search sort
             logger.info(f"Starting search sort for FileID: {file_id_db}")
             try:
                 sort_result = await update_sort_order(str(file_id_db), logger=logger)
@@ -1017,7 +1015,6 @@ async def process_restart_batch(
                         f"Successful entries: {successful_entries}/{len(entries)}\n"
                         f"Failed entries: {failed_entries}\n"
                         f"Last EntryID: {last_entry_id_processed}\n"
-                        f"Search sort status: {'Success' if sort_result.get('status_code') == 200 else 'Failed'}\n"
                         f"Log file: {log_filename}\n"
                         f"Log URL: {log_public_url or 'Not available'}\n"
                         f"Used all variations: {use_all_variations}"
