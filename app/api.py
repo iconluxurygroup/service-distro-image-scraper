@@ -987,6 +987,62 @@ async def process_restart_batch(
                 logger=logger,
                 file_id=str(file_id_db)
             )
+
+            # --- BEGIN NEW CODE ---
+            # Step 1: Run search sort
+            logger.info(f"Starting search sort for FileID: {file_id_db}")
+            try:
+                sort_result = await update_sort_order(str(file_id_db), logger=logger)
+                logger.info(f"Search sort completed for FileID: {file_id_db}. Result: {sort_result}")
+            except Exception as e:
+                logger.error(f"Error running search sort for FileID {file_id_db}: {e}", exc_info=True)
+                # Continue to file generation even if sort fails, but log the error
+                sort_result = {"status_code": 500, "message": str(e)}
+
+            # Step 2: Generate download file
+            logger.info(f"Queuing download file generation for FileID: {file_id_db}")
+            try:
+                if background_tasks is None:
+                    logger.warning("No BackgroundTasks provided; creating a new one for file generation")
+                    background_tasks = BackgroundTasks()
+                await run_generate_download_file(str(file_id_db), logger, log_filename, background_tasks)
+                logger.info(f"Download file generation queued for FileID: {file_id_db}")
+                
+                # Update email notification to include file generation status
+                if to_emails:
+                    subject = f"File Generation Queued for FileID: {file_id_db}"
+                    message = (
+                        f"Excel file generation for FileID {file_id_db} has been queued.\n"
+                        f"Batch processing results:\n"
+                        f"Successful entries: {successful_entries}/{len(entries)}\n"
+                        f"Failed entries: {failed_entries}\n"
+                        f"Last EntryID: {last_entry_id_processed}\n"
+                        f"Search sort status: {'Success' if sort_result.get('status_code') == 200 else 'Failed'}\n"
+                        f"Log file: {log_filename}\n"
+                        f"Log URL: {log_public_url or 'Not available'}\n"
+                        f"Used all variations: {use_all_variations}"
+                    )
+                    await send_message_email(to_emails, subject=subject, message=message, logger=logger)
+            except Exception as e:
+                logger.error(f"Error queuing download file generation for FileID {file_id_db}: {e}", exc_info=True)
+                # Update email notification to report failure
+                if to_emails:
+                    subject = f"File Generation Failed for FileID: {file_id_db}"
+                    message = (
+                        f"Excel file generation for FileID {file_id_db} failed.\n"
+                        f"Error: {str(e)}\n"
+                        f"Batch processing results:\n"
+                        f"Successful entries: {successful_entries}/{len(entries)}\n"
+                        f"Failed entries: {failed_entries}\n"
+                        f"Last EntryID: {last_entry_id_processed}\n"
+                        f"Search sort status: {'Success' if sort_result.get('status_code') == 200 else 'Failed'}\n"
+                        f"Log file: {log_filename}\n"
+                        f"Log URL: {log_public_url or 'Not available'}\n"
+                        f"Used all variations: {use_all_variations}"
+                    )
+                    await send_message_email(to_emails, subject=subject, message=message, logger=logger)
+            # --- END NEW CODE ---
+
             return {
                 "message": "Search processing completed",
                 "file_id": str(file_id_db),
