@@ -27,15 +27,63 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
+import logging
+from typing import Optional
+import requests
+from requests.exceptions import RequestException, Timeout
+
+# Default logger setup
+default_logger = logging.getLogger(__name__)
+
+def validate_url(url: Optional[str], logger: Optional[logging.Logger] = None, timeout: int = 5) -> bool:
+    """
+    Validate a thumbnail URL by checking its format and accessibility.
+    Returns False if the URL is invalid, results in a 404, or times out.
+    
+    Args:
+        url: The URL to validate (optional string).
+        logger: Optional logger instance.
+        timeout: Timeout for the HTTP request in seconds (default: 5).
+    
+    Returns:
+        bool: True if the URL is valid and accessible, False otherwise.
+    """
     logger = logger or default_logger
+    
+    # Basic string validation
     if not url or url == '' or 'placeholder' in str(url).lower():
-        logger.debug(f"Invalid thumbnail URL: {url}")
+        logger.debug(f"Invalid URL: {url}")
         return False
     if not str(url).startswith(('http://', 'https://')):
-        logger.debug(f"Non-HTTP thumbnail URL: {url}")
+        logger.debug(f"Non-HTT URL: {url}")
         return False
-    return True
+    
+    # HTTP request validation
+    try:
+        # Use HEAD request to minimize data transfer
+        response = requests.head(url, timeout=timeout, allow_redirects=True)
+        
+        # If HEAD is not allowed (405), fall back to GET
+        if response.status_code == 405:
+            response = requests.get(url, timeout=timeout, allow_redirects=True)
+        
+        # Check for 404 or other non-2xx status codes
+        if response.status_code == 404:
+            logger.debug(f"Thumbnail URL returned 404: {url}")
+            return False
+        if response.status_code >= 400:
+            logger.debug(f"Thumbnail URL returned status {response.status_code}: {url}")
+            return False
+        
+        logger.debug(f"Thumbnail URL validated successfully: {url}")
+        return True
+    
+    except Timeout:
+        logger.debug(f"Thumbnail URL timed out: {url}")
+        return False
+    except RequestException as e:
+        logger.debug(f"Failed to validate thumbnail URL {url}: {str(e)}")
+        return False
 
 def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
     logger = default_logger
@@ -106,17 +154,16 @@ async def insert_search_results(
             logger.error(f"Worker PID {process.pid}: {errors[-1]}")
             continue
 
-        category = res.get("ProductCategory", "").lower()
         image_url = clean_url_string(res.get("ImageUrl", ""))
         image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""))
         image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False)
         image_source = clean_url_string(res.get("ImageSource", ""))
 
-        if not image_url or not validate_thumbnail_url(image_url, logger):
+        if not image_url or not validate_url(image_url, logger):
             errors.append(f"Invalid ImageUrl skipped: {image_url}")
             logger.debug(f"Worker PID {process.pid}: {errors[-1]}")
             continue
-        if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
+        if image_url_thumbnail and not validate_url(image_url_thumbnail, logger):
             image_url_thumbnail = None
 
         data.append({
