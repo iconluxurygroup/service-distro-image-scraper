@@ -1109,8 +1109,8 @@ async def api_process_ai_images(
             entry_ids=entry_ids,
             step=step,
             limit=limit,
-            concurrency=concurrency,
-            logger=logger
+            concurrency=concurrency
+            # Removed logger=logger to prevent duplicate argument
         )
         
         if result["status_code"] != 200:
@@ -1118,8 +1118,7 @@ async def api_process_ai_images(
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
         
-        
-        logger.info(f"Completed AI image processing for FileID: {file_id}")
+        logger.info(f"Completed AI image processing for FileID {file_id}")
         return {
             "status": "success",
             "status_code": 200,
@@ -1130,7 +1129,7 @@ async def api_process_ai_images(
         logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
-
+    
 @router.get("/get-images-excel-db/{file_id}", tags=["Database"])
 async def get_images_excel_db_endpoint(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id)
