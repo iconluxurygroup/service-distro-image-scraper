@@ -1190,6 +1190,11 @@ from sqlalchemy.sql import text
 import json
 
 # Add to existing router
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from sqlalchemy.sql import text
+import json
+
+# Add to existing router in api.py
 @router.post("/sort-by-relevance/{file_id}", tags=["Sorting"])
 async def api_sort_by_relevance(
     file_id: str,
@@ -1197,7 +1202,8 @@ async def api_sort_by_relevance(
     background_tasks: BackgroundTasks = None
 ):
     """
-    Sort results in utb_ImageScraperResult by relevance score from AiJson for a given FileID.
+    Sort results in utb_ImageScraperResult by relevance score from AiJson for a given FileID,
+    only for records with a non-NULL AiJson field.
     Updates the SortOrder field in descending order of relevance (highest score gets SortOrder 1).
     """
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
@@ -1216,13 +1222,14 @@ async def api_sort_by_relevance(
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
             result.close()
 
-        # Fetch results with AiJson
+        # Fetch results with non-NULL AiJson
         query = """
             SELECT ResultID, EntryID, AiJson
             FROM utb_ImageScraperResult
             WHERE EntryID IN (
                 SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
             )
+            AND AiJson IS NOT NULL
         """
         params = {"file_id": int(file_id)}
         if entry_ids:
@@ -1235,12 +1242,15 @@ async def api_sort_by_relevance(
             result.close()
 
         if not rows:
-            logger.warning(f"No results found for FileID {file_id}" + (f", EntryIDs {entry_ids}" if entry_ids else ""))
+            logger.warning(
+                f"No results with non-NULL AiJson found for FileID {file_id}" +
+                (f", EntryIDs {entry_ids}" if entry_ids else "")
+            )
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             return {
                 "status": "success",
                 "status_code": 200,
-                "message": "No results found to sort",
+                "message": "No results with AiJson found to sort",
                 "log_url": log_public_url
             }
 
@@ -1249,11 +1259,8 @@ async def api_sort_by_relevance(
         for row in rows:
             result_id, entry_id, ai_json = row
             try:
-                if ai_json:
-                    ai_data = json.loads(ai_json)
-                    relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
-                else:
-                    relevance = 0.0
+                ai_data = json.loads(ai_json)
+                relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
                 results_with_scores.append({
                     "ResultID": result_id,
                     "EntryID": entry_id,
@@ -1261,11 +1268,18 @@ async def api_sort_by_relevance(
                 })
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning(f"Invalid AiJson for ResultID {result_id}: {e}")
-                results_with_scores.append({
-                    "ResultID": result_id,
-                    "EntryID": entry_id,
-                    "relevance": 0.0
-                })
+                # Skip records with invalid AiJson
+                continue
+
+        if not results_with_scores:
+            logger.warning(f"No valid AiJson data found for sorting in FileID {file_id}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            return {
+                "status": "success",
+                "status_code": 200,
+                "message": "No valid AiJson data found to sort",
+                "log_url": log_public_url
+            }
 
         # Sort by relevance (descending)
         results_with_scores.sort(key=lambda x: x["relevance"], reverse=True)
@@ -1293,7 +1307,7 @@ async def api_sort_by_relevance(
                     }
                 )
             await conn.commit()
-            logger.info(f"Updated SortOrder for {len(updates)} results for FileID {file_id}")
+            logger.info(f"Updated SortOrder for {len(updates)} results with AiJson for FileID {file_id}")
 
         # Enqueue verification task (optional)
         if background_tasks:
@@ -1302,7 +1316,9 @@ async def api_sort_by_relevance(
                 FROM utb_ImageScraperResult 
                 WHERE EntryID IN (
                     SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
-                ) AND SortOrder IS NOT NULL
+                ) 
+                AND AiJson IS NOT NULL 
+                AND SortOrder IS NOT NULL
             """
             params = {"file_id": int(file_id)}
             await enqueue_db_update(
@@ -1319,7 +1335,7 @@ async def api_sort_by_relevance(
         return {
             "status": "success",
             "status_code": 200,
-            "message": f"Sorted {len(updates)} results by relevance for FileID {file_id}",
+            "message": f"Sorted {len(updates)} results with AiJson by relevance for FileID {file_id}",
             "log_url": log_public_url,
             "data": {
                 "sorted_results": [
@@ -1332,7 +1348,8 @@ async def api_sort_by_relevance(
     except Exception as e:
         logger.error(f"Error sorting by relevance for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Error sorting by relevance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error sorting by relevance: {str(e)}") 
+
 @router.post("/reset-step1/{file_id}", tags=["Database"])
 async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
