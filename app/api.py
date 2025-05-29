@@ -624,12 +624,22 @@ import uuid
 import json
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 
+from fastapi import BackgroundTasks
+from sqlalchemy.sql import text
+import asyncio
+from typing import Optional, List, Dict, Any
+import uuid
+import json
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+from math import ceil
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
     use_all_variations: bool = False,
     logger: Optional[logging.Logger] = None,
     background_tasks: BackgroundTasks = None,
+    num_workers: int = 1,  # Number of workers
 ) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
@@ -645,14 +655,18 @@ async def process_restart_batch(
             if mem_info.rss / 1024**2 > 1000:
                 logger.warning(f"High memory usage")
 
-        logger.info(f"Starting processing for FileID: {file_id_db}, Use all variations: {use_all_variations}")
+        logger.info(f"Starting processing for FileID: {file_id_db}, Workers: {num_workers}, Use all variations: {use_all_variations}")
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        BATCH_SIZE = 50  # Process 50 entries per batch for 50 entries/s
-        MAX_CONCURRENCY = 50  # One task per entry
-        MAX_ENTRY_RETRIES = 3  # Limit retries to reduce latency
-        RELEVANCE_THRESHOLD = 0.9  # Stop if relevance >= 0.9
+        TARGET_THROUGHPUT = 50  # Entries/second across all workers
+        BATCH_TIME = 0.1  # 100ms per batch for responsiveness
+        BATCH_SIZE = max(5, ceil((TARGET_THROUGHPUT / num_workers) * BATCH_TIME))  # Dynamic batch size
+        MAX_CONCURRENCY = BATCH_SIZE  # One task per entry in batch
+        MAX_ENTRY_RETRIES = 3
+        RELEVANCE_THRESHOLD = 0.9
+
+        logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
 
         # Validate FileID
         async with async_engine.connect() as conn:
@@ -710,7 +724,7 @@ async def process_restart_batch(
             return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
 
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
-        logger.info(f"Created {len(entry_batches)} batches")
+        logger.info(f"Created {len(entry_batches)} batches of size {BATCH_SIZE}")
 
         successful_entries = 0
         failed_entries = 0
@@ -751,7 +765,7 @@ async def process_restart_batch(
                                     logger.warning(f"No search terms for EntryID {entry_id}")
                                     return entry_id, False
 
-                                client = SearchClient(endpoint, logger, max_concurrency=1)  # Single search at a time
+                                client = SearchClient(endpoint, logger, max_concurrency=1)
                                 try:
                                     for term in search_terms:
                                         logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
@@ -805,14 +819,14 @@ async def process_restart_batch(
                                                 logger.warning(f"Failed to insert result for EntryID {entry_id}")
                                                 continue
 
-                                            # Run AI analysis immediately
+                                            # Run AI analysis
                                             logger.debug(f"Running AI analysis for ResultID {result_id}, EntryID {entry_id}")
                                             ai_result = await batch_vision_reason(
                                                 file_id=str(file_id_db),
                                                 entry_ids=[entry_id],
                                                 step=0,
-                                                limit=1,  # One result at a time
-                                                concurrency=1,  # Minimize overhead
+                                                limit=1,
+                                                concurrency=1,
                                                 logger=logger,
                                                 background_tasks=background_tasks
                                             )
@@ -820,7 +834,7 @@ async def process_restart_batch(
                                                 logger.warning(f"AI analysis failed for EntryID {entry_id}: {ai_result['message']}")
                                                 continue
 
-                                            # Check relevance score
+                                            # Check relevance
                                             async with async_engine.connect() as conn:
                                                 result = await conn.execute(
                                                     text("SELECT AiJson FROM utb_ImageScraperResult WHERE ResultID = :result_id"),
@@ -866,7 +880,7 @@ async def process_restart_batch(
                                                         logger.debug(f"Invalid AiJson for ResultID {result_id}: {e}")
                                                         continue
 
-                                        # If no threshold match, continue to next term (unless use_all_variations)
+                                        # Stop after term unless use_all_variations
                                         if not use_all_variations:
                                             logger.debug(f"No threshold match for term '{term}' in EntryID {entry_id}, stopping")
                                             break
@@ -961,7 +975,7 @@ async def process_restart_batch(
                         break
 
                 elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s ({successful_entries / elapsed_time:.2f} entries/s)")
+                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s ({len(batch_entries) / elapsed_time:.2f} entries/s)")
                 log_memory_usage()
 
             # Update ImageCompleteTime
@@ -1015,7 +1029,8 @@ async def process_restart_batch(
                     f"Failed entries: {failed_entries}\n"
                     f"Last EntryID: {last_entry_id_processed}\n"
                     f"Log file: {log_filename}\n"
-                    f"Used all variations: {use_all_variations}"
+                    f"Used all variations: {use_all_variations}\n"
+                    f"Workers: {num_workers}"
                 )
                 await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
@@ -1054,7 +1069,8 @@ async def process_restart_batch(
                         f"Last EntryID: {last_entry_id_processed}\n"
                         f"Log file: {log_filename}\n"
                         f"Log URL: {log_public_url or 'Not available'}\n"
-                        f"Used all variations: {use_all_variations}"
+                        f"Used all variations: {use_all_variations}\n"
+                        f"Workers: {num_workers}"
                     )
                     await send_message_email(to_emails, subject=subject, message=message, logger=logger)
             except Exception as e:
@@ -1071,7 +1087,8 @@ async def process_restart_batch(
                         f"Search sort status: {'Success' if sort_result.get('status_code') == 200 else 'Failed'}\n"
                         f"Log file: {log_filename}\n"
                         f"Log URL: {log_public_url or 'Not available'}\n"
-                        f"Used all variations: {use_all_variations}"
+                        f"Used all variations: {use_all_variations}\n"
+                        f"Workers: {num_workers}"
                     )
                     await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
@@ -1084,7 +1101,8 @@ async def process_restart_batch(
                 "log_filename": log_filename,
                 "log_public_url": log_public_url or "",
                 "last_entry_id": str(last_entry_id_processed),
-                "use_all_variations": str(use_all_variations)
+                "use_all_variations": str(use_all_variations),
+                "num_workers": str(num_workers)
             }
         finally:
             producer.close()
@@ -1103,7 +1121,7 @@ async def process_restart_batch(
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
-        
+
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
