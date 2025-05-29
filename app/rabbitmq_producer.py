@@ -122,9 +122,9 @@ class RabbitMQProducer:
             self.is_connected = False
             raise
 
-    async def publish_update(self, update_task: Dict[str, Any], routing_key: str = None):
+    async def publish_update(self, update_task: Dict[str, Any], routing_key: str = None, correlation_id: Optional[str] = None):
         """Publish an update task to the queue with persistent delivery."""
-        await self.publish_message(update_task, routing_key)
+        await self.publish_message(update_task, routing_key, correlation_id)
 
     async def close(self):
         """Close the RabbitMQ connection and channel."""
@@ -147,7 +147,7 @@ async def enqueue_db_update(
     task_type: str = "db_update",
     producer: Optional[RabbitMQProducer] = None,
     response_queue: Optional[str] = None,
-    correlation_id: Optional[str] = None,  # Added correlation_id parameter
+    correlation_id: Optional[str] = None,
 ):
     """Enqueue a database update task to RabbitMQ."""
     should_close = False
@@ -166,7 +166,7 @@ async def enqueue_db_update(
             "timestamp": datetime.datetime.now().isoformat(),
             "response_queue": response_queue,
         }
-        await producer.publish_update(update_task, correlation_id=correlation_id)  # Pass correlation_id
+        await producer.publish_update(update_task, correlation_id=correlation_id)
         logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}, CorrelationID: {correlation_id}")
     except Exception as e:
         logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
