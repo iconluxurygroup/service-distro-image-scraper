@@ -608,6 +608,21 @@ import uuid
 import json
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 import httpx
+from fastapi import BackgroundTasks
+from sqlalchemy.sql import text
+import asyncio
+from typing import Optional, List, Dict, Any
+import uuid
+import json
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+
+from fastapi import BackgroundTasks
+from sqlalchemy.sql import text
+import asyncio
+from typing import Optional, List, Dict, Any
+import uuid
+import json
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 
 async def process_restart_batch(
     file_id_db: int,
@@ -638,7 +653,6 @@ async def process_restart_batch(
         MAX_CONCURRENCY = 50  # One task per entry
         MAX_ENTRY_RETRIES = 3  # Limit retries to reduce latency
         RELEVANCE_THRESHOLD = 0.9  # Stop if relevance >= 0.9
-        MAX_SEARCH_TERMS = 3  # Limit variations to reduce bad results
 
         # Validate FileID
         async with async_engine.connect() as conn:
@@ -720,7 +734,7 @@ async def process_restart_batch(
                                     brand_rules=brand_rules,
                                     logger=logger
                                 )
-                                # Generate and prioritize search terms
+                                # Generate and order search terms (worst to best)
                                 search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
                                 variation_order = [
                                     "default", "brand_alias", "model_alias", "delimiter_variations",
@@ -730,7 +744,7 @@ async def process_restart_batch(
                                 for variation_type in variation_order:
                                     if variation_type in search_terms_dict:
                                         search_terms.extend(search_terms_dict[variation_type])
-                                search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))[:MAX_SEARCH_TERMS]
+                                search_terms = [term.lower().strip() for term in search_terms]
                                 logger.debug(f"Generated {len(search_terms)} search terms for EntryID {entry_id}: {search_terms}")
 
                                 if not search_terms:
@@ -852,7 +866,7 @@ async def process_restart_batch(
                                                         logger.debug(f"Invalid AiJson for ResultID {result_id}: {e}")
                                                         continue
 
-                                        # If no threshold match, try next term (unless use_all_variations)
+                                        # If no threshold match, continue to next term (unless use_all_variations)
                                         if not use_all_variations:
                                             logger.debug(f"No threshold match for term '{term}' in EntryID {entry_id}, stopping")
                                             break
@@ -1018,7 +1032,7 @@ async def process_restart_batch(
             logger.info(f"Starting search sort for FileID: {file_id_db}")
             try:
                 sort_result = await update_sort_order(str(file_id_db), logger=logger)
-                logger.info(f"Search sort completed for FileID: {file_id_db}. Result: {sort_result}")
+                logger.info(f"Search sort completed for FileID {file_id_db}. Result: {sort_result}")
             except Exception as e:
                 logger.error(f"Error running search sort for FileID {file_id_db}: {e}")
                 sort_result = {"status_code": 500, "message": str(e)}
@@ -1089,7 +1103,7 @@ async def process_restart_batch(
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
 
-
+        
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
