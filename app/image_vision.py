@@ -10,7 +10,7 @@ import google.generativeai as genai
 from ultralytics import YOLO
 import numpy as np
 from typing import Optional, List, Tuple, Dict
-#from config import GOOGLE_API_KEY, BASE_CONFIG_URL
+from config import GOOGLE_API_KEY, BASE_CONFIG_URL
 from common import load_config, CONFIG_FILES  # Import from common.py
 
 # Default logger setup

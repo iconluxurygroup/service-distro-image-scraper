@@ -6,16 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from api import app
 import os
 from waitress import serve
-from load_config import load_config_constants
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# Load configuration before importing other modules
-CONFIG_URL = "https://iconluxury.group/secrets/scraper_config.json"
-CONFIG = load_config_constants(CONFIG_URL, fallback_db_password="Ftu5675FDG54hjhiuu$")
-if not CONFIG:
-    logger.error("Failed to load configuration. Exiting.")
-    sys.exit(1)
+
 def shutdown(signalnum, frame):
     logger.info("Received shutdown signal, stopping gracefully")
     sys.exit(0)

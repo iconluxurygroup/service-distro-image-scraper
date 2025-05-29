@@ -10,7 +10,7 @@ import asyncio
 from typing import List, Optional, Dict, Any, Tuple
 from fuzzywuzzy import fuzz
 from functools import lru_cache
-#from config import BASE_CONFIG_URL
+from config import BASE_CONFIG_URL
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
