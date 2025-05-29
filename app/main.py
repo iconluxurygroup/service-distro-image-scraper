@@ -12,7 +12,8 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 # Load configuration before importing other modules
 CONFIG_URL = "https://iconluxury.group/secrets/scraper_config.json"
-if not load_config_constants(CONFIG_URL):
+CONFIG = load_config_constants(CONFIG_URL, fallback_db_password="Ftu5675FDG54hjhiuu$")
+if not CONFIG:
     logger.error("Failed to load configuration. Exiting.")
     sys.exit(1)
 def shutdown(signalnum, frame):

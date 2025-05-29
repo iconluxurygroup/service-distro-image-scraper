@@ -3,13 +3,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 import logging
 import os
+from main import CONFIG
 #from config import DB_PASSWORD, SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, GOOGLE_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, REGION, S3_CONFIG
 from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
-DB_PASSWORD = "Ftu5675FDG54hjhiuu$"
-db_password = DB_PASSWORD
+db_password = CONFIG.DB_PASSWORD
 if not db_password:
     logger.error("DB_PASSWORD environment variable not set")
     raise ValueError("Database password not provided")
