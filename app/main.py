@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 # Load configuration before importing other modules
-CONFIG_URL = "https://iconluxury.group/static_settings/config.json"
+CONFIG_URL = "https://iconluxury.group/secrets/scraper_config.json"
 if not load_config_constants(CONFIG_URL):
     logger.error("Failed to load configuration. Exiting.")
     sys.exit(1)
