@@ -765,7 +765,7 @@ async def process_restart_batch(
                     result = await conn.execute(
                         text("""
                             UPDATE utb_ImageScraperRecords
-                            SET Step1 = 'PROCESSING'
+                            SET Step1 = GETDATE()
                             WHERE EntryID = :entry_id AND Step1 IS NULL
                         """),
                         {"entry_id": entry_id}
@@ -892,9 +892,9 @@ async def process_restart_batch(
                                     if sort_results:
                                         logger.debug(f"Worker {worker_id} Sort order updated for EntryID {entry_id}")
                                     break
-                        finally:
+                            finally:
                                 await client.close()
-                        if results_written:
+                            if results_written:
                                 break
                         if not results_written:
                             logger.warning(f"Worker {worker_id} No results written for EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
