@@ -97,9 +97,6 @@ async def insert_search_results(
 
     data = []
     errors = []
-    category_filters = {
-        "footwear": ["appliance", "whirlpool", "parts"]
-    }
 
     for res in deduped_results:
         try:
@@ -121,12 +118,6 @@ async def insert_search_results(
             continue
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
             image_url_thumbnail = None
-
-        if category in category_filters and any(
-            keyword in image_url.lower() for keyword in category_filters[category]
-        ):
-            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
-            continue
 
         data.append({
             "EntryID": entry_id,
