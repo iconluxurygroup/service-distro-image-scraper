@@ -3,7 +3,7 @@ import logging
 import aiosmtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-#from config import SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, VERSION
+from config import SENDER_EMAIL, SENDER_PASSWORD, SENDER_NAME, VERSION
 
 # Module-level logger
 default_logger = logging.getLogger(__name__)

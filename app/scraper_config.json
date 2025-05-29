@@ -1,0 +1,43 @@
+{
+  "version": "4.8.1",
+  "email_settings": {
+    "sender_email": "nik@luxurymarket.com",
+    "sender_password": "wvug kynd dfhd xrjh",
+    "sender_name": "superscraper"
+  },
+  "api_keys": {
+    "google_api_key": "AIzaSyDXfc_kdxa5UX2h9D3WwktefCqdyjHasn8",
+    "grok_api_key": "xai-ucA8EcERzruUwHAa1duxYallTxycDumI5n3eVY7EJqhZVD0ywiiza3zEmRB4Tw7eNC5k0VuXVndYOUj9",
+    "grok_endpoint": "https://api.x.ai/v1/chat/completions"
+  },
+  "proxy_settings": {
+    "search_proxy_api_url": "https://api.thedataproxy.com/v2/proxy/fetch"
+  },
+  "brand_settings": {
+    "brand_rules_url": "https://raw.githubusercontent.com/iconluxurygroup/legacy-icon-product-api/refs/heads/main/task_settings/brand_settings.json"
+  },
+  "aws_settings": {
+    "access_key_id": "AKIA2CUNLEV6V627SWI7",
+    "secret_access_key": "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",
+    "region": "us-east-2"
+  },
+  "s3_config": {
+    "endpoint": "https://s3.us-east-2.amazonaws.com",
+    "region": "us-east-2",
+    "access_key": "AKIA2CUNLEV6V627SWI7",
+    "secret_key": "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",
+    "bucket_name": "iconluxurygroup",
+    "r2_endpoint": "https://aa2f6aae69e7fb4bd8e2cd4311c411cb.r2.cloudflarestorage.com",
+    "r2_access_key": "8b5a4a988c474205e0172eab5479d6f2",
+    "r2_secret_key": "8ff719bbf2946c1b6a81fcf2121e1a41604a0b6f2890f308871b381e98a8d725",
+    "r2_account_id": "aa2f6aae69e7fb4bd8e2cd4311c411cb",
+    "r2_bucket_name": "iconluxurygroup",
+    "r2_custom_domain": "https://iconluxury.group"
+  },
+  "database_settings": {
+    "db_password": "Ftu5675FDG54hjhiuu$"
+  },
+  "base_config": {
+    "base_config_url": "https://iconluxury.group/static_settings/"
+  }
+}
