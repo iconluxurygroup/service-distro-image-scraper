@@ -10,7 +10,7 @@ from io import BytesIO
 from typing import Optional, List, Tuple, Dict
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from image_vision import detect_objects_with_computer_vision_async, analyze_image_with_gemini_async
-from vision_utils import fetch_missing_images  # Updated import
+from vision_utils import fetch_missing_images
 from config import BASE_CONFIG_URL
 from common import clean_string, generate_aliases, generate_brand_aliases, load_config, CONFIG_FILES
 import pandas as pd
@@ -42,7 +42,7 @@ category_hierarchy_example = {
 category_mapping_example = {
     "pants": "trouser", "jeans": "trouser", "jacket": "coat", "sneakers": "sneaker",
     "running-shoe": "sneaker", "tshirt": "t-shirt", "shirt": "t-shirt",
-    "sweatshirt": "sweater", "hoodie": "sweater"
+    "sweatshirt": "sweater", "hoodie": "sweater", "purse": "bag", "handbag": "bag"
 }
 
 # Load configurations
@@ -215,7 +215,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
     result_id = row.get("ResultID")
     default_result = (
         result_id or 0,
-        json.dumps({"error": "Unknown processing error", "result_id": result_id or 0, "scores": {"sentiment": 0.0, "relevance": 0.0}}),
+        json.dumps({"error": "Unknown processing error", "result_id": result_id or 0, "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0}}),
         "Processing failed",
         1,
         None
@@ -232,7 +232,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         product_details = {
             "brand": str(row.get("ProductBrand") or "None"),
             "category": str(row.get("ProductCategory") or "None"),
-            "color": str(row.get("ProductColor") or "None")
+            "color": str(row.get("ProductColor") or "None"),
+            "model": str(row.get("ProductModel") or "None")
         }
 
         thumbnail_base64 = await fetch_stored_thumbnail(result_id, session, logger)
@@ -246,7 +247,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             ai_json = json.dumps({
                 "error": f"Image download failed for URLs: {image_urls}",
                 "result_id": result_id,
-                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
                 "thumbnail": thumbnail_base64
             })
             return result_id, ai_json, "Image download failed", 1, thumbnail_base64
@@ -260,7 +261,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             ai_json = json.dumps({
                 "error": cv_description or "CV detection failed",
                 "result_id": result_id,
-                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
                 "thumbnail": thumbnail_base64
             })
             return result_id, ai_json, "CV detection failed", 1, thumbnail_base64
@@ -268,8 +269,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         cls_label, seg_label = extract_labels(cv_description)
         detected_objects = cv_description.split("\n")[2:] if "Segmented objects:" in cv_description else []
         labels = [label for label in [cls_label, seg_label] if label]
-        is_fashion = any(label.lower() in [fl.lower() for fl in fashion_labels_example] for label in labels if label)
-        non_fashion_labels = [label for label in labels if label and label.lower() not in [fl.lower() for fl in fashion_labels_example]]
+        is_fashion = any(is_related_to_category(label, product_details["category"]) for label in labels if label)
+        non_fashion_labels = [label for label in labels if label and not is_related_to_category(label, product_details["category"])]
 
         person_detected = any(conf > 0.5 for conf in person_confidences)
         cls_conf = float(re.search(r"Classification: \w+(?:\s+\w+)* \(confidence: ([\d.]+)\)", cv_description).group(1)) if cls_label else 0.0
@@ -279,8 +280,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             logger.info(f"Non-fashion objects detected for ResultID {result_id}: {non_fashion_labels}")
             ai_json = json.dumps({
                 "description": f"Image contains multiple objects: {non_fashion_labels}, none of which are fashion-related.",
-                "extracted_features": {"brand": "Unknown", "category": "Multiple", "color": "Unknown"},
-                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "extracted_features": {"brand": "Unknown", "category": "Multiple", "color": "Unknown", "model": "Unknown"},
+                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
                 "reasoning": f"Multiple non-fashion objects detected: {non_fashion_labels}.",
                 "cv_detection": cv_description,
                 "person_confidences": person_confidences,
@@ -293,8 +294,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             logger.info(f"No fashion items or persons for ResultID {result_id}")
             ai_json = json.dumps({
                 "description": "Image lacks fashion items and persons with sufficient confidence.",
-                "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown"},
-                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown", "model": "Unknown"},
+                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
                 "reasoning": "No person detected and low confidence in fashion detection.",
                 "cv_detection": cv_description,
                 "person_confidences": person_confidences,
@@ -311,14 +312,14 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             ai_json = json.dumps({
                 "error": gemini_result.get('features', {}).get('reasoning', 'Gemini analysis failed'),
                 "result_id": result_id,
-                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
                 "thumbnail": thumbnail_base64
             })
             return result_id, ai_json, "Gemini analysis failed", 1, thumbnail_base64
 
         features = gemini_result.get("features", {
             "description": cv_description,
-            "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown"},
+            "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown", "model": "Unknown"},
             "match_score": 0.5,
             "reasoning": "Gemini analysis failed; using CV description"
         })
@@ -332,10 +333,28 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             match_score = 0.5
         reasoning = features.get("reasoning", "No reasoning provided").encode('utf-8').decode('utf-8')
 
+        # Calculate individual scores
+        detected_category = extracted_features.get("category", "unknown").lower()
+        category_score = 1.0 if is_related_to_category(detected_category, product_details["category"]) else 0.5
+
+        detected_color = extracted_features.get("color", "unknown").lower()
+        color_score = 1.0 if detected_color == product_details["color"].lower() and detected_color != "unknown" else 0.5
+
+        detected_brand = extracted_features.get("brand", "unknown").lower()
+        brand_aliases = generate_brand_aliases(product_details["brand"]) if product_details["brand"].lower() != "none" else []
+        brand_score = 1.0 if detected_brand in brand_aliases or detected_brand == product_details["brand"].lower() else 0.5
+
+        detected_model = extracted_features.get("model", "unknown").lower()
+        model_score = 1.0 if detected_model == product_details["model"].lower() and detected_model != "unknown" else 0.3
+
         ai_json = json.dumps({
             "scores": {
                 "sentiment": match_score,
-                "relevance": match_score
+                "relevance": match_score,
+                "category": category_score,
+                "color": color_score,
+                "brand": brand_score,
+                "model": model_score
             },
             "category": extracted_features.get("category", "unknown"),
             "keywords": [extracted_features.get("category", "unknown").lower()],
@@ -354,7 +373,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             ai_json = json.dumps({
                 "error": f"Malformed JSON: {e}",
                 "result_id": result_id,
-                "scores": {"sentiment": 0.0, "relevance": 0.0},
+                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
                 "thumbnail": thumbnail_base64
             })
             return result_id, ai_json, "JSON generation failed", 1, thumbnail_base64
@@ -371,7 +390,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         ai_json = json.dumps({
             "error": f"Processing error: {e}",
             "result_id": result_id or 0,
-            "scores": {"sentiment": 0.0, "relevance": 0.0},
+            "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
             "thumbnail": thumbnail_base64
         })
         return result_id or 0, ai_json, "Processing failed", 1, thumbnail_base64
@@ -381,7 +400,7 @@ async def process_entry(
     entry_id: int,
     entry_df: pd.DataFrame,
     logger: logging.Logger
-) -> List[Tuple[str, bool, str, int]]:  # Change return type to 4-tuple
+) -> List[Tuple[str, bool, str, int]]:
     logger.info(f"Starting task for EntryID: {entry_id} with {len(entry_df)} rows for FileID: {file_id}")
     updates = []
 
@@ -416,7 +435,7 @@ async def process_entry(
                     logger.error(f"Invalid result from process_image: {result}")
                     continue
                 result_id, ai_json, ai_caption, is_fashion, thumbnail_base64 = result
-                updates.append((ai_json, is_fashion, ai_caption, result_id))  # Exclude thumbnail_base64
+                updates.append((ai_json, is_fashion, ai_caption, result_id))
 
         logger.info(f"Completed task for EntryID: {entry_id} with {len(updates)} updates")
         return updates
