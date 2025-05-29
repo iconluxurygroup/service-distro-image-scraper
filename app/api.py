@@ -760,222 +760,172 @@ async def process_restart_batch(
 
             async def process_entry(entry):
                 entry_id, search_string, brand, color, category = entry
-                async with semaphore:
-                    results_written = False
-                    try:
-                        for attempt in range(1, MAX_ENTRY_RETRIES + 1):
-                            try:
-                                logger.debug(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}")
-                                search_string, brand, model, color = await preprocess_sku(
-                                    search_string=search_string,
-                                    known_brand=brand,
-                                    brand_rules=brand_rules,
-                                    logger=logger
-                                )
-                                search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
-                                variation_order = [
-                                    "default", "brand_alias", "model_alias", "delimiter_variations",
-                                    "color_variations", "no_color", "category_specific"
+                worker_id = str(uuid.uuid4())[:8]
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(
+                        text("""
+                            UPDATE utb_ImageScraperRecords
+                            SET Step1 = 'PROCESSING'
+                            WHERE EntryID = :entry_id AND Step1 IS NULL
+                        """),
+                        {"entry_id": entry_id}
+                    )
+                    await conn.commit()
+                    if result.rowcount == 0:
+                        logger.info(f"Worker {worker_id} Skipping EntryID {entry_id}: already being processed")
+                        return entry_id, True
+
+                results_written = False
+                failed_terms = set()
+                try:
+                    for attempt in range(1, MAX_ENTRY_RETRIES + 1):
+                        logger.debug(f"Worker {worker_id} Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}")
+                        search_string, brand, model, color = await preprocess_sku(
+                            search_string=search_string,
+                            known_brand=brand,
+                            brand_rules=brand_rules,
+                            logger=logger
+                        )
+                        search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
+                        search_terms = []
+                        for variation_type in ["default", "brand_alias", "model_alias", "delimiter_variations", "color_variations", "no_color", "category_specific"]:
+                            if variation_type in search_terms_dict:
+                                search_terms.extend(search_terms_dict[variation_type])
+                        search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
+                        logger.debug(f"Worker {worker_id} Generated {len(search_terms)} search terms: {search_terms}")
+
+                        if not search_terms:
+                            logger.warning(f"Worker {worker_id} No search terms for EntryID {entry_id}")
+                            return entry_id, False
+
+                        client = SearchClient(SEARCH_PROXY_API_URL, logger, max_concurrency=1)
+                        try:
+                            for term in search_terms:
+                                if (entry_id, term) in failed_terms:
+                                    logger.debug(f"Worker {worker_id} Skipping failed term '{term}' for EntryID {entry_id}")
+                                    continue
+                                logger.debug(f"Worker {worker_id} Searching term '{term}' for EntryID {entry_id}")
+                                results = await client.search(term, brand, entry_id)
+                                if isinstance(results, Exception):
+                                    logger.error(f"Worker {worker_id} Search failed for EntryID {entry_id}, term '{term}': {results}")
+                                    failed_terms.add((entry_id, term))
+                                    continue
+                                if not results:
+                                    logger.debug(f"Worker {worker_id} No results for term '{term}' in EntryID {entry_id}")
+                                    failed_terms.add((entry_id, term))
+                                    continue
+                                processed_results = await process_results(results, entry_id, brand, term, logger)
+                                valid_results = [
+                                    res for res in processed_results
+                                    if all(col in res for col in required_columns)
+                                    and not res["ImageUrl"].startswith("placeholder://")
                                 ]
-                                search_terms = []
-                                for variation_type in variation_order:
-                                    if variation_type in search_terms_dict:
-                                        search_terms.extend(search_terms_dict[variation_type])
-                                search_terms = [term.lower().strip() for term in search_terms]
-                                logger.debug(f"Generated {len(search_terms)} search terms for EntryID {entry_id}: {search_terms}")
+                                logger.debug(f"Worker {worker_id} Processed {len(processed_results)} results, {len(valid_results)} valid for EntryID {entry_id}")
+                                if valid_results:
+                                    logger.debug(f"Worker {worker_id} Sample valid result: {valid_results[0]}")
+                                else:
+                                    logger.warning(f"Worker {worker_id} No valid results for term '{term}' in EntryID {entry_id}")
+                                    continue
 
-                                if not search_terms:
-                                    logger.warning(f"No search terms for EntryID {entry_id}")
-                                    return entry_id, False
+                                # Deduplicate results
+                                seen_urls = set()
+                                deduped_results = []
+                                for res in valid_results:
+                                    if res["ImageUrl"] not in seen_urls:
+                                        seen_urls.add(res["ImageUrl"])
+                                        deduped_results.append(res)
+                                logger.debug(f"Worker {worker_id} Deduplicated {len(valid_results)} to {len(deduped_results)} results")
 
-                                client = SearchClient(endpoint, logger, max_concurrency=1)
+                                # Try insert_search_results
                                 try:
-                                    for term in search_terms:
-                                        logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
-                                        results = await client.search(term, brand, entry_id)
-                                        if isinstance(results, Exception):
-                                            logger.debug(f"Error for term '{term}' in EntryID {entry_id}: {results}")
-                                            continue
-                                        if not results:
-                                            logger.debug(f"No results for term '{term}' in EntryID {entry_id}")
-                                            continue
-                                        processed_results = await process_results(results, entry_id, brand, term, logger)
-                                        valid_results = [
-                                            res for res in processed_results
-                                            if all(col in res for col in required_columns) and
-                                            not res["ImageUrl"].startswith("placeholder://")
-                                        ]
-                                        rejected_results = [
-                                            res for res in processed_results
-                                            if res not in valid_results
-                                        ]
-                                        if rejected_results:
-                                            logger.debug(f"Rejected {len(rejected_results)} results for EntryID {entry_id}: {rejected_results[:2]}")
-
-                                        if not valid_results:
-                                            logger.debug(f"No valid results for term '{term}' in EntryID {entry_id}")
-                                            continue
-
-                                        for result in valid_results:
-                                            # Enqueue result insertion
-                                            sql = """
-                                                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, SortOrder)
-                                                VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, 0);
-                                                SELECT SCOPE_IDENTITY() AS ResultID;
-                                            """
-                                            params = {
-                                                "entry_id": result["EntryID"],
-                                                "image_url": result["ImageUrl"],
-                                                "image_desc": result["ImageDesc"],
-                                                "image_source": result["ImageSource"],
-                                                "image_url_thumbnail": result["ImageUrlThumbnail"]
+                                    success = await insert_search_results(
+                                        results=deduped_results,
+                                        logger=logger,
+                                        file_id=str(file_id_db),
+                                        background_tasks=background_tasks
+                                    )
+                                    if success:
+                                        results_written = True
+                                        logger.info(f"Worker {worker_id} Successfully inserted {len(deduped_results)} results for EntryID {entry_id}")
+                                    else:
+                                        logger.warning(f"Worker {worker_id} Failed to insert results for EntryID {entry_id}")
+                                except Exception as e:
+                                    logger.error(f"Worker {worker_id} Error inserting results for EntryID {entry_id}: {e}", exc_info=True)
+                                    # Synchronous batch insert fallback
+                                    async with async_engine.connect() as conn:
+                                        batch_params = [
+                                            {
+                                                "entry_id": res["EntryID"],
+                                                "image_url": res["ImageUrl"],
+                                                "image_desc": res["ImageDesc"],
+                                                "image_source": res["ImageSource"],
+                                                "image_url_thumbnail": res["ImageUrlThumbnail"]
                                             }
-                                            correlation_id = str(uuid.uuid4())
-                                            try:
-                                                result_id = await enqueue_with_retry(
-                                                    sql=sql,
-                                                    params=params,
-                                                    task_type="insert_result",
-                                                    correlation_id=correlation_id
-                                                )
-                                            except Exception as e:
-                                                logger.error(f"Failed to enqueue result for EntryID {entry_id}: {e}")
-                                                # Fallback synchronous insert
-                                                async with async_engine.connect() as conn:
-                                                    try:
-                                                        result = await conn.execute(text(sql), params)
-                                                        result_id = result.scalar()
-                                                        await conn.commit()
-                                                        logger.debug(f"Synchronous insert succeeded for EntryID {entry_id}, ResultID: {result_id}")
-                                                    except Exception as se:
-                                                        logger.error(f"Synchronous insert failed for EntryID {entry_id}: {se}")
-                                                        continue
-
-                                            if not result_id:
-                                                logger.warning(f"No ResultID for EntryID {entry_id}, skipping")
-                                                continue
-
+                                            for res in deduped_results
+                                        ]
+                                        sql = """
+                                            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+                                            VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, GETDATE())
+                                        """
+                                        try:
+                                            await conn.execute(text(sql), batch_params)
+                                            await conn.commit()
                                             results_written = True
-                                            logger.debug(f"Enqueued result for EntryID {entry_id}, ResultID: {result_id}, CorrelationID: {correlation_id}")
+                                            logger.info(f"Worker {worker_id} Synchronous batch insert succeeded for {len(batch_params)} results, EntryID {entry_id}")
+                                        except Exception as se:
+                                            logger.error(f"Worker {worker_id} Synchronous batch insert failed for EntryID {entry_id}: {se}", exc_info=True)
+                                            continue
 
-                                            # Run AI analysis
-                                            logger.debug(f"Running AI analysis for ResultID {result_id}, EntryID {entry_id}")
-                                            for ai_attempt in range(1, 3):
-                                                try:
-                                                    ai_result = await batch_vision_reason(
-                                                        file_id=str(file_id_db),
-                                                        entry_ids=[entry_id],
-                                                        step=0,
-                                                        limit=1,
-                                                        concurrency=1,
-                                                        logger=logger,
-                                                        background_tasks=background_tasks
-                                                    )
-                                                    if ai_result["status_code"] != 200:
-                                                        logger.warning(f"AI analysis failed for EntryID {entry_id}: {ai_result['message']}")
-                                                        if ai_attempt < 2:
-                                                            await asyncio.sleep(1)
-                                                            continue
-                                                        break
-                                                    break
-                                                except Exception as e:
-                                                    logger.warning(f"AI analysis error for EntryID {entry_id}: {e}")
-                                                    if ai_attempt < 2:
-                                                        await asyncio.sleep(1)
-                                                        continue
-                                                    break
-
-                                            # Check relevance
-                                            async with async_engine.connect() as conn:
-                                                result = await conn.execute(
-                                                    text("SELECT AiJson FROM utb_ImageScraperResult WHERE ResultID = :result_id"),
-                                                    {"result_id": result_id}
-                                                )
-                                                row = result.fetchone()
-                                                result.close()
-                                                if row and row[0]:
-                                                    try:
-                                                        ai_data = json.loads(row[0])
-                                                        relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
-                                                        logger.debug(f"Relevance score for ResultID {result_id}: {relevance}")
-                                                        if relevance >= RELEVANCE_THRESHOLD:
-                                                            logger.info(f"High-relevance image (score: {relevance}) for ResultID {result_id}, EntryID {entry_id}")
-                                                            # Enqueue SortOrder update
-                                                            sql = """
-                                                                UPDATE utb_ImageScraperResult
-                                                                SET SortOrder = 1
-                                                                WHERE ResultID = :result_id
-                                                            """
-                                                            params = {"result_id": result_id}
-                                                            await enqueue_with_retry(
-                                                                sql=sql,
-                                                                params=params,
-                                                                task_type="update_sort_order",
-                                                                correlation_id=str(uuid.uuid4())
-                                                            )
-                                                            # Enqueue Step1 update
-                                                            sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                                                            params = {"entry_id": entry_id}
-                                                            await enqueue_with_retry(
-                                                                sql=sql,
-                                                                params=params,
-                                                                task_type="update_step1",
-                                                                correlation_id=str(uuid.uuid4())
-                                                            )
-                                                            return entry_id, True
-                                                    except (json.JSONDecodeError, ValueError) as e:
-                                                        logger.debug(f"Invalid AiJson for ResultID {result_id}: {e}")
-
-                                        # Process all valid results before stopping
-                                        logger.debug(f"Processed {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
-
-                                    if results_written:
-                                        # Update sort order for non-threshold results
-                                        sort_results = await update_search_sort_order(
-                                            file_id=str(file_id_db),
-                                            entry_id=str(entry_id),
-                                            brand=brand,
-                                            model=search_string,
-                                            color=color,
-                                            category=category,
-                                            logger=logger,
-                                            brand_rules=brand_rules,
-                                            background_tasks=background_tasks
-                                        )
-                                        if sort_results:
-                                            logger.debug(f"Sort order updated for EntryID {entry_id}")
-                                            # Enqueue Step1 update
-                                            sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                                            params = {"entry_id": entry_id}
-                                            await enqueue_with_retry(
-                                                sql=sql,
-                                                params=params,
-                                                task_type="update_step1",
-                                                correlation_id=str(uuid.uuid4())
-                                            )
-                                            return entry_id, True
-                                finally:
-                                    await client.close()
-                            except Exception as e:
-                                logger.debug(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}")
-                                if attempt < MAX_ENTRY_RETRIES:
-                                    await asyncio.sleep(2 ** attempt)
-                                continue
-                        # All retries failed
-                        logger.warning(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                                if results_written:
+                                    # Update sort order
+                                    sort_results = await update_search_sort_order(
+                                        file_id=str(file_id_db),
+                                        entry_id=str(entry_id),
+                                        brand=brand,
+                                        model=search_string,
+                                        color=color,
+                                        category=category,
+                                        logger=logger,
+                                        brand_rules=brand_rules,
+                                        background_tasks=background_tasks
+                                    )
+                                    if sort_results:
+                                        logger.debug(f"Worker {worker_id} Sort order updated for EntryID {entry_id}")
+                                    break
+                        finally:
+                                await client.close()
+                        if results_written:
+                                break
                         if not results_written:
-                            sql = "UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE EntryID = :entry_id"
+                            logger.warning(f"Worker {worker_id} No results written for EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                            async with async_engine.connect() as conn:
+                                await conn.execute(
+                                    text("UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE EntryID = :entry_id"),
+                                    {"entry_id": entry_id}
+                                )
+                                await conn.commit()
+                        else:
+                            sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                             params = {"entry_id": entry_id}
-                            await enqueue_with_retry(
-                                sql=sql,
-                                params=params,
-                                task_type="reset_step1_failed",
-                                correlation_id=str(uuid.uuid4())
-                            )
+                            try:
+                                await enqueue_with_retry(
+                                    sql=sql,
+                                    params=params,
+                                    task_type="update_step1",
+                                    correlation_id=str(uuid.uuid4())
+                                )
+                                logger.info(f"Worker {worker_id} Enqueued Step1 update for EntryID {entry_id}")
+                            except Exception as e:
+                                logger.error(f"Worker {worker_id} Failed to enqueue Step1 update for EntryID {entry_id}: {e}")
+                                # Synchronous Step1 update
+                                async with async_engine.connect() as conn:
+                                    await conn.execute(text(sql), params)
+                                    await conn.commit()
+                                    logger.info(f"Worker {worker_id} Synchronous Step1 update succeeded for EntryID {entry_id}")
                         return entry_id, results_written
-                    except Exception as e:
-                        logger.warning(f"Unexpected error processing EntryID {entry_id}: {e}")
-                        return entry_id, results_written
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
+                    return entry_id, results_written
 
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
