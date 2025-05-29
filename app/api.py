@@ -1411,6 +1411,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from sqlalchemy.sql import text
 import httpx
 from typing import Optional, List
+import uuid
 
 @router.post("/validate-images/{file_id}", tags=["Validation"])
 async def api_validate_images(
@@ -1545,7 +1546,7 @@ async def api_validate_images(
                                 background_tasks=background_tasks,
                                 task_type="mark_invalid_image",
                                 producer=producer,
-                                correlation_id=correlation_id
+                                correlation_id=correlation_id  # Now supported
                             )
                             logger.info(
                                 f"Enqueued SortOrder=-5 for ResultID {result_id}, "
@@ -1588,15 +1589,17 @@ async def api_validate_images(
                     AND SortOrder = -5
                 """
                 params = {"file_id": int(file_id)}
+                correlation_id = str(uuid.uuid4())
                 await enqueue_db_update(
                     file_id=file_id,
                     sql=sql,
                     params=params,
                     background_tasks=background_tasks,
                     task_type="verify_invalid_images",
-                    producer=producer
+                    producer=producer,
+                    correlation_id=correlation_id  # Now supported
                 )
-                logger.info(f"Enqueued verification of invalid images for FileID {file_id}")
+                logger.info(f"Enqueued verification of invalid images for FileID {file_id}, CorrelationID: {correlation_id}")
 
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             return {
@@ -1613,7 +1616,7 @@ async def api_validate_images(
                 }
             }
         finally:
-            producer.close()
+            await producer.close()  # Properly await the close coroutine
             logger.info(f"Closed RabbitMQ producer for FileID {file_id}")
     except Exception as e:
         logger.error(f"Error validating images for FileID {file_id}: {e}", exc_info=True)
