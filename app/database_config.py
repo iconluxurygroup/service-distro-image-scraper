@@ -8,6 +8,7 @@ from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
+DB_PASSWORD = "Ftu5675FDG54hjhiuu$"
 db_password = DB_PASSWORD
 if not db_password:
     logger.error("DB_PASSWORD environment variable not set")
