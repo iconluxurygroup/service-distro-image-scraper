@@ -147,6 +147,7 @@ async def enqueue_db_update(
     task_type: str = "db_update",
     producer: Optional[RabbitMQProducer] = None,
     response_queue: Optional[str] = None,
+    correlation_id: Optional[str] = None,  # Added correlation_id parameter
 ):
     """Enqueue a database update task to RabbitMQ."""
     should_close = False
@@ -165,8 +166,8 @@ async def enqueue_db_update(
             "timestamp": datetime.datetime.now().isoformat(),
             "response_queue": response_queue,
         }
-        await producer.publish_update(update_task)
-        logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
+        await producer.publish_update(update_task, correlation_id=correlation_id)  # Pass correlation_id
+        logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}, CorrelationID: {correlation_id}")
     except Exception as e:
         logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise
