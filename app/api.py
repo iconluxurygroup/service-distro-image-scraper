@@ -624,6 +624,7 @@ import uuid
 import json
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 
+
 from fastapi import BackgroundTasks
 from sqlalchemy.sql import text
 import asyncio
@@ -632,6 +633,8 @@ import uuid
 import json
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 from math import ceil
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import logging
 
 async def process_restart_batch(
     file_id_db: int,
@@ -639,7 +642,7 @@ async def process_restart_batch(
     use_all_variations: bool = False,
     logger: Optional[logging.Logger] = None,
     background_tasks: BackgroundTasks = None,
-    num_workers: int = 1,  # Number of workers
+    num_workers: int = 1,
 ) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id_db}.log"
     try:
@@ -659,10 +662,10 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        TARGET_THROUGHPUT = 50  # Entries/second across all workers
-        BATCH_TIME = 0.1  # 100ms per batch for responsiveness
-        BATCH_SIZE = max(5, ceil((TARGET_THROUGHPUT / num_workers) * BATCH_TIME))  # Dynamic batch size
-        MAX_CONCURRENCY = BATCH_SIZE  # One task per entry in batch
+        TARGET_THROUGHPUT = 50
+        BATCH_TIME = 0.1
+        BATCH_SIZE = max(5, ceil((TARGET_THROUGHPUT / num_workers) * BATCH_TIME))
+        MAX_CONCURRENCY = BATCH_SIZE
         MAX_ENTRY_RETRIES = 3
         RELEVANCE_THRESHOLD = 0.9
 
@@ -735,9 +738,30 @@ async def process_restart_batch(
         producer = RabbitMQProducer()
         try:
             semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+            @retry(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=1, max=5),
+                retry=retry_if_exception_type(Exception),
+                before_sleep=lambda retry_state: logger.debug(
+                    f"Retrying enqueue for EntryID {entry_id} (attempt {retry_state.attempt_number}/3)"
+                )
+            )
+            async def enqueue_with_retry(sql, params, task_type, correlation_id):
+                return await enqueue_db_update(
+                    file_id=str(file_id_db),
+                    sql=sql,
+                    params=params,
+                    background_tasks=background_tasks,
+                    task_type=task_type,
+                    producer=producer,
+                    correlation_id=correlation_id,
+                    return_result=(task_type == "insert_result")
+                )
+
             async def process_entry(entry):
                 entry_id, search_string, brand, color, category = entry
                 async with semaphore:
+                    results_written = False
                     try:
                         for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                             try:
@@ -748,7 +772,6 @@ async def process_restart_batch(
                                     brand_rules=brand_rules,
                                     logger=logger
                                 )
-                                # Generate and order search terms (worst to best)
                                 search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
                                 variation_order = [
                                     "default", "brand_alias", "model_alias", "delimiter_variations",
@@ -780,19 +803,24 @@ async def process_restart_batch(
                                         valid_results = [
                                             res for res in processed_results
                                             if all(col in res for col in required_columns) and
-                                            not res["ImageUrl"].startswith("placeholder://") and
-                                            not any(kw in res.get("ImageDesc", "").lower() for kw in ['wallpaper', 'stock photo', 'decor'])
+                                            not res["ImageUrl"].startswith("placeholder://")
                                         ]
+                                        rejected_results = [
+                                            res for res in processed_results
+                                            if res not in valid_results
+                                        ]
+                                        if rejected_results:
+                                            logger.debug(f"Rejected {len(rejected_results)} results for EntryID {entry_id}: {rejected_results[:2]}")
+
                                         if not valid_results:
                                             logger.debug(f"No valid results for term '{term}' in EntryID {entry_id}")
                                             continue
 
-                                        # Process each result individually
                                         for result in valid_results:
                                             # Enqueue result insertion
                                             sql = """
-                                                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail)
-                                                VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail);
+                                                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, SortOrder)
+                                                VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, 0);
                                                 SELECT SCOPE_IDENTITY() AS ResultID;
                                             """
                                             params = {
@@ -803,36 +831,59 @@ async def process_restart_batch(
                                                 "image_url_thumbnail": result["ImageUrlThumbnail"]
                                             }
                                             correlation_id = str(uuid.uuid4())
-                                            result_id = await enqueue_db_update(
-                                                file_id=str(file_id_db),
-                                                sql=sql,
-                                                params=params,
-                                                background_tasks=background_tasks,
-                                                task_type="insert_result",
-                                                producer=producer,
-                                                correlation_id=correlation_id,
-                                                return_result=True
-                                            )
-                                            logger.debug(f"Enqueued result for EntryID {entry_id}, CorrelationID: {correlation_id}")
+                                            try:
+                                                result_id = await enqueue_with_retry(
+                                                    sql=sql,
+                                                    params=params,
+                                                    task_type="insert_result",
+                                                    correlation_id=correlation_id
+                                                )
+                                            except Exception as e:
+                                                logger.error(f"Failed to enqueue result for EntryID {entry_id}: {e}")
+                                                # Fallback synchronous insert
+                                                async with async_engine.connect() as conn:
+                                                    try:
+                                                        result = await conn.execute(text(sql), params)
+                                                        result_id = result.scalar()
+                                                        await conn.commit()
+                                                        logger.debug(f"Synchronous insert succeeded for EntryID {entry_id}, ResultID: {result_id}")
+                                                    except Exception as se:
+                                                        logger.error(f"Synchronous insert failed for EntryID {entry_id}: {se}")
+                                                        continue
 
                                             if not result_id:
-                                                logger.warning(f"Failed to insert result for EntryID {entry_id}")
+                                                logger.warning(f"No ResultID for EntryID {entry_id}, skipping")
                                                 continue
+
+                                            results_written = True
+                                            logger.debug(f"Enqueued result for EntryID {entry_id}, ResultID: {result_id}, CorrelationID: {correlation_id}")
 
                                             # Run AI analysis
                                             logger.debug(f"Running AI analysis for ResultID {result_id}, EntryID {entry_id}")
-                                            ai_result = await batch_vision_reason(
-                                                file_id=str(file_id_db),
-                                                entry_ids=[entry_id],
-                                                step=0,
-                                                limit=1,
-                                                concurrency=1,
-                                                logger=logger,
-                                                background_tasks=background_tasks
-                                            )
-                                            if ai_result["status_code"] != 200:
-                                                logger.warning(f"AI analysis failed for EntryID {entry_id}: {ai_result['message']}")
-                                                continue
+                                            for ai_attempt in range(1, 3):
+                                                try:
+                                                    ai_result = await batch_vision_reason(
+                                                        file_id=str(file_id_db),
+                                                        entry_ids=[entry_id],
+                                                        step=0,
+                                                        limit=1,
+                                                        concurrency=1,
+                                                        logger=logger,
+                                                        background_tasks=background_tasks
+                                                    )
+                                                    if ai_result["status_code"] != 200:
+                                                        logger.warning(f"AI analysis failed for EntryID {entry_id}: {ai_result['message']}")
+                                                        if ai_attempt < 2:
+                                                            await asyncio.sleep(1)
+                                                            continue
+                                                        break
+                                                    break
+                                                except Exception as e:
+                                                    logger.warning(f"AI analysis error for EntryID {entry_id}: {e}")
+                                                    if ai_attempt < 2:
+                                                        await asyncio.sleep(1)
+                                                        continue
+                                                    break
 
                                             # Check relevance
                                             async with async_engine.connect() as conn:
@@ -856,61 +907,53 @@ async def process_restart_batch(
                                                                 WHERE ResultID = :result_id
                                                             """
                                                             params = {"result_id": result_id}
-                                                            await enqueue_db_update(
-                                                                file_id=str(file_id_db),
+                                                            await enqueue_with_retry(
                                                                 sql=sql,
                                                                 params=params,
-                                                                background_tasks=background_tasks,
                                                                 task_type="update_sort_order",
-                                                                producer=producer
+                                                                correlation_id=str(uuid.uuid4())
                                                             )
                                                             # Enqueue Step1 update
                                                             sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                                                             params = {"entry_id": entry_id}
-                                                            await enqueue_db_update(
-                                                                file_id=str(file_id_db),
+                                                            await enqueue_with_retry(
                                                                 sql=sql,
                                                                 params=params,
-                                                                background_tasks=background_tasks,
                                                                 task_type="update_step1",
-                                                                producer=producer
+                                                                correlation_id=str(uuid.uuid4())
                                                             )
                                                             return entry_id, True
                                                     except (json.JSONDecodeError, ValueError) as e:
                                                         logger.debug(f"Invalid AiJson for ResultID {result_id}: {e}")
-                                                        continue
 
-                                        # Stop after term unless use_all_variations
-                                        if not use_all_variations:
-                                            logger.debug(f"No threshold match for term '{term}' in EntryID {entry_id}, stopping")
-                                            break
+                                        # Process all valid results before stopping
+                                        logger.debug(f"Processed {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
 
-                                    # Update sort order for non-threshold results
-                                    sort_results = await update_search_sort_order(
-                                        file_id=str(file_id_db),
-                                        entry_id=str(entry_id),
-                                        brand=brand,
-                                        model=search_string,
-                                        color=color,
-                                        category=category,
-                                        logger=logger,
-                                        brand_rules=brand_rules,
-                                        background_tasks=background_tasks
-                                    )
-                                    if sort_results:
-                                        logger.debug(f"Sort order updated for EntryID {entry_id}")
-                                        # Enqueue Step1 update
-                                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                                        params = {"entry_id": entry_id}
-                                        await enqueue_db_update(
+                                    if results_written:
+                                        # Update sort order for non-threshold results
+                                        sort_results = await update_search_sort_order(
                                             file_id=str(file_id_db),
-                                            sql=sql,
-                                            params=params,
-                                            background_tasks=background_tasks,
-                                            task_type="update_step1",
-                                            producer=producer
+                                            entry_id=str(entry_id),
+                                            brand=brand,
+                                            model=search_string,
+                                            color=color,
+                                            category=category,
+                                            logger=logger,
+                                            brand_rules=brand_rules,
+                                            background_tasks=background_tasks
                                         )
-                                        return entry_id, True
+                                        if sort_results:
+                                            logger.debug(f"Sort order updated for EntryID {entry_id}")
+                                            # Enqueue Step1 update
+                                            sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
+                                            params = {"entry_id": entry_id}
+                                            await enqueue_with_retry(
+                                                sql=sql,
+                                                params=params,
+                                                task_type="update_step1",
+                                                correlation_id=str(uuid.uuid4())
+                                            )
+                                            return entry_id, True
                                 finally:
                                     await client.close()
                             except Exception as e:
@@ -920,26 +963,24 @@ async def process_restart_batch(
                                 continue
                         # All retries failed
                         logger.warning(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
-                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE EntryID = :entry_id"
-                        params = {"entry_id": entry_id}
-                        await enqueue_db_update(
-                            file_id=str(file_id_db),
-                            sql=sql,
-                            params=params,
-                            background_tasks=background_tasks,
-                            task_type="reset_step1_failed",
-                            producer=producer
-                        )
-                        return entry_id, False
+                        if not results_written:
+                            sql = "UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE EntryID = :entry_id"
+                            params = {"entry_id": entry_id}
+                            await enqueue_with_retry(
+                                sql=sql,
+                                params=params,
+                                task_type="reset_step1_failed",
+                                correlation_id=str(uuid.uuid4())
+                            )
+                        return entry_id, results_written
                     except Exception as e:
                         logger.warning(f"Unexpected error processing EntryID {entry_id}: {e}")
-                        return entry_id, False
+                        return entry_id, results_written
 
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
                 start_time = datetime.datetime.now()
 
-                # Process batch
                 results = await asyncio.gather(
                     *(process_entry(entry) for entry in batch_entries),
                     return_exceptions=True
@@ -958,7 +999,6 @@ async def process_restart_batch(
                     else:
                         failed_entries += 1
 
-                # Check remaining entries
                 async with async_engine.connect() as conn:
                     result = await conn.execute(
                         text("""
@@ -978,7 +1018,6 @@ async def process_restart_batch(
                 logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s ({len(batch_entries) / elapsed_time:.2f} entries/s)")
                 log_memory_usage()
 
-            # Update ImageCompleteTime
             if successful_entries > 0:
                 logger.info(f"Updating ImageCompleteTime for FileID {file_id_db}")
                 sql = """
@@ -987,16 +1026,13 @@ async def process_restart_batch(
                     WHERE ID = :file_id
                 """
                 params = {"file_id": file_id_db_int}
-                await enqueue_db_update(
-                    file_id=str(file_id_db),
+                await enqueue_with_retry(
                     sql=sql,
                     params=params,
-                    background_tasks=background_tasks,
                     task_type="update_file_image_complete_time",
-                    producer=producer
+                    correlation_id=str(uuid.uuid4())
                 )
 
-            # Verify results
             async with async_engine.connect() as conn:
                 result = await conn.execute(
                     text("""
@@ -1019,7 +1055,6 @@ async def process_restart_batch(
                 )
                 result.close()
 
-            # Send email notification
             to_emails = await get_send_to_email(file_id_db, logger=logger)
             if to_emails:
                 subject = f"Processing Completed for FileID: {file_id_db}"
@@ -1034,7 +1069,6 @@ async def process_restart_batch(
                 )
                 await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
-            # Upload log
             log_public_url = await upload_file_to_space(
                 file_src=log_filename,
                 save_as=f"job_logs/job_{file_id_db}.log",
@@ -1043,7 +1077,6 @@ async def process_restart_batch(
                 file_id=str(file_id_db)
             )
 
-            # Run final sort
             logger.info(f"Starting search sort for FileID: {file_id_db}")
             try:
                 sort_result = await update_sort_order(str(file_id_db), logger=logger)
@@ -1052,7 +1085,6 @@ async def process_restart_batch(
                 logger.error(f"Error running search sort for FileID {file_id_db}: {e}")
                 sort_result = {"status_code": 500, "message": str(e)}
 
-            # Queue file generation
             logger.info(f"Queuing download file generation for FileID: {file_id_db}")
             try:
                 if background_tasks is None:
@@ -1120,8 +1152,7 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-
-
+        
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
