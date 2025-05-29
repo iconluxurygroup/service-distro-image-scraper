@@ -1193,6 +1193,10 @@ import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 from sqlalchemy.sql import text
 import json
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from sqlalchemy.sql import text
+import json
+from collections import defaultdict
 
 # Add to existing router in api.py
 @router.post("/sort-by-relevance/{file_id}", tags=["Sorting"])
@@ -1203,11 +1207,11 @@ async def api_sort_by_relevance(
 ):
     """
     Sort results in utb_ImageScraperResult by relevance score from AiJson for a given FileID,
-    only for records with a non-NULL AiJson field.
-    Updates the SortOrder field in descending order of relevance (highest score gets SortOrder 1).
+    grouping by EntryID to assign consecutive SortOrder (1, 2, 3, ...) within each EntryID.
+    Only updates records with a non-NULL AiJson field.
     """
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    logger.info(f"Sorting results by relevance for FileID: {file_id}, EntryIDs: {entry_ids}")
+    logger.info(f"Sorting results by relevance per EntryID for FileID: {file_id}, EntryIDs: {entry_ids}")
 
     try:
         # Validate FileID exists
@@ -1254,24 +1258,23 @@ async def api_sort_by_relevance(
                 "log_url": log_public_url
             }
 
-        # Extract relevance scores
-        results_with_scores = []
+        # Group results by EntryID
+        results_by_entry = defaultdict(list)
         for row in rows:
             result_id, entry_id, ai_json = row
             try:
                 ai_data = json.loads(ai_json)
                 relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
-                results_with_scores.append({
+                results_by_entry[entry_id].append({
                     "ResultID": result_id,
-                    "EntryID": entry_id,
                     "relevance": relevance
                 })
             except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"Invalid AiJson for ResultID {result_id}: {e}")
+                logger.warning(f"Invalid AiJson for ResultID {result_id}, EntryID {entry_id}: {e}")
                 # Skip records with invalid AiJson
                 continue
 
-        if not results_with_scores:
+        if not results_by_entry:
             logger.warning(f"No valid AiJson data found for sorting in FileID {file_id}")
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             return {
@@ -1281,16 +1284,19 @@ async def api_sort_by_relevance(
                 "log_url": log_public_url
             }
 
-        # Sort by relevance (descending)
-        results_with_scores.sort(key=lambda x: x["relevance"], reverse=True)
-
-        # Assign SortOrder (1 for highest relevance, 2 for next, etc.)
+        # Sort and assign SortOrder per EntryID
         updates = []
-        for sort_order, result in enumerate(results_with_scores, 1):
-            updates.append({
-                "result_id": result["ResultID"],
-                "sort_order": sort_order
-            })
+        for entry_id, results in results_by_entry.items():
+            # Sort by relevance (descending), then by ResultID (ascending) for stable sorting
+            results.sort(key=lambda x: (x["relevance"], -x["ResultID"]), reverse=True)
+            # Assign consecutive SortOrder (1, 2, 3, ...)
+            for sort_order, result in enumerate(results, 1):
+                updates.append({
+                    "result_id": result["ResultID"],
+                    "sort_order": sort_order,
+                    "entry_id": entry_id
+                })
+            logger.debug(f"Assigned SortOrder for {len(results)} results in EntryID {entry_id}")
 
         # Update SortOrder in database
         async with async_engine.connect() as conn:
@@ -1307,18 +1313,19 @@ async def api_sort_by_relevance(
                     }
                 )
             await conn.commit()
-            logger.info(f"Updated SortOrder for {len(updates)} results with AiJson for FileID {file_id}")
+            logger.info(f"Updated SortOrder for {len(updates)} results across {len(results_by_entry)} EntryIDs for FileID {file_id}")
 
-        # Enqueue verification task (optional)
+        # Enqueue verification task
         if background_tasks:
             sql = """
-                SELECT COUNT(*) 
+                SELECT EntryID, COUNT(*) 
                 FROM utb_ImageScraperResult 
                 WHERE EntryID IN (
                     SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
                 ) 
                 AND AiJson IS NOT NULL 
                 AND SortOrder IS NOT NULL
+                GROUP BY EntryID
             """
             params = {"file_id": int(file_id)}
             await enqueue_db_update(
@@ -1335,11 +1342,11 @@ async def api_sort_by_relevance(
         return {
             "status": "success",
             "status_code": 200,
-            "message": f"Sorted {len(updates)} results with AiJson by relevance for FileID {file_id}",
+            "message": f"Sorted {len(updates)} results with AiJson by relevance across {len(results_by_entry)} EntryIDs for FileID {file_id}",
             "log_url": log_public_url,
             "data": {
                 "sorted_results": [
-                    {"ResultID": u["result_id"], "SortOrder": u["sort_order"]}
+                    {"ResultID": u["result_id"], "EntryID": u["entry_id"], "SortOrder": u["sort_order"]}
                     for u in updates
                 ]
             }
@@ -1348,7 +1355,7 @@ async def api_sort_by_relevance(
     except Exception as e:
         logger.error(f"Error sorting by relevance for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Error sorting by relevance: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Error sorting by relevance: {str(e)}")
 
 @router.post("/reset-step1/{file_id}", tags=["Database"])
 async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
