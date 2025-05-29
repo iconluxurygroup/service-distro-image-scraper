@@ -1185,7 +1185,154 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from sqlalchemy.sql import text
+import json
 
+# Add to existing router
+@router.post("/sort-by-relevance/{file_id}", tags=["Sorting"])
+async def api_sort_by_relevance(
+    file_id: str,
+    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to sort, if not all"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Sort results in utb_ImageScraperResult by relevance score from AiJson for a given FileID.
+    Updates the SortOrder field in descending order of relevance (highest score gets SortOrder 1).
+    """
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Sorting results by relevance for FileID: {file_id}, EntryIDs: {entry_ids}")
+
+    try:
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id} does not exist")
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
+
+        # Fetch results with AiJson
+        query = """
+            SELECT ResultID, EntryID, AiJson
+            FROM utb_ImageScraperResult
+            WHERE EntryID IN (
+                SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
+            )
+        """
+        params = {"file_id": int(file_id)}
+        if entry_ids:
+            query += " AND EntryID IN :entry_ids"
+            params["entry_ids"] = tuple(entry_ids)
+
+        async with async_engine.connect() as conn:
+            result = await conn.execute(text(query), params)
+            rows = result.fetchall()
+            result.close()
+
+        if not rows:
+            logger.warning(f"No results found for FileID {file_id}" + (f", EntryIDs {entry_ids}" if entry_ids else ""))
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            return {
+                "status": "success",
+                "status_code": 200,
+                "message": "No results found to sort",
+                "log_url": log_public_url
+            }
+
+        # Extract relevance scores
+        results_with_scores = []
+        for row in rows:
+            result_id, entry_id, ai_json = row
+            try:
+                if ai_json:
+                    ai_data = json.loads(ai_json)
+                    relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
+                else:
+                    relevance = 0.0
+                results_with_scores.append({
+                    "ResultID": result_id,
+                    "EntryID": entry_id,
+                    "relevance": relevance
+                })
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Invalid AiJson for ResultID {result_id}: {e}")
+                results_with_scores.append({
+                    "ResultID": result_id,
+                    "EntryID": entry_id,
+                    "relevance": 0.0
+                })
+
+        # Sort by relevance (descending)
+        results_with_scores.sort(key=lambda x: x["relevance"], reverse=True)
+
+        # Assign SortOrder (1 for highest relevance, 2 for next, etc.)
+        updates = []
+        for sort_order, result in enumerate(results_with_scores, 1):
+            updates.append({
+                "result_id": result["ResultID"],
+                "sort_order": sort_order
+            })
+
+        # Update SortOrder in database
+        async with async_engine.connect() as conn:
+            for update in updates:
+                await conn.execute(
+                    text("""
+                        UPDATE utb_ImageScraperResult
+                        SET SortOrder = :sort_order
+                        WHERE ResultID = :result_id
+                    """),
+                    {
+                        "sort_order": update["sort_order"],
+                        "result_id": update["result_id"]
+                    }
+                )
+            await conn.commit()
+            logger.info(f"Updated SortOrder for {len(updates)} results for FileID {file_id}")
+
+        # Enqueue verification task (optional)
+        if background_tasks:
+            sql = """
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult 
+                WHERE EntryID IN (
+                    SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
+                ) AND SortOrder IS NOT NULL
+            """
+            params = {"file_id": int(file_id)}
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=sql,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="verify_sort_order",
+                producer=RabbitMQProducer()
+            )
+            logger.info(f"Enqueued SortOrder verification for FileID {file_id}")
+
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Sorted {len(updates)} results by relevance for FileID {file_id}",
+            "log_url": log_public_url,
+            "data": {
+                "sorted_results": [
+                    {"ResultID": u["result_id"], "SortOrder": u["sort_order"]}
+                    for u in updates
+                ]
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error sorting by relevance for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error sorting by relevance: {str(e)}")
 @router.post("/reset-step1/{file_id}", tags=["Database"])
 async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
