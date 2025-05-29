@@ -437,7 +437,26 @@ async def generate_search_variations(
     total_variations = sum(len(v) for v in variations.values())
     logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
     return variations
-
+async def create_predefined_aliases(logger: Optional[logging.Logger] = None) -> Dict[str, List[str]]:
+    logger = logger or default_logger
+    # Load brand_rules using load_config
+    brand_rules = await load_config(
+        file_key="brand_rules",
+        fallback={"brand_rules": []},
+        logger=logger,
+        config_name="brand_rules"
+    )
+    
+    predefined_aliases = {}
+    for rule in brand_rules.get("brand_rules", []):
+        if rule.get("is_active", False):
+            full_name = rule.get("full_name", "")
+            aliases = rule.get("names", [])
+            if full_name:
+                predefined_aliases[full_name] = aliases
+    
+    logger.debug(f"Created predefined_aliases: {predefined_aliases}")
+    return predefined_aliases
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
     brand_clean = clean_string(brand).lower()
     if not brand_clean:

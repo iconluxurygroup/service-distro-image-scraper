@@ -236,6 +236,9 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             "model": str(row.get("ProductModel") or "None")
         }
 
+        # Fetch predefined_aliases
+        predefined_aliases = await create_predefined_aliases(logger=logger)
+
         thumbnail_base64 = await fetch_stored_thumbnail(result_id, session, logger)
         image_data, downloaded_url = await get_image_data_async(image_urls, session, logger)
         if not thumbnail_base64:
@@ -341,7 +344,8 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         color_score = 1.0 if detected_color == product_details["color"].lower() and detected_color != "unknown" else 0.5
 
         detected_brand = extracted_features.get("brand", "unknown").lower()
-        brand_aliases = generate_brand_aliases(product_details["brand"]) if product_details["brand"].lower() != "none" else []
+        # Updated call to generate_brand_aliases
+        brand_aliases = await generate_brand_aliases(product_details["brand"], predefined_aliases) if product_details["brand"].lower() != "none" else []
         brand_score = 1.0 if detected_brand in brand_aliases or detected_brand == product_details["brand"].lower() else 0.5
 
         detected_model = extracted_features.get("model", "unknown").lower()
