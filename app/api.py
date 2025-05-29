@@ -591,6 +591,15 @@ from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
 import json
 import uuid
 
+from fastapi import BackgroundTasks
+from sqlalchemy.sql import text
+import asyncio
+from typing import Optional, List, Dict, Any
+from collections import defaultdict
+import uuid
+import json
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -616,11 +625,14 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        BATCH_SIZE = 15
-        MAX_CONCURRENCY = 50
-        MAX_ENTRY_RETRIES = 5
-        RELEVANCE_THRESHOLD = 0.9  # Configurable threshold for AI relevance score
+        BATCH_SIZE = 50  # Increased to process more entries per batch
+        MAX_CONCURRENCY = 200  # Increased to handle more concurrent tasks
+        MAX_ENTRY_RETRIES = 3  # Reduced retries to minimize latency
+        RELEVANCE_THRESHOLD = 0.9  # Threshold for AI relevance score
+        SEARCH_CONCURRENCY = 20  # Concurrent search terms per entry
+        AI_CONCURRENCY = 50  # Concurrent AI analysis tasks
 
+        # Validate FileID
         async with async_engine.connect() as conn:
             result = await conn.execute(
                 text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
@@ -631,6 +643,7 @@ async def process_restart_batch(
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
             result.close()
 
+        # Fetch starting entry_id
         if entry_id is None:
             entry_id = await fetch_last_valid_entry(str(file_id_db_int), logger)
             if entry_id is not None:
@@ -644,6 +657,7 @@ async def process_restart_batch(
                     logger.info(f"Resuming from EntryID: {entry_id}")
                     result.close()
 
+        # Cache brand rules
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched")
@@ -652,6 +666,7 @@ async def process_restart_batch(
         endpoint = SEARCH_PROXY_API_URL
         logger.info(f"Using endpoint: {endpoint} with API key authentication")
 
+        # Fetch entries
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory 
@@ -690,7 +705,7 @@ async def process_restart_batch(
                     try:
                         for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                             try:
-                                logger.info(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}, Use all variations: {use_all_variations}")
+                                logger.debug(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}")
                                 search_string, brand, model, color = await preprocess_sku(
                                     search_string=search_string,
                                     known_brand=brand,
@@ -708,189 +723,180 @@ async def process_restart_batch(
                                     if variation_type in search_terms_dict:
                                         search_terms.extend(search_terms_dict[variation_type])
                                 search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
-                                logger.info(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
+                                logger.debug(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
 
                                 if not search_terms:
                                     logger.warning(f"No search terms for EntryID {entry_id}")
                                     return entry_id, False
 
-                                client = SearchClient(endpoint, logger)
+                                client = SearchClient(endpoint, logger, max_concurrency=SEARCH_CONCURRENCY)
                                 try:
-                                    all_results = []
-                                    for term in search_terms:
-                                        logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
+                                    # Parallelize search terms
+                                    async def search_term(term):
                                         results = await client.search(term, brand, entry_id)
                                         if isinstance(results, Exception):
-                                            logger.error(f"Error for term '{term}' in EntryID {entry_id}: {results}")
-                                            continue
-                                        if not results:
-                                            logger.debug(f"No results for term '{term}' in EntryID {entry_id}")
-                                            continue
-                                        processed_results = await process_results(results, entry_id, brand, term, logger)
-                                        if not processed_results:
-                                            logger.debug(f"No valid processed results for term '{term}' in EntryID {entry_id}")
-                                            continue
-                                        valid_results = [
-                                            res for res in processed_results
+                                            logger.debug(f"Error for term '{term}' in EntryID {entry_id}: {results}")
+                                            return []
+                                        processed = await process_results(results, entry_id, brand, term, logger)
+                                        return [
+                                            res for res in processed
                                             if all(col in res for col in required_columns) and not res["ImageUrl"].startswith("placeholder://")
                                         ]
-                                        if not valid_results:
-                                            logger.warning(f"No valid results for term '{term}' in EntryID {entry_id}")
-                                            continue
 
-                                        # Insert results to get ResultIDs
-                                        insert_success = await insert_search_results(
-                                            results=valid_results,
-                                            logger=logger,
+                                    search_tasks = [
+                                        search_term(term) for term in search_terms[:SEARCH_CONCURRENCY]
+                                    ]
+                                    results_list = await asyncio.gather(*search_tasks, return_exceptions=True)
+                                    all_results = []
+                                    for results in results_list:
+                                        if isinstance(results, Exception):
+                                            logger.debug(f"Search task failed for EntryID {entry_id}: {results}")
+                                            continue
+                                        all_results.extend(results)
+
+                                    if not all_results:
+                                        logger.warning(f"No valid results for EntryID {entry_id} on attempt {attempt}")
+                                        continue
+
+                                    # Deduplicate results
+                                    deduplicated_results = []
+                                    seen = set()
+                                    for res in all_results:
+                                        key = (res['EntryID'], res['ImageUrl'])
+                                        if key not in seen:
+                                            seen.add(key)
+                                            deduplicated_results.append(res)
+                                    logger.debug(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
+
+                                    # Insert results
+                                    insert_success = await insert_search_results(
+                                        results=deduplicated_results,
+                                        logger=logger,
+                                        file_id=str(file_id_db),
+                                        background_tasks=background_tasks
+                                    )
+                                    if not insert_success:
+                                        logger.warning(f"Failed to insert results for EntryID {entry_id}")
+                                        continue
+
+                                    # Fetch ResultIDs
+                                    async with async_engine.connect() as conn:
+                                        result = await conn.execute(
+                                            text("""
+                                                SELECT ResultID, ImageUrl
+                                                FROM utb_ImageScraperResult
+                                                WHERE EntryID = :entry_id
+                                                AND SortOrder IS NULL
+                                            """),
+                                            {"entry_id": entry_id}
+                                        )
+                                        db_results = [
+                                            {"ResultID": row[0], "ImageUrl": row[1], "EntryID": entry_id}
+                                            for row in result.fetchall()
+                                        ]
+                                        result.close()
+
+                                    # AI analysis
+                                    if db_results:
+                                        logger.debug(f"Running AI analysis for {len(db_results)} results in EntryID {entry_id}")
+                                        ai_result = await batch_vision_reason(
                                             file_id=str(file_id_db),
+                                            entry_ids=[entry_id],
+                                            step=0,
+                                            limit=len(db_results),
+                                            concurrency=AI_CONCURRENCY,
+                                            logger=logger,
                                             background_tasks=background_tasks
                                         )
-                                        if not insert_success:
-                                            logger.warning(f"Failed to insert results for EntryID {entry_id} on attempt {attempt}")
+                                        if ai_result["status_code"] != 200:
+                                            logger.warning(f"AI analysis failed for EntryID {entry_id}: {ai_result['message']}")
                                             continue
 
-                                        # Fetch ResultIDs for the inserted results
+                                        # Check for threshold match
                                         async with async_engine.connect() as conn:
                                             result = await conn.execute(
                                                 text("""
-                                                    SELECT ResultID, ImageUrl
+                                                    SELECT ResultID, AiJson
                                                     FROM utb_ImageScraperResult
                                                     WHERE EntryID = :entry_id
-                                                    AND SortOrder IS NULL
+                                                    AND AiJson IS NOT NULL
                                                 """),
                                                 {"entry_id": entry_id}
                                             )
-                                            db_results = [
-                                                {"ResultID": row[0], "ImageUrl": row[1], "EntryID": entry_id}
-                                                for row in result.fetchall()
-                                            ]
+                                            ai_results = result.fetchall()
                                             result.close()
+                                            for row in ai_results:
+                                                result_id, ai_json = row
+                                                try:
+                                                    ai_data = json.loads(ai_json)
+                                                    relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
+                                                    if relevance >= RELEVANCE_THRESHOLD:
+                                                        logger.info(
+                                                            f"High-relevance image (score: {relevance}) "
+                                                            f"for ResultID {result_id}, EntryID {entry_id}"
+                                                        )
+                                                        await conn.execute(
+                                                            text("""
+                                                                UPDATE utb_ImageScraperResult
+                                                                SET SortOrder = 1
+                                                                WHERE ResultID = :result_id
+                                                            """),
+                                                            {"result_id": result_id}
+                                                        )
+                                                        await conn.commit()
+                                                        # Enqueue Step1 update
+                                                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
+                                                        params = {"entry_id": entry_id}
+                                                        await enqueue_db_update(
+                                                            file_id=str(file_id_db),
+                                                            sql=sql,
+                                                            params=params,
+                                                            background_tasks=background_tasks,
+                                                            task_type="update_step1",
+                                                            producer=producer,
+                                                        )
+                                                        return entry_id, True
+                                                except (json.JSONDecodeError, ValueError) as e:
+                                                    logger.debug(f"Invalid AiJson for ResultID {result_id}: {e}")
+                                                    continue
 
-                                        # Perform AI analysis
-                                        if db_results:
-                                            logger.info(f"Running AI analysis for {len(db_results)} results in EntryID {entry_id}")
-                                            ai_result = await batch_vision_reason(
-                                                file_id=str(file_id_db),
-                                                entry_ids=[entry_id],
-                                                step=0,
-                                                limit=len(db_results),
-                                                concurrency=concurrency,
-                                                logger=logger,
-                                                background_tasks=background_tasks
-                                            )
-                                            if ai_result["status_code"] != 200:
-                                                logger.error(f"AI analysis failed for EntryID {entry_id}: {ai_result['message']}")
-                                                continue
-
-                                            # Check for threshold match
-                                            async with async_engine.connect() as conn:
-                                                result = await conn.execute(
-                                                    text("""
-                                                        SELECT ResultID, AiJson
-                                                        FROM utb_ImageScraperResult
-                                                        WHERE EntryID = :entry_id
-                                                        AND AiJson IS NOT NULL
-                                                    """),
-                                                    {"entry_id": entry_id}
-                                                )
-                                                ai_results = result.fetchall()
-                                                result.close()
-                                                for row in ai_results:
-                                                    result_id, ai_json = row
-                                                    try:
-                                                        ai_data = json.loads(ai_json)
-                                                        relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
-                                                        if relevance >= RELEVANCE_THRESHOLD:
-                                                            logger.info(
-                                                                f"Found high-relevance image (score: {relevance}) "
-                                                                f"for ResultID {result_id}, EntryID {entry_id}. Stopping search."
-                                                            )
-                                                            # Update SortOrder for this result
-                                                            await conn.execute(
-                                                                text("""
-                                                                    UPDATE utb_ImageScraperResult
-                                                                    SET SortOrder = 1
-                                                                    WHERE ResultID = :result_id
-                                                                """),
-                                                                {"result_id": result_id}
-                                                            )
-                                                            await conn.commit()
-                                                            # Enqueue Step1 update
-                                                            sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                                                            params = {"entry_id": entry_id}
-                                                            await enqueue_db_update(
-                                                                file_id=str(file_id_db),
-                                                                sql=sql,
-                                                                params=params,
-                                                                background_tasks=background_tasks,
-                                                                task_type="update_step1",
-                                                                producer=producer,
-                                                            )
-                                                            return entry_id, True
-                                                    except (json.JSONDecodeError, ValueError) as e:
-                                                        logger.warning(f"Invalid AiJson for ResultID {result_id}: {e}")
-                                                        continue
-
-                                        all_results.extend(valid_results)
-                                        logger.info(f"Added {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
-
-                                        # Update sort order if no threshold match yet
-                                        sort_results = await update_search_sort_order(
-                                            file_id=str(file_id_db),
-                                            entry_id=str(entry_id),
-                                            brand=brand,
-                                            model=search_string,
-                                            color=color,
-                                            category=category,
-                                            logger=logger,
-                                            brand_rules=brand_rules,
-                                            background_tasks=background_tasks
-                                        )
-                                        if not sort_results:
-                                            logger.warning(f"No sort order updates for EntryID {entry_id} on attempt {attempt}")
-                                            continue
-
-                                        # Stop if we have enough results and not using all variations
-                                        if valid_results and (not use_all_variations or len(all_results) >= 10):
-                                            logger.info(f"Stopping search after valid results for term '{term}' in EntryID {entry_id}")
-                                            break
-
-                                    if all_results:
-                                        # Deduplicate results
-                                        deduplicated_results = []
-                                        seen = set()
-                                        for res in all_results:
-                                            key = (res['EntryID'], res['ImageUrl'])
-                                            if key not in seen:
-                                                seen.add(key)
-                                                deduplicated_results.append(res)
-                                        logger.info(f"Deduplicated to {len(deduplicated_results)} rows for EntryID {entry_id}")
-
-                                        # Enqueue Step1 update
-                                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                                        params = {"entry_id": entry_id}
-                                        await enqueue_db_update(
-                                            file_id=str(file_id_db),
-                                            sql=sql,
-                                            params=params,
-                                            background_tasks=background_tasks,
-                                            task_type="update_step1",
-                                            producer=producer,
-                                        )
-                                        logger.info(f"Completed processing for EntryID {entry_id}")
-                                        return entry_id, True
-                                    else:
-                                        logger.warning(f"No valid results for EntryID {entry_id} on attempt {attempt}")
+                                    # Update sort order if no threshold match
+                                    sort_results = await update_search_sort_order(
+                                        file_id=str(file_id_db),
+                                        entry_id=str(entry_id),
+                                        brand=brand,
+                                        model=search_string,
+                                        color=color,
+                                        category=category,
+                                        logger=logger,
+                                        brand_rules=brand_rules,
+                                        background_tasks=background_tasks
+                                    )
+                                    if not sort_results:
+                                        logger.debug(f"No sort order updates for EntryID {entry_id}")
                                         continue
+
+                                    # Enqueue Step1 update
+                                    sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
+                                    params = {"entry_id": entry_id}
+                                    await enqueue_db_update(
+                                        file_id=str(file_id_db),
+                                        sql=sql,
+                                        params=params,
+                                        background_tasks=background_tasks,
+                                        task_type="update_step1",
+                                        producer=producer,
+                                    )
+                                    return entry_id, True
                                 finally:
                                     await client.close()
                             except Exception as e:
-                                logger.error(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}", exc_info=True)
+                                logger.debug(f"Error processing EntryID {entry_id} on attempt {attempt}: {e}")
                                 if attempt < MAX_ENTRY_RETRIES:
                                     await asyncio.sleep(2 ** attempt)
                                 continue
                         # All retries failed
-                        logger.error(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
+                        logger.warning(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
                         sql = "UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE EntryID = :entry_id"
                         params = {"entry_id": entry_id}
                         await enqueue_db_update(
@@ -903,13 +909,14 @@ async def process_restart_batch(
                         )
                         return entry_id, False
                     except Exception as e:
-                        logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
+                        logger.warning(f"Unexpected error processing EntryID {entry_id}: {e}")
                         return entry_id, False
 
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
                 logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
                 start_time = datetime.datetime.now()
 
+                # Process batch with high concurrency
                 results = await asyncio.gather(
                     *(process_entry(entry) for entry in batch_entries),
                     return_exceptions=True
@@ -918,7 +925,7 @@ async def process_restart_batch(
                 for entry, result in zip(batch_entries, results):
                     entry_id = entry[0]
                     if isinstance(result, Exception):
-                        logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
+                        logger.warning(f"Error processing EntryID {entry_id}: {result}")
                         failed_entries += 1
                         continue
                     entry_id_result, success = result
@@ -928,6 +935,7 @@ async def process_restart_batch(
                     else:
                         failed_entries += 1
 
+                # Check remaining entries
                 async with async_engine.connect() as conn:
                     result = await conn.execute(
                         text("""
@@ -944,10 +952,10 @@ async def process_restart_batch(
                         break
 
                 elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s")
+                logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s ({successful_entries / elapsed_time:.2f} entries/s)")
                 log_memory_usage()
 
-            # Update ImageCompleteTime at file level if any entries were successfully processed
+            # Update ImageCompleteTime
             if successful_entries > 0:
                 logger.info(f"Updating ImageCompleteTime for FileID {file_id_db}")
                 sql = """
@@ -964,8 +972,8 @@ async def process_restart_batch(
                     task_type="update_file_image_complete_time",
                     producer=producer,
                 )
-                logger.info(f"Enqueued ImageCompleteTime update for FileID {file_id_db}")
 
+            # Verify results
             async with async_engine.connect() as conn:
                 result = await conn.execute(
                     text("""
@@ -986,10 +994,9 @@ async def process_restart_batch(
                     f"Verification: {total_entries} total entries, "
                     f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder"
                 )
-                if null_entries > 0:
-                    logger.warning(f"Found {null_entries} entries with NULL SortOrder")
                 result.close()
 
+            # Send email notification
             to_emails = await get_send_to_email(file_id_db, logger=logger)
             if to_emails:
                 subject = f"Processing Completed for FileID: {file_id_db}"
@@ -1003,6 +1010,7 @@ async def process_restart_batch(
                 )
                 await send_message_email(to_emails, subject=subject, message=message, logger=logger)
 
+            # Upload log
             log_public_url = await upload_file_to_space(
                 file_src=log_filename,
                 save_as=f"job_logs/job_{file_id_db}.log",
@@ -1011,21 +1019,22 @@ async def process_restart_batch(
                 file_id=str(file_id_db)
             )
 
+            # Run final sort
             logger.info(f"Starting search sort for FileID: {file_id_db}")
             try:
                 sort_result = await update_sort_order(str(file_id_db), logger=logger)
                 logger.info(f"Search sort completed for FileID {file_id_db}. Result: {sort_result}")
             except Exception as e:
-                logger.error(f"Error running search sort for FileID {file_id_db}: {e}", exc_info=True)
+                logger.error(f"Error running search sort for FileID {file_id_db}: {e}")
                 sort_result = {"status_code": 500, "message": str(e)}
 
+            # Queue file generation
             logger.info(f"Queuing download file generation for FileID: {file_id_db}")
             try:
                 if background_tasks is None:
                     background_tasks = BackgroundTasks()
                 await run_generate_download_file(str(file_id_db), logger, log_filename, background_tasks)
                 logger.info(f"Download file generation queued for FileID {file_id_db}")
-
                 if to_emails:
                     subject = f"File Generation Queued for FileID: {file_id_db}"
                     message = (
@@ -1040,7 +1049,7 @@ async def process_restart_batch(
                     )
                     await send_message_email(to_emails, subject=subject, message=message, logger=logger)
             except Exception as e:
-                logger.error(f"Error queuing download file generation for FileID {file_id_db}: {e}", exc_info=True)
+                logger.error(f"Error queuing download file generation for FileID {file_id_db}: {e}")
                 if to_emails:
                     subject = f"File Generation Failed for FileID: {file_id_db}"
                     message = (
@@ -1072,7 +1081,7 @@ async def process_restart_batch(
             producer.close()
             logger.info(f"Closed RabbitMQ producer for FileID {file_id_db}")
     except Exception as e:
-        logger.error(f"Error processing FileID {file_id_db}: {e}", exc_info=True)
+        logger.error(f"Error processing FileID {file_id_db}: {e}")
         log_public_url = await upload_file_to_space(
             file_src=log_filename,
             save_as=f"job_logs/job_{file_id_db}.log",
@@ -1086,7 +1095,6 @@ async def process_restart_batch(
         logger.info(f"Disposed database engines")
 
 
-        
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
