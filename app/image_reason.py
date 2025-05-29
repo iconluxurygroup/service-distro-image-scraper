@@ -381,8 +381,7 @@ async def process_entry(
     entry_id: int,
     entry_df: pd.DataFrame,
     logger: logging.Logger
-) -> List[Tuple[str, bool, str, int, Optional[str]]]:
-    """Process image entries for an EntryID, ensuring valid updates."""
+) -> List[Tuple[str, bool, str, int]]:  # Change return type to 4-tuple
     logger.info(f"Starting task for EntryID: {entry_id} with {len(entry_df)} rows for FileID: {file_id}")
     updates = []
 
@@ -417,7 +416,7 @@ async def process_entry(
                     logger.error(f"Invalid result from process_image: {result}")
                     continue
                 result_id, ai_json, ai_caption, is_fashion, thumbnail_base64 = result
-                updates.append((ai_json, is_fashion, ai_caption, result_id, thumbnail_base64))
+                updates.append((ai_json, is_fashion, ai_caption, result_id))  # Exclude thumbnail_base64
 
         logger.info(f"Completed task for EntryID: {entry_id} with {len(updates)} updates")
         return updates
