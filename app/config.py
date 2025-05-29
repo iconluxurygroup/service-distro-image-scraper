@@ -7,7 +7,7 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # Load configuration
-CONFIG_URL = "https://iconluxury.group/static_settings/config.json"
+CONFIG_URL = "https://iconluxury.group/secrets/scraper_config.json"
 config = load_config_constants(CONFIG_URL, fallback_db_password="Ftu5675FDG54hjhiuu$")
 if not config:
     logger.error("Failed to load configuration. Exiting.")
