@@ -31,7 +31,7 @@ from db_utils import (
 )
 from search_utils import update_search_sort_order, insert_search_results, update_sort_order, update_sort_no_image_entry
 from database_config import conn_str, async_engine
-from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL
+# from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError

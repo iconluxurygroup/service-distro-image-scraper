@@ -11,7 +11,7 @@ from typing import Optional, List, Tuple, Dict
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from image_vision import detect_objects_with_computer_vision_async, analyze_image_with_gemini_async
 from vision_utils import fetch_missing_images  # Updated import
-from config import BASE_CONFIG_URL
+#from config import BASE_CONFIG_URL
 from common import clean_string, generate_aliases, generate_brand_aliases, load_config, CONFIG_FILES
 import pandas as pd
 import pyodbc

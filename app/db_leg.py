@@ -18,7 +18,7 @@ from requests.exceptions import RequestException
 from common import clean_string, validate_model, generate_aliases, filter_model_results, calculate_priority, generate_brand_aliases, validate_brand
 # Import check_endpoint_health from utils.py
 # Import database configuration
-from config import conn_str, engine,async_engine
+#from config import conn_str, engine,async_engine
 
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:

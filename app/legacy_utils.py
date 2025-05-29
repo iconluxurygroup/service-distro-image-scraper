@@ -320,7 +320,6 @@ async def search_variation(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> Dict:
-    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     try:
@@ -386,7 +385,6 @@ async def process_and_tag_results(
     use_all_variations: bool = False,
     file_id_db: Optional[int] = None
 ) -> List[Dict]:
-    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     
@@ -506,7 +504,6 @@ async def process_single_all(
     category: Optional[str] = None,
     logger: Optional[logging.Logger] = None
 ) -> bool:
-    from config import SEARCH_PROXY_API_URL
     logger = logger or default_logger
     process = psutil.Process()
     
