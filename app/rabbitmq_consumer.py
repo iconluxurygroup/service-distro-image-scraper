@@ -17,6 +17,25 @@ import aiormq.exceptions
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+import aio_pika
+import json
+import logging
+import asyncio
+import signal
+import sys
+import datetime
+from rabbitmq_producer import RabbitMQProducer
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from database_config import async_engine
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import psutil
+from typing import Optional, Dict, Any
+import aiormq.exceptions
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
 class RabbitMQConsumer:
     def __init__(
         self,
@@ -191,7 +210,7 @@ class RabbitMQConsumer:
             results = [dict(zip(columns, row)) for row in rows]
             logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
             if response_queue:
-                producer = await RabbitMQProducer.get_producer(logger=logger)  # Updated
+                producer = await RabbitMQProducer.get_producer(logger=logger)
                 try:
                     await producer.connect()
                     response = {"file_id": file_id, "results": results}

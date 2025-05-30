@@ -227,7 +227,6 @@ async def insert_search_results(
             raise RuntimeError(f"Failed to initialize RabbitMQ producer for FileID {file_id}: {str(e)}")
 
     correlation_id = str(uuid.uuid4())
-    response_queue = producer.response_queue_name
 
     try:
         # Deduplicate results

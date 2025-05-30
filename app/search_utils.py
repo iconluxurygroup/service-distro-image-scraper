@@ -104,7 +104,6 @@ async def update_search_sort_order(
 
         update_data = []
         correlation_id = str(uuid.uuid4())
-        response_queue = producer.response_queue_name
         total_updated = 0
 
         for index, res in enumerate(sorted_results):
