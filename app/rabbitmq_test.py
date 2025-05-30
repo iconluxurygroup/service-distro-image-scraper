@@ -9,7 +9,7 @@ from rabbitmq_producer import RabbitMQProducer, get_producer
 from rabbitmq_consumer import RabbitMQConsumer
 from config import RABBITMQ_URL
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-import aiormq,datetime
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)  # Enable debug logging
@@ -42,9 +42,9 @@ async def test_rabbitmq_producer(
             try:
                 await channel.get_queue(test_queue_name)
                 await channel.queue_delete(test_queue_name)
-                logger.debug(f"Deleted existing test queue: {test_queue_name}")
+                logger.debug(f"Deleted test queue: {test_queue_name}")
             except aio_pika.exceptions.QueueEmpty:
-                logger.debug(f"No existing test queue: {test_queue_name}")
+                logger.debug(f"No test queue: {test_queue_name}")
 
             await channel.declare_queue(test_queue_name, durable=False, exclusive=False, auto_delete=True)
             logger.debug(f"Declared test queue: {test_queue_name}")
@@ -102,7 +102,7 @@ async def test_rabbitmq_producer(
 
 async def test_rabbitmq_connection(
     logger: Optional[logging.Logger] = None,
-    timeout: float = 60.0  # Increased timeout
+    timeout: float = 60.0
 ) -> bool:
     logger = logger or logging.getLogger(__name__)
     test_queue_name = f"test_queue_{uuid.uuid4().hex}"
@@ -120,7 +120,7 @@ async def test_rabbitmq_connection(
             await producer.connect()
             logger.info("Producer connected successfully")
 
-            # Declare test queue *before* consumer connects
+            # Declare test queue
             channel = producer.channel
             if not channel or channel.is_closed:
                 await producer.connect()
@@ -131,7 +131,7 @@ async def test_rabbitmq_connection(
             logger.info("Testing RabbitMQ consumer connection...")
             consumer = RabbitMQConsumer(amqp_url=RABBITMQ_URL, queue_name=test_queue_name, producer=producer)
             await consumer.connect()
-            logger.info("Consumer connected successfully")
+            logger.info(f"Consumer connected, consuming from queue: {test_queue_name}")
 
             # Callback to process message
             async def test_callback(message: aio_pika.IncomingMessage):
@@ -172,7 +172,7 @@ async def test_rabbitmq_connection(
 
             # Retry waiting for message
             @retry(
-                stop=stop_after_attempt(5),  # Increased attempts
+                stop=stop_after_attempt(5),
                 wait=wait_fixed(5),
                 retry=retry_if_exception_type(asyncio.TimeoutError),
                 before_sleep=lambda retry_state: logger.info(
