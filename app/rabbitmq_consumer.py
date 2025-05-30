@@ -41,8 +41,8 @@ class RabbitMQConsumer:
         self,
         amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
         queue_name: str = "db_update_queue",
-        connection_timeout: float = 10.0,
-        operation_timeout: float = 5.0,
+        connection_timeout: float = 30.0,  # Increased from 10.0
+        operation_timeout: float = 15.0,
     ):
         logger.debug("Initializing RabbitMQConsumer")
         self.amqp_url = amqp_url
