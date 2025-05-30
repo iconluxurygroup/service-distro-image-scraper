@@ -248,9 +248,6 @@ class RabbitMQConsumer:
         except Exception as e:
             logger.error(f"Unexpected error executing SELECT for FileID {file_id}: {e}", exc_info=True)
             raise
-        finally:
-            if hasattr(conn, 'close'):
-                await conn.close()
 
     async def execute_sort_order_update(self, params: Dict[str, Any], file_id: str) -> bool:
         try:
@@ -272,10 +269,10 @@ class RabbitMQConsumer:
                 logger.info(f"Updated SortOrder for FileID: {file_id}, EntryID: {entry_id}, affected {rowcount} rows")
                 return rowcount > 0
         except SQLAlchemyError as e:
-            logger.error(f"Database error updating SortOrder for FileID: {file_id}: {e}", exc_info=True)
+            logger.error(f"Database error updating SortOrder for FileID {file_id}: {e}", exc_info=True)
             return False
         except Exception as e:
-            logger.error(f"Unexpected error updating SortOrder for FileID: {file_id}: {e}", exc_info=True)
+            logger.error(f"Unexpected error updating SortOrder for FileID {file_id}: {e}", exc_info=True)
             return False
 
     async def execute_new_task(self, task: Dict[str, Any], logger: logging.Logger) -> bool:
