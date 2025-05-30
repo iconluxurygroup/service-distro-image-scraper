@@ -11,7 +11,7 @@ from waitress import serve
 from sqlalchemy.sql import text
 from rabbitmq_producer import cleanup_producer, get_producer
 from logging_config import setup_job_logger
-from search_utils import insert_search_results
+from db_utils import insert_search_results
 from database_config import async_engine
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ async def test_insert_search_result():
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     logger.info("Running test insertion of search result on startup")
 
+    local_producer = None
     try:
         # Sample search result
         sample_result = [
@@ -37,7 +38,6 @@ async def test_insert_search_result():
         ]
 
         # Initialize local RabbitMQ producer
-        local_producer = None
         try:
             async with asyncio.timeout(10):
                 local_producer = await get_producer(logger)
@@ -100,7 +100,7 @@ async def test_insert_search_result():
         await async_engine.dispose()
         logger.info("Test insertion completed, database engine disposed")
 
-async def shutdown(signalnum, frame):
+async def shutdown(signalnum):
     logger.info(f"Received shutdown signal {signalnum}, stopping gracefully")
     try:
         await cleanup_producer()
@@ -108,7 +108,7 @@ async def shutdown(signalnum, frame):
         logger.error(f"Error during cleanup: {e}", exc_info=True)
     sys.exit(0)
 
-if __name__ == "__main__":
+def main():
     logger.info("Starting application")
 
     # Fix Ultralytics config
@@ -123,82 +123,94 @@ if __name__ == "__main__":
         allow_headers=["*"],
     )
 
+    # Create a new event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     # Register shutdown handlers
-    loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(sig, None)))
+        loop.add_signal_handler(sig, lambda: loop.create_task(shutdown(sig)))
 
     # Run test insertion on startup
     try:
         loop.run_until_complete(test_insert_search_result())
     except Exception as e:
         logger.error(f"Error running test insertion: {e}", exc_info=True)
+        loop.close()
         sys.exit(1)
 
     # Run server
-    if platform.system() == "Windows":
-        logger.info("Running Waitress on Windows")
-        serve(
-            app,
-            host="0.0.0.0",
-            port=8080,
-            threads=int(os.cpu_count() / 2 + 1),
-            connection_limit=1000,
-            asyncore_loop_timeout=120
-        )
-    else:
-        logger.info("Running Gunicorn with Uvicorn workers on Unix")
-        from gunicorn.app.base import BaseApplication
-        from gunicorn.config import Config
-        from uvicorn.workers import UvicornWorker
+    try:
+        if platform.system() == "Windows":
+            logger.info("Running Waitress on Windows")
+            loop.close()  # Close loop before Waitress, as it’s not async
+            serve(
+                app,
+                host="0.0.0.0",
+                port=8080,
+                threads=int(os.cpu_count() / 2 + 1),
+                connection_limit=1000,
+                asyncore_loop_timeout=120
+            )
+        else:
+            logger.info("Running Gunicorn with Uvicorn workers on Unix")
+            from gunicorn.app.base import BaseApplication
+            from gunicorn.config import Config
+            from uvicorn.workers import UvicornWorker
 
-        class StandaloneApplication(BaseApplication):
-            def __init__(self, app, options=None):
-                self.options = options or {}
-                self.application = app
-                super().__init__()
+            class StandaloneApplication(BaseApplication):
+                def __init__(self, app, options=None):
+                    self.options = options or {}
+                    self.application = app
+                    super().__init__()
 
-            def load_config(self):
-                config = Config()
-                for key, value in self.options.items():
-                    config.set(key, value)
-                self.cfg = config
+                def load_config(self):
+                    config = Config()
+                    for key, value in self.options.items():
+                        config.set(key, value)
+                    self.cfg = config
 
-            def load(self):
-                return self.application
+                def load(self):
+                    return self.application
 
-        options = {
-            "bind": "0.0.0.0:8080",
-            "workers": int(os.cpu_count() / 2 + 1),
-            "worker_class": "uvicorn.workers.UvicornWorker",
-            "loglevel": "info",
-            "timeout": 600,
-            "graceful_timeout": 580,
-            "proc_name": "gunicorn_large_batch",
-            "accesslog": "-",
-            "errorlog": "-",
-            "logconfig_dict": {
-                "loggers": {
-                    "gunicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
-                    "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
-                },
-                "handlers": {
-                    "console": {
-                        "class": "logging.StreamHandler",
-                        "formatter": "generic",
-                        "stream": "ext://sys.stdout",
+            options = {
+                "bind": "0.0.0.0:8080",
+                "workers": int(os.cpu_count() / 2 + 1),
+                "worker_class": "uvicorn.workers.UvicornWorker",
+                "loglevel": "info",
+                "timeout": 600,
+                "graceful_timeout": 580,
+                "proc_name": "gunicorn_large_batch",
+                "accesslog": "-",
+                "errorlog": "-",
+                "logconfig_dict": {
+                    "loggers": {
+                        "gunicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                        "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                    },
+                    "handlers": {
+                        "console": {
+                            "class": "logging.StreamHandler",
+                            "formatter": "generic",
+                            "stream": "ext://sys.stdout",
+                        },
+                    },
+                    "formatters": {
+                        "generic": {
+                            "format": "%(asctime)s [%(process)d] [%(levelname)s] %(message)s",
+                            "datefmt": "[%Y-%m-%d %H:%M:%S %z]",
+                        },
                     },
                 },
-                "formatters": {
-                    "generic": {
-                        "format": "%(asctime)s [%(process)d] [%(levelname)s] %(message)s",
-                        "datefmt": "[%Y-%m-%d %H:%M:%S %z]",
-                    },
-                },
-            },
-        }
-        try:
+            }
+            loop.close()  # Close loop before Gunicorn
             StandaloneApplication(app, options).run()
-        except Exception as e:
-            logger.error(f"Error starting Gunicorn: {e}", exc_info=True)
-            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error starting server: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        if not loop.is_closed():
+            loop.close()
+
+if __name__ == "__main__":
+    main()
