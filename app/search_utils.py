@@ -44,7 +44,6 @@ async def insert_search_results(
     logger = logger or default_logger
     process = psutil.Process()
     logger.info(f"Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
-    log_filename = f"job_logs/job_{file_id}.log"
     
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
@@ -60,23 +59,10 @@ async def insert_search_results(
             logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
             return False
 
-    channel = producer.channel
-    if channel is None:
-        logger.error(f"Worker PID {process.pid}: RabbitMQ channel is not available for FileID {file_id}")
-        return False
-
     correlation_id = str(uuid.uuid4())
-    response_queue = f"select_response_{correlation_id}"
+    response_queue = producer.response_queue_name
 
     try:
-        # Declare response queue
-        try:
-            queue = await channel.declare_queue(response_queue, durable=False, exclusive=False, auto_delete=True)
-            logger.debug(f"Declared response queue {response_queue}")
-        except Exception as e:
-            logger.error(f"Failed to declare response queue {response_queue}: {e}", exc_info=True)
-            return False
-        
         # Deduplicate results
         entry_ids = list(set(row["EntryID"] for row in results))
         existing_keys = set()
@@ -109,14 +95,6 @@ async def insert_search_results(
             response_received = asyncio.Event()
             response_data = None
 
-            @retry(
-                stop=stop_after_attempt(3),
-                wait=wait_exponential(multiplier=1, min=2, max=10),
-                retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
-                before_sleep=lambda retry_state: logger.info(
-                    f"Retrying consume_responses for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
-                )
-            )
             async def consume_responses(queue):
                 nonlocal response_data
                 try:
@@ -130,6 +108,18 @@ async def insert_search_results(
                 except Exception as e:
                     logger.error(f"Error in consume_responses for FileID {file_id}: {e}", exc_info=True)
                     raise
+
+            # Ensure queue exists
+            channel = producer.channel
+            if not channel or channel.is_closed:
+                await producer.connect()
+                channel = producer.channel
+            try:
+                queue = await channel.get_queue(response_queue)
+            except aio_pika.exceptions.QueueEmpty:
+                queue = await channel.declare_queue(
+                    response_queue, durable=False, exclusive=False, auto_delete=True
+                )
 
             consume_task = asyncio.create_task(consume_responses(queue))
             try:
@@ -148,7 +138,7 @@ async def insert_search_results(
                 consume_task.cancel()
                 await asyncio.sleep(0.1)
 
-        # Prepare update and insert queries
+        # Prepare and enqueue updates/inserts
         update_query = """
             UPDATE utb_ImageScraperResult
             SET ImageDesc = :ImageDesc,
@@ -180,7 +170,6 @@ async def insert_search_results(
             else:
                 insert_batch.append((insert_query, params))
 
-        # Enqueue updates and inserts
         batch_size = 100
         for i in range(0, len(update_batch), batch_size):
             batch = update_batch[i:i + batch_size]
@@ -217,13 +206,6 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in insert_search_results for FileID {file_id}: {e}", exc_info=True)
         return False
-    finally:
-        try:
-            if channel and not channel.is_closed:
-                await channel.queue_delete(response_queue)
-                logger.debug(f"Deleted response queue {response_queue}")
-        except Exception as e:
-            logger.warning(f"Worker PID {process.pid}: Failed to delete response queue {response_queue}: {e}")
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -268,12 +250,9 @@ async def update_search_sort_order(
         results = [dict(zip(columns, row)) for row in rows]
         logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
-        # Preprocess inputs
+        # Preprocess inputs and assign priorities
         brand_clean = clean_string(brand).lower() if brand else ""
         model_clean = normalize_model(model) if model else ""
-        logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
-
-        # Generate aliases
         brand_aliases = []
         if brand and brand_rules and "brand_rules" in brand_rules:
             for rule in brand_rules["brand_rules"]:
@@ -286,77 +265,72 @@ async def update_search_sort_order(
         model_aliases = generate_aliases(model_clean) if model_clean else []
         if model_clean and not model_aliases:
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
-        logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
-        # Assign priorities
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
             image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
-
             model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
+            res["priority"] = 1 if model_matched and brand_matched else 2 if model_matched else 3 if brand_matched else 4
 
-            if model_matched and brand_matched:
-                res["priority"] = 1
-            elif model_matched:
-                res["priority"] = 2
-            elif brand_matched:
-                res["priority"] = 3
-            else:
-                res["priority"] = 4
-            logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
-
-        # Sort results
         sorted_results = sorted(results, key=lambda x: x["priority"])
-        logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
         # Enqueue updates
         global producer
-        if not producer:
-            logger.error("RabbitMQ producer not initialized")
-            raise ValueError("RabbitMQ producer not initialized")
+        if producer is None or not producer.is_connected:
+            producer = await get_producer(logger)
+
+        update_data = []
+        correlation_id = str(uuid.uuid4())
+        response_queue = producer.response_queue_name
+        total_updated = 0
+
+        for index, res in enumerate(sorted_results):
+            sort_order = -2 if res["priority"] == 4 else (index + 1)
+            params = {
+                "sort_order": sort_order,
+                "entry_id": entry_id,
+                "result_id": res["ResultID"]
+            }
+            update_query = """
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = :sort_order
+                WHERE EntryID = :entry_id AND ResultID = :result_id
+            """
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=update_query,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="update_sort_order",
+                producer=producer,
+                response_queue=response_queue,
+                correlation_id=correlation_id,
+                return_result=True,
+                logger=logger
+            )
+            update_data.append({
+                "ResultID": res["ResultID"],
+                "EntryID": entry_id,
+                "SortOrder": sort_order
+            })
+
+        # Consume response
+        channel = producer.channel
+        if not channel or channel.is_closed:
+            await producer.connect()
+            channel = producer.channel
         try:
-            update_data = []
-            response_queue = f"select_response_{uuid.uuid4().hex}"
-            correlation_id = str(uuid.uuid4())
-            total_updated = 0
+            queue = await channel.get_queue(response_queue)
+        except aio_pika.exceptions.QueueEmpty:
+            queue = await channel.declare_queue(
+                response_queue, durable=False, exclusive=False, auto_delete=True
+            )
 
-            for index, res in enumerate(sorted_results):
-                sort_order = -2 if res["priority"] == 4 else (index + 1)
-                params = {
-                    "sort_order": sort_order,
-                    "entry_id": entry_id,
-                    "result_id": res["ResultID"]
-                }
-                update_query = """
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = :sort_order
-                    WHERE EntryID = :entry_id AND ResultID = :result_id
-                """
-                # Enqueue update with response queue to track completion
-                await enqueue_db_update(
-                    file_id=file_id,
-                    sql=update_query,
-                    params=params,
-                    background_tasks=background_tasks,
-                    task_type="update_sort_order",
-                    producer=producer,
-                    response_queue=response_queue,
-                    correlation_id=correlation_id,
-                    return_result=True
-                )
-                update_data.append({
-                    "ResultID": res["ResultID"],
-                    "EntryID": entry_id,
-                    "SortOrder": sort_order
-                })
-                logger.debug(f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}")
-
-            # Wait for responses
-            async with aio_pika.connect_robust(producer.amqp_url) as connection:
-                channel = await connection.channel()
-                queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+        async def consume_response(queue):
+            nonlocal total_updated
+            try:
                 async with queue.iterator() as queue_iter:
                     async for message in queue_iter:
                         async with message.process():
@@ -364,12 +338,22 @@ async def update_search_sort_order(
                                 response = json.loads(message.body.decode())
                                 total_updated += response.get("result", 0)
                                 break
+            except Exception as e:
+                logger.error(f"Error consuming response for FileID {file_id}: {e}", exc_info=True)
+                raise
 
-            logger.info(f"Worker PID {process.pid}: Processed SortOrder updates for {total_updated} rows for EntryID {entry_id}")
-            return update_data if total_updated > 0 else []
-        except Exception as e:
-            logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
-        raise
+        consume_task = asyncio.create_task(consume_response(queue))
+        try:
+            async with asyncio.timeout(300):
+                await asyncio.sleep(0.1)  # Allow response to arrive
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for response for FileID {file_id}")
+        finally:
+            consume_task.cancel()
+
+        logger.info(f"Worker PID {process.pid}: Processed SortOrder updates for {total_updated} rows for EntryID {entry_id}")
+        return update_data if total_updated > 0 else []
+
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         raise

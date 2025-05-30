@@ -352,7 +352,7 @@ def setup_signal_handlers(loop):
     import signal
     import time
     last_signal_time = 0
-    debounce_interval = 1.0  # seconds
+    debounce_interval = 1.0
 
     async def handle_shutdown():
         try:
