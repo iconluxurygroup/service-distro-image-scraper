@@ -1147,8 +1147,7 @@ async def api_clear_ai_json(
         try:
             # Enqueue the update operation
             correlation_id = str(uuid.uuid4())
-            rows_affected = # In api_clear_ai_json
-            await enqueue_db_update(
+            rows_affected = await enqueue_db_update(
                 file_id=file_id,
                 sql=sql,
                 params=params,
