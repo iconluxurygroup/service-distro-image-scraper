@@ -211,28 +211,43 @@ def flatten_entry_ids(entry_ids, logger, correlation_id):
 import signal
 import asyncio
 
+import signal
+import asyncio
+
 def register_shutdown_handler(producer, consumer, logger, correlation_id):
-    def handle_shutdown(loop):
-        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        if consumer:
-            loop.run_until_complete(consumer.close())
-            logger.debug(f"[{correlation_id}] Closed RabbitMQ consumer on shutdown")
-        if producer:
-            loop.run_until_complete(producer.close())
-            logger.debug(f"[{correlation_id}] Closed RabbitMQ producer on shutdown")
-        loop.stop()
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
+    async def handle_shutdown():
+        try:
+            tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            if consumer:
+                await consumer.close()
+                logger.debug(f"[{correlation_id}] Closed RabbitMQ consumer on shutdown")
+            if producer:
+                await producer.close()
+                logger.debug(f"[{correlation_id}] Closed RabbitMQ producer on shutdown")
+        except Exception as e:
+            logger.error(f"[{correlation_id}] Error during shutdown: {e}", exc_info=True)
+
+    def shutdown_callback():
+        asyncio.create_task(handle_shutdown())
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_shutdown, loop)
+        loop.add_signal_handler(sig, shutdown_callback)
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
     retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception(is_retryable_exception),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -386,8 +401,8 @@ async def insert_search_results(
                     logger=logger
                 )
                 logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued SELECT query for {len(flat_entry_ids)} EntryIDs")
-            except aiormq.exceptions.ChannelLockedResource as e:
-                logger.error(f"[{correlation_id}] Queue {response_queue} locked: {e}")
+            except (aiormq.exceptions.ChannelNotFoundEntity, aiormq.exceptions.ChannelLockedResource) as e:
+                logger.error(f"[{correlation_id}] Queue {response_queue} error: {e}")
                 raise
 
             consume_task = asyncio.create_task(consume_responses())
@@ -844,8 +859,19 @@ async def enqueue_db_update(
             try:
                 await consumer.connect()
                 logger.debug(f"[{correlation_id}] Connected to consumer for queue {response_queue}")
+            except aiormq.exceptions.ChannelNotFoundEntity:
+                logger.warning(f"[{correlation_id}] Queue {response_queue} not found, attempting to recreate")
+                # Recreate the queue
+                channel = await consumer.get_channel()
+                await channel.declare_queue(
+                    response_queue,
+                    exclusive=True,
+                    auto_delete=True,
+                    arguments={"x-expires": 300000}
+                )
+                logger.debug(f"[{correlation_id}] Recreated queue {response_queue}")
             except aiormq.exceptions.ChannelLockedResource as e:
-                logger.error(f"[{correlation_id}] Failed to connect to queue {response_queue}: {e}")
+                logger.error(f"[{correlation_id}] Queue {response_queue} locked: {e}")
                 raise
             except Exception as e:
                 logger.error(f"[{correlation_id}] Unexpected error connecting to queue {response_queue}: {e}")
