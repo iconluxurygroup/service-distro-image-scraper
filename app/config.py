@@ -29,6 +29,7 @@ REGION = config['REGION']
 S3_CONFIG = config['S3_CONFIG']
 DB_PASSWORD = config['DB_PASSWORD']
 BASE_CONFIG_URL = config['BASE_CONFIG_URL']
+RABBITMQ_URL="amqp://app_user:app_password@localhost:5672/app_vhost"
 
 # Example: Log loaded config for debugging
 logger.info(f"Loaded config: VERSION={VERSION}, BASE_CONFIG_URL={BASE_CONFIG_URL}")

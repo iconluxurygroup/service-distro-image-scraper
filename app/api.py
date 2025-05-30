@@ -75,10 +75,13 @@ class JobStatusResponse(BaseModel):
 async def lifespan(app: FastAPI):
     global producer
     default_logger.info("Starting up FastAPI application")
-    producer = RabbitMQProducer()
+    
+    rabbitmq_url = os.getenv("RABBITMQ_URL", "amqp://app_user:app_password@localhost:5672/app_vhost")
+    producer = RabbitMQProducer(amqp_url=rabbitmq_url)
     try:
         await producer.connect()
         default_logger.info("RabbitMQ producer connected")
+        
         loop = asyncio.get_running_loop()
         shutdown_event = asyncio.Event()
 
@@ -90,16 +93,17 @@ async def lifespan(app: FastAPI):
             loop.add_signal_handler(sig, handle_shutdown, sig.name)
 
         yield
+        
     except Exception as e:
         default_logger.error(f"Error during application startup: {e}", exc_info=True)
         raise
     finally:
-        await asyncio.wait_for(shutdown_event.wait(), timeout=None)
         default_logger.info("Shutting down FastAPI application")
         if producer:
             await producer.close()
             default_logger.info("RabbitMQ producer closed")
-        await async_engine.dispose()
+        # Uncomment if async_engine is defined
+        # await async_engine.dispose()
         default_logger.info("Database engine disposed")
 
 app.lifespan = lifespan
