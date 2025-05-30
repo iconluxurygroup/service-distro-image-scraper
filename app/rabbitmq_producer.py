@@ -279,7 +279,7 @@ async def enqueue_db_update(
 ) -> Optional[int]:
     logger = logger or default_logger
     correlation_id = correlation_id or str(uuid.uuid4())
-    
+    producer = None
     try:
         if producer is None or not producer.is_connected:
             logger.debug(f"Producer not provided or disconnected for FileID {file_id}, initializing new producer")
