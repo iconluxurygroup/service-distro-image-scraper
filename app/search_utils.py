@@ -75,7 +75,7 @@ async def insert_search_results(
             """
             params = {f"id{i}": entry_id for i, entry_id in enumerate(entry_ids)}
             try:
-                await enqueue_db_update(
+                result = await enqueue_db_update(
                     file_id=file_id,
                     sql=select_query,
                     params=params,
@@ -88,55 +88,15 @@ async def insert_search_results(
                     logger=logger
                 )
                 logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
-            except Exception as e:
-                logger.error(f"Failed to enqueue deduplication query: {e}", exc_info=True)
-                return False
-
-            response_received = asyncio.Event()
-            response_data = None
-
-            async def consume_responses(queue):
-                nonlocal response_data
-                try:
-                    async with queue.iterator() as queue_iter:
-                        async for message in queue_iter:
-                            async with message.process():
-                                if message.correlation_id == correlation_id:
-                                    response_data = json.loads(message.body.decode())
-                                    response_received.set()
-                                    break
-                except Exception as e:
-                    logger.error(f"Error in consume_responses for FileID {file_id}: {e}", exc_info=True)
-                    raise
-
-            # Ensure queue exists
-            channel = producer.channel
-            if not channel or channel.is_closed:
-                await producer.connect()
-                channel = producer.channel
-            try:
-                queue = await channel.get_queue(response_queue)
-            except aio_pika.exceptions.QueueEmpty:
-                queue = await channel.declare_queue(
-                    response_queue, durable=False, exclusive=False, auto_delete=True
-                )
-
-            consume_task = asyncio.create_task(consume_responses(queue))
-            try:
-                async with asyncio.timeout(120):
-                    await response_received.wait()
-                if response_data and "results" in response_data:
-                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data["results"]}
+                if result and isinstance(result, list):
+                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in result}
                     logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No deduplication results received")
                     return False
-            except asyncio.TimeoutError:
-                logger.warning(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
+            except Exception as e:
+                logger.error(f"Failed to enqueue deduplication query: {e}", exc_info=True)
                 return False
-            finally:
-                consume_task.cancel()
-                await asyncio.sleep(0.1)
 
         # Prepare and enqueue updates/inserts
         update_query = """

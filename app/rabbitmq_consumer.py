@@ -13,7 +13,7 @@ import psutil
 from typing import Optional, Dict, Any
 from rabbitmq_producer import RabbitMQProducer
 import uuid
-
+from config import RABBITMQ_URL
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
