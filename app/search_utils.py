@@ -155,7 +155,7 @@ async def insert_search_results(
                         response_received.set()
                         logger.debug(f"Worker PID {process.pid}: Received response for FileID {file_id}")
 
-        entry_ids = list(set(row["EntryID"] for row in data))
+        entry_ids = list(set(row["EntryID"] for row in response_data))
         existing_keys = set()
         if entry_ids:
             placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
@@ -210,7 +210,7 @@ async def insert_search_results(
 
         update_batch = []
         insert_batch = []
-        for row in data:
+        for row in response_data:
             key = (row["EntryID"], row["ImageUrl"])
             if key in existing_keys:
                 update_batch.append((update_query, row))
@@ -245,10 +245,6 @@ async def insert_search_results(
         logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts")
 
         return len(insert_batch) > 0 or len(update_batch) > 0
-
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
-        raise
 
 @retry(
     stop=stop_after_attempt(3),
