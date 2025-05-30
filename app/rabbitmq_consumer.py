@@ -465,7 +465,7 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
         await consumer.close()
         await consumer.producer.close()
 
-        # Shutdown async generators and executor if loop is not running
+        # Shutdown async generators and executor
         if loop.is_running():
             loop.stop()
         await loop.shutdown_asyncgens()
@@ -480,7 +480,38 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
             except Exception as e:
                 logger.error(f"Error closing event loop: {e}", exc_info=True)
         logger.info("Shutdown complete.")
-
+async def main():
+    try:
+        if args.clear:
+            logger.info("Clearing queue...")
+            await consumer.purge_queue()
+            logger.info("Queue cleared successfully")
+            return
+        if args.delete_mismatched:
+            logger.info("Checking and deleting queues with mismatched durability...")
+            await consumer.connect()
+            for queue_name, durable in [
+                (consumer.queue_name, True),
+                (consumer.new_queue_name, True),
+                (consumer.response_queue_name, True)
+            ]:
+                await consumer.check_queue_durability(
+                    consumer.channel, queue_name, durable, delete_if_mismatched=True
+                )
+            logger.info("Queue durability check and cleanup completed")
+            await consumer.close()
+            return
+        logger.info("Starting consumer...")
+        await consumer.start_consuming()
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt in main, shutting down...")
+        await shutdown(consumer, loop)
+    except SystemExit as e:
+        logger.info(f"Exiting with code {e.code}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in main: {e}", exc_info=True)
+        await shutdown(consumer, loop)       
 if __name__ == "__main__":
     import argparse
 
@@ -494,7 +525,8 @@ if __name__ == "__main__":
 
     producer = RabbitMQProducer()
     consumer = RabbitMQConsumer(producer=producer)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     try:
         signal.signal(signal.SIGINT, signal_handler(consumer, loop))
@@ -502,43 +534,11 @@ if __name__ == "__main__":
     except ValueError as e:
         logger.warning(f"Could not set signal handlers: {e}")
 
-    async def main():
-        try:
-            if args.clear:
-                logger.info("Clearing queue...")
-                await consumer.purge_queue()
-                logger.info("Queue cleared successfully")
-                return
-            if args.delete_mismatched:
-                logger.info("Checking and deleting queues with mismatched durability...")
-                await consumer.connect()  # Ensure connection is established
-                for queue_name, durable in [
-                    (consumer.queue_name, True),
-                    (consumer.new_queue_name, True),
-                    (consumer.response_queue_name, True)
-                ]:
-                    await consumer.check_queue_durability(
-                        consumer.channel, queue_name, durable, delete_if_mismatched=True
-                    )
-                logger.info("Queue durability check and cleanup completed")
-                return
-            logger.info("Starting consumer...")
-            await consumer.start_consuming()
-        except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt in main, shutting down...")
-            await shutdown(consumer, loop)
-        except SystemExit as e:
-            logger.info(f"Exiting with code {e.code}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in main: {e}", exc_info=True)
-            await shutdown(consumer, loop)
-
     try:
         loop.run_until_complete(main())
     except SystemExit:
         pass
-    except RuntimeError as e:
+    except Exception as e:
         logger.error(f"Error running main: {e}", exc_info=True)
     finally:
         if not loop.is_closed():
