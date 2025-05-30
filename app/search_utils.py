@@ -128,35 +128,35 @@ async def insert_search_results(
     process = psutil.Process()
     logger.info(f"Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
     log_filename = f"job_logs/job_{file_id}.log"
+    
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
+
     global producer
     try:
         async with asyncio.timeout(60):
-            if not producer or not producer.is_connected:
+            if not producer or not producer.is_connected or not producer.channel or producer.channel.is_closed:
                 logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
-                producer = get_producer()  # Or however the producer is obtained
-        channel = await producer.channel()
+                producer = await get_producer(logger)  # Await get_producer
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
         raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
-    channel = await producer.channel()
-    response_queue = f"select_response_{uuid.uuid4().hex}"
-    queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
-    response_received = asyncio.Event()
-    response_data = []
 
-    async def consume_responses():
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                async with message.process():
-                    if message.correlation_id == file_id:
-                        response_data.append(json.loads(message.body.decode()))
-                        response_received.set()
-                        logger.debug(f"Worker PID {process.pid}: Received response for FileID {file_id}")
+    channel = producer.channel  # Access as attribute
+    if channel is None:
+        logger.error(f"Worker PID {process.pid}: RabbitMQ channel is not available for FileID {file_id}")
+        return False
 
-        entry_ids = list(set(row["EntryID"] for row in response_data))
+    correlation_id = str(uuid.uuid4())
+    response_queue = f"select_response_{correlation_id}"
+
+    try:
+        # Declare response queue
+        queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+        
+        # Deduplicate results
+        entry_ids = list(set(row["EntryID"] for row in results))
         existing_keys = set()
         if entry_ids:
             placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
@@ -173,29 +173,42 @@ async def insert_search_results(
                 background_tasks=background_tasks,
                 task_type="select_deduplication",
                 producer=producer,
-                response_queue=response_queue
+                response_queue=response_queue,
+                correlation_id=correlation_id,
+                return_result=True
             )
             logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+
+            response_received = asyncio.Event()
+            response_data = None
+
+            async def consume_responses():
+                nonlocal response_data
+                async with queue.iterator() as queue_iter:
+                    async for message in queue_iter:
+                        async with message.process():
+                            if message.correlation_id == correlation_id:
+                                response_data = json.loads(message.body.decode())
+                                response_received.set()
+                                break
 
             consume_task = asyncio.create_task(consume_responses())
             try:
                 async with asyncio.timeout(30):
                     await response_received.wait()
-                if response_data:
-                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
+                if response_data and "results" in response_data:
+                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data["results"]}
                     logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No deduplication results received")
             except asyncio.TimeoutError:
                 logger.warning(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
+                return False
             finally:
                 consume_task.cancel()
-                try:
-                    await asyncio.sleep(0.5)  # Allow time for message processing
-                    # No need to manually cancel consumer or delete queue; auto_delete=True handles cleanup
-                except Exception as e:
-                    logger.warning(f"Worker PID {process.pid}: Error during queue cleanup: {e}")
+                await asyncio.sleep(0.1)  # Allow cleanup
 
+        # Prepare update and insert queries
         update_query = """
             UPDATE utb_ImageScraperResult
             SET ImageDesc = :ImageDesc,
@@ -211,13 +224,23 @@ async def insert_search_results(
 
         update_batch = []
         insert_batch = []
-        for row in response_data:
+        create_time = datetime.datetime.now().isoformat()
+        for row in results:
             key = (row["EntryID"], row["ImageUrl"])
+            params = {
+                "EntryID": row["EntryID"],
+                "ImageUrl": row["ImageUrl"],
+                "ImageDesc": row.get("ImageDesc", ""),
+                "ImageSource": row.get("ImageSource", ""),
+                "ImageUrlThumbnail": row.get("ImageUrlThumbnail", ""),
+                "CreateTime": create_time
+            }
             if key in existing_keys:
-                update_batch.append((update_query, row))
+                update_batch.append((update_query, params))
             else:
-                insert_batch.append((insert_query, row))
+                insert_batch.append((insert_query, params))
 
+        # Enqueue updates and inserts
         batch_size = 100
         for i in range(0, len(update_batch), batch_size):
             batch = update_batch[i:i + batch_size]
@@ -229,6 +252,7 @@ async def insert_search_results(
                     background_tasks=background_tasks,
                     task_type="update_search_result",
                     producer=producer,
+                    correlation_id=str(uuid.uuid4())
                 )
         logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates")
 
@@ -242,10 +266,20 @@ async def insert_search_results(
                     background_tasks=background_tasks,
                     task_type="insert_search_result",
                     producer=producer,
+                    correlation_id=str(uuid.uuid4())
                 )
         logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts")
 
         return len(insert_batch) > 0 or len(update_batch) > 0
+
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Error in insert_search_results for FileID {file_id}: {e}", exc_info=True)
+        return False
+    finally:
+        try:
+            await channel.delete_queue(response_queue)
+        except Exception as e:
+            logger.warning(f"Worker PID {process.pid}: Failed to delete response queue {response_queue}: {e}")
 
 @retry(
     stop=stop_after_attempt(3),
