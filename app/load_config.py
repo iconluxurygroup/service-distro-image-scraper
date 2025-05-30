@@ -28,33 +28,70 @@ def load_config_constants(config_url: str, fallback_db_password: Optional[str] =
         
         # Build config dictionary
         config = {
-            'VERSION': config_data.get('version'),
-            'SENDER_EMAIL': config_data.get('email_settings', {}).get('sender_email'),
-            'SENDER_PASSWORD': config_data.get('email_settings', {}).get('sender_password'),
-            'SENDER_NAME': config_data.get('email_settings', {}).get('sender_name'),
-            'GOOGLE_API_KEY': config_data.get('api_keys', {}).get('google_api_key'),
-            'GROK_API_KEY': config_data.get('api_keys', {}).get('grok_api_key'),
-            'GROK_ENDPOINT': config_data.get('api_keys', {}).get('grok_endpoint'),
-            'SEARCH_PROXY_API_URL': config_data.get('proxy_settings', {}).get('search_proxy_api_url'),
-            'BRAND_RULES_URL': config_data.get('brand_settings', {}).get('brand_rules_url'),
-            'AWS_ACCESS_KEY_ID': config_data.get('aws_settings', {}).get('access_key_id'),
-            'AWS_SECRET_ACCESS_KEY': config_data.get('aws_settings', {}).get('secret_access_key'),
-            'REGION': config_data.get('aws_settings', {}).get('region'),
-            'S3_CONFIG': config_data.get('s3_config', {}),
-            'DB_PASSWORD': config_data.get('database_settings', {}).get('db_password', fallback_db_password),
-            'BASE_CONFIG_URL': config_data.get('base_config', {}).get('base_config_url')
+            'version': config_data.get('version'),
+            'email_settings': {
+                'sender_email': config_data.get('email_settings', {}).get('sender_email'),
+                'sender_password': config_data.get('email_settings', {}).get('sender_password'),
+                'sender_name': config_data.get('email_settings', {}).get('sender_name')
+            },
+            'api_keys': {
+                'google_api_key': config_data.get('api_keys', {}).get('google_api_key'),
+                'grok_api_key': config_data.get('api_keys', {}).get('grok_api_key'),
+                'grok_endpoint': config_data.get('api_keys', {}).get('grok_endpoint')
+            },
+            'proxy_settings': {
+                'search_proxy_api_url': config_data.get('proxy_settings', {}).get('search_proxy_api_url')
+            },
+            'brand_settings': {
+                'brand_rules_url': config_data.get('brand_settings', {}).get('brand_rules_url')
+            },
+            'aws_settings': {
+                'access_key_id': config_data.get('aws_settings', {}).get('access_key_id'),
+                'secret_access_key': config_data.get('aws_settings', {}).get('secret_access_key'),
+                'region': config_data.get('aws_settings', {}).get('region')
+            },
+            's3_config': config_data.get('s3_config', {}),
+            'database_settings': {
+                'db_password': config_data.get('database_settings', {}).get('db_password', fallback_db_password)
+            },
+            'base_config': {
+                'base_config_url': config_data.get('base_config', {}).get('base_config_url')
+            },
+            'rabbitmq_settings': {
+                'url': config_data.get('rabbitmq_settings', {}).get('url'),
+                'user': config_data.get('rabbitmq_settings', {}).get('user'),
+                'password': config_data.get('rabbitmq_settings', {}).get('password'),
+                'host': config_data.get('rabbitmq_settings', {}).get('host'),
+                'port': config_data.get('rabbitmq_settings', {}).get('port'),
+                'vhost': config_data.get('rabbitmq_settings', {}).get('vhost')
+            }
         }
         
         # Verify all critical constants are set
         required_keys = [
-            'VERSION', 'SENDER_EMAIL', 'SENDER_PASSWORD', 'SENDER_NAME',
-            'GOOGLE_API_KEY', 'GROK_API_KEY', 'GROK_ENDPOINT',
-            'SEARCH_PROXY_API_URL', 'BRAND_RULES_URL',
-            'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'REGION',
-            'S3_CONFIG', 'DB_PASSWORD', 'BASE_CONFIG_URL'
+            'version',
+            'email_settings.sender_email', 'email_settings.sender_password', 'email_settings.sender_name',
+            'api_keys.google_api_key', 'api_keys.grok_api_key', 'api_keys.grok_endpoint',
+            'proxy_settings.search_proxy_api_url',
+            'brand_settings.brand_rules_url',
+            'aws_settings.access_key_id', 'aws_settings.secret_access_key', 'aws_settings.region',
+            's3_config',
+            'database_settings.db_password',
+            'base_config.base_config_url',
+            'rabbitmq_settings.url', 'rabbitmq_settings.user', 'rabbitmq_settings.password',
+            'rabbitmq_settings.host', 'rabbitmq_settings.port', 'rabbitmq_settings.vhost'
         ]
         
-        missing = [key for key in required_keys if config.get(key) is None]
+        missing = []
+        for key in required_keys:
+            # Handle nested keys
+            value = config
+            for part in key.split('.'):
+                value = value.get(part)
+                if value is None:
+                    missing.append(key)
+                    break
+        
         if missing:
             logger.error(f"Missing config values: {', '.join(missing)}")
             return None
