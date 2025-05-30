@@ -194,6 +194,7 @@ async def enqueue_db_update(
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
     return_result: bool = False,
+    logger: Optional[logging.Logger] = None
 ) -> Optional[int]:
     if producer is None:
         default_logger.error("RabbitMQ producer not initialized")
