@@ -211,11 +211,17 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
     return False
 
 async def process_image(row, session: aiohttp.ClientSession, logger: logging.Logger) -> Tuple[int, str, Optional[str], int, Optional[str]]:
-    """Process a single image row with Gemini API, ensuring valid JSON output and thumbnail."""
+    """Process a single image row with Gemini API, ensuring valid JSON output and thumbnail.
+    Sentiment score reflects linesheet/product shot quality (clean white background, front of product, no lifestyle).
+    Relevance score remains tied to match_score."""
     result_id = row.get("ResultID")
     default_result = (
         result_id or 0,
-        json.dumps({"error": "Unknown processing error", "result_id": result_id or 0, "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0}}),
+        json.dumps({
+            "error": "Unknown processing error",
+            "result_id": result_id or 0,
+            "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0}
+        }),
         "Processing failed",
         1,
         None
@@ -258,6 +264,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         base64_image = base64.b64encode(image_data).decode("utf-8")
         Image.open(BytesIO(image_data)).convert("RGB")
 
+        # Computer vision analysis
         cv_success, cv_description, person_confidences = await detect_objects_with_computer_vision_async(base64_image, logger)
         if not cv_success or not cv_description:
             logger.warning(f"Computer vision detection failed for ResultID {result_id}: {cv_description}")
@@ -307,6 +314,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             })
             return result_id, ai_json, "No fashion items detected", 0, thumbnail_base64
 
+        # Gemini analysis
         gemini_result = await analyze_image_with_gemini_async(base64_image, product_details, logger=logger, cv_description=cv_description)
         logger.debug(f"Gemini raw response for ResultID {result_id}: {json.dumps(gemini_result, indent=2)}")
 
@@ -336,7 +344,73 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             match_score = 0.5
         reasoning = features.get("reasoning", "No reasoning provided").encode('utf-8').decode('utf-8')
 
-        # Calculate individual scores
+        # Calculate linesheet sentiment score
+        sentiment_score = 0.0
+        sentiment_reasoning = []
+
+        # 1. Check for clean white/plain background
+        background_score = 0.0
+        background_description = reasoning.lower() + description.lower()
+        if any(term in background_description for term in ["white background", "plain background", "clean background", "studio shot"]):
+            background_score = 1.0
+            sentiment_reasoning.append("Clean white/plain background detected")
+        elif any(term in background_description for term in ["complex background", "outdoor", "lifestyle", "cluttered"]):
+            background_score = 0.2
+            sentiment_reasoning.append("Complex or lifestyle background detected")
+        else:
+            # Basic background color check using image data
+            try:
+                image = Image.open(BytesIO(image_data)).convert("RGB")
+                pixels = image.getdata()
+                white_pixels = sum(1 for r, g, b in pixels if r > 240 and g > 240 and b > 240)
+                total_pixels = image.width * image.height
+                if white_pixels / total_pixels > 0.8:  # 80% white pixels
+                    background_score = 0.9
+                    sentiment_reasoning.append("Predominantly white background based on pixel analysis")
+                else:
+                    background_score = 0.5
+                    sentiment_reasoning.append("Neutral background; no clear white or complex indication")
+            except Exception as e:
+                logger.warning(f"Background pixel analysis failed for ResultID {result_id}: {e}")
+                background_score = 0.5
+                sentiment_reasoning.append("Background analysis inconclusive")
+
+        # 2. Check for no people
+        people_score = 0.0
+        if not person_detected:
+            people_score = 1.0
+            sentiment_reasoning.append("No people detected")
+        else:
+            people_score = 0.3
+            sentiment_reasoning.append("People detected in image")
+
+        # 3. Check for single product focus
+        product_focus_score = 0.0
+        if len(detected_objects) <= 1 and is_fashion:
+            product_focus_score = 1.0
+            sentiment_reasoning.append("Single fashion product detected")
+        elif len(detected_objects) > 1:
+            product_focus_score = 0.4
+            sentiment_reasoning.append(f"Multiple objects detected: {non_fashion_labels}")
+        else:
+            product_focus_score = 0.6
+            sentiment_reasoning.append("Single object but unclear if fashion-related")
+
+        # 4. Check for image clarity (proxy via CV confidence)
+        clarity_score = max(cls_conf, seg_conf, 0.5)
+        sentiment_reasoning.append(f"Image clarity based on CV confidence: {clarity_score:.2f}")
+
+        # Weighted sentiment score
+        sentiment_score = (
+            0.4 * background_score +
+            0.3 * people_score +
+            0.2 * product_focus_score +
+            0.1 * clarity_score
+        )
+        sentiment_reasoning_str = "; ".join(sentiment_reasoning)
+        logger.debug(f"Sentiment score for ResultID {result_id}: {sentiment_score:.2f} ({sentiment_reasoning_str})")
+
+        # Calculate other individual scores
         detected_category = extracted_features.get("category", "unknown").lower()
         category_score = 1.0 if is_related_to_category(detected_category, product_details["category"]) else 0.5
 
@@ -344,27 +418,27 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         color_score = 1.0 if detected_color == product_details["color"].lower() and detected_color != "unknown" else 0.5
 
         detected_brand = extracted_features.get("brand", "unknown").lower()
-        # Updated call to generate_brand_aliases
         brand_aliases = await generate_brand_aliases(product_details["brand"], predefined_aliases) if product_details["brand"].lower() != "none" else []
         brand_score = 1.0 if detected_brand in brand_aliases or detected_brand == product_details["brand"].lower() else 0.5
 
         detected_model = extracted_features.get("model", "unknown").lower()
         model_score = 1.0 if detected_model == product_details["model"].lower() and detected_model != "unknown" else 0.3
 
+        # Build AiJson
         ai_json = json.dumps({
             "scores": {
-                "sentiment": match_score,
-                "relevance": match_score,
-                "category": category_score,
-                "color": color_score,
-                "brand": brand_score,
-                "model": model_score
+                "sentiment": round(sentiment_score, 2),
+                "relevance": round(match_score, 2),
+                "category": round(category_score, 2),
+                "color": round(color_score, 2),
+                "brand": round(brand_score, 2),
+                "model": round(model_score, 2)
             },
             "category": extracted_features.get("category", "unknown"),
             "keywords": [extracted_features.get("category", "unknown").lower()],
             "description": description,
             "extracted_features": extracted_features,
-            "reasoning": reasoning,
+            "reasoning": f"{reasoning}; Sentiment: {sentiment_reasoning_str}",
             "cv_detection": cv_description,
             "person_confidences": person_confidences,
             "result_id": result_id,
@@ -385,7 +459,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         ai_caption = description if description.strip() else f"{product_details['brand']} {product_details['category']} item"
         is_fashion = extracted_features.get("category", "unknown").lower() != "unknown"
 
-        logger.info(f"Processed ResultID {result_id} successfully")
+        logger.info(f"Processed ResultID {result_id} successfully: Sentiment={sentiment_score:.2f}, Relevance={match_score:.2f}")
         return result_id, ai_json, ai_caption, 1 if is_fashion else 0, thumbnail_base64
 
     except Exception as e:
