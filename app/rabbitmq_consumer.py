@@ -411,7 +411,7 @@ if __name__ == "__main__":
     from rabbitmq_test import test_rabbitmq_connection
 
     parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
-    parser.add_argument("--clear-queue", action="store_true", help="Manually clear the queue and exit")
+    parser.add_argument("--clear", action="store_true", help="Manually clear the queue and exit")
     args = parser.parse_args()
 
     producer = RabbitMQProducer()

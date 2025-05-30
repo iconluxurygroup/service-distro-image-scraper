@@ -67,7 +67,7 @@ class RabbitMQProducer:
                         retry_delay=5,
                     )
                     self.channel = await self.connection.channel()
-                    await self.channel.set_qos(prefetch_count=1)  # Reduced to 1
+                    await self.channel.set_qos(prefetch_count=1)
                     await self.channel.declare_queue(self.queue_name, durable=True)
                     await self.channel.declare_queue(
                         self.response_queue_name, durable=False, exclusive=False, auto_delete=True
