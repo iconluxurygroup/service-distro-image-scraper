@@ -432,6 +432,7 @@ def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
 async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     logger.info("Initiating shutdown...")
     try:
+        # Cancel all tasks except the current one
         tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
@@ -439,12 +440,16 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 logger.debug(f"Task {task.get_name()} cancelled or timed out during shutdown")
+
+        # Close consumer and producer
         await consumer.close()
         await consumer.producer.close()
+
+        # Shutdown async generators and executor if loop is not running
         if loop.is_running():
             loop.stop()
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.run_until_complete(loop.shutdown_default_executor())
+        await loop.shutdown_asyncgens()
+        await loop.shutdown_default_executor()
     except Exception as e:
         logger.error(f"Error during shutdown: {e}", exc_info=True)
     finally:
