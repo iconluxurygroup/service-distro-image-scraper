@@ -380,9 +380,11 @@ def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     """Create a signal handler for graceful shutdown."""
     def handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        # Ensure shutdown is awaited
-        task = asyncio.ensure_future(shutdown(consumer, loop))
-        loop.run_until_complete(task)
+        # Schedule shutdown as a task
+        asyncio.ensure_future(shutdown(consumer, loop))
+        # Allow the loop to process the shutdown task
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
         exit(0)
     return handler
 
