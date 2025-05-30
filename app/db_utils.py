@@ -244,15 +244,6 @@ def register_shutdown_handler(producer, consumer, logger, correlation_id):
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception(is_retryable_exception),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
