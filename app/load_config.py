@@ -34,13 +34,16 @@ def load_config_constants(config_url: str, fallback_db_password: Optional[str] =
                 'sender_password': config_data.get('email_settings', {}).get('sender_password'),
                 'sender_name': config_data.get('email_settings', {}).get('sender_name')
             },
-            'api_keys': {
-                'google_api_key': config_data.get('api_keys', {}).get('google_api_key'),
-                'grok_api_key': config_data.get('api_keys', {}).get('grok_api_key'),
-                'grok_endpoint': config_data.get('api_keys', {}).get('grok_endpoint')
+            'grok_settings': {
+                'api_key': config_data.get('grok_settings', {}).get('api_key'),
+                'endpoint': config_data.get('grok_settings', {}).get('endpoint')
             },
-            'proxy_settings': {
-                'search_proxy_api_url': config_data.get('proxy_settings', {}).get('search_proxy_api_url')
+            'dataproxy_settings': {
+                'api_key': config_data.get('dataproxy_settings', {}).get('api_key'),
+                'api_url': config_data.get('dataproxy_settings', {}).get('api_url')
+            },
+            'google_api_settings': {
+                'api_key': config_data.get('google_api_settings', {}).get('api_key')
             },
             'brand_settings': {
                 'brand_rules_url': config_data.get('brand_settings', {}).get('brand_rules_url')
@@ -71,8 +74,9 @@ def load_config_constants(config_url: str, fallback_db_password: Optional[str] =
         required_keys = [
             'version',
             'email_settings.sender_email', 'email_settings.sender_password', 'email_settings.sender_name',
-            'api_keys.google_api_key', 'api_keys.grok_api_key', 'api_keys.grok_endpoint',
-            'proxy_settings.search_proxy_api_url',
+            'grok_settings.api_key', 'grok_settings.endpoint',
+            'dataproxy_settings.api_key', 'dataproxy_settings.api_url',
+            'google_api_settings.api_key',
             'brand_settings.brand_rules_url',
             'aws_settings.access_key_id', 'aws_settings.secret_access_key', 'aws_settings.region',
             's3_config',

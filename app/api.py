@@ -119,7 +119,7 @@ class SearchClient:
         self.endpoint = endpoint
         self.logger = logger
         self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
+        self.api_key = ""
         self.headers = {
             "accept": "application/json",
             "x-api-key": self.api_key,
