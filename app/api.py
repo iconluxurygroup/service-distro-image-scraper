@@ -95,7 +95,6 @@ from sqlalchemy.sql import text
 from database_config import async_engine
 from logging_config import setup_job_logger
 from db_utils import insert_search_results
-from rabbitmq_producer import cleanup_producer
 from config import VERSION
 
 
