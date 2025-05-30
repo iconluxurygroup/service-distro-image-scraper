@@ -80,10 +80,11 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 # ... other imports ...
 
 import sys
-from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 # ... other imports ...
 
+from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global producer
@@ -125,7 +126,6 @@ async def lifespan(app: FastAPI):
 # ... rest of main.py ...
 
 app.lifespan = lifespan
-
 class SearchClient:
     def __init__(self, endpoint: str, logger: logging.Logger, max_concurrency: int = 10):
         self.endpoint = endpoint

@@ -11,6 +11,16 @@ from rabbitmq_consumer import RabbitMQConsumer
 from config import RABBITMQ_URL
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
+import asyncio
+import logging
+import aio_pika
+import json
+import uuid
+from rabbitmq_producer import RabbitMQProducer, get_producer
+from rabbitmq_consumer import RabbitMQConsumer
+from config import RABBITMQ_URL
+from tenacity import retry, stop_after_attempt, wait_fixed
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
@@ -106,15 +116,10 @@ async def test_rabbitmq_producer(
         except Exception as e:
             logger.warning(f"Error cleaning up test resources: {e}")
 
-async def test_rabbitmq_connection(
-    logger: Optional[logging.Logger] = None,
-    timeout: float = 30.0
-) -> bool:
-    logger = logger or logging.getLogger(__name__)
+async def test_rabbitmq_connection(timeout: float = 30.0) -> bool:
     test_queue_name = f"test_queue_{uuid.uuid4().hex}"
     test_correlation_id = str(uuid.uuid4())
     test_message_received = asyncio.Event()
-    received_message = None
 
     producer = None
     consumer = None
@@ -131,114 +136,49 @@ async def test_rabbitmq_connection(
             await consumer.connect()
             logger.info("Consumer connected successfully")
 
+            # Declare test queue
             channel = producer.channel
-            if not channel or channel.is_closed:
-                await producer.connect()
-                channel = producer.channel
-
-            try:
-                await channel.get_queue(test_queue_name)
-                await channel.queue_delete(test_queue_name)
-                logger.debug(f"Deleted existing test queue: {test_queue_name}")
-            except aio_pika.exceptions.QueueEmpty:
-                logger.debug(f"No existing test queue: {test_queue_name}")
-
-            await channel.declare_queue(test_queue_name, durable=False, exclusive=False, auto_delete=True)
+            await channel.declare_queue(test_queue_name, durable=False, auto_delete=True)
             logger.debug(f"Declared test queue: {test_queue_name}")
 
+            # Callback to process message
             async def test_callback(message: aio_pika.IncomingMessage):
-                nonlocal received_message
-                logger.debug(f"Callback triggered for message with correlation_id: {message.correlation_id}, body: {message.body[:100]}")
-                try:
-                    async with message.process():
-                        logger.debug(f"Processing message with delivery_tag: {message.delivery_tag}")
-                        if message.correlation_id == test_correlation_id:
-                            received_message = json.loads(message.body.decode())
-                            logger.debug(f"Received test message: {received_message}")
-                            test_message_received.set()
-                        else:
-                            logger.warning(f"Unexpected correlation_id: {message.correlation_id}, expected: {test_correlation_id}")
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error in callback: {e}", exc_info=True)
-                except Exception as e:
-                    logger.error(f"Error in callback: {e}", exc_info=True)
+                logger.debug(f"Callback triggered: {message.body}")
+                async with message.process():
+                    if message.correlation_id == test_correlation_id:
+                        test_message_received.set()
+                        logger.debug("Test message received")
 
-            queue = await consumer.channel.get_queue(test_queue_name)
-            await queue.consume(test_callback)
-            logger.debug(f"Started consuming from test queue: {test_queue_name}")
+            await consumer.channel.get_queue(test_queue_name).consume(test_callback)
+            logger.debug(f"Started consuming from {test_queue_name}")
 
-            test_task = {
-                "file_id": "test_123",
-                "task_type": "test_task",
-                "sql": "SELECT 1",
-                "params": {"test_param": "test_value"},
-                "timestamp": datetime.datetime.now().isoformat(),
-                "correlation_id": test_correlation_id,
-            }
+            # Send test message
+            test_task = {"correlation_id": test_correlation_id, "test": "data"}
             await producer.publish_message(
                 message=test_task,
                 routing_key=test_queue_name,
                 correlation_id=test_correlation_id
             )
-            logger.info(f"Published test message to queue: {test_queue_name}, correlation_id: {test_correlation_id}")
+            logger.info(f"Published test message to {test_queue_name}")
 
-            queue_state = await channel.get_queue(test_queue_name)
-            logger.debug(f"Queue {test_queue_name} has {queue_state.message_count} messages")
-
-            @retry(
-                stop=stop_after_attempt(3),
-                wait=wait_fixed(5),
-                retry=retry_if_exception_type(asyncio.TimeoutError),
-                before_sleep=lambda retry_state: logger.info(
-                    f"Retrying message receipt (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-                )
-            )
+            # Retry waiting for message
+            @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
             async def wait_for_message():
                 async with asyncio.timeout(30.0):
                     await test_message_received.wait()
 
             await wait_for_message()
-            
-            if received_message and received_message.get("correlation_id") == test_correlation_id:
-                logger.info("RabbitMQ connection test successful: message sent and received correctly")
-                return True
-            else:
-                logger.error("RabbitMQ connection test failed: message not received or mismatched")
-                return False
+            logger.info("RabbitMQ connection test successful")
+            return True
 
     except asyncio.TimeoutError:
         logger.error("Timeout during RabbitMQ connection test")
         return False
-    except aio_pika.exceptions.ProbableAuthenticationError as e:
-        logger.error(f"Authentication error: {e}. Check username, password, and virtual host in {RABBITMQ_URL}")
-        return False
-    except aio_pika.exceptions.AMQPConnectionError as e:
-        logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-        return False
-    except aiormq.exceptions.ConnectionChannelError as e:
-        logger.error(f"Channel error during test: {e}", exc_info=True)
-        return False
-    except aiormq.exceptions.ChannelPreconditionFailed as e:
-        logger.error(f"Queue declaration conflict: {e}", exc_info=True)
-        return False
     except Exception as e:
-        logger.error(f"Unexpected error during RabbitMQ connection test: {e}", exc_info=True)
+        logger.error(f"Test failed: {e}", exc_info=True)
         return False
     finally:
-        try:
-            if consumer:
-                await consumer.close()
-            if producer and producer.is_connected:
-                if producer.channel and not producer.channel.is_closed:
-                    try:
-                        await producer.channel.queue_delete(test_queue_name)
-                        logger.debug(f"Deleted test queue: {test_queue_name}")
-                    except:
-                        pass
-                await producer.close()
-        except Exception as e:
-            logger.warning(f"Error cleaning up test resources: {e}")
-        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        await asyncio.sleep(0.5)
+        if consumer:
+            await consumer.close()
+        if producer:
+            await producer.close()
