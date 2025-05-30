@@ -13,7 +13,8 @@ from typing import Optional, List, Dict
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
+from rabbitmq_producer import RabbitMQProducer
+from rabbitmq_consumer import RabbitMQConsumer
 from database_config import conn_str, async_engine
 from s3_utils import upload_file_to_space
 producer = None
@@ -646,3 +647,78 @@ async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logge
     except Exception as e:
         logger.error(f"Unexpected error for FileID {file_id}: {e}", exc_info=True)
         return None
+    
+async def enqueue_db_update(
+    file_id: str,
+    sql: str,
+    params: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    task_type: str = "db_update",
+    producer: Optional[RabbitMQProducer] = None,
+    response_queue: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    return_result: bool = False,
+    logger: Optional[logging.Logger] = None,
+):
+    should_close = False
+    if producer is None:
+        producer = RabbitMQProducer()
+        should_close = True
+
+    try:
+        await producer.connect()
+        sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
+        update_task = {
+            "file_id": file_id,
+            "task_type": task_type,
+            "sql": sql_str,
+            "params": params,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "response_queue": response_queue,
+        }
+        if return_result and response_queue:
+            # Create a temporary consumer to wait for the response
+            consumer = RabbitMQConsumer(
+                amqp_url=producer.amqp_url,
+                queue_name=response_queue,
+                connection_timeout=10.0,
+                operation_timeout=5.0,
+            )
+            await consumer.connect()
+            result_future = asyncio.Future()
+
+            async def temp_callback(message: aio_pika.IncomingMessage):
+                async with message.process():
+                    if message.correlation_id == correlation_id:
+                        response = json.loads(message.body.decode())
+                        result_future.set_result(response.get("results", []))
+                        logger.info(f"Received response for correlation_id {correlation_id} from {response_queue}")
+
+            await consumer.channel.declare_queue(response_queue, durable=False, exclusive=True, auto_delete=True)
+            queue = await consumer.channel.get_queue(response_queue)
+            await queue.consume(temp_callback)
+
+            await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
+            logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
+
+            # Wait for the response with a timeout
+            try:
+                async with asyncio.timeout(30):  # 30-second timeout
+                    result = await result_future
+                    logger.info(f"Received deduplication result for FileID: {file_id}")
+                    return result
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout waiting for deduplication response for FileID: {file_id}")
+                raise
+            finally:
+                await consumer.close()
+        else:
+            await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
+            logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
+    except Exception as e:
+        logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
+        raise
+    finally:
+        if should_close:
+            await producer.close()
+            logger.info(f"Closed RabbitMQ producer for FileID: {file_id}")
