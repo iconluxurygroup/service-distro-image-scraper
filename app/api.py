@@ -589,6 +589,7 @@ async def process_restart_batch(
     num_workers: int = 1,
 ) -> Dict[str, str]:
     log_filename = f"job_logs/job_{file_id_db}.log"
+    producer = None
     try:
         if logger is None:
             logger, log_filename = setup_job_logger(job_id=str(file_id_db), log_dir="job_logs", console_output=True)
@@ -623,7 +624,6 @@ async def process_restart_batch(
         RELEVANCE_THRESHOLD = 0.9
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
 
-        producer = await get_producer(logger)
         if not producer or not producer.is_connected:
             logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
             try:
