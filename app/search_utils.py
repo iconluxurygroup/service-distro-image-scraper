@@ -12,13 +12,13 @@ from fastapi import BackgroundTasks
 import psutil
 import re
 import urllib.parse
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+from rabbitmq_producer import RabbitMQProducer
 import asyncio
 import uuid
 import aio_pika
 from config import RABBITMQ_URL
 from s3_utils import upload_file_to_space
-
+from db_utils import enqueue_db_update
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)

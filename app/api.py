@@ -40,6 +40,7 @@ from db_utils import (
     insert_search_results,
     update_initial_sort_order,
     get_images_excel_db,
+    enqueue_db_update,
     update_file_generate_complete,
     update_file_location_complete,
 )
@@ -49,7 +50,7 @@ from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL, RABBITMQ_URL,
 from email_utils import send_message_email
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+from rabbitmq_producer import RabbitMQProducer
 
 app = FastAPI(title="super_scraper", version=VERSION)
 
