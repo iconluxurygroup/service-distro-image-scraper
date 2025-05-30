@@ -7,6 +7,7 @@ import sys
 import datetime
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
+import aiormq
 from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import psutil
