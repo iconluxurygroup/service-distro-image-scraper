@@ -360,21 +360,21 @@ class RabbitMQConsumer:
             logger.error(f"Error testing task for FileID: {file_id}, TaskType: {task_type}: {e}", exc_info=True)
             return False
 
-async def shutdown(consumer, loop):
+async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
+    logger.info("Initiating shutdown...")
     # Cancel all running tasks (except the current one)
     tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
     for task in tasks:
         task.cancel()
     
-    # Stop the consumer and close the RabbitMQ connection
-    await consumer.stop()
+    # Stop the consumer and close RabbitMQ connection
+    await consumer.close()
     
-    # Stop the event loop
+    # Stop and clean up the event loop
     loop.stop()
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    
-    # Close the loop
+    await loop.shutdown_asyncgens()
     loop.close()
+    logger.info("Shutdown complete.")
 
 def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     """Create a signal handler for graceful shutdown."""
