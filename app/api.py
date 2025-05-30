@@ -552,32 +552,28 @@ async def process_restart_batch(
 
         # Ensure global producer is available
         global producer
-        if not producer:
-            logger.error("RabbitMQ producer not initialized, creating new instance")
-            ValueError("MQ producer not initialized, creating new instance")   
-        try:
-            async with asyncio.timeout(10):
-                await producer.connect()
-        except asyncio.TimeoutError as te:
-            logger.error(f"Timeout connecting to RabbitMQ: {te}", exc_info=True)
-            log_public_url = await upload_file_to_space(
-                file_src=log_filename,
-                save_as=f"job_logs/job_{file_id_db}.log",
-                is_public=True,
-                logger=logger,
-                file_id=str(file_id_db)
-            )
-            return {"error": "Failed to connect to RabbitMQ", "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
-        except Exception as e:
-            logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-            log_public_url = await upload_file_to_space(
-                file_src=log_filename,
-                save_as=f"job_logs/job_{file_id_db}.log",
-                is_public=True,
-                logger=logger,
-                file_id=str(file_id_db)
-            )
-            return {"error": f"RabbitMQ connection error: {str(e)}", "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
+        if not producer or not producer.is_connected:
+            logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
+            try:
+                producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
+                async with asyncio.timeout(10):
+                    await producer.connect()
+                logger.info("Successfully initialized RabbitMQ producer")
+            except Exception as e:
+                logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
+                log_public_url = await upload_file_to_space(
+                    file_src=log_filename,
+                    save_as=f"job_logs/job_{file_id_db}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=str(file_id_db)
+                )
+                return {
+                    "error": f"Failed to initialize RabbitMQ producer: {str(e)}",
+                    "log_filename": log_filename,
+                    "log_public_url": log_public_url or "",
+                    "last_entry_id": str(entry_id or "")
+                }
 
         async with async_engine.connect() as conn:
             result = await conn.execute(
