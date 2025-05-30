@@ -52,13 +52,14 @@ async def test_insert_search_result():
         # Use BackgroundTasks for enqueuing DB update
         background_tasks = BackgroundTasks()
 
-        # Insert the sample result
+        # Insert the sample result with local producer
         try:
             success = await insert_search_results(
                 results=sample_result,
                 logger=logger,
                 file_id=file_id,
-                background_tasks=background_tasks
+                background_tasks=background_tasks,
+                producer=local_producer  # Pass local producer
             )
             if success:
                 logger.info(f"Test search result inserted successfully for EntryID 9999, FileID {file_id}")
@@ -143,7 +144,7 @@ def main():
     try:
         if platform.system() == "Windows":
             logger.info("Running Waitress on Windows")
-            loop.close()  # Close loop before Waitress, as it’s not async
+            loop.close()  # Close loop before Waitress
             serve(
                 app,
                 host="0.0.0.0",
