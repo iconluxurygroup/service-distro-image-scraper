@@ -40,19 +40,28 @@ class RabbitMQConsumer:
         self._lock = asyncio.Lock()
         self.producer = producer or RabbitMQProducer(amqp_url=amqp_url)
 
-    async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool) -> bool:
+    async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool, delete_if_mismatched: bool = False) -> bool:
         try:
             queue = await channel.declare_queue(queue_name, passive=True)
             is_durable = queue.declaration_result.fields.get('durable', False)
+            logger.debug(f"Queue {queue_name} exists with durable={is_durable}, arguments={queue.declaration_result.fields}")
             if is_durable != expected_durable:
                 logger.warning(
-                    f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}. "
-                    f"Consider deleting the queue or updating its properties."
+                    f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}."
                 )
+                if delete_if_mismatched:
+                    try:
+                        await channel.queue_delete(queue_name)
+                        logger.info(f"Deleted queue {queue_name} due to mismatched durability")
+                        return True  # Safe to recreate
+                    except Exception as e:
+                        logger.error(f"Failed to delete queue {queue_name}: {e}", exc_info=True)
+                        return False
                 return False
             return True
         except aio_pika.exceptions.QueueEmpty:
-            return True  # Queue doesn't exist, safe to create
+            logger.debug(f"Queue {queue_name} does not exist")
+            return True  # Safe to create
         except Exception as e:
             logger.error(f"Error checking queue {queue_name} durability: {e}", exc_info=True)
             return False
@@ -74,17 +83,17 @@ class RabbitMQConsumer:
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
 
-                    # Check and declare queues
                     queues = [
                         (self.queue_name, True),
                         (self.response_queue_name, True),
                         (self.new_queue_name, True),
                     ]
                     for queue_name, durable in queues:
-                        if not await self.check_queue_durability(self.channel, queue_name, durable):
+                        if not await self.check_queue_durability(self.channel, queue_name, durable, delete_if_mismatched=args.delete_mismatched):
                             raise ValueError(
                                 f"Queue {queue_name} has mismatched durability settings. "
-                                f"Please delete the queue or update its properties in RabbitMQ."
+                                f"Delete the queue in RabbitMQ (http://localhost:15672, vhost app_vhost) or "
+                                f"run with --delete-mismatched to auto-delete."
                             )
                         queue = await self.channel.declare_queue(queue_name, durable=durable)
                         await queue.bind('logs')
@@ -421,7 +430,8 @@ def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
             return
         last_signal_time = current_time
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(shutdown(consumer, loop)))
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(shutdown(consumer, loop)))
 
     return handler
 
@@ -437,21 +447,27 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
                 logger.debug(f"Task {task.get_name()} cancelled or timed out during shutdown")
         await consumer.close()
         await consumer.producer.close()
-        loop.stop()
+        if loop.is_running():
+            loop.stop()
         await loop.shutdown_asyncgens()
         await loop.shutdown_default_executor()
     except Exception as e:
         logger.error(f"Error during shutdown: {e}", exc_info=True)
     finally:
         if not loop.is_closed():
-            loop.close()
+            try:
+                loop.close()
+                logger.info("Event loop closed")
+            except Exception as e:
+                logger.error(f"Error closing event loop: {e}", exc_info=True)
         logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
-    parser.add_argument("--clear", action="store_true", help="Manually clear the queue and exit")
+    parser = argparse.ArgumentParser(description="RabbitMQ Consumer with queue management")
+    parser.add_argument("--clear", action="store_true", help="Purge the main queue and exit")
+    parser.add_argument("--delete-mismatched", action="store_true", help="Delete queues with mismatched durability settings")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -460,8 +476,12 @@ if __name__ == "__main__":
     producer = RabbitMQProducer()
     consumer = RabbitMQConsumer(producer=producer)
     loop = asyncio.get_event_loop()
-    signal.signal(signal.SIGINT, signal_handler(consumer, loop))
-    signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
+
+    try:
+        signal.signal(signal.SIGINT, signal_handler(consumer, loop))
+        signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
+    except ValueError as e:
+        logger.warning(f"Could not set signal handlers: {e}")
 
     async def main():
         try:
