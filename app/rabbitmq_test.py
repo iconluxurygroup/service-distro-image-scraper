@@ -7,6 +7,7 @@ import datetime
 import aiormq
 from typing import Optional
 from rabbitmq_producer import RabbitMQProducer, get_producer
+from rabbitmq_consumer import RabbitMQConsumer
 from config import RABBITMQ_URL
 
 logger = logging.getLogger(__name__)
