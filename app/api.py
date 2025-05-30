@@ -1947,7 +1947,8 @@ async def api_validate_images(
                             params=params,
                             background_tasks=background_tasks,
                             task_type="mark_invalid_image",
-                            correlation_id=correlation_id
+                            correlation_id=correlation_id,
+                            response_queue="shared_response_queue"  # Use shared queue
                         )
                         logger.info(
                             f"Enqueued SortOrder=-5 for ResultID {result_id}, "
