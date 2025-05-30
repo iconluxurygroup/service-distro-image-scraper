@@ -364,7 +364,8 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    consumer = RabbitMQConsumer
+    producer = loop.run_until_complete(RabbitMQProducer.get_producer())
+    consumer = RabbitMQConsumer(producer=producer)
     try:
         signal.signal(signal.SIGINT, signal_handler(consumer, loop))
         signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
