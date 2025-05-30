@@ -5,7 +5,7 @@ import asyncio
 import json
 import datetime,uuid
 import aio_pika
-import os
+import os,aiormq
 import aiofiles
 import psutil
 from fastapi import BackgroundTasks
