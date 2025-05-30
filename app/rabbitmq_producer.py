@@ -148,8 +148,9 @@ async def enqueue_db_update(
     producer: Optional[RabbitMQProducer] = None,
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
+    return_result: bool = False,
 ):
-    """Enqueue a database update task to RabbitMQ."""
+    """Enqueue a database update task to RabbitMQ and optionally wait for the result."""
     should_close = False
     if producer is None:
         producer = RabbitMQProducer()
@@ -158,6 +159,9 @@ async def enqueue_db_update(
     try:
         await producer.connect()
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
+        correlation_id = correlation_id or str(uuid.uuid4())
+        response_queue = response_queue or f"select_response_{correlation_id}" if return_result else None
+
         update_task = {
             "file_id": file_id,
             "task_type": task_type,
@@ -166,8 +170,35 @@ async def enqueue_db_update(
             "timestamp": datetime.datetime.now().isoformat(),
             "response_queue": response_queue,
         }
-        await producer.publish_update(update_task, correlation_id=correlation_id)
-        logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}, CorrelationID: {correlation_id}")
+
+        if return_result:
+            # Set up a temporary response queue
+            async with producer.channel:
+                await producer.channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+                # Publish the message
+                await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
+                logger.info(f"Enqueued database update with response queue for FileID: {file_id}, TaskType: {task_type}, CorrelationID: {correlation_id}")
+
+                # Wait for the response
+                async with producer.channel:
+                    queue = await producer.channel.get_queue(response_queue)
+                    async with queue.iterator() as queue_iter:
+                        async for message in queue_iter:
+                            if message.correlation_id == correlation_id:
+                                async with message.process():
+                                    try:
+                                        response = json.loads(message.body.decode())
+                                        logger.info(f"Received response for FileID: {file_id}, CorrelationID: {correlation_id}")
+                                        return response.get("result", 0)  # Expecting rows affected or similar
+                                    except json.JSONDecodeError as e:
+                                        logger.error(f"Invalid response format for FileID: {file_id}: {e}")
+                                        raise
+        else:
+            # Standard enqueue without waiting for result
+            await producer.publish_update(update_task, correlation_id=correlation_id)
+            logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}, CorrelationID: {correlation_id}")
+            return None
+
     except Exception as e:
         logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise

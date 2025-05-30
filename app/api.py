@@ -1155,6 +1155,7 @@ async def api_clear_ai_json(
                 task_type="clear_ai_json",
                 producer=producer,
                 correlation_id=correlation_id,
+                return_result=True  # To get the number of rows affected
             )
             logger.info(f"Enqueued AiJson and AiCaption clear for FileID: {file_id}, CorrelationID: {correlation_id}, Rows affected: {rows_affected}")
 
