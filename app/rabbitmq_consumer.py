@@ -46,18 +46,35 @@ class RabbitMQConsumer:
                 async with asyncio.timeout(self.connection_timeout):
                     if self.connection and not self.connection.is_closed:
                         await self.connection.close()
-                    self.connection = await aio_pika.connect_robust(self.amqp_url, connection_attempts=3, retry_delay=5)
+                    self.connection = await aio_pika.connect_robust(
+                        self.amqp_url,
+                        connection_attempts=3,
+                        retry_delay=5,
+                    )
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
-                    await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
-                    queue = await self.channel.declare_queue('', exclusive=True)  # Temporary queue
-                    await queue.bind('logs')
-                    self.queue_name = queue.name
+                    # Use provided queue_name
+                    try:
+                        await self.channel.get_queue(self.queue_name)
+                        logger.debug(f"Queue {self.queue_name} already exists")
+                    except aio_pika.exceptions.QueueEmpty:
+                        if self.queue_name.startswith('test_queue_'):
+                            await self.channel.declare_queue(self.queue_name, durable=False, exclusive=False, auto_delete=True)
+                        else:
+                            await self.channel.declare_queue(self.queue_name, durable=True)
+                        logger.debug(f"Declared queue: {self.queue_name}")
+                    # Declare response queue for non-test scenarios
+                    if not self.queue_name.startswith('test_queue_'):
+                        try:
+                            await self.channel.get_queue(self.producer.response_queue_name)
+                        except aio_pika.exceptions.QueueEmpty:
+                            await self.channel.declare_queue(
+                                self.producer.response_queue_name, durable=True, exclusive=False, auto_delete=False
+                            )
                     logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
             except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
                 logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 raise
-
     async def close(self):
         """Close the RabbitMQ connection and channel gracefully."""
         async with self._lock:
@@ -418,11 +435,11 @@ if __name__ == "__main__":
 
     async def main():
         try:
-            #logger.info("Testing RabbitMQ producer and consumer connections on startup...")
-            # if not await test_rabbitmq_connection(logger):
-            #     logger.error("RabbitMQ connection test failed, exiting")
-            #     sys.exit(1)
-            # logger.info("RabbitMQ connection test passed")
+            logger.info("Testing RabbitMQ producer and consumer connections on startup...")
+            if not await test_rabbitmq_connection(logger):
+                logger.error("RabbitMQ connection test failed, exiting")
+                sys.exit(1)
+            logger.info("RabbitMQ connection test passed")
 
             if args.clear:
                 await consumer.purge_queue()
