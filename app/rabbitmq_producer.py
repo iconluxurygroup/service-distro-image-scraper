@@ -93,6 +93,24 @@ class RabbitMQProducer:
             return obj.isoformat()
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
+    async def check_connection(self):
+        async with self._lock:
+            if (
+                not self.is_connected
+                or not self.connection
+                or self.connection.is_closed
+                or not self.channel
+                or self.channel.is_closed
+            ):
+                await self.connect()
+            try:
+                # Verify channel usability
+                await self.channel.nop()
+            except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
+                default_logger.warning(f"Channel invalid, reconnecting: {e}")
+                await self.connect()
+            return self.is_connected
+
     async def publish_message(
         self,
         message: Dict[str, Any],
@@ -103,7 +121,7 @@ class RabbitMQProducer:
         async with self._lock:
             await self.check_connection()
             queue_name = routing_key or self.queue_name
-            default_logger.debug(f"Preparing to publish to queue: {queue_name}, correlation_id: {correlation_id}")
+            default_logger.debug(f"Publishing to queue: {queue_name}, correlation_id: {correlation_id}")
             try:
                 async with asyncio.timeout(self.operation_timeout):
                     message_body = json.dumps(message, default=self.custom_json_serializer)
@@ -118,8 +136,7 @@ class RabbitMQProducer:
                         routing_key=queue_name,
                     )
                     default_logger.info(
-                        f"Successfully published message to queue: {queue_name}, "
-                        f"correlation_id: {correlation_id}, task: {message_body[:200]}"
+                        f"Published message to queue: {queue_name}, correlation_id: {correlation_id}"
                     )
             except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
                 default_logger.error(f"Channel error during publish to {queue_name}: {e}", exc_info=True)
@@ -156,25 +173,6 @@ class RabbitMQProducer:
                 self.is_connected = False
             except Exception as e:
                 default_logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
-
-    async def check_connection(self):
-        async with self._lock:
-            if (
-                not self.is_connected
-                or not self.connection
-                or self.connection.is_closed
-                or not self.channel
-                or self.channel.is_closed
-            ):
-                await self.connect()
-            try:
-                # Verify channel is usable by performing a lightweight operation
-                await self.channel.nop()
-            except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError):
-                default_logger.warning("Channel invalid, reconnecting")
-                await self.connect()
-            return self.is_connected
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -327,7 +325,7 @@ async def enqueue_db_update(
 
                 consume_task = asyncio.create_task(consume_response(queue))
                 try:
-                    async with asyncio.timeout(300):  # Increased timeout
+                    async with asyncio.timeout(300):
                         await response_received.wait()
                     if response_data and "result" in response_data:
                         logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
@@ -340,7 +338,7 @@ async def enqueue_db_update(
                     return 0
                 finally:
                     consume_task.cancel()
-                    await asyncio.sleep(0.1)  # Allow cleanup
+                    await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error(f"Error consuming response for FileID {file_id}: {e}", exc_info=True)
                 return 0
