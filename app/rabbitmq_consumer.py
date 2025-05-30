@@ -24,15 +24,17 @@ class RabbitMQConsumer:
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
+        producer: Optional[RabbitMQProducer] = None
     ):
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
-        self.connection: Optional[aio_pika.RobustConnection] = None
-        self.channel: Optional[aio_pika.RobustChannel] = None
+        self.connection = None
+        self.channel = None
         self.is_consuming = False
         self._lock = asyncio.Lock()
+        self.producer = producer or RabbitMQProducer(amqp_url=amqp_url)
 
     async def connect(self):
         """Establish a robust connection to RabbitMQ and declare the queue."""
@@ -202,7 +204,7 @@ class RabbitMQConsumer:
         file_id = task.get("file_id", "unknown")
         select_sql = task.get("sql")
         params = task.get("params", {})
-        response_queue = task.get("response_queue", "shared_response_queue")
+        response_queue = task.get("response_queue", self.producer.response_queue_name)
         correlation_id = task.get("correlation_id")
         logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql[:100]}, params: {params}")
         if not params:
@@ -215,17 +217,21 @@ class RabbitMQConsumer:
             results = [dict(zip(columns, row)) for row in rows]
             logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
             if response_queue:
-                producer = RabbitMQProducer(amqp_url=self.amqp_url)
                 try:
-                    await producer.connect()
-                    response = {"file_id": file_id, "results": results, "correlation_id": correlation_id, "result": len(results)}
+                    await self.producer.check_connection()
+                    response = {
+                        "file_id": file_id,
+                        "results": results,
+                        "correlation_id": correlation_id,
+                        "result": len(results)
+                    }
                     @retry(
                         stop=stop_after_attempt(3),
                         wait=wait_exponential(multiplier=1, min=2, max=10),
                         retry=retry_if_exception_type(aio_pika.exceptions.AMQPError)
                     )
                     async def publish_with_retry():
-                        await producer.publish_message(
+                        await self.producer.publish_message(
                             response,
                             routing_key=response_queue,
                             correlation_id=correlation_id
@@ -233,8 +239,9 @@ class RabbitMQConsumer:
                         logger.debug(f"Sent {len(results)} SELECT results to {response_queue} for FileID {file_id}")
                     
                     await publish_with_retry()
-                finally:
-                    await producer.close()
+                except Exception as e:
+                    logger.error(f"Failed to publish SELECT results for FileID {file_id}: {e}", exc_info=True)
+                    raise
             return {"results": results}
         except SQLAlchemyError as e:
             logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
