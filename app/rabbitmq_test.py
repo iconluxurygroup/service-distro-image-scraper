@@ -1,8 +1,8 @@
 import asyncio
 import logging
 import aio_pika
-import json
-import uuid,aiormq
+import json,aiormq
+import uuid
 import datetime
 from typing import Optional
 from rabbitmq_producer import RabbitMQProducer, get_producer
@@ -12,7 +12,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_t
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    logger.setLevel(logging.DEBUG)  # Enable debug logging
+    logger.setLevel(logging.DEBUG)
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -120,7 +120,6 @@ async def test_rabbitmq_connection(
             await producer.connect()
             logger.info("Producer connected successfully")
 
-            # Declare test queue
             channel = producer.channel
             if not channel or channel.is_closed:
                 await producer.connect()
@@ -133,7 +132,6 @@ async def test_rabbitmq_connection(
             await consumer.connect()
             logger.info(f"Consumer connected, consuming from queue: {test_queue_name}")
 
-            # Callback to process message
             async def test_callback(message: aio_pika.IncomingMessage):
                 nonlocal received_message
                 logger.debug(f"Callback triggered: correlation_id={message.correlation_id}, body={message.body[:100]}")
@@ -154,7 +152,6 @@ async def test_rabbitmq_connection(
             await queue.consume(test_callback)
             logger.debug(f"Started consuming from {test_queue_name}")
 
-            # Send test message
             test_task = {
                 "correlation_id": test_correlation_id,
                 "test": "data",
@@ -170,7 +167,6 @@ async def test_rabbitmq_connection(
             queue_state = await channel.get_queue(test_queue_name)
             logger.debug(f"Queue {test_queue_name} has {queue_state.message_count} messages")
 
-            # Retry waiting for message
             @retry(
                 stop=stop_after_attempt(5),
                 wait=wait_fixed(5),
