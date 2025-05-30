@@ -43,7 +43,7 @@ from db_utils import (
 )
 from search_utils import update_search_sort_order, insert_search_results, update_sort_order, update_sort_no_image_entry
 from database_config import async_engine
-from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL,RABBITMQ_URL
+from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL,RABBITMQ_URL,DATAPROXY_API_KEY
 from email_utils import send_message_email
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
@@ -119,7 +119,7 @@ class SearchClient:
         self.endpoint = endpoint
         self.logger = logger
         self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.api_key = ""
+        self.api_key = DATAPROXY_API_KEY
         self.headers = {
             "accept": "application/json",
             "x-api-key": self.api_key,
