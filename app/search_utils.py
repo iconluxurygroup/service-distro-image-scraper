@@ -20,14 +20,7 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# Configuration (consider moving to environment variables or config file)
-RESPONSE_TIMEOUT = 60  # seconds
-BATCH_SIZE = 100
 MAX_CONCURRENCY = 10
-CATEGORY_FILTERS = {
-    "footwear": ["appliance", "whirlpool", "parts"],
-    # Add more categories as needed
-}
 
 @retry(
     stop=stop_after_attempt(3),
