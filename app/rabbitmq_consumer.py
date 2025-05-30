@@ -46,9 +46,7 @@ class RabbitMQConsumer:
             is_durable = queue.declaration_result.fields.get('durable', False)
             logger.debug(f"Queue {queue_name} exists with durable={is_durable}, arguments={queue.declaration_result.fields}")
             if is_durable != expected_durable:
-                logger.warning(
-                    f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}."
-                )
+                logger.warning(f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}.")
                 if delete_if_mismatched:
                     try:
                         await channel.queue_delete(queue_name)
@@ -59,7 +57,7 @@ class RabbitMQConsumer:
                         return False
                 return False
             return True
-        except aio_pika.exceptions.QueueEmpty:
+        except (aio_pika.exceptions.QueueEmpty, aiormq.exceptions.ChannelNotFoundEntity):
             logger.debug(f"Queue {queue_name} does not exist")
             return True  # Safe to create
         except Exception as e:
