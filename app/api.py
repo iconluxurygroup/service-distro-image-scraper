@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 import signal
 import uuid
 import math
+import sys
 from collections import defaultdict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import aio_pika
