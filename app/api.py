@@ -43,7 +43,7 @@ from db_utils import (
 )
 from search_utils import update_search_sort_order, insert_search_results, update_sort_order, update_sort_no_image_entry
 from database_config import async_engine
-from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL
+from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL,RABBITMQ_URL
 from email_utils import send_message_email
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
     global producer
     default_logger.info("Starting up FastAPI application")
     
-    rabbitmq_url = os.getenv("RABBITMQ_URL", "amqp://app_user:app_password@localhost:5672/app_vhost")
+    rabbitmq_url = RABBITMQ_URL
     producer = RabbitMQProducer(amqp_url=rabbitmq_url)
     try:
         await producer.connect()
