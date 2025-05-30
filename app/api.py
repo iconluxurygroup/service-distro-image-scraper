@@ -1211,6 +1211,9 @@ async def api_restart_search_all(
     entry_id: Optional[int] = None,
     background_tasks: BackgroundTasks = None
 ):
+    """
+    Restarts the batch processing for the given FileID with all search variations.
+    """
     logger, log_filename = setup_job_logger(job_id=file_id)
     logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
     try:
@@ -1231,7 +1234,13 @@ async def api_restart_search_all(
                 endpoint_errors = debug_info.get("endpoint_errors", [])
                 for error in endpoint_errors:
                     logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
-            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            log_public_url = await upload_file_to_space(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id}.log",
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
             raise HTTPException(status_code=result["status_code"], detail=result["message"])
         logger.info(f"Completed restart batch for FileID: {file_id}")
         return {
@@ -1242,8 +1251,17 @@ async def api_restart_search_all(
         }
     except Exception as e:
         logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
-        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id}.log",
+            is_public=True,
+            logger=logger,
+            file_id=file_id
+        )
         raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
+    finally:
+        await async_engine.dispose()
+        logger.info(f"Disposed database engine for FileID {file_id}")
 
 @router.post("/process-images-ai/{file_id}", tags=["Processing"])
 async def api_process_ai_images(
