@@ -1,12 +1,8 @@
-import json
 import logging
-import psutil
-import datetime
+import json
 import asyncio
-import uuid
 import aio_pika
 from typing import Dict, Any, Optional
-from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from config import RABBITMQ_URL
 
@@ -19,9 +15,6 @@ if not default_logger.handlers:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-# Global producer instance
-producer = None
-
 class RabbitMQProducer:
     def __init__(
         self,
@@ -30,6 +23,15 @@ class RabbitMQProducer:
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
     ):
+        """
+        Initialize RabbitMQ producer with connection parameters.
+        
+        Args:
+            amqp_url: RabbitMQ connection URL.
+            queue_name: Name of the queue for database updates.
+            connection_timeout: Timeout for establishing connection (seconds).
+            operation_timeout: Timeout for publishing messages (seconds).
+        """
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.connection_timeout = connection_timeout
@@ -39,12 +41,21 @@ class RabbitMQProducer:
         self.is_connected = False
         self._lock = asyncio.Lock()
 
-    async def connect(self):
-        """Establish a robust connection to RabbitMQ and declare a durable queue."""
+    async def connect(self) -> 'RabbitMQProducer':
+        """
+        Establish a robust connection to RabbitMQ and declare a durable queue.
+        
+        Returns:
+            Self: The producer instance for method chaining.
+        
+        Raises:
+            asyncio.TimeoutError: If connection times out.
+            aio_pika.exceptions.AMQPError: For RabbitMQ connection or channel errors.
+        """
         async with self._lock:
             if self.is_connected and self.connection and not self.connection.is_closed:
                 default_logger.debug("RabbitMQ connection already established")
-                return
+                return self
             try:
                 async with asyncio.timeout(self.connection_timeout):
                     self.connection = await aio_pika.connect_robust(
@@ -53,12 +64,14 @@ class RabbitMQProducer:
                         retry_delay=5,
                     )
                     self.channel = await self.connection.channel()
-                    await self.channel.set_qos(prefetch_count=1)
+                    await self.channel.set_qos(prefetch_count=2)  # Limit concurrent messages
                     await self.channel.declare_queue(self.queue_name, durable=True)
                     self.is_connected = True
                     default_logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
+                    return self
             except asyncio.TimeoutError:
                 default_logger.error("Timeout connecting to RabbitMQ")
+                self.is_connected = False
                 raise
             except aio_pika.exceptions.ProbableAuthenticationError as e:
                 default_logger.error(
@@ -66,16 +79,19 @@ class RabbitMQProducer:
                     f"Check username, password, and virtual host in {self.amqp_url}.",
                     exc_info=True
                 )
+                self.is_connected = False
                 raise
-            except aio_pika.exceptions.AMQPConnectionError as e:
+            except aio_pika.exceptions.AMQPConnectionError:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+                self.is_connected = False
                 raise
-            except aio_pika.exceptions.ChannelInvalidStateError as e:
+            except aio_pika.exceptions.InvalidStateError as e:
                 default_logger.error(
                     f"Channel error connecting to RabbitMQ: {e}. "
                     f"Ensure channel is properly configured.",
                     exc_info=True
                 )
+                self.is_connected = False
                 raise
 
     @retry(
@@ -87,7 +103,7 @@ class RabbitMQProducer:
             asyncio.TimeoutError
         )),
         before_sleep=lambda retry_state: default_logger.info(
-            f"Retrying RabbitMQ operation (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+            f"Retrying RabbitMQ publish (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
         )
     )
     async def publish_message(
@@ -97,7 +113,18 @@ class RabbitMQProducer:
         correlation_id: Optional[str] = None,
         reply_to: Optional[str] = None
     ):
-        """Publish a message to the queue with optional correlation_id and reply_to."""
+        """
+        Publish a message to the specified queue.
+        
+        Args:
+            message: Dictionary to be serialized as JSON.
+            routing_key: Queue name (defaults to self.queue_name).
+            correlation_id: Optional correlation ID for tracking.
+            reply_to: Optional reply-to queue for responses.
+        
+        Raises:
+            Exception: If publishing fails after retries.
+        """
         async with self._lock:
             if not self.is_connected or not self.connection or self.connection.is_closed:
                 await self.connect()
@@ -129,7 +156,9 @@ class RabbitMQProducer:
                 raise
 
     async def close(self):
-        """Close the RabbitMQ connection and channel."""
+        """
+        Close the RabbitMQ channel and connection gracefully.
+        """
         async with self._lock:
             try:
                 if self.channel and not self.channel.is_closed:
