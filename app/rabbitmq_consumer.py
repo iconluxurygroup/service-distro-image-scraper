@@ -163,7 +163,9 @@ class RabbitMQConsumer:
             await queue.consume(self.callback)
             new_queue = await self.channel.get_queue(self.new_queue_name)
             await new_queue.consume(self.callback)
-            logger.info(f"Started consuming messages from {self.queue_name} and {self.new_queue_name}. To exit press CTRL+C")
+            response_queue = await self.channel.get_queue(self.response_queue_name)
+            await response_queue.consume(self.callback)
+            logger.info(f"Started consuming messages from {self.queue_name}, {self.new_queue_name}, and {self.response_queue_name}")
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             logger.info("Consumer cancelled, shutting down...")
