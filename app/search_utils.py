@@ -131,12 +131,27 @@ async def insert_search_results(
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
 
-    required_columns = {"EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"}
-    for res in results:
-        if not required_columns.issubset(res.keys()):
-            missing_cols = required_columns - set(res.keys())
-            logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
-            return False
+    # Initialize RabbitMQ producer per call
+    producer = None
+    try:
+        if not os.getenv("RABBITMQ_URL"):
+            logger.error("RABBITMQ_URL environment variable not set")
+            raise ValueError("RABBITMQ_URL not configured")
+        
+        producer = RabbitMQProducer(amqp_url=os.getenv("RABBITMQ_URL"))
+        async with asyncio.timeout(10):
+            await producer.connect()
+        logger.info(f"Worker PID {process.pid}: Successfully initialized RabbitMQ producer")
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id}.log",
+            is_public=True,
+            logger=logger,
+            file_id=str(file_id)
+        )
+        raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
     data = []
     errors = []
 
@@ -172,11 +187,6 @@ async def insert_search_results(
     if not data:
         logger.warning(f"Worker PID {process.pid}: No valid rows to insert. Errors: {errors}")
         return False
-
-    global producer
-    if not producer:
-        logger.error("RabbitMQ producer not initialized")
-        raise ValueError("RabbitMQ producer not initialized")
 
     connection = None
     try:
