@@ -30,7 +30,8 @@ class RabbitMQConsumer:
     ):
         self.amqp_url = amqp_url
         self.queue_name = queue_name
-        self.new_queue_name = "new_task_queue"  # New queue
+        self.new_queue_name = "new_task_queue"
+        self.response_queue_name = "shared_response_queue"
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
         self.connection = None
@@ -38,6 +39,23 @@ class RabbitMQConsumer:
         self.is_consuming = False
         self._lock = asyncio.Lock()
         self.producer = producer or RabbitMQProducer(amqp_url=amqp_url)
+
+    async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool) -> bool:
+        try:
+            queue = await channel.declare_queue(queue_name, passive=True)
+            is_durable = queue.declaration_result.fields.get('durable', False)
+            if is_durable != expected_durable:
+                logger.warning(
+                    f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}. "
+                    f"Consider deleting the queue or updating its properties."
+                )
+                return False
+            return True
+        except aio_pika.exceptions.QueueEmpty:
+            return True  # Queue doesn't exist, safe to create
+        except Exception as e:
+            logger.error(f"Error checking queue {queue_name} durability: {e}", exc_info=True)
+            return False
 
     async def connect(self):
         async with self._lock:
@@ -55,17 +73,23 @@ class RabbitMQConsumer:
                     )
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
-                    # Declare and bind existing queue
-                    queue = await self.channel.declare_queue(self.queue_name, durable=True)
-                    await queue.bind('logs')
-                    logger.debug(f"Queue {self.queue_name} declared and bound to logs exchange")
-                    # Declare and bind response queue
-                    response_queue = await self.channel.declare_queue(self.producer.response_queue_name, durable=True)
-                    await response_queue.bind('logs')
-                    # Declare and bind new queue
-                    new_queue = await self.channel.declare_queue(self.new_queue_name, durable=True)
-                    await new_queue.bind('logs')
-                    logger.debug(f"Queue {self.new_queue_name} declared and bound to logs exchange")
+
+                    # Check and declare queues
+                    queues = [
+                        (self.queue_name, True),
+                        (self.response_queue_name, True),
+                        (self.new_queue_name, True),
+                    ]
+                    for queue_name, durable in queues:
+                        if not await self.check_queue_durability(self.channel, queue_name, durable):
+                            raise ValueError(
+                                f"Queue {queue_name} has mismatched durability settings. "
+                                f"Please delete the queue or update its properties in RabbitMQ."
+                            )
+                        queue = await self.channel.declare_queue(queue_name, durable=durable)
+                        await queue.bind('logs')
+                        logger.debug(f"Queue {queue_name} declared and bound to logs exchange")
+
                     logger.info(f"Connected to RabbitMQ, consuming from queues: {self.queue_name}, {self.new_queue_name}")
             except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
                 logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
@@ -289,7 +313,6 @@ class RabbitMQConsumer:
         file_id = task.get("file_id", "unknown")
         try:
             logger.info(f"Processing new_task for FileID {file_id}: {task}")
-            # Example: Perform a simple database operation
             async with async_engine.connect() as conn:
                 result = await conn.execute(text("SELECT 1 AS test"))
                 row = result.fetchone()
@@ -398,8 +421,8 @@ def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
             return
         last_signal_time = current_time
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        asyncio.ensure_future(shutdown(consumer, loop))
-    
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(shutdown(consumer, loop)))
+
     return handler
 
 async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
@@ -408,6 +431,10 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
         tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.debug(f"Task {task.get_name()} cancelled or timed out during shutdown")
         await consumer.close()
         await consumer.producer.close()
         loop.stop()
@@ -438,6 +465,11 @@ if __name__ == "__main__":
 
     async def main():
         try:
+            if args.clear:
+                logger.info("Clearing queue...")
+                await consumer.purge_queue()
+                logger.info("Queue cleared successfully")
+                return
             logger.info("Starting consumer...")
             await consumer.start_consuming()
         except KeyboardInterrupt:
@@ -454,17 +486,13 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except SystemExit:
         pass
-    except Exception as e:
+    except RuntimeError as e:
         logger.error(f"Error running main: {e}", exc_info=True)
     finally:
         try:
-            tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
-            for task in tasks:
-                task.cancel()
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.run_until_complete(loop.shutdown_default_executor())
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}", exc_info=True)
-        finally:
             if not loop.is_closed():
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
                 loop.close()
+        except Exception as e:
+            logger.error(f"Error during final cleanup: {e}", exc_info=True)
