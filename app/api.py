@@ -37,12 +37,13 @@ from db_utils import (
     update_log_url_in_db,
     get_send_to_email,
     fetch_last_valid_entry,
+    insert_search_results,
     update_initial_sort_order,
     get_images_excel_db,
     update_file_generate_complete,
     update_file_location_complete,
 )
-from search_utils import update_search_sort_order, insert_search_results, update_sort_order, update_sort_no_image_entry
+from search_utils import update_search_sort_order, update_sort_order, update_sort_no_image_entry
 from database_config import async_engine
 from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL,RABBITMQ_URL,DATAPROXY_API_KEY
 from email_utils import send_message_email
