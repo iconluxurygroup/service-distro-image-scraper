@@ -17,6 +17,7 @@ from rabbitmq_producer import RabbitMQProducer
 from rabbitmq_consumer import RabbitMQConsumer
 from database_config import conn_str, async_engine
 from typing import Any
+from common import clean_string, normalize_model, generate_aliases,validate_thumbnail_url,clean_url_string
 from s3_utils import upload_file_to_space
 producer = None
 default_logger = logging.getLogger(__name__)
