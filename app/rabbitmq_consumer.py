@@ -344,7 +344,7 @@ async def main():
             await consumer.purge_queue()
             logger.info("Queue cleared")
             return
-        if args.delete-mismatched:
+        if args.delete:
             logger.info("Checking and deleting queues with mismatched durability...")
             await consumer.connect()
             for queue_name in [consumer.queue_name, consumer.new_queue_name, consumer.response_queue_name]:
