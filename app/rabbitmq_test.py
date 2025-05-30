@@ -2,7 +2,7 @@ import asyncio
 import logging
 import aio_pika
 import json
-import uuid
+import uuid,aiormq
 import datetime
 from typing import Optional
 from rabbitmq_producer import RabbitMQProducer, get_producer
