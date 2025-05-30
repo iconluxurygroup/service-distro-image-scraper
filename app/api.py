@@ -1102,7 +1102,112 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines")
-        
+@router.post("/clear-ai-json/{file_id}", tags=["Database"])
+async def api_clear_ai_json(
+    file_id: str,
+    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to clear AI data for, if not all"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Clears AiJson and AiCaption fields in utb_ImageScraperResult for a given FileID.
+    Optionally restricts to specific EntryIDs if provided.
+    """
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Clearing AiJson and AiCaption for FileID: {file_id}" + (f", EntryIDs: {entry_ids}" if entry_ids else ""))
+
+    try:
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id} does not exist")
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
+
+        # Prepare SQL query to clear AiJson and AiCaption
+        sql = """
+            UPDATE utb_ImageScraperResult
+            SET AiJson = NULL, AiCaption = NULL
+            FROM utb_ImageScraperResult t
+            INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+            WHERE r.FileID = :file_id
+            AND (t.AiJson IS NOT NULL OR t.AiCaption IS NOT NULL)
+        """
+        params = {"file_id": int(file_id)}
+        if entry_ids:
+            sql += " AND t.EntryID IN :entry_ids"
+            params["entry_ids"] = tuple(entry_ids)
+
+        # Initialize RabbitMQ producer
+        producer = RabbitMQProducer()
+        try:
+            # Enqueue the update operation
+            correlation_id = str(uuid.uuid4())
+            rows_affected = await enqueue_db_update(
+                file_id=file_id,
+                sql=sql,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="clear_ai_json",
+                producer=producer,
+                correlation_id=correlation_id,
+                return_result=True  # To get the number of rows affected
+            )
+            logger.info(f"Enqueued AiJson and AiCaption clear for FileID: {file_id}, CorrelationID: {correlation_id}, Rows affected: {rows_affected}")
+
+            # Enqueue verification task
+            verify_sql = """
+                SELECT COUNT(*) 
+                FROM utb_ImageScraperResult t
+                INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                WHERE r.FileID = :file_id 
+                AND (t.AiJson IS NOT NULL OR t.AiCaption IS NOT NULL)
+            """
+            verify_params = {"file_id": int(file_id)}
+            if entry_ids:
+                verify_sql += " AND t.EntryID IN :entry_ids"
+                verify_params["entry_ids"] = tuple(entry_ids)
+
+            verify_correlation_id = str(uuid.uuid4())
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=verify_sql,
+                params=verify_params,
+                background_tasks=background_tasks,
+                task_type="verify_clear_ai_json",
+                producer=producer,
+                correlation_id=verify_correlation_id,
+                return_result=True
+            )
+            logger.info(f"Enqueued verification for FileID: {file_id}, CorrelationID: {verify_correlation_id}")
+
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            return {
+                "status": "success",
+                "status_code": 200,
+                "message": f"Enqueued AiJson and AiCaption clear for {rows_affected} rows for FileID: {file_id}",
+                "log_url": log_public_url,
+                "data": {
+                    "file_id": file_id,
+                    "entry_ids": entry_ids,
+                    "rows_affected": rows_affected,
+                    "correlation_id": correlation_id
+                }
+            }
+        finally:
+            await producer.close()
+            logger.info(f"Closed RabbitMQ producer for FileID {file_id}")
+    except Exception as e:
+        logger.error(f"Error clearing AiJson and AiCaption for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error clearing AiJson and AiCaption for FileID {file_id}: {str(e)}")
+    finally:
+        await async_engine.dispose()
+        logger.info(f"Disposed database engine for FileID {file_id}")       
 @router.get("/sort-by-search/{file_id}", tags=["Sorting"])
 async def api_match_and_search_sort(file_id: str):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
