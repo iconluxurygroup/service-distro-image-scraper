@@ -53,13 +53,22 @@ class RabbitMQConsumer:
                     )
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
-                    await self.channel.declare_queue(self.queue_name, durable=True)
-                    try:
-                        await self.channel.get_queue(self.producer.response_queue_name)
-                    except aio_pika.exceptions.QueueEmpty:
-                        await self.channel.declare_queue(
-                            self.producer.response_queue_name, durable=True, exclusive=False, auto_delete=False
-                        )
+                    # Only declare queue if not a test queue (starts with 'test_queue_')
+                    if not self.queue_name.startswith('test_queue_'):
+                        await self.channel.declare_queue(self.queue_name, durable=True)
+                    else:
+                        try:
+                            await self.channel.get_queue(self.queue_name)  # Verify queue exists
+                        except aio_pika.exceptions.QueueEmpty:
+                            await self.channel.declare_queue(self.queue_name, durable=False, exclusive=False, auto_delete=True)
+                    # Only declare response queue for non-test scenarios
+                    if not self.queue_name.startswith('test_queue_'):
+                        try:
+                            await self.channel.get_queue(self.producer.response_queue_name)
+                        except aio_pika.exceptions.QueueEmpty:
+                            await self.channel.declare_queue(
+                                self.producer.response_queue_name, durable=True, exclusive=False, auto_delete=False
+                            )
                     logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
             except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
                 logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
