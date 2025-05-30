@@ -85,12 +85,85 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 # ... other imports ...
 
 from contextlib import asynccontextmanager
+import logging
+import asyncio
+import sys
+from fastapi import FastAPI, BackgroundTasks
+from contextlib import asynccontextmanager
+from sqlalchemy.sql import text
+from database_config import async_engine
+from logging_config import setup_job_logger
+from db_utils import insert_search_results
+from rabbitmq_producer import get_producer, cleanup_producer
+from config import VERSION
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global producer
     default_logger.info("Starting up FastAPI application")
     
     try:
-        
+        # Initialize global RabbitMQ producer
+        async with asyncio.timeout(10):
+            producer = await get_producer(default_logger)
+        if not producer or not producer.is_connected:
+            default_logger.error("Failed to initialize RabbitMQ producer, shutting down")
+            sys.exit(1)
+        default_logger.info("Global RabbitMQ producer initialized")
+
+        # Run test insertion
+        default_logger.info("Running test insertion of search result on startup")
+        file_id = "test_file_123"
+        logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+        try:
+            # Sample search result
+            sample_result = [
+                {
+                    "EntryID": 9999,  # Dummy EntryID
+                    "ImageUrl": "https://example.com/test_image.jpg",
+                    "ImageDesc": "Test image description",
+                    "ImageSource": "example.com",
+                    "ImageUrlThumbnail": "https://example.com/test_thumbnail.jpg"
+                }
+            ]
+
+            # Use BackgroundTasks for enqueuing DB update
+            background_tasks = BackgroundTasks()
+
+            # Insert the sample result
+            success = await insert_search_results(
+                results=sample_result,
+                logger=logger,
+                file_id=file_id,
+                background_tasks=background_tasks
+            )
+            if success:
+                logger.info(f"Test search result inserted successfully for EntryID 9999, FileID {file_id}")
+            else:
+                logger.error(f"Failed to insert test search result for EntryID 9999, FileID {file_id}")
+
+            # Verify the insertion
+            async with async_engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT COUNT(*) 
+                        FROM utb_ImageScraperResult 
+                        WHERE EntryID = :entry_id
+                    """),
+                    {"entry_id": 9999}
+                )
+                count = result.fetchone()[0]
+                result.close()
+                if count > 0:
+                    logger.info(f"Verification: Found {count} record(s) for EntryID 9999")
+                else:
+                    logger.warning(f"Verification failed: No records found for EntryID 9999")
+        except Exception as e:
+            logger.error(f"Error during test insertion: {e}", exc_info=True)
+            sys.exit(1)
+
+        # Set up shutdown handling
         loop = asyncio.get_running_loop()
         shutdown_event = asyncio.Event()
 

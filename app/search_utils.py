@@ -61,7 +61,7 @@ async def insert_search_results(
 
     # Use provided producer or global producer
     local_producer = producer
-    global producer as global_producer
+    global producer global_producer
     if local_producer is None:
         if global_producer is None or not global_producer.is_connected or not global_producer.channel or global_producer.channel.is_closed:
             logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
