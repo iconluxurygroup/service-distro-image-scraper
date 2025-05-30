@@ -61,26 +61,38 @@ class RabbitMQProducer:
                 return self
             try:
                 async with asyncio.timeout(self.connection_timeout):
-                    self.connection = await aio_pika.connect_robust(
-                        self.amqp_url,
-                        connection_attempts=3,
-                        retry_delay=5,
-                    )
+                    self.connection = await aio_pika.connect_robust(self.amqp_url, connection_attempts=3, retry_delay=5)
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
-                    await self.channel.declare_queue(self.queue_name, durable=True)
-                    await self.channel.declare_queue(
-                        self.response_queue_name, durable=False, exclusive=False, auto_delete=True
-                    )
+                    await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
                     self.is_connected = True
-                    default_logger.info(f"Connected to RabbitMQ and declared queues: {self.queue_name}, {self.response_queue_name}")
+                    default_logger.info("Connected to RabbitMQ and declared fanout exchange: logs")
                     return self
-            except asyncio.TimeoutError:
-                default_logger.error("Timeout connecting to RabbitMQ")
+            except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
+                default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 self.is_connected = False
                 raise
-            except aio_pika.exceptions.AMQPConnectionError as e:
-                default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+
+    async def publish_message(self, message: Dict[str, Any], routing_key: Optional[str] = None, correlation_id: Optional[str] = None, reply_to: Optional[str] = None):
+        async with self._lock:
+            await self.check_connection()
+            try:
+                async with asyncio.timeout(self.operation_timeout):
+                    message_body = json.dumps(message, default=self.custom_json_serializer)
+                    exchange = await self.channel.get_exchange('logs')
+                    await exchange.publish(
+                        aio_pika.Message(
+                            body=message_body.encode(),
+                            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                            correlation_id=correlation_id,
+                            reply_to=reply_to,
+                            content_type="application/json",
+                        ),
+                        routing_key=''  # Ignored for fanout
+                    )
+                    default_logger.info(f"Published message to exchange: logs, correlation_id: {correlation_id}")
+            except Exception as e:
+                default_logger.error(f"Failed to publish message: {e}", exc_info=True)
                 self.is_connected = False
                 raise
 
@@ -107,48 +119,6 @@ class RabbitMQProducer:
                 default_logger.warning(f"Channel invalid, reconnecting: {e}")
                 await self.connect()
             return self.is_connected
-
-    async def publish_message(
-        self,
-        message: Dict[str, Any],
-        routing_key: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-        reply_to: Optional[str] = None
-    ):
-        async with self._lock:
-            await self.check_connection()
-            queue_name = routing_key or self.queue_name
-            default_logger.debug(f"Publishing to queue: {queue_name}, correlation_id: {correlation_id}")
-            for attempt in range(3):
-                try:
-                    async with asyncio.timeout(self.operation_timeout):
-                        message_body = json.dumps(message, default=self.custom_json_serializer)
-                        await self.channel.default_exchange.publish(
-                            aio_pika.Message(
-                                body=message_body.encode(),
-                                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                                correlation_id=correlation_id,
-                                reply_to=reply_to,
-                                content_type="application/json",
-                            ),
-                            routing_key=queue_name,
-                        )
-                        default_logger.info(
-                            f"Published message to queue: {queue_name}, correlation_id: {correlation_id}"
-                        )
-                        return
-                except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
-                    default_logger.warning(f"Channel error during publish to {queue_name} (attempt {attempt + 1}/3): {e}")
-                    self.is_connected = False
-                    await self.connect()
-                    if attempt == 2:
-                        default_logger.error(f"Failed to publish message to {queue_name} after 3 attempts: {e}", exc_info=True)
-                        raise
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    default_logger.error(f"Failed to publish message to {queue_name}: {e}", exc_info=True)
-                    self.is_connected = False
-                    raise
 
     async def cleanup_queue(self, queue_name: str):
         async with self._cleanup_lock:
