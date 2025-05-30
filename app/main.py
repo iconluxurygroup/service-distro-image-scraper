@@ -36,58 +36,76 @@ async def test_insert_search_result():
             }
         ]
 
-        # Initialize RabbitMQ producer
-        local_producer = await get_producer(logger)
-        if not local_producer or not local_producer.is_connected:
-            logger.error("Failed to initialize RabbitMQ producer for test")
+        # Initialize local RabbitMQ producer
+        local_producer = None
+        try:
+            async with asyncio.timeout(10):
+                local_producer = await get_producer(logger)
+            if not local_producer or not local_producer.is_connected:
+                logger.error("Failed to initialize RabbitMQ producer for test")
+                return
+            logger.info("Local RabbitMQ producer initialized for test")
+        except Exception as e:
+            logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
             return
 
         # Use BackgroundTasks for enqueuing DB update
         background_tasks = BackgroundTasks()
 
         # Insert the sample result
-        success = await insert_search_results(
-            results=sample_result,
-            logger=logger,
-            file_id=file_id,
-            background_tasks=background_tasks
-        )
-
-        if success:
-            logger.info(f"Test search result inserted successfully for EntryID 9999, FileID {file_id}")
-        else:
-            logger.error(f"Failed to insert test search result for EntryID 9999, FileID {file_id}")
+        try:
+            success = await insert_search_results(
+                results=sample_result,
+                logger=logger,
+                file_id=file_id,
+                background_tasks=background_tasks
+            )
+            if success:
+                logger.info(f"Test search result inserted successfully for EntryID 9999, FileID {file_id}")
+            else:
+                logger.error(f"Failed to insert test search result for EntryID 9999, FileID {file_id}")
+        except Exception as e:
+            logger.error(f"Error inserting test search result: {e}", exc_info=True)
 
         # Verify the insertion
-        async with async_engine.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT COUNT(*) 
-                    FROM utb_ImageScraperResult 
-                    WHERE EntryID = :entry_id
-                """),
-                {"entry_id": 9999}
-            )
-            count = result.fetchone()[0]
-            result.close()
-            if count > 0:
-                logger.info(f"Verification: Found {count} record(s) for EntryID 9999")
-            else:
-                logger.warning(f"Verification failed: No records found for EntryID 9999")
-
-        # Clean up local producer
-        if local_producer and local_producer.is_connected:
-            await local_producer.close()
-            logger.info("Local RabbitMQ producer closed")
+        try:
+            async with async_engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT COUNT(*) 
+                        FROM utb_ImageScraperResult 
+                        WHERE EntryID = :entry_id
+                    """),
+                    {"entry_id": 9999}
+                )
+                count = result.fetchone()[0]
+                result.close()
+                if count > 0:
+                    logger.info(f"Verification: Found {count} record(s) for EntryID 9999")
+                else:
+                    logger.warning(f"Verification failed: No records found for EntryID 9999")
+        except Exception as e:
+            logger.error(f"Error verifying insertion: {e}", exc_info=True)
 
     except Exception as e:
-        logger.error(f"Error during test insertion: {e}", exc_info=True)
+        logger.error(f"Unexpected error during test insertion: {e}", exc_info=True)
     finally:
+        # Clean up local producer
+        if local_producer and local_producer.is_connected:
+            try:
+                await local_producer.close()
+                logger.info("Local RabbitMQ producer closed")
+            except Exception as e:
+                logger.error(f"Error closing local producer: {e}", exc_info=True)
         await async_engine.dispose()
         logger.info("Test insertion completed, database engine disposed")
 
-def shutdown(signalnum, frame):
-    logger.info("Received shutdown signal, stopping gracefully")
+async def shutdown(signalnum, frame):
+    logger.info(f"Received shutdown signal {signalnum}, stopping gracefully")
+    try:
+        await cleanup_producer()
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}", exc_info=True)
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -106,11 +124,16 @@ if __name__ == "__main__":
     )
 
     # Register shutdown handlers
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(sig, None)))
 
     # Run test insertion on startup
-    asyncio.run(test_insert_search_result())
+    try:
+        loop.run_until_complete(test_insert_search_result())
+    except Exception as e:
+        logger.error(f"Error running test insertion: {e}", exc_info=True)
+        sys.exit(1)
 
     # Run server
     if platform.system() == "Windows":
@@ -174,4 +197,8 @@ if __name__ == "__main__":
                 },
             },
         }
-        StandaloneApplication(app, options).run()
+        try:
+            StandaloneApplication(app, options).run()
+        except Exception as e:
+            logger.error(f"Error starting Gunicorn: {e}", exc_info=True)
+            sys.exit(1)
