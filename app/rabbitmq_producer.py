@@ -10,7 +10,7 @@ from config import RABBITMQ_URL
 from fastapi import BackgroundTasks
 import datetime
 import aiormq.exceptions
-
+producer = None
 # Logging setup
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
