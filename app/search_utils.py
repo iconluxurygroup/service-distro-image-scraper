@@ -109,6 +109,7 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             return ""
     return cleaned
 
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -136,14 +137,14 @@ async def insert_search_results(
     global producer
     try:
         async with asyncio.timeout(60):
-            if not producer or not producer.is_connected or not producer.channel or producer.channel.is_closed:
+            if producer is None or not producer.is_connected or not producer.channel or producer.channel.is_closed:
                 logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
                 producer = await get_producer(logger)  # Await get_producer
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
         raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
 
-    channel = producer.channel  # Access as attribute
+    channel = producer.channel  # Access channel attribute
     if channel is None:
         logger.error(f"Worker PID {process.pid}: RabbitMQ channel is not available for FileID {file_id}")
         return False
@@ -225,7 +226,7 @@ async def insert_search_results(
         update_batch = []
         insert_batch = []
         create_time = datetime.datetime.now().isoformat()
-        for row in results:
+        for row in results:  # Iterate over input results, not response_data
             key = (row["EntryID"], row["ImageUrl"])
             params = {
                 "EntryID": row["EntryID"],
@@ -277,10 +278,10 @@ async def insert_search_results(
         return False
     finally:
         try:
-            await channel.delete_queue(response_queue)
+            if channel and not channel.is_closed:
+                await channel.delete_queue(response_queue)
         except Exception as e:
             logger.warning(f"Worker PID {process.pid}: Failed to delete response queue {response_queue}: {e}")
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
