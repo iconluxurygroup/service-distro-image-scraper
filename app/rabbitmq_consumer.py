@@ -140,18 +140,18 @@ class RabbitMQConsumer:
             raise
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=10),
-        retry=retry_if_exception_type((
-            aio_pika.exceptions.AMQPError,
-            aio_pika.exceptions.ChannelClosed,
-            asyncio.TimeoutError,
-            aiormq.exceptions.ChannelInvalidStateError
-        )),
-        before_sleep=lambda retry_state: logger.info(
-            f"Retrying start_consuming (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-        )
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((
+        aio_pika.exceptions.AMQPError,
+        aio_pika.exceptions.ChannelClosed,
+        asyncio.TimeoutError,
+        aiormq.exceptions.ChannelInvalidStateError
+    )),
+    before_sleep=lambda retry_state: logger.info(
+        f"Retrying start_consuming (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
+)
     async def start_consuming(self):
         try:
             await self.connect()
@@ -163,7 +163,7 @@ class RabbitMQConsumer:
             response_queue = await self.channel.get_queue(self.response_queue_name)
             await response_queue.consume(self.callback)
             logger.info(f"Started consuming messages from {self.queue_name}, {self.new_queue_name}, and {self.response_queue_name}")
-            await asyncio.Event().wait()
+            await asyncio.Event().wait()  # Keep consumer running
         except asyncio.CancelledError:
             logger.info("Consumer cancelled, shutting down...")
             self.is_consuming = False
@@ -187,11 +187,6 @@ class RabbitMQConsumer:
             self.is_consuming = False
             await self.close()
             await asyncio.sleep(2)
-            raise
-        except KeyboardInterrupt:
-            logger.info("Received KeyboardInterrupt, shutting down consumer")
-            self.is_consuming = False
-            await self.close()
             raise
         except Exception as e:
             logger.error(f"Unexpected error in consumer: {e}", exc_info=True)
@@ -488,6 +483,19 @@ if __name__ == "__main__":
                 logger.info("Clearing queue...")
                 await consumer.purge_queue()
                 logger.info("Queue cleared successfully")
+                return
+            if args.delete_mismatched:
+                logger.info("Checking and deleting queues with mismatched durability...")
+                await consumer.connect()  # Ensure connection is established
+                for queue_name, durable in [
+                    (consumer.queue_name, True),
+                    (consumer.new_queue_name, True),
+                    (consumer.response_queue_name, True)
+                ]:
+                    await consumer.check_queue_durability(
+                        consumer.channel, queue_name, durable, delete_if_mismatched=True
+                    )
+                logger.info("Queue durability check and cleanup completed")
                 return
             logger.info("Starting consumer...")
             await consumer.start_consuming()
