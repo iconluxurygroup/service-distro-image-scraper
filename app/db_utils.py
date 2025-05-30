@@ -704,6 +704,13 @@ async def enqueue_db_update(
     return_result: bool = False,
     logger: Optional[logging.Logger] = None,
 ):
+    logger = logger or default_logger  # Ensure a valid logger
+    if logger is None:
+        logger = logging.getLogger(__name__)  # Fallback to a new logger if default_logger is None
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
     should_close = False
     if producer is None:
         producer = RabbitMQProducer()
@@ -721,7 +728,6 @@ async def enqueue_db_update(
             "response_queue": response_queue,
         }
         if return_result and response_queue:
-            # Create a temporary consumer to wait for the response
             consumer = RabbitMQConsumer(
                 amqp_url=producer.amqp_url,
                 queue_name=response_queue,
@@ -745,9 +751,8 @@ async def enqueue_db_update(
             await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
             logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
 
-            # Wait for the response with a timeout
             try:
-                async with asyncio.timeout(30):  # 30-second timeout
+                async with asyncio.timeout(30):
                     result = await result_future
                     logger.info(f"Received deduplication result for FileID: {file_id}")
                     return result
