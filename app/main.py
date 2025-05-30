@@ -11,7 +11,7 @@ from waitress import serve
 from sqlalchemy.sql import text
 from rabbitmq_producer import cleanup_producer, get_producer
 from logging_config import setup_job_logger
-from db_utils import insert_search_results
+from search_utils import insert_search_results
 from database_config import async_engine
 
 logger = logging.getLogger(__name__)
