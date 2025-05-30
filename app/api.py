@@ -1147,7 +1147,8 @@ async def api_clear_ai_json(
         try:
             # Enqueue the update operation
             correlation_id = str(uuid.uuid4())
-            rows_affected = await enqueue_db_update(
+            rows_affected = # In api_clear_ai_json
+            await enqueue_db_update(
                 file_id=file_id,
                 sql=sql,
                 params=params,
@@ -1155,7 +1156,6 @@ async def api_clear_ai_json(
                 task_type="clear_ai_json",
                 producer=producer,
                 correlation_id=correlation_id,
-                return_result=True  # To get the number of rows affected
             )
             logger.info(f"Enqueued AiJson and AiCaption clear for FileID: {file_id}, CorrelationID: {correlation_id}, Rows affected: {rows_affected}")
 
