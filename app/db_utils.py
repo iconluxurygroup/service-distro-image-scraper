@@ -263,8 +263,8 @@ async def insert_search_results(
     try:
         correlation_id = str(uuid.uuid4())
         response_queue = f"select_response_{uuid.uuid4().hex}"
-        # Use producer's existing connection and channel
-        await producer.connect()  # Ensure connection is active
+        logger.debug(f"[{correlation_id}] Using response queue: {response_queue}")
+        await producer.connect()
         channel = producer.channel
         queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
         response_received = asyncio.Event()
@@ -277,9 +277,10 @@ async def insert_search_results(
                         if message.correlation_id == correlation_id:
                             response_data.append(json.loads(message.body.decode()))
                             response_received.set()
-                            logger.debug(f"Worker PID {process.pid}: Received response for correlation_id {correlation_id}")
+                            logger.debug(f"[{correlation_id}] Received response for FileID {file_id}")
 
         entry_ids = list(set(row["EntryID"] for row in data))
+        logger.debug(f"[{correlation_id}] Enqueuing SELECT for EntryIDs: {entry_ids}")
         existing_keys = set()
         if entry_ids:
             placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
@@ -298,21 +299,22 @@ async def insert_search_results(
                 producer=producer,
                 response_queue=response_queue,
                 correlation_id=correlation_id,
+                return_result=True,
                 logger=logger
             )
-            logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
 
             consume_task = asyncio.create_task(consume_responses())
             try:
-                async with asyncio.timeout(60):
+                async with asyncio.timeout(120):  # Increased to 120 seconds
                     await response_received.wait()
                 if response_data:
                     existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
-                    logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                    logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
                 else:
-                    logger.warning(f"Worker PID {process.pid}: No deduplication results received")
+                    logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No deduplication results received")
             except asyncio.TimeoutError:
-                logger.error(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
+                logger.error(f"[{correlation_id}] Worker PID {process.pid}: Timeout waiting for SELECT results")
                 raise
             finally:
                 consume_task.cancel()
@@ -358,7 +360,7 @@ async def insert_search_results(
                     correlation_id=cid,
                     logger=logger
                 )
-        logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
+        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
 
         for i in range(0, len(insert_batch), batch_size):
             batch = insert_batch[i:i + batch_size]
@@ -375,7 +377,7 @@ async def insert_search_results(
                     correlation_id=cid,
                     logger=logger
                 )
-        logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
+        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
 
         async with async_engine.connect() as conn:
             query = text("""
@@ -387,16 +389,15 @@ async def insert_search_results(
                 "create_time": min(row["CreateTime"] for row in data)
             })
             inserted_count = result.scalar()
-            logger.info(f"Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
+            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
 
         return len(insert_batch) > 0 or len(update_batch) > 0
 
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"[{correlation_id}] Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         raise
     finally:
-        # Do not close producer here to maintain singleton connection
-        logger.info(f"Worker PID {process.pid}: Completed insert_search_results for FileID {file_id}")
+        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Completed insert_search_results for FileID {file_id}")
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
