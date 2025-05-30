@@ -14,6 +14,7 @@ import uuid
 from database_config import async_engine
 from config import RABBITMQ_URL
 from rabbitmq_producer import RabbitMQProducer
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ class RabbitMQConsumer:
         queue_name: str = "db_update_queue",
         connection_timeout: float = 60.0,
         operation_timeout: float = 15.0,
-        producer: Optional['RabbitMQProducer'] = None
+        producer: Optional[RabbitMQProducer] = None
     ):
         self.amqp_url = amqp_url
         self.queue_name = queue_name
@@ -41,7 +42,10 @@ class RabbitMQConsumer:
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=30),
-        retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, aiormq.exceptions.ChannelInvalidStateError))
+        retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, aiormq.exceptions.ChannelInvalidStateError)),
+        before_sleep=lambda retry_state: logger.info(
+            f"Retrying connect (attempt {retry_state.attempt_number}/5) after {retry_state.next_action.sleep}s"
+        )
     )
     async def connect(self):
         async with self._lock:
@@ -50,19 +54,17 @@ class RabbitMQConsumer:
                 self.connection = await aio_pika.connect_robust(
                     self.amqp_url,
                     timeout=self.connection_timeout,
-                    loop=asyncio.get_running_loop()
+                    loop=asyncio.get_running_loop(),
+                    connection_attempts=10,
+                    retry_delay=5
                 )
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=1)
                 await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
-                for queue_name, durable in [
-                    (self.queue_name, True),
-                    (self.new_queue_name, True),
-                    (self.response_queue_name, True)
-                ]:
-                    queue = await self.channel.declare_queue(queue_name, durable=durable)
+                for queue_name in [self.queue_name, self.new_queue_name, self.response_queue_name]:
+                    queue = await self.channel.declare_queue(queue_name, durable=True)
                     await queue.bind('logs')
-                    logger.info(f"Declared and bound queue {queue_name} to logs exchange")
+                    logger.debug(f"Declared and bound queue {queue_name} to logs exchange")
                 logger.info("Successfully connected to RabbitMQ")
             except aio_pika.exceptions.AMQPError as e:
                 logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
@@ -93,6 +95,18 @@ class RabbitMQConsumer:
                 self.channel = None
                 self.connection = None
                 self.is_consuming = False
+
+    async def purge_queue(self):
+        try:
+            if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
+                await self.connect()
+            queue = await self.channel.get_queue(self.queue_name)
+            purge_count = await queue.purge()
+            logger.info(f"Purged {purge_count} messages from queue: {self.queue_name}")
+            return purge_count
+        except Exception as e:
+            logger.error(f"Error purging queue {self.queue_name}: {e}", exc_info=True)
+            raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -127,12 +141,16 @@ class RabbitMQConsumer:
         async with self._lock:
             if not self.channel or self.channel.is_closed:
                 logger.warning("Channel closed, attempting reconnect")
-                try:
-                    await self.connect()
-                except Exception as e:
-                    logger.error(f"Reconnect failed: {e}", exc_info=True)
-                    await message.nack(requeue=True)
-                    return
+                for attempt in range(3):
+                    try:
+                        await self.connect()
+                        break
+                    except Exception as e:
+                        logger.error(f"Reconnect attempt {attempt + 1} failed: {e}", exc_info=True)
+                        if attempt == 2:
+                            await message.nack(requeue=True)
+                            return
+                        await asyncio.sleep(2)
         
         async with message.process(requeue=True, ignore_processed=True):
             try:
@@ -171,9 +189,11 @@ class RabbitMQConsumer:
             except asyncio.TimeoutError:
                 logger.error(f"Timeout processing message for FileID: {file_id}, TaskType: {task_type}")
                 await message.nack(requeue=True)
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.error(f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}", exc_info=True)
                 await message.nack(requeue=True)
+                await asyncio.sleep(2)
 
     async def execute_update(self, task: Dict[str, Any], conn, logger: logging.Logger) -> Dict[str, Any]:
         file_id = task.get("file_id", "unknown")
@@ -229,7 +249,8 @@ class RabbitMQConsumer:
             logger.error(f"Unexpected error executing SELECT for FileID {file_id}: {e}", exc_info=True)
             raise
         finally:
-            await conn.close()
+            if hasattr(conn, 'close'):
+                await conn.close()
 
     async def execute_sort_order_update(self, params: Dict[str, Any], file_id: str) -> bool:
         try:
@@ -268,13 +289,6 @@ class RabbitMQConsumer:
         except Exception as e:
             logger.error(f"Error executing new_task for FileID {file_id}: {e}", exc_info=True)
             return False
-import asyncio
-import signal
-import logging
-import argparse
-
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
 async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     logger.info("Initiating shutdown...")
@@ -318,6 +332,7 @@ def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     return handler
 
 async def main():
+    import argparse
     parser = argparse.ArgumentParser(description="RabbitMQ Consumer")
     parser.add_argument("--clear", action="store_true", help="Purge the main queue and exit")
     parser.add_argument("--delete-mismatched", action="store_true", help="Delete queues with mismatched durability")
@@ -349,8 +364,11 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    producer = None
-    consumer = None
+    try:
+        signal.signal(signal.SIGINT, signal_handler(consumer, loop))
+        signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
+    except ValueError as e:
+        logger.warning(f"Could not set signal handlers: {e}")
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
