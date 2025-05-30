@@ -751,6 +751,7 @@ async def enqueue_db_update(
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     should_close = False
+    consumer = None
     if producer is None:
         producer = await RabbitMQProducer.get_producer(logger=logger)
         should_close = True
@@ -773,7 +774,11 @@ async def enqueue_db_update(
                 connection_timeout=10.0,
                 operation_timeout=5.0,
             )
-            await consumer.connect()
+            try:
+                await consumer.connect()
+            except aiormq.exceptions.ChannelLockedResource as e:
+                logger.error(f"[{correlation_id}] Failed to connect to queue {response_queue}: {e}")
+                raise
             result_future = asyncio.Future()
 
             async def temp_callback(message: aio_pika.IncomingMessage):
@@ -783,7 +788,6 @@ async def enqueue_db_update(
                         result_future.set_result(response.get("results", []))
                         logger.info(f"[{correlation_id}] Received response for correlation_id {correlation_id} from {response_queue}")
 
-            # Do not re-declare the queue; use the existing exclusive queue
             queue = await consumer.channel.get_queue(response_queue)
             await queue.consume(temp_callback)
 
@@ -798,8 +802,6 @@ async def enqueue_db_update(
             except asyncio.TimeoutError:
                 logger.error(f"[{correlation_id}] Timeout waiting for deduplication response for FileID: {file_id}")
                 raise
-            finally:
-                await consumer.close()
         else:
             await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
             logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
@@ -807,6 +809,9 @@ async def enqueue_db_update(
         logger.error(f"[{correlation_id}] Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise
     finally:
-        if should_close:
+        if consumer:
+            await consumer.close()
+            logger.debug(f"[{correlation_id}] Closed RabbitMQ consumer for queue {response_queue}")
+        if should_close and producer:
             await producer.close()
-            logger.info(f"[{correlation_id}] Closed RabbitMQ producer for FileID: {file_id}")
+            logger.debug(f"[{correlation_id}] Closed RabbitMQ producer for FileID: {file_id}")
