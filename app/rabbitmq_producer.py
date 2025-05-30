@@ -119,31 +119,36 @@ class RabbitMQProducer:
             await self.check_connection()
             queue_name = routing_key or self.queue_name
             default_logger.debug(f"Publishing to queue: {queue_name}, correlation_id: {correlation_id}")
-            try:
-                async with asyncio.timeout(self.operation_timeout):
-                    message_body = json.dumps(message, default=self.custom_json_serializer)
-                    await self.channel.default_exchange.publish(
-                        aio_pika.Message(
-                            body=message_body.encode(),
-                            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                            correlation_id=correlation_id,
-                            reply_to=reply_to,
-                            content_type="application/json",
-                        ),
-                        routing_key=queue_name,
-                    )
-                    default_logger.info(
-                        f"Published message to queue: {queue_name}, correlation_id: {correlation_id}"
-                    )
-            except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
-                default_logger.error(f"Channel error during publish to {queue_name}: {e}", exc_info=True)
-                self.is_connected = False
-                await self.connect()
-                raise
-            except Exception as e:
-                default_logger.error(f"Failed to publish message to {queue_name}: {e}", exc_info=True)
-                self.is_connected = False
-                raise
+            for attempt in range(3):
+                try:
+                    async with asyncio.timeout(self.operation_timeout):
+                        message_body = json.dumps(message, default=self.custom_json_serializer)
+                        await self.channel.default_exchange.publish(
+                            aio_pika.Message(
+                                body=message_body.encode(),
+                                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                                correlation_id=correlation_id,
+                                reply_to=reply_to,
+                                content_type="application/json",
+                            ),
+                            routing_key=queue_name,
+                        )
+                        default_logger.info(
+                            f"Published message to queue: {queue_name}, correlation_id: {correlation_id}"
+                        )
+                        return
+                except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
+                    default_logger.warning(f"Channel error during publish to {queue_name} (attempt {attempt + 1}/3): {e}")
+                    self.is_connected = False
+                    await self.connect()
+                    if attempt == 2:
+                        default_logger.error(f"Failed to publish message to {queue_name} after 3 attempts: {e}", exc_info=True)
+                        raise
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    default_logger.error(f"Failed to publish message to {queue_name}: {e}", exc_info=True)
+                    self.is_connected = False
+                    raise
 
     async def cleanup_queue(self, queue_name: str):
         async with self._cleanup_lock:

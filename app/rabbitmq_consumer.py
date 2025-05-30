@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class RabbitMQConsumer:
     def __init__(
         self,
-        amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
+        amqp_url: str = RABBITMQ_URL,
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
@@ -57,7 +57,7 @@ class RabbitMQConsumer:
                         await self.channel.get_queue(self.producer.response_queue_name)
                     except aio_pika.exceptions.QueueEmpty:
                         await self.channel.declare_queue(
-                            self.producer.response_queue_name, durable=False, exclusive=False, auto_delete=True
+                            self.producer.response_queue_name, durable=True, exclusive=False, auto_delete=False
                         )
                     logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
             except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
@@ -411,10 +411,12 @@ if __name__ == "__main__":
     parser.add_argument("--clear-queue", action="store_true", help="Manually clear the queue and exit")
     args = parser.parse_args()
 
-    consumer = RabbitMQConsumer()
+    producer = RabbitMQProducer()
+    consumer = RabbitMQConsumer(producer=producer)
     loop = asyncio.get_event_loop()
     signal.signal(signal.SIGINT, signal_handler(consumer, loop))
     signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
+    # ... rest of main ...
 
     if args.clear_queue:
         try:
