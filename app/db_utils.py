@@ -208,15 +208,27 @@ def flatten_entry_ids(entry_ids, logger, correlation_id):
         else:
             logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}, type: {type(id)}")
     return flat_ids
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
+import signal
+import asyncio
+
+def register_shutdown_handler(producer, consumer, logger, correlation_id):
+    def handle_shutdown(loop):
+        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if consumer:
+            loop.run_until_complete(consumer.close())
+            logger.debug(f"[{correlation_id}] Closed RabbitMQ consumer on shutdown")
+        if producer:
+            loop.run_until_complete(producer.close())
+            logger.debug(f"[{correlation_id}] Closed RabbitMQ producer on shutdown")
+        loop.stop()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, handle_shutdown, loop)
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
