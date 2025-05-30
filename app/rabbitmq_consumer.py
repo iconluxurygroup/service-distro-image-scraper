@@ -203,7 +203,7 @@ class RabbitMQConsumer:
         file_id = task.get("file_id", "unknown")
         select_sql = task.get("sql")
         params = task.get("params", {})
-        response_queue = task.get("response_queue")
+        response_queue = task.get("response_queue", "shared_response_queue")  # Fallback to shared queue
         correlation_id = task.get("correlation_id")
         logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql[:100]}, params: {params}")
         if not params:
@@ -220,14 +220,12 @@ class RabbitMQConsumer:
                 try:
                     await producer.connect()
                     response = {"file_id": file_id, "results": results, "correlation_id": correlation_id}
-                    # Retry publishing with a new queue name if locked
                     @retry(
                         stop=stop_after_attempt(3),
                         wait=wait_exponential(multiplier=1, min=2, max=10),
-                        retry=retry_if_exception_type(aiormq.exceptions.ChannelLockedResource)  # Updated exception
+                        retry=retry_if_exception_type(aiormq.exceptions.ChannelLockedResource)
                     )
                     async def publish_with_retry():
-                        # Use the original response queue name
                         await producer.publish_message(
                             response,
                             routing_key=response_queue,
@@ -236,7 +234,7 @@ class RabbitMQConsumer:
                         logger.debug(f"Sent {len(results)} SELECT results to {response_queue} for FileID {file_id}")
                     
                     await publish_with_retry()
-                except aiormq.exceptions.ChannelLockedResource as e:  # Updated exception
+                except aiormq.exceptions.ChannelLockedResource as e:
                     logger.error(f"Failed to publish to {response_queue} after retries: {e}", exc_info=True)
                     raise
                 finally:
