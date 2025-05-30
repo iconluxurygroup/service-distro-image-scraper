@@ -928,14 +928,15 @@ async def process_restart_batch(
                     return entry_id, results_written
 
             for batch_idx, batch_entries in enumerate(entry_batches, 1):
-                logger.info(f"Processing batch {batch_idx}/{len(entry_batches)}")
+                logger.info(f"Processing batch {batch_idx}/{len(entry_batches)} with {len(batch_entries)} entries")
                 start_time = datetime.datetime.now()
-
+            
                 results = await asyncio.gather(
                     *(process_entry(entry) for entry in batch_entries),
                     return_exceptions=True
                 )
-
+            
+                batch_successful = 0
                 for entry, result in zip(batch_entries, results):
                     entry_id = entry[0]
                     if isinstance(result, Exception):
@@ -944,11 +945,14 @@ async def process_restart_batch(
                         continue
                     entry_id_result, success = result
                     if success:
+                        batch_successful += 1
                         successful_entries += 1
                         last_entry_id_processed = entry_id
                     else:
                         failed_entries += 1
-
+            
+                logger.info(f"Batch {batch_idx} completed: {batch_successful}/{len(batch_entries)} successful")
+            
                 async with async_engine.connect() as conn:
                     result = await conn.execute(
                         text("""
@@ -960,6 +964,7 @@ async def process_restart_batch(
                     )
                     remaining_entries = result.fetchone()[0]
                     result.close()
+                    logger.info(f"Remaining entries to process: {remaining_entries}")
                     if remaining_entries == 0:
                         logger.info(f"All entries processed for FileID {file_id_db}")
                         break
