@@ -788,14 +788,10 @@ async def process_restart_batch(
         producer = RabbitMQProducer()
         try:
             semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-
             @retry(
                 stop=stop_after_attempt(3),
                 wait=wait_exponential(multiplier=1, min=1, max=5),
-                retry=retry_if_exception_type(Exception),
-                before_sleep=lambda retry_state: logger.debug(
-                    f"Retrying enqueue for FileID {file_id_db}, TaskType {task_type}, CorrelationID {correlation_id} (attempt {retry_state.attempt_number}/3)"
-                )
+                retry=retry_if_exception_type(Exception)
             )
             async def enqueue_with_retry(sql, params, task_type, correlation_id, response_queue=None, return_result=False):
                 try:
