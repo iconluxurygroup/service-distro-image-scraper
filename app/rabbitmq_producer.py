@@ -18,7 +18,7 @@ if not default_logger.handlers:
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-
+producer = None
 class RabbitMQProducer:
     def __init__(
         self,
