@@ -1564,10 +1564,10 @@ async def api_sort_by_relevance(
 @router.post("/reset-step1/{file_id}", tags=["Database"])
 async def api_reset_step1(
     file_id: str,
-    background_tasks: BackgroundTasks,
-    logger: Optional[logging.Logger] = None
+    background_tasks: BackgroundTasks
 ):
-    logger = logger or default_logger
+    # Initialize logger with setup_job_logger
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     logger.info(f"Resetting Step1 for FileID: {file_id}")
     
     try:
@@ -1612,7 +1612,7 @@ async def api_reset_step1(
         )
         logger.info(f"Enqueued Step1 reset for FileID: {file_id}, CorrelationID: {correlation_id}")
         log_public_url = await upload_file_to_space(
-            file_src=f"job_logs/job_{file_id}.log",
+            file_src=log_filename,
             save_as=f"job_logs/job_{file_id}.log",
             is_public=True,
             logger=logger,
@@ -1628,7 +1628,6 @@ async def api_reset_step1(
     
     except ValueError as e:
         logger.error(f"Error enqueuing Step1 reset for FileID {file_id}: {e}", exc_info=True)
-        log_filename = f"job_logs/job_{file_id}.log"
         log_public_url = await upload_file_to_space(
             file_src=log_filename,
             save_as=f"job_logs/job_{file_id}.log",
@@ -1639,7 +1638,6 @@ async def api_reset_step1(
         raise HTTPException(status_code=500, detail=f"Failed to reset Step1: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in Step1 reset for FileID {file_id}: {e}", exc_info=True)
-        log_filename = f"job_logs/job_{file_id}.log"
         log_public_url = await upload_file_to_space(
             file_src=log_filename,
             save_as=f"job_logs/job_{file_id}.log",
@@ -1651,7 +1649,7 @@ async def api_reset_step1(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engine for FileID {file_id}")
-        
+
 @router.post("/reset-step1-no-results/{file_id}", tags=["Database"])
 async def api_reset_step1_no_results(
     file_id: str,
