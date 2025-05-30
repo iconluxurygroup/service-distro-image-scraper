@@ -45,13 +45,11 @@ from db_utils import (
 )
 from search_utils import update_search_sort_order, update_sort_order, update_sort_no_image_entry
 from database_config import async_engine
-from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL,RABBITMQ_URL,DATAPROXY_API_KEY
+from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL, RABBITMQ_URL, DATAPROXY_API_KEY
 from email_utils import send_message_email
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
-
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
-
 
 app = FastAPI(title="super_scraper", version=VERSION)
 
@@ -65,46 +63,14 @@ router = APIRouter()
 JOB_STATUS = {}
 LAST_UPLOAD = {}
 
-# Global RabbitMQ producer
-producer = None
-
-class JobStatusResponse(BaseModel):
-    status: str = Field(..., description="Job status (e.g., queued, running, completed, failed)")
-    message: str = Field(..., description="Descriptive message about the job status")
-    public_url: Optional[str] = Field(None, description="R2 URL of the generated Excel file, if available")
-    log_url: Optional[str] = Field(None, description="R2 URL of the job log file, if available")
-    timestamp: str = Field(..., description="ISO timestamp of the response")
-
-import sys
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
-# ... other imports ...
-
-import sys
-
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
-# ... other imports ...
-
-from contextlib import asynccontextmanager
-import logging
-import asyncio
-import sys
-from fastapi import FastAPI, BackgroundTasks
-from contextlib import asynccontextmanager
-from sqlalchemy.sql import text
-from database_config import async_engine
-from logging_config import setup_job_logger
-from db_utils import insert_search_results
-from config import VERSION
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     default_logger.info("Starting up FastAPI application")
     
     try:
         # Initialize global RabbitMQ producer
-        async with asyncio.timeout(10):
+        global producer
+        async with asyncio.timeout(20):  # Increased timeout
             producer = await RabbitMQProducer.get_producer(default_logger)
         if not producer or not producer.is_connected:
             default_logger.error("Failed to initialize RabbitMQ producer, shutting down")
@@ -116,21 +82,16 @@ async def lifespan(app: FastAPI):
         file_id = "test_file_123"
         logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
         try:
-            # Sample search result
             sample_result = [
                 {
-                    "EntryID": 9999,  # Dummy EntryID
+                    "EntryID": 9999,
                     "ImageUrl": "https://example.com/test_image.jpg",
                     "ImageDesc": "Test image description",
                     "ImageSource": "example.com",
                     "ImageUrlThumbnail": "https://example.com/test_thumbnail.jpg"
                 }
             ]
-
-            # Use BackgroundTasks for enqueuing DB update
             background_tasks = BackgroundTasks()
-
-            # Insert the sample result
             success = await insert_search_results(
                 results=sample_result,
                 logger=logger,
@@ -142,14 +103,9 @@ async def lifespan(app: FastAPI):
             else:
                 logger.error(f"Failed to insert test search result for EntryID 9999, FileID {file_id}")
 
-            # Verify the insertion
             async with async_engine.connect() as conn:
                 result = await conn.execute(
-                    text("""
-                        SELECT COUNT(*) 
-                        FROM utb_ImageScraperResult 
-                        WHERE EntryID = :entry_id
-                    """),
+                    text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id"),
                     {"entry_id": 9999}
                 )
                 count = result.fetchone()[0]
@@ -182,10 +138,6 @@ async def lifespan(app: FastAPI):
             default_logger.info("RabbitMQ producer closed")
         await async_engine.dispose()
         default_logger.info("Database engine disposed")
-
-# ... rest of main.py ...
-
-# ... rest of main.py ...
 
 app.lifespan = lifespan
 class SearchClient:
