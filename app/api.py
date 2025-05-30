@@ -235,16 +235,7 @@ async def process_and_tag_results(
         
         logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
         
-        # Filter irrelevant results
-        irrelevant_keywords = ['wallpaper', 'sofa', 'furniture', 'decor', 'stock photo', 'card', 'pokemon']
-        filtered_results = [
-            res for res in deduplicated_results
-            if not any(kw.lower() in res.get("ImageDesc", "").lower() for kw in irrelevant_keywords)
-        ]
-        
-        logger.info(f"Worker PID {process.pid}: Filtered to {len(filtered_results)} results after removing irrelevant items for EntryID {entry_id}")
-        
-        return filtered_results
+        return deduplicated_results
     
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
