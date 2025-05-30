@@ -24,8 +24,8 @@ class RabbitMQConsumer:
         self,
         amqp_url: str = RABBITMQ_URL,
         queue_name: str = "db_update_queue",
-        connection_timeout: float = 10.0,
-        operation_timeout: float = 5.0,
+        connection_timeout: float = 30.0,  # Increased timeout
+        operation_timeout: float = 10.0,  # Increased timeout
         producer: Optional[RabbitMQProducer] = None
     ):
         self.amqp_url = amqp_url
@@ -40,6 +40,18 @@ class RabbitMQConsumer:
         self._lock = asyncio.Lock()
         self.producer = producer or RabbitMQProducer(amqp_url=amqp_url)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiormq.exceptions.ChannelInvalidStateError, aio_pika.exceptions.AMQPError)),
+        before_sleep=lambda retry_state: logger.info(
+            f"Retrying queue declaration for {retry_state.kwargs['queue_name']} "
+            f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+        )
+    )
+    async def declare_queue_with_retry(self, channel, queue_name: str, durable: bool):
+        return await channel.declare_queue(queue_name, durable=durable)
+
     async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool, delete_if_mismatched: bool = False) -> bool:
         try:
             queue = await channel.declare_queue(queue_name, passive=True)
@@ -51,7 +63,7 @@ class RabbitMQConsumer:
                     try:
                         await channel.queue_delete(queue_name)
                         logger.info(f"Deleted queue {queue_name} due to mismatched durability")
-                        return True  # Safe to recreate
+                        return True
                     except Exception as e:
                         logger.error(f"Failed to delete queue {queue_name}: {e}", exc_info=True)
                         return False
@@ -59,7 +71,7 @@ class RabbitMQConsumer:
             return True
         except (aio_pika.exceptions.QueueEmpty, aiormq.exceptions.ChannelNotFoundEntity):
             logger.debug(f"Queue {queue_name} does not exist")
-            return True  # Safe to create
+            return True
         except Exception as e:
             logger.error(f"Error checking queue {queue_name} durability: {e}", exc_info=True)
             return False
@@ -75,8 +87,9 @@ class RabbitMQConsumer:
                         await self.connection.close()
                     self.connection = await aio_pika.connect_robust(
                         self.amqp_url,
-                        connection_attempts=3,
+                        connection_attempts=5,  # Increased attempts
                         retry_delay=5,
+                        timeout=30  # Increased connection timeout
                     )
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
@@ -93,7 +106,7 @@ class RabbitMQConsumer:
                                 f"Delete the queue in RabbitMQ (http://localhost:15672, vhost app_vhost) or "
                                 f"run with --delete-mismatched to auto-delete."
                             )
-                        queue = await self.channel.declare_queue(queue_name, durable=durable)
+                        queue = await self.declare_queue_with_retry(self.channel, queue_name, durable)
                         await queue.bind('logs')
                         logger.debug(f"Queue {queue_name} declared and bound to logs exchange")
 
@@ -136,7 +149,8 @@ class RabbitMQConsumer:
         retry=retry_if_exception_type((
             aio_pika.exceptions.AMQPError,
             aio_pika.exceptions.ChannelClosed,
-            asyncio.TimeoutError
+            asyncio.TimeoutError,
+            aiormq.exceptions.ChannelInvalidStateError
         )),
         before_sleep=lambda retry_state: logger.info(
             f"Retrying start_consuming (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -157,7 +171,7 @@ class RabbitMQConsumer:
             self.is_consuming = False
             await self.close()
             raise
-        except (aio_pika.exceptions.AMQPConnectionError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError) as e:
+        except (aio_pika.exceptions.AMQPConnectionError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError, aiormq.exceptions.ChannelInvalidStateError) as e:
             logger.error(f"Connection error: {e}, attempting retry...", exc_info=True)
             self.is_consuming = False
             await self.close()
@@ -447,8 +461,8 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
         await consumer.producer.close()
         if loop.is_running():
             loop.stop()
-        await loop.shutdown_asyncgens()
-        await loop.shutdown_default_executor()
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
     except Exception as e:
         logger.error(f"Error during shutdown: {e}", exc_info=True)
     finally:
@@ -507,10 +521,7 @@ if __name__ == "__main__":
     except RuntimeError as e:
         logger.error(f"Error running main: {e}", exc_info=True)
     finally:
-        try:
-            if not loop.is_closed():
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.run_until_complete(loop.shutdown_default_executor())
-                loop.close()
-        except Exception as e:
-            logger.error(f"Error during final cleanup: {e}", exc_info=True)
+        if not loop.is_closed():
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+            loop.close()
