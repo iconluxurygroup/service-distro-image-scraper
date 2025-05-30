@@ -2189,8 +2189,6 @@ async def api_reset_step1_no_results(
         await async_engine.dispose()
         logger.info(f"Disposed database engine for FileID {file_id}")
 
-producer = None
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global producer
@@ -2199,8 +2197,6 @@ async def lifespan(app: FastAPI):
     try:
         await producer.connect()
         default_logger.info("RabbitMQ producer connected")
-
-        # Signal handlers
         loop = asyncio.get_running_loop()
         shutdown_event = asyncio.Event()
 
