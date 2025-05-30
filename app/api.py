@@ -494,7 +494,6 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
     except Exception as e:
         logger.error(f"Failed to upload log for FileID {file_id} after retries: {e}", exc_info=True)
         return None
-
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -538,13 +537,12 @@ async def process_restart_batch(
         RELEVANCE_THRESHOLD = 0.9
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
 
-        # Ensure global producer is available
         global producer
         if not producer or not producer.is_connected:
             logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
             try:
-                async with asyncio.timeout(20):  # Increased from 10 to 20 seconds
-                    producer = await get_producer(logger)  # Use get_producer
+                async with asyncio.timeout(20):
+                    producer = await get_producer(logger)
                 logger.info("Successfully initialized RabbitMQ producer")
             except Exception as e:
                 logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
@@ -595,32 +593,40 @@ async def process_restart_batch(
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched for FileID {file_id_db}")
-            log_public_url = await upload_file_to_space(
-                file_src=log_filename,
-                save_as=f"job_logs/job_{file_id_db}.log",
-                is_public=True,
-                logger=logger,
-                file_id=str(file_id_db)
-            )
-            return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
+            # Fallback to a default brand rule for known brands
+            brand_rules = {
+                "Scotch & Soda": {
+                    "aliases": ["Scotch and Soda", "S&S"],
+                    "sku_pattern": r"^\d{6,8}[a-zA-Z0-9]*$"
+                }
+            }
+            logger.info(f"Using fallback brand rules: {brand_rules}")
+        else:
+            logger.debug(f"Fetched brand rules: {brand_rules}")
+            if "Scotch & Soda" not in brand_rules:
+                brand_rules["Scotch & Soda"] = {
+                    "aliases": ["Scotch and Soda", "S&S"],
+                    "sku_pattern": r"^\d{6,8}[a-zA-Z0-9]*$"
+                }
+                logger.info(f"Added 'Scotch & Soda' to brand rules")
 
         endpoint = SEARCH_PROXY_API_URL
         logger.debug(f"Using search endpoint: {endpoint}")
         async with async_engine.connect() as conn:
-                query = text("""
-                    SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory
-                    FROM utb_ImageScraperRecords r
-                    LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
-                    WHERE r.FileID = :file_id
-                    AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
-                    AND r.Step1 IS NULL
-                    AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.[SortOrder] <= 0)
-                    ORDER BY r.EntryID
-                """)
-                result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
-                entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
-                logger.info(f"Found {len(entries)} entries needing processing for FileID {file_id_db}")
-                result.close()
+            query = text("""
+                SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory
+                FROM utb_ImageScraperRecords r
+                LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+                WHERE r.FileID = :file_id
+                AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
+                AND r.Step1 IS NULL
+                AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.[SortOrder] <= 0)
+                ORDER BY r.EntryID
+            """)
+            result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
+            entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
+            logger.info(f"Found {len(entries)} entries needing processing for FileID {file_id_db}")
+            result.close()
 
         if not entries:
             logger.warning(f"No valid EntryIDs found for FileID {file_id_db}")
