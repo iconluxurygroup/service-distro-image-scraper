@@ -667,7 +667,7 @@ async def process_restart_batch(
         file_id_db_int = file_id_db
         BATCH_SIZE = 5  # Hardcode to 10 entries per batch
         MAX_CONCURRENCY = 20
-        MAX_ENTRY_RETRIES = 3
+        MAX_ENTRY_RETRIES = 7
         RELEVANCE_THRESHOLD = 0.9
 
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
