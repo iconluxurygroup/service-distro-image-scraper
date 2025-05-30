@@ -285,14 +285,14 @@ async def insert_search_results(
         # Pre-check for existing rows
         if entry_ids:
             async with async_engine.connect() as conn:
+                flat_entry_ids = [id[0] if isinstance(id, (list, tuple)) else id for id in entry_ids]
                 query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
-                result = await conn.execute(query, {"entry_ids": tuple(entry_ids)})
+                result = await conn.execute(query, {"entry_ids": tuple(flat_entry_ids)})
                 count = result.scalar()
-                logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {entry_ids}")
+                logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {flat_entry_ids}")
 
         existing_keys = set()
         if entry_ids:
-            # Flatten entry_ids if necessary
             flat_entry_ids = [id[0] if isinstance(id, (list, tuple)) else id for id in entry_ids]
             select_query = text("""
                 SELECT EntryID, ImageUrl
@@ -300,7 +300,7 @@ async def insert_search_results(
                 WHERE EntryID IN :entry_ids
             """)
             params = {"entry_ids": tuple(flat_entry_ids)}
-            result = await enqueue_db_update(
+            await enqueue_db_update(
                 file_id=file_id,
                 sql=select_query,
                 params=params,
@@ -313,6 +313,7 @@ async def insert_search_results(
                 logger=logger
             )
             logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued SELECT query for {len(flat_entry_ids)} EntryIDs")
+
             consume_task = asyncio.create_task(consume_responses())
             try:
                 async with asyncio.timeout(120):
@@ -328,6 +329,7 @@ async def insert_search_results(
             finally:
                 consume_task.cancel()
                 await asyncio.sleep(0.5)
+
         # ... (rest of the function remains unchanged)
 
         update_query = """
