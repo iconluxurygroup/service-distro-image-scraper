@@ -558,7 +558,7 @@ async def process_restart_batch(
             try:
                 producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
                 async with asyncio.timeout(10):
-                    await producer.connect()
+                    producer = await producer.connect()  # Assign return value
                 logger.info("Successfully initialized RabbitMQ producer")
             except Exception as e:
                 logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
@@ -716,7 +716,7 @@ async def process_restart_batch(
                             for term in search_terms:
                                 logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
                                 # Enforce a 30-second timeout for the search operation
-                                async with asyncio.timeout(30):
+                                async with asyncio.timeout(60):
                                     results = await async_process_entry_search(
                                         search_string=term,
                                         brand=brand,
