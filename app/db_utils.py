@@ -235,10 +235,14 @@ def register_shutdown_handler(producer, consumer, logger, correlation_id):
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, shutdown_callback)
+from tenacity import retry_if_exception
+def is_retryable_exception(exception):
+    return isinstance(exception, (SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)) and \
+           not isinstance(exception, (aiormq.exceptions.ChannelNotFoundEntity, aiormq.exceptions.ChannelLockedResource))
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
+    retry=retry_if_exception(is_retryable_exception),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
