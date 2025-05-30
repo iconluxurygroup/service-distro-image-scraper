@@ -4,6 +4,7 @@ import pyodbc
 import asyncio
 import json
 import datetime
+import aio_pika
 import os
 import aiofiles
 import psutil
