@@ -216,8 +216,7 @@ async def insert_search_results(
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
-
-    global producer
+    producer = await get_producer(logger)
     if producer is None or not producer.is_connected or not producer.channel or producer.channel.is_closed:
         logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
         try:

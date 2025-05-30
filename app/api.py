@@ -101,7 +101,6 @@ from config import VERSION
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global producer
     default_logger.info("Starting up FastAPI application")
     
     try:
@@ -624,7 +623,7 @@ async def process_restart_batch(
         RELEVANCE_THRESHOLD = 0.9
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
 
-        global producer
+        producer = await get_producer(logger)
         if not producer or not producer.is_connected:
             logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
             try:
@@ -1809,7 +1808,7 @@ async def api_reset_step1_no_results(
         logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
 
         # Ensure global producer is available
-        global producer
+        producer = await get_producer(logger)
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError(f"RabbitMQ not initialized")
@@ -1981,7 +1980,7 @@ async def api_validate_images(
         logger.info(f"Found {len(results)} images to validate for FileID {file_id}")
 
         # Ensure global producer is available
-        global producer
+        producer = await get_producer(logger)
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
@@ -2192,7 +2191,7 @@ async def api_reset_step1_no_results(
         logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
 
         # Ensure global producer is available
-        global producer
+        producer = await get_producer(logger)
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")

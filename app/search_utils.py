@@ -98,7 +98,7 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
 
         # Enqueue updates
-        global producer
+        producer = await get_producer(logger)
         if producer is None or not producer.is_connected:
             producer = await get_producer(logger)
 
