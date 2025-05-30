@@ -408,25 +408,21 @@ if __name__ == "__main__":
             logger.error(f"Failed to clear queue: {e}", exc_info=True)
             sys.exit(1)
 
-    sample_task = {
-        "file_id": "321",
-        "task_type": "update_sort_order",
-        "sql": "UPDATE_SORT_ORDER",
-        "params": {
-            "entry_id": "119061",
-            "result_id": "1868277",
-            "sort_order": 1
-        },
-        "timestamp": "2025-05-21T12:34:08.307076"
-    }
-
     async def main():
-        await consumer.test_task(sample_task)
-        await consumer.start_consuming()
+        try:
+            await consumer.test_task(sample_task)
+            await consumer.start_consuming()
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt in main, shutting down...")
+            await shutdown(consumer, loop)
+        except Exception as e:
+            logger.error(f"Unexpected error in main: {e}", exc_info=True)
+            await shutdown(consumer, loop)
 
     try:
         loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        loop.run_until_complete(shutdown(consumer, loop))
+    except Exception as e:
+        logger.error(f"Error running main: {e}", exc_info=True)
     finally:
-        loop.close()
+        if not loop.is_closed():
+            loop.close()
