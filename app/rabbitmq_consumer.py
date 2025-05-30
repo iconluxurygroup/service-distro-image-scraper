@@ -9,12 +9,11 @@ from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import psutil 
+import psutil
 from typing import Optional, Dict, Any
 from rabbitmq_producer import RabbitMQProducer
-import aiormq.exceptions  # Add this import at the top of rabbitmq_consumer.py
 import uuid
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -26,15 +25,6 @@ class RabbitMQConsumer:
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
     ):
-        """
-        Initialize RabbitMQ consumer with connection parameters.
-        
-        Args:
-            amqp_url: RabbitMQ connection URL.
-            queue_name: Name of the queue to consume from.
-            connection_timeout: Timeout for establishing connection (seconds).
-            operation_timeout: Timeout for processing messages (seconds).
-        """
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.connection_timeout = connection_timeout
@@ -58,7 +48,7 @@ class RabbitMQConsumer:
                         retry_delay=5,
                     )
                     self.channel = await self.connection.channel()
-                    await self.channel.set_qos(prefetch_count=1)  # Process one message at a time
+                    await self.channel.set_qos(prefetch_count=1)
                     await self.channel.declare_queue(self.queue_name, durable=True)
                     logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
             except asyncio.TimeoutError:
@@ -113,17 +103,17 @@ class RabbitMQConsumer:
             raise
 
     @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((
-        aio_pika.exceptions.AMQPError,
-        aio_pika.exceptions.ChannelClosed,
-        asyncio.TimeoutError
-    )),
-    before_sleep=lambda retry_state: logger.info(
-        f"Retrying start_consuming (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception_type((
+            aio_pika.exceptions.AMQPError,
+            aio_pika.exceptions.ChannelClosed,
+            asyncio.TimeoutError
+        )),
+        before_sleep=lambda retry_state: logger.info(
+            f"Retrying start_consuming (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+        )
     )
-)
     async def start_consuming(self):
         """Start consuming messages with robust reconnection."""
         try:
@@ -133,11 +123,16 @@ class RabbitMQConsumer:
             await queue.consume(self.callback)
             logger.info("Started consuming messages. To exit press CTRL+C")
             await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            logger.info("Consumer cancelled, shutting down...")
+            self.is_consuming = False
+            await self.close()
+            raise
         except (aio_pika.exceptions.AMQPConnectionError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError) as e:
             logger.error(f"Connection error: {e}, attempting retry...", exc_info=True)
             self.is_consuming = False
             await self.close()
-            raise  # Let tenacity handle retry
+            raise
         except aio_pika.exceptions.ProbableAuthenticationError as e:
             logger.error(
                 f"Authentication error: {e}. "
@@ -154,8 +149,8 @@ class RabbitMQConsumer:
             )
             self.is_consuming = False
             await self.close()
-            await asyncio.sleep(2)  # Brief delay to avoid rapid reconnection
-            raise  # Let tenacity handle retry
+            await asyncio.sleep(2)
+            raise
         except KeyboardInterrupt:
             logger.info("Received KeyboardInterrupt, shutting down consumer")
             self.is_consuming = False
@@ -189,6 +184,7 @@ class RabbitMQConsumer:
                 f"Database error executing UPDATE/INSERT: {sql[:100]}, params: {params}, error: {str(e)}",
                 exc_info=True
             )
+            await conn.rollback()
             raise
         except Exception as e:
             logger.error(
@@ -196,14 +192,18 @@ class RabbitMQConsumer:
                 f"Unexpected error executing UPDATE/INSERT: {sql[:100]}, params: {params}, error: {str(e)}",
                 exc_info=True
             )
+            await conn.rollback()
             raise
+        finally:
+            if hasattr(conn, 'close'):
+                await conn.close()
 
     async def execute_select(self, task: Dict[str, Any], conn, logger: logging.Logger) -> Dict[str, Any]:
         """Execute a SELECT query and optionally send results to a response queue."""
         file_id = task.get("file_id", "unknown")
         select_sql = task.get("sql")
         params = task.get("params", {})
-        response_queue = task.get("response_queue", "shared_response_queue")  # Fallback to shared queue
+        response_queue = task.get("response_queue", "shared_response_queue")
         correlation_id = task.get("correlation_id")
         logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql[:100]}, params: {params}")
         if not params:
@@ -223,7 +223,7 @@ class RabbitMQConsumer:
                     @retry(
                         stop=stop_after_attempt(3),
                         wait=wait_exponential(multiplier=1, min=2, max=10),
-                        retry=retry_if_exception_type(aiormq.exceptions.ChannelLockedResource)
+                        retry=retry_if_exception_type(aio_pika.exceptions.AMQPError)
                     )
                     async def publish_with_retry():
                         await producer.publish_message(
@@ -234,9 +234,6 @@ class RabbitMQConsumer:
                         logger.debug(f"Sent {len(results)} SELECT results to {response_queue} for FileID {file_id}")
                     
                     await publish_with_retry()
-                except aiormq.exceptions.ChannelLockedResource as e:
-                    logger.error(f"Failed to publish to {response_queue} after retries: {e}", exc_info=True)
-                    raise
                 finally:
                     await producer.close()
             return {"results": results}
@@ -246,6 +243,9 @@ class RabbitMQConsumer:
         except Exception as e:
             logger.error(f"Unexpected error executing SELECT for FileID {file_id}: {e}", exc_info=True)
             raise
+        finally:
+            if hasattr(conn, 'close'):
+                await conn.close()
 
     async def execute_sort_order_update(self, params: Dict[str, Any], file_id: str) -> bool:
         """Execute an update_sort_order task."""
@@ -280,15 +280,18 @@ class RabbitMQConsumer:
                 return rowcount > 0
         except SQLAlchemyError as e:
             logger.error(f"Database error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
+            if 'conn' in locals() and hasattr(conn, 'rollback'):
+                await conn.rollback()
             return False
         except Exception as e:
             logger.error(f"Unexpected error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
+            if 'conn' in locals() and hasattr(conn, 'rollback'):
+                await conn.rollback()
             return False
 
     async def callback(self, message: aio_pika.IncomingMessage):
         """Process incoming messages from the queue."""
         async with self._lock:
-            # Ensure channel is valid; reconnect if necessary
             for attempt in range(3):
                 if not self.channel or self.channel.is_closed:
                     logger.warning(f"Channel is closed or invalid, attempting reconnect (attempt {attempt + 1}/3)")
@@ -372,15 +375,10 @@ class RabbitMQConsumer:
 
 async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     logger.info("Initiating shutdown...")
-    # Cancel all running tasks (except the current one)
     tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
     for task in tasks:
         task.cancel()
-    
-    # Stop the consumer and close RabbitMQ connection
     await consumer.close()
-    
-    # Stop and clean up the event loop
     loop.stop()
     await loop.shutdown_asyncgens()
     loop.close()
@@ -390,9 +388,7 @@ def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     """Create a signal handler for graceful shutdown."""
     def handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        # Schedule shutdown as a task
         asyncio.ensure_future(shutdown(consumer, loop))
-        # Allow the loop to process the shutdown task
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
         exit(0)
@@ -417,6 +413,18 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Failed to clear queue: {e}", exc_info=True)
             sys.exit(1)
+
+    sample_task = {
+        "file_id": "321",
+        "task_type": "update_sort_order",
+        "sql": "UPDATE_SORT_ORDER",
+        "params": {
+            "entry_id": "119061",
+            "result_id": "1868277",
+            "sort_order": 1
+        },
+        "timestamp": "2025-05-21T12:34:08.307076"
+    }
 
     async def main():
         try:
