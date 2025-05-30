@@ -406,9 +406,12 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
             loop.close()
         logger.info("Shutdown complete.")
 
+# ... imports and class definition unchanged ...
+
 if __name__ == "__main__":
     import argparse
     import sys
+    import asyncio
     from rabbitmq_test import test_rabbitmq_connection
 
     parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
@@ -429,7 +432,7 @@ if __name__ == "__main__":
                 sys.exit(1)
             logger.info("RabbitMQ connection test passed")
 
-            if args.clear:  # Fixed to match --clear
+            if args.clear:
                 await consumer.purge_queue()
                 logger.info("Queue cleared successfully. Exiting.")
                 sys.exit(0)
@@ -450,18 +453,30 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt in main, shutting down...")
             await shutdown(consumer, loop)
+        except SystemExit as e:
+            logger.info(f"Exiting with code {e.code}")
+            raise
         except Exception as e:
             logger.error(f"Unexpected error in main: {e}", exc_info=True)
             await shutdown(consumer, loop)
 
     try:
         loop.run_until_complete(main())
+    except SystemExit as e:
+        # Handle exit without cleanup errors
+        pass
     except Exception as e:
         logger.error(f"Error running main: {e}", exc_info=True)
     finally:
-        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        if not loop.is_closed():
-            loop.close()
+        try:
+            # Cancel tasks while loop is active
+            tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}", exc_info=True)
+        finally:
+            if not loop.is_closed():
+                loop.close()
