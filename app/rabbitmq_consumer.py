@@ -262,7 +262,6 @@ class RabbitMQConsumer:
         except Exception as e:
             logger.error(f"Error updating SortOrder for FileID: {file_id}, EntryID: {entry_id}: {e}", exc_info=True)
             return False
-
     async def callback(self, message: aio_pika.IncomingMessage):
         async with message.process(requeue=True, ignore_processed=True):
             try:
@@ -280,7 +279,7 @@ class RabbitMQConsumer:
                             result = await self.execute_select(task, conn, logger)
                             response = {"file_id": file_id, "results": result}
                             if response_queue:
-                                producer = RabbitMQProducer(amqp_url=self.amqp_url)
+                                producer = await RabbitMQProducer.get_producer(logger=logger, amqp_url=self.amqp_url)
                                 try:
                                     await producer.connect()
                                     await producer.publish_message(
@@ -293,7 +292,8 @@ class RabbitMQConsumer:
                                         f"for FileID: {file_id}"
                                     )
                                 finally:
-                                    await producer.close()
+                                    # Do not close producer to maintain singleton connection
+                                    pass
                         success = True
                     elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
                         success = await self.execute_sort_order_update(task.get("params", {}), file_id)
@@ -301,13 +301,13 @@ class RabbitMQConsumer:
                         async with async_engine.begin() as conn:
                             result = await self.execute_update(task, conn, logger)
                             success = True
-                if success:
-                    await message.ack()
-                    logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
-                else:
-                    logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
-                    await message.nack(requeue=True)
-                    await asyncio.sleep(2)
+                    if success:
+                        await message.ack()
+                        logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
+                    else:
+                        logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
+                        await message.nack(requeue=True)
+                        await asyncio.sleep(2)
             except asyncio.TimeoutError:
                 logger.error(f"Timeout processing message for FileID: {file_id}, TaskType: {task_type}")
                 await message.nack(requeue=True)
@@ -319,7 +319,6 @@ class RabbitMQConsumer:
                 )
                 await message.nack(requeue=True)
                 await asyncio.sleep(2)
-
     async def test_task(self, task: dict):
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
