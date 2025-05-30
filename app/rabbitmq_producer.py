@@ -75,55 +75,53 @@ class RabbitMQProducer:
             return False
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((
-            aio_pika.exceptions.AMQPError,
-            aio_pika.exceptions.ChannelClosed,
-            asyncio.TimeoutError,
-            asyncio.CancelledError,
-        )),
-        before_sleep=lambda retry_state: default_logger.info(
-            f"Retrying connect (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-        )
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, aiormq.exceptions.ChannelInvalidStateError)),
+    before_sleep=lambda retry_state: default_logger.info(
+        f"Retrying connect (attempt {retry_state.attempt_number}/5) after {retry_state.next_action.sleep}s"
     )
-    async def connect(self) -> 'RabbitMQProducer':
+)
+    async def connect(self):
         async with self._lock:
-            if self.is_connected and self.connection and not self.connection.is_closed:
-                default_logger.debug("RabbitMQ connection already established")
-                return self
             try:
-                async with asyncio.timeout(self.connection_timeout):
-                    self.connection = await aio_pika.connect_robust(self.amqp_url, connection_attempts=5, retry_delay=5, timeout=30)
-                    self.channel = await self.connection.channel()
-                    await self.channel.set_qos(prefetch_count=1)
-                    await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
+                # Close existing connection/channel
+                await self.close()
 
-                    queues = [
-                        (self.queue_name, True),
-                        (self.response_queue_name, True),
-                        (self.new_queue_name, True),
-                    ]
-                    for queue_name, durable in queues:
-                        if not await self.check_queue_durability(self.channel, queue_name, durable, delete_if_mismatched=args.delete_mismatched):
-                            raise ValueError(
-                                f"Queue {queue_name} has mismatched durability settings. "
-                                f"Delete the queue in RabbitMQ (http://localhost:15672, vhost app_vhost) or "
-                                f"run with --delete-mismatched to auto-delete."
-                            )
-                        queue = await self.channel.declare_queue(queue_name, durable=durable)
-                        await queue.bind('logs')
-                        default_logger.debug(f"Queue {queue_name} declared and bound to logs exchange")
+                # Establish new connection
+                self.connection = await aio_pika.connect_robust(
+                    self.amqp_url,
+                    timeout=self.connection_timeout,
+                    loop=asyncio.get_running_loop()
+                )
+                self.channel = await self.connection.channel()
+                await self.channel.set_qos(prefetch_count=1)  # Limit prefetch for stability
 
-                    self.is_connected = True
-                    default_logger.info(
-                        f"Connected to RabbitMQ, declared fanout exchange: logs, and queues: "
-                        f"{self.queue_name}, {self.response_queue_name}, {self.new_queue_name}"
+                # Declare fanout exchange
+                await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
+
+                # Check and declare queues with durability settings
+                for queue_name, durable in [
+                    (self.queue_name, True),
+                    (self.new_queue_name, True),
+                    (self.response_queue_name, True)
+                ]:
+                    should_declare = await self.check_queue_durability(
+                        self.channel, queue_name, durable, delete_if_mismatched=True
                     )
-                    return self
-            except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
-                default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-                self.is_connected = False
+                    if should_declare:
+                        queue = await self.declare_queue_with_retry(self.channel, queue_name, durable)
+                        await queue.bind('logs')  # Bind queue to logs exchange
+                        logger.info(f"Declared and bound queue {queue_name} with durable={durable} to logs exchange")
+
+                logger.info("Successfully connected to RabbitMQ")
+            except aio_pika.exceptions.AMQPError as e:
+                logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+                await self.close()
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error during connection: {e}", exc_info=True)
+                await self.close()
                 raise
 
     async def publish_message(

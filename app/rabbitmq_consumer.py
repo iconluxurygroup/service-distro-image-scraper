@@ -480,6 +480,7 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
             except Exception as e:
                 logger.error(f"Error closing event loop: {e}", exc_info=True)
         logger.info("Shutdown complete.")
+        
 async def main():
     try:
         if args.clear:
