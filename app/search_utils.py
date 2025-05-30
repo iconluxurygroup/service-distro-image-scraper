@@ -2,7 +2,6 @@ import logging
 import os
 import datetime
 import json
-import aiofiles
 from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
