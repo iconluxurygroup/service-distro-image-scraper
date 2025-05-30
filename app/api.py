@@ -1569,6 +1569,7 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
             result.close()
 
         # Ensure producer is initialized and connected
+        global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             producer = RabbitMQProducer()
@@ -1715,6 +1716,7 @@ async def api_reset_step1_no_results(
         logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
 
         # Ensure global producer is available
+        global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             producer = RabbitMQProducer()
@@ -1886,6 +1888,7 @@ async def api_validate_images(
         logger.info(f"Found {len(results)} images to validate for FileID {file_id}")
 
         # Ensure global producer is available
+        global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
@@ -2095,6 +2098,7 @@ async def api_reset_step1_no_results(
         logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
 
         # Ensure global producer is available
+        global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
