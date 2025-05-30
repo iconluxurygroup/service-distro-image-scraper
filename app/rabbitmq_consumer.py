@@ -114,16 +114,13 @@ class RabbitMQConsumer:
         except aio_pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
             raise
-        except aiormq.exceptions.ChannelLockedResource:
-            logger.warning(f"Queue {self.queue_name} is locked, generating new queue name")
-            self.queue_name = f"{self.queue_name}_{uuid.uuid4().hex[:8]}"
-            await self.declare_queue_with_retry(
-                self.channel,
-                self.queue_name,
-                exclusive=True,
-                auto_delete=True,
-                arguments={"x-expires": 600000}
+        except aiormq.exceptions.ChannelLockedResource as e:
+            logger.error(
+                f"Resource locked error for queue {self.queue_name}: {e}. "
+                f"Ensure queue is not exclusively locked by another connection.",
+                exc_info=True
             )
+            raise
     async def get_channel(self) -> aio_pika.Channel:
         """Get the RabbitMQ channel, connecting if necessary."""
         if not self.channel or self.channel.is_closed:

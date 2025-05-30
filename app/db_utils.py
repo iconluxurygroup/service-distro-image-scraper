@@ -311,27 +311,40 @@ async def insert_search_results(
     register_shutdown_handler(producer, None, logger, correlation_id)
 
     try:
-        response_queue = f"select_response_{uuid.uuid4().hex}_{file_id}_{correlation_id}"
+        response_queue = f"select_response_{uuid.uuid4().hex}"
         logger.debug(f"[{correlation_id}] Declaring response queue: {response_queue}")
-        consumer = RabbitMQConsumer(
-            amqp_url=producer.amqp_url,
-            queue_name=response_queue,
-            connection_timeout=30.0,
-            operation_timeout=15.0,
+        await producer.connect()
+        channel = producer.channel
+        queue = await channel.declare_queue(
+            response_queue,
+            exclusive=True,
+            auto_delete=True,
+            arguments={"x-expires": 300000}  # Queue expires after 5 minutes
         )
-        await consumer.connect()
+        logger.debug(f"[{correlation_id}] Queue {response_queue} declared successfully")
 
         response_received = asyncio.Event()
         response_data = []
 
         async def consume_responses():
-            async with (await consumer.channel.get_queue(response_queue)).iterator() as queue_iter:
+            async with queue.iterator() as queue_iter:
                 async for message in queue_iter:
                     async with message.process():
                         if message.correlation_id == correlation_id:
                             response_data.append(json.loads(message.body.decode()))
                             response_received.set()
                             logger.debug(f"[{correlation_id}] Received response for FileID {file_id}")
+
+        def flatten_entry_ids(entry_ids, logger, correlation_id):
+            flat_ids = []
+            for id in entry_ids:
+                if isinstance(id, (list, tuple)):
+                    flat_ids.extend(flatten_entry_ids(id, logger, correlation_id))
+                elif isinstance(id, int):
+                    flat_ids.append(id)
+                else:
+                    logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}, type: {type(id)}")
+            return flat_ids
 
         entry_ids = list(set(row["EntryID"] for row in data))
         logger.debug(f"[{correlation_id}] Raw EntryIDs: {entry_ids}, type: {type(entry_ids)}")
@@ -389,7 +402,7 @@ async def insert_search_results(
 
             consume_task = asyncio.create_task(consume_responses())
             try:
-                async with asyncio.timeout(180):
+                async with asyncio.timeout(120):
                     await response_received.wait()
                 if response_data:
                     existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
@@ -397,7 +410,7 @@ async def insert_search_results(
                 else:
                     logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No deduplication results received")
             except asyncio.TimeoutError:
-                logger.error(f"[{correlation_id}] Timeout waiting for SELECT results")
+                logger.error(f"[{correlation_id}] Worker PID {process.pid}: Timeout waiting for SELECT results")
                 raise
             finally:
                 if consume_task:
@@ -439,7 +452,7 @@ async def insert_search_results(
                     sql=sql,
                     params=params,
                     background_tasks=background_tasks,
-                    task_type="update",
+                    task_type="update_search_result",
                     producer=producer,
                     correlation_id=cid,
                     logger=logger
@@ -456,7 +469,7 @@ async def insert_search_results(
                     sql=sql,
                     params=params,
                     background_tasks=background_tasks,
-                    task_type="insert",
+                    task_type="insert_search_result",
                     producer=producer,
                     correlation_id=cid,
                     logger=logger
@@ -465,7 +478,10 @@ async def insert_search_results(
 
         async with async_engine.connect() as conn:
             if len(flat_entry_ids) == 1:
-                query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id AND CreateTime >= :create_time")
+                query = text("""
+                    SELECT COUNT(*) FROM utb_ImageScraperResult
+                    WHERE EntryID = :entry_id AND CreateTime >= :create_time
+                """)
                 result = await conn.execute(query, {
                     "entry_id": flat_entry_ids[0],
                     "create_time": min(row["CreateTime"] for row in data)
@@ -485,7 +501,7 @@ async def insert_search_results(
         return len(insert_batch) > 0 or len(update_batch) > 0
 
     except Exception as e:
-        logger.error(f"[{correlation_id}] Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"[{correlation_id}] Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         raise
     finally:
         if consumer:
@@ -805,18 +821,17 @@ async def enqueue_db_update(
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
     return_result: bool = False,
-    consumer: Optional[RabbitMQConsumer] = None,
     logger: Optional[logging.Logger] = None,
 ):
     logger = logger or logging.getLogger(__name__)
     if not logger.handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-    should_close_producer = False
-    should_close_consumer = False
+    should_close = False
+    consumer = None
     if producer is None:
         producer = await RabbitMQProducer.get_producer(logger=logger)
-        should_close_producer = True
+        should_close = True
 
     try:
         await producer.connect()
@@ -830,18 +845,32 @@ async def enqueue_db_update(
             "response_queue": response_queue,
         }
         if return_result and response_queue:
-            if consumer is None:
-                consumer = RabbitMQConsumer(
-                    amqp_url=producer.amqp_url,
-                    queue_name=response_queue,
-                    connection_timeout=30.0,
-                    operation_timeout=15.0,
-                )
-                should_close_consumer = True
+            consumer = RabbitMQConsumer(
+                amqp_url=producer.amqp_url,
+                queue_name=response_queue,
+                connection_timeout=10.0,
+                operation_timeout=5.0,
+            )
+            try:
                 await consumer.connect()
-                logger.debug(f"[{correlation_id}] Created and connected consumer for queue {response_queue}")
-            else:
-                logger.debug(f"[{correlation_id}] Using provided consumer for queue {response_queue}")
+                logger.debug(f"[{correlation_id}] Connected to consumer for queue {response_queue}")
+            except aiormq.exceptions.ChannelNotFoundEntity:
+                logger.warning(f"[{correlation_id}] Queue {response_queue} not found, attempting to recreate")
+                # Recreate the queue
+                channel = await consumer.get_channel()
+                await channel.declare_queue(
+                    response_queue,
+                    exclusive=True,
+                    auto_delete=True,
+                    arguments={"x-expires": 300000}
+                )
+                logger.debug(f"[{correlation_id}] Recreated queue {response_queue}")
+            except aiormq.exceptions.ChannelLockedResource as e:
+                logger.error(f"[{correlation_id}] Queue {response_queue} locked: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"[{correlation_id}] Unexpected error connecting to queue {response_queue}: {e}")
+                raise
 
             result_future = asyncio.Future()
 
@@ -859,7 +888,7 @@ async def enqueue_db_update(
             logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
 
             try:
-                async with asyncio.timeout(180):
+                async with asyncio.timeout(120):
                     result = await result_future
                     logger.info(f"[{correlation_id}] Received deduplication result for FileID: {file_id}")
                     return result
@@ -873,9 +902,9 @@ async def enqueue_db_update(
         logger.error(f"[{correlation_id}] Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise
     finally:
-        if should_close_consumer and consumer:
+        if consumer:
             await consumer.close()
             logger.debug(f"[{correlation_id}] Closed RabbitMQ consumer for queue {response_queue}")
-        if should_close_producer and producer:
+        if should_close and producer:
             await producer.close()
             logger.debug(f"[{correlation_id}] Closed RabbitMQ producer for FileID: {file_id}")
