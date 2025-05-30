@@ -239,13 +239,11 @@ async def enqueue_db_update(
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
         response_queue = response_queue or f"response_{correlation_id}" if return_result else None
 
-        # Sanitize params to convert datetime objects
-        sanitized_params = {}
-        for key, value in params.items():
-            if isinstance(value, datetime.datetime):
-                sanitized_params[key] = value.isoformat()
-            else:
-                sanitized_params[key] = value
+        # Sanitize params
+        sanitized_params = {
+            key: value.isoformat() if isinstance(value, datetime.datetime) else value
+            for key, value in params.items()
+        }
 
         update_task = {
             "file_id": file_id,
@@ -273,13 +271,7 @@ async def enqueue_db_update(
                     await producer.connect()
                     channel = producer.channel
 
-                # Clean up stale queue
-                try:
-                    await producer.cleanup_queue(response_queue)
-                except Exception as e:
-                    logger.warning(f"Failed to clean up response queue {response_queue} before declaration: {e}")
-
-                # Declare response queue with retries
+                # Declare response queue without cleanup
                 @retry(
                     stop=stop_after_attempt(3),
                     wait=wait_exponential(multiplier=1, min=1, max=5),
@@ -293,9 +285,8 @@ async def enqueue_db_update(
                         return await channel.declare_queue(
                             response_queue, durable=False, exclusive=False, auto_delete=True
                         )
-                    except aiormq.exceptions.ChannelLockedResource:
-                        logger.warning(f"Queue {response_queue} locked, attempting to delete and retry")
-                        await producer.cleanup_queue(response_queue)
+                    except aiormq.exceptions.ChannelNotFoundEntity:
+                        logger.warning(f"Queue {response_queue} not found, retrying declaration")
                         raise
 
                 try:
@@ -311,7 +302,7 @@ async def enqueue_db_update(
                 @retry(
                     stop=stop_after_attempt(3),
                     wait=wait_exponential(multiplier=1, min=2, max=10),
-                    retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
+                    retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, asyncio.TimeoutError, aiormq.exceptions.ChannelNotFoundEntity)),
                     before_sleep=lambda retry_state: logger.info(
                         f"Retrying consume_response for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
                     )
@@ -332,7 +323,7 @@ async def enqueue_db_update(
 
                 consume_task = asyncio.create_task(consume_response(queue))
                 try:
-                    async with asyncio.timeout(120):  # Increased to match search_utils.py
+                    async with asyncio.timeout(120):
                         await response_received.wait()
                     if response_data and "result" in response_data:
                         logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
