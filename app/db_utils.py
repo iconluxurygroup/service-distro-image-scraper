@@ -292,14 +292,15 @@ async def insert_search_results(
 
         existing_keys = set()
         if entry_ids:
-            placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
-            select_query = f"""
+            # Flatten entry_ids if necessary
+            flat_entry_ids = [id[0] if isinstance(id, (list, tuple)) else id for id in entry_ids]
+            select_query = text("""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
-                WHERE EntryID IN ({placeholders})
-            """
-            params = {f"id{i}": entry_id for i, entry_id in enumerate(entry_ids)}
-            await enqueue_db_update(
+                WHERE EntryID IN :entry_ids
+            """)
+            params = {"entry_ids": tuple(flat_entry_ids)}
+            result = await enqueue_db_update(
                 file_id=file_id,
                 sql=select_query,
                 params=params,
@@ -311,8 +312,7 @@ async def insert_search_results(
                 return_result=True,
                 logger=logger
             )
-            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
-
+            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued SELECT query for {len(flat_entry_ids)} EntryIDs")
             consume_task = asyncio.create_task(consume_responses())
             try:
                 async with asyncio.timeout(120):
