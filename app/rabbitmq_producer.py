@@ -202,7 +202,7 @@ async def cleanup_producer():
         default_logger.info("Cleaned up RabbitMQ producer")
 
 @retry(
-    stop=stop_after_attempt(5),  # Increased from 3 to 5
+    stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((
         aio_pika.exceptions.AMQPError,
@@ -273,7 +273,7 @@ async def enqueue_db_update(
                     await producer.connect()
                     channel = producer.channel
 
-                # Attempt to clean up stale queue
+                # Clean up stale queue
                 try:
                     await producer.cleanup_queue(response_queue)
                 except Exception as e:
@@ -296,7 +296,7 @@ async def enqueue_db_update(
                     except aiormq.exceptions.ChannelLockedResource:
                         logger.warning(f"Queue {response_queue} locked, attempting to delete and retry")
                         await producer.cleanup_queue(response_queue)
-                        raise  # Retry declaration
+                        raise
 
                 try:
                     queue = await declare_queue()
@@ -332,7 +332,7 @@ async def enqueue_db_update(
 
                 consume_task = asyncio.create_task(consume_response(queue))
                 try:
-                    async with asyncio.timeout(60):
+                    async with asyncio.timeout(120):  # Increased to match search_utils.py
                         await response_received.wait()
                     if response_data and "result" in response_data:
                         logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
@@ -346,11 +346,8 @@ async def enqueue_db_update(
                 finally:
                     consume_task.cancel()
                     try:
-                        if hasattr(channel, 'queue_delete'):
-                            await channel.queue_delete(response_queue)
-                            logger.debug(f"Deleted response queue {response_queue}")
-                        else:
-                            logger.warning(f"queue_delete not available, skipping deletion of {response_queue}")
+                        await channel.queue_delete(response_queue)
+                        logger.debug(f"Deleted response queue {response_queue}")
                     except Exception as e:
                         logger.warning(f"Failed to delete response queue {response_queue}: {e}")
                     await asyncio.sleep(0.1)
