@@ -220,7 +220,6 @@ class RabbitMQProducer:
     )
 )
 async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProducer:
-    producer = await get_producer(logger)
     logger = logger or default_logger
 
     if not RABBITMQ_URL:
@@ -242,7 +241,6 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
     return producer
 
 async def cleanup_producer():
-    producer = await get_producer(logger)
     if producer is not None and producer.is_connected:
         try:
             await producer.close()

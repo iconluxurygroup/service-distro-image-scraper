@@ -75,45 +75,6 @@ class RabbitMQConsumer:
             logger.error(f"Error checking queue {queue_name} durability: {e}", exc_info=True)
             return False
 
-    async def connect(self):
-        async with self._lock:
-            if self.connection and not self.connection.is_closed and self.channel and not self.channel.is_closed:
-                logger.debug("RabbitMQ connection already established")
-                return
-            try:
-                async with asyncio.timeout(self.connection_timeout):
-                    if self.connection and not self.connection.is_closed:
-                        await self.connection.close()
-                    self.connection = await aio_pika.connect_robust(
-                        self.amqp_url,
-                        connection_attempts=5,
-                        retry_delay=5,
-                        timeout=30
-                    )
-                    self.channel = await self.connection.channel()
-                    await self.channel.set_qos(prefetch_count=1)
-
-                    queues = [
-                        (self.queue_name, True),
-                        (self.response_queue_name, True),
-                        (self.new_queue_name, True),
-                    ]
-                    for queue_name, durable in queues:
-                        if not await self.check_queue_durability(self.channel, queue_name, durable, delete_if_mismatched=args.delete_mismatched):
-                            raise ValueError(
-                                f"Queue {queue_name} has mismatched durability settings. "
-                                f"Delete the queue in RabbitMQ (http://localhost:15672, vhost app_vhost) or "
-                                f"run with --delete-mismatched to auto-delete."
-                            )
-                        queue = await self.declare_queue_with_retry(self.channel, queue_name, durable)
-                        await queue.bind('logs')
-                        logger.debug(f"Queue {queue_name} declared and bound to logs exchange")
-
-                    logger.info(f"Connected to RabbitMQ, consuming from queues: {self.queue_name}, {self.new_queue_name}")
-            except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
-                logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-                raise
-
     async def close(self):
         async with self._lock:
             try:
