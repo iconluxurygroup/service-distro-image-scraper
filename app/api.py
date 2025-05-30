@@ -662,9 +662,9 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        TARGET_THROUGHPUT = 50
-        BATCH_TIME = 0.1
-        BATCH_SIZE = max(5, ceil((TARGET_THROUGHPUT / num_workers) * BATCH_TIME))
+        TARGET_THROUGHPUT = 200  # Increase to 200 records per second
+        BATCH_TIME = 0.2         # Increase to 0.2 seconds
+        BATCH_SIZE = max(10, ceil((TARGET_THROUGHPUT / num_workers) * BATCH_TIME))
         MAX_CONCURRENCY = BATCH_SIZE
         MAX_ENTRY_RETRIES = 3
         RELEVANCE_THRESHOLD = 0.9
