@@ -91,15 +91,7 @@ async def lifespan(app: FastAPI):
     default_logger.info("Starting up FastAPI application")
     
     try:
-        default_logger.info("Testing RabbitMQ producer connection on startup...")
-        from app.rabbitmq_test import test_rabbitmq_producer
-        if not await test_rabbitmq_producer(default_logger):
-            default_logger.error("RabbitMQ producer test failed, shutting down application")
-            sys.exit(1)
-        default_logger.info("RabbitMQ producer test passed")
-
         producer = await get_producer(default_logger)
-        default_logger.info("RabbitMQ producer initialized")
         
         loop = asyncio.get_running_loop()
         shutdown_event = asyncio.Event()
