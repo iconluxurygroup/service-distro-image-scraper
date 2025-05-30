@@ -289,9 +289,19 @@ class RabbitMQConsumer:
         """Process incoming messages from the queue."""
         async with self._lock:
             # Ensure channel is valid; reconnect if necessary
-            if not self.channel or self.channel.is_closed:
-                logger.warning("Channel is closed or invalid, attempting to reconnect")
-                await self.connect()
+            for attempt in range(3):
+                if not self.channel or self.channel.is_closed:
+                    logger.warning(f"Channel is closed or invalid, attempting reconnect (attempt {attempt + 1}/3)")
+                    try:
+                        await self.connect()
+                        break
+                    except Exception as e:
+                        logger.error(f"Reconnect attempt {attempt + 1} failed: {e}", exc_info=True)
+                        if attempt == 2:
+                            logger.error("Max reconnect attempts reached, re-queueing message")
+                            await message.nack(requeue=True)
+                            return
+                        await asyncio.sleep(2)
         
         async with message.process(requeue=True, ignore_processed=True):
             try:
