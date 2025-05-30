@@ -2187,29 +2187,37 @@ async def api_reset_step1_no_results(
         await async_engine.dispose()
         logger.info(f"Disposed database engine for FileID {file_id}")
 
+producer = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup logic
+    global producer
     default_logger.info("Starting up FastAPI application")
-
-    # Signal handlers
-    loop = asyncio.get_running_loop()
-    shutdown_event = asyncio.Event()
-
-    def handle_shutdown(signal_type):
-        default_logger.info(f"Received {signal_type}, initiating graceful shutdown")
-        shutdown_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_shutdown, sig.name)
-
+    producer = RabbitMQProducer()
     try:
+        await producer.connect()
+        default_logger.info("RabbitMQ producer connected")
+
+        # Signal handlers
+        loop = asyncio.get_running_loop()
+        shutdown_event = asyncio.Event()
+
+        def handle_shutdown(signal_type):
+            default_logger.info(f"Received {signal_type}, initiating graceful shutdown")
+            shutdown_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_shutdown, sig.name)
+
         yield
     finally:
-        # Wait for shutdown signal or continue with cleanup
         await asyncio.wait_for(shutdown_event.wait(), timeout=None)
         default_logger.info("Shutting down FastAPI application")
+        if producer:
+            await producer.close()
+            default_logger.info("RabbitMQ producer closed")
         await async_engine.dispose()
         default_logger.info("Database engine disposed")
 
+app.lifespan = lifespan
 app.include_router(router, prefix="/api/v4")

@@ -173,7 +173,11 @@ async def insert_search_results(
         logger.warning(f"Worker PID {process.pid}: No valid rows to insert. Errors: {errors}")
         return False
 
-    producer = RabbitMQProducer()
+    global producer
+    if not producer:
+        logger.error("RabbitMQ producer not initialized")
+        raise ValueError("RabbitMQ producer not initialized")
+
     connection = None
     try:
         response_queue = f"select_response_{uuid.uuid4().hex}"
@@ -286,11 +290,6 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         raise
-    finally:
-        if connection and not connection.is_closed:
-            await connection.close()
-        await producer.close()
-        logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer")
 
 @retry(
     stop=stop_after_attempt(3),
@@ -380,7 +379,10 @@ async def update_search_sort_order(
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
         # Enqueue updates
-        producer = RabbitMQProducer()
+        global producer
+        if not producer:
+            logger.error("RabbitMQ producer not initialized")
+            raise ValueError("RabbitMQ producer not initialized")
         try:
             update_data = []
             response_queue = f"select_response_{uuid.uuid4().hex}"
@@ -432,10 +434,6 @@ async def update_search_sort_order(
 
             logger.info(f"Worker PID {process.pid}: Processed SortOrder updates for {total_updated} rows for EntryID {entry_id}")
             return update_data if total_updated > 0 else []
-        finally:
-            await producer.close()
-            logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
-
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         raise
