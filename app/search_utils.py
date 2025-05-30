@@ -135,11 +135,12 @@ async def insert_search_results(
         if not RABBITMQ_URL:
             logger.error("RABBITMQ_URL environment variable not set")
             raise ValueError("RABBITMQ_URL not configured")
-        
-        producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
-        async with asyncio.timeout(10):
-            await producer.connect()
-        logger.info(f"Worker PID {process.pid}: Successfully initialized RabbitMQ producer")
+        global producer
+        if not producer:
+            producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
+            async with asyncio.timeout(10):
+                await producer.connect()
+            logger.info(f"Worker PID {process.pid}: Successfully initialized RabbitMQ producer")
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
         log_public_url = await upload_file_to_space(
