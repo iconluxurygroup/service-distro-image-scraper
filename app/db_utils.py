@@ -197,15 +197,17 @@ async def update_file_generate_complete(file_id: str, logger: Optional[logging.L
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         raise
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
+def flatten_entry_ids(entry_ids, logger, correlation_id):
+    flat_ids = []
+    for id in entry_ids:
+        if isinstance(id, (list, tuple)):
+            # Recursively flatten nested structures
+            flat_ids.extend(flatten_entry_ids(id, logger, correlation_id))
+        elif isinstance(id, int):
+            flat_ids.append(id)
+        else:
+            logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}, type: {type(id)}")
+    return flat_ids
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -291,16 +293,11 @@ async def insert_search_results(
         entry_ids = list(set(row["EntryID"] for row in data))
         logger.debug(f"[{correlation_id}] Raw EntryIDs: {entry_ids}, type: {type(entry_ids)}")
         # Flatten entry_ids
-        flat_entry_ids = []
-        for id in entry_ids:
-            if isinstance(id, (list, tuple)):
-                flat_entry_ids.append(id[0])
-            elif isinstance(id, int):
-                flat_entry_ids.append(id)
-            else:
-                logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}")
-        logger.debug(f"[{correlation_id}] Flattened EntryIDs: {flat_entry_ids}")
-
+        flat_entry_ids = flatten_entry_ids(entry_ids, logger, correlation_id)
+        logger.debug(f"[{correlation_id}] Flattened EntryIDs: {flat_entry_ids}, type: {type(flat_entry_ids)}")
+        if not flat_entry_ids:
+            logger.warning(f"[{correlation_id}] No valid EntryIDs after flattening")
+            return False
         # Pre-check for existing rows
         if flat_entry_ids:
             async with async_engine.connect() as conn:
