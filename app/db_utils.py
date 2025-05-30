@@ -212,7 +212,9 @@ async def insert_search_results(
     file_id: str = None,
     background_tasks: Optional[BackgroundTasks] = None
 ) -> bool:
-    logger = logger or default_logger
+    logger = logger or logging.getLogger(__name__)
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     process = psutil.Process()
     logger.info(f"Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
 
@@ -257,141 +259,144 @@ async def insert_search_results(
         logger.warning(f"Worker PID {process.pid}: No valid rows to insert. Errors: {errors}")
         return False
 
-    producer = await RabbitMQProducer.get_producer()
+    producer = await RabbitMQProducer.get_producer(logger=logger)
     try:
         correlation_id = str(uuid.uuid4())
         response_queue = f"select_response_{uuid.uuid4().hex}"
-        # Correct usage of aio_pika.connect_robust
-        async with await aio_pika.connect_robust(producer.amqp_url) as connection:
-            channel = await connection.channel()
-            queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
-            response_received = asyncio.Event()
-            response_data = []
+        # Use producer's existing connection and channel
+        await producer.connect()  # Ensure connection is active
+        channel = producer.channel
+        queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+        response_received = asyncio.Event()
+        response_data = []
 
-            async def consume_responses():
-                async with queue.iterator() as queue_iter:
-                    async for message in queue_iter:
-                        async with message.process():
-                            if message.correlation_id == correlation_id:
-                                response_data.append(json.loads(message.body.decode()))
-                                response_received.set()
-                                logger.debug(f"Worker PID {process.pid}: Received response for correlation_id {correlation_id}")
+        async def consume_responses():
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process():
+                        if message.correlation_id == correlation_id:
+                            response_data.append(json.loads(message.body.decode()))
+                            response_received.set()
+                            logger.debug(f"Worker PID {process.pid}: Received response for correlation_id {correlation_id}")
 
-            entry_ids = list(set(row["EntryID"] for row in data))
-            existing_keys = set()
-            if entry_ids:
-                placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
-                select_query = f"""
-                    SELECT EntryID, ImageUrl
-                    FROM utb_ImageScraperResult
-                    WHERE EntryID IN ({placeholders})
-                """
-                params = {f"id{i}": entry_id for i, entry_id in enumerate(entry_ids)}
+        entry_ids = list(set(row["EntryID"] for row in data))
+        existing_keys = set()
+        if entry_ids:
+            placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
+            select_query = f"""
+                SELECT EntryID, ImageUrl
+                FROM utb_ImageScraperResult
+                WHERE EntryID IN ({placeholders})
+            """
+            params = {f"id{i}": entry_id for i, entry_id in enumerate(entry_ids)}
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=select_query,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="select_deduplication",
+                producer=producer,
+                response_queue=response_queue,
+                correlation_id=correlation_id,
+                logger=logger
+            )
+            logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+
+            consume_task = asyncio.create_task(consume_responses())
+            try:
+                async with asyncio.timeout(60):
+                    await response_received.wait()
+                if response_data:
+                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
+                    logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                else:
+                    logger.warning(f"Worker PID {process.pid}: No deduplication results received")
+            except asyncio.TimeoutError:
+                logger.error(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
+                raise
+            finally:
+                consume_task.cancel()
+                await asyncio.sleep(0.5)
+
+        update_query = """
+            UPDATE utb_ImageScraperResult
+            SET ImageDesc = :ImageDesc,
+                ImageSource = :ImageSource,
+                ImageUrlThumbnail = :ImageUrlThumbnail,
+                CreateTime = :CreateTime
+            WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
+        """
+        insert_query = """
+            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+            VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
+        """
+
+        update_batch = []
+        insert_batch = []
+        for row in data:
+            key = (row["EntryID"], row["ImageUrl"])
+            if key in existing_keys:
+                update_batch.append((update_query, row))
+            else:
+                insert_batch.append((insert_query, row))
+
+        batch_size = 100
+        update_cids = []
+        insert_cids = []
+        for i in range(0, len(update_batch), batch_size):
+            batch = update_batch[i:i + batch_size]
+            for sql, params in batch:
+                cid = str(uuid.uuid4())
+                update_cids.append(cid)
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=select_query,
+                    sql=sql,
                     params=params,
                     background_tasks=background_tasks,
-                    task_type="select_deduplication",
+                    task_type="update_search_result",
                     producer=producer,
-                    response_queue=response_queue,
-                    correlation_id=correlation_id
+                    correlation_id=cid,
+                    logger=logger
                 )
-                logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+        logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
 
-                consume_task = asyncio.create_task(consume_responses())
-                try:
-                    async with asyncio.timeout(60):
-                        await response_received.wait()
-                    if response_data:
-                        existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
-                        logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
-                    else:
-                        logger.warning(f"Worker PID {process.pid}: No deduplication results received")
-                except asyncio.TimeoutError:
-                    logger.error(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
-                    raise
-                finally:
-                    consume_task.cancel()
-                    await asyncio.sleep(0.5)
+        for i in range(0, len(insert_batch), batch_size):
+            batch = insert_batch[i:i + batch_size]
+            for sql, params in batch:
+                cid = str(uuid.uuid4())
+                insert_cids.append(cid)
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=sql,
+                    params=params,
+                    background_tasks=background_tasks,
+                    task_type="insert_search_result",
+                    producer=producer,
+                    correlation_id=cid,
+                    logger=logger
+                )
+        logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
 
-            update_query = """
-                UPDATE utb_ImageScraperResult
-                SET ImageDesc = :ImageDesc,
-                    ImageSource = :ImageSource,
-                    ImageUrlThumbnail = :ImageUrlThumbnail,
-                    CreateTime = :CreateTime
-                WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
-            """
-            insert_query = """
-                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
-                VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
-            """
+        async with async_engine.connect() as conn:
+            query = text("""
+                SELECT COUNT(*) FROM utb_ImageScraperResult
+                WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
+            """)
+            result = await conn.execute(query, {
+                "entry_ids": tuple(entry_ids),
+                "create_time": min(row["CreateTime"] for row in data)
+            })
+            inserted_count = result.scalar()
+            logger.info(f"Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
 
-            update_batch = []
-            insert_batch = []
-            for row in data:
-                key = (row["EntryID"], row["ImageUrl"])
-                if key in existing_keys:
-                    update_batch.append((update_query, row))
-                else:
-                    insert_batch.append((insert_query, row))
-
-            batch_size = 100
-            update_cids = []
-            insert_cids = []
-            for i in range(0, len(update_batch), batch_size):
-                batch = update_batch[i:i + batch_size]
-                for sql, params in batch:
-                    cid = str(uuid.uuid4())
-                    update_cids.append(cid)
-                    await enqueue_db_update(
-                        file_id=file_id,
-                        sql=sql,
-                        params=params,
-                        background_tasks=background_tasks,
-                        task_type="update_search_result",
-                        producer=producer,
-                        correlation_id=cid
-                    )
-            logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
-
-            for i in range(0, len(insert_batch), batch_size):
-                batch = insert_batch[i:i + batch_size]
-                for sql, params in batch:
-                    cid = str(uuid.uuid4())
-                    insert_cids.append(cid)
-                    await enqueue_db_update(
-                        file_id=file_id,
-                        sql=sql,
-                        params=params,
-                        background_tasks=background_tasks,
-                        task_type="insert_search_result",
-                        producer=producer,
-                        correlation_id=cid
-                    )
-            logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
-
-            async with async_engine.connect() as conn:
-                query = text("""
-                    SELECT COUNT(*) FROM utb_ImageScraperResult
-                    WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
-                """)
-                result = await conn.execute(query, {
-                    "entry_ids": tuple(entry_ids),
-                    "create_time": min(row["CreateTime"] for row in data)
-                })
-                inserted_count = result.scalar()
-                logger.info(f"Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
-
-            return len(insert_batch) > 0 or len(update_batch) > 0
+        return len(insert_batch) > 0 or len(update_batch) > 0
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         raise
     finally:
-        await producer.close()
-        logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer")
+        # Do not close producer here to maintain singleton connection
+        logger.info(f"Worker PID {process.pid}: Completed insert_search_results for FileID {file_id}")
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
