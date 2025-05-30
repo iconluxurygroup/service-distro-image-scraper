@@ -102,8 +102,7 @@ class RabbitMQProducer:
         reply_to: Optional[str] = None
     ):
         async with self._lock:
-            if not self.is_connected or not self.connection or self.connection.is_closed:
-                await self.connect()
+            await self.check_connection()  # Ensure connection and channel are valid
             queue_name = routing_key or self.queue_name
             try:
                 async with asyncio.timeout(self.operation_timeout):
@@ -122,6 +121,11 @@ class RabbitMQProducer:
                         f"Published message to queue: {queue_name}, "
                         f"correlation_id: {correlation_id}, task: {message_body[:200]}"
                     )
+            except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
+                default_logger.error(f"Channel error during publish to {queue_name}: {e}", exc_info=True)
+                self.is_connected = False
+                await self.connect()  # Reconnect and retry
+                raise
             except Exception as e:
                 default_logger.error(f"Failed to publish message to {queue_name}: {e}", exc_info=True)
                 self.is_connected = False
@@ -155,7 +159,19 @@ class RabbitMQProducer:
 
     async def check_connection(self):
         async with self._lock:
-            if not self.is_connected or not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
+            if (
+                not self.is_connected
+                or not self.connection
+                or self.connection.is_closed
+                or not self.channel
+                or self.channel.is_closed
+            ):
+                await self.connect()
+            try:
+                # Verify channel is usable by performing a lightweight operation
+                await self.channel.nop()
+            except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError):
+                default_logger.warning("Channel invalid, reconnecting")
                 await self.connect()
             return self.is_connected
 
