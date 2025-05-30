@@ -455,8 +455,8 @@ if __name__ == "__main__":
                 "task_type": "update_sort_order",
                 "sql": "UPDATE_SORT_ORDER",
                 "params": {
-                    "entry_id": "119061",
-                    "result_id": "1868277",
+                    "entry_id": "134394",
+                    "result_id": "2323422",
                     "sort_order": 1
                 },
                 "timestamp": "2025-05-21T12:34:08.307076"
