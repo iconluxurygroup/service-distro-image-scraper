@@ -9,6 +9,7 @@ from typing import Optional
 from rabbitmq_producer import RabbitMQProducer, get_producer
 from rabbitmq_consumer import RabbitMQConsumer
 from config import RABBITMQ_URL
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -101,7 +102,7 @@ async def test_rabbitmq_producer(
                         logger.debug(f"Deleted test queue: {test_queue_name}")
                     except:
                         pass
-                # Do not close producer, as it's used globally
+                # Do not close producer for FastAPI
         except Exception as e:
             logger.warning(f"Error cleaning up test resources: {e}")
 
@@ -147,14 +148,16 @@ async def test_rabbitmq_connection(
 
             async def test_callback(message: aio_pika.IncomingMessage):
                 nonlocal received_message
-                logger.debug(f"Callback triggered for message with correlation_id: {message.correlation_id}")
+                logger.debug(f"Callback triggered for message with correlation_id: {message.correlation_id}, body: {message.body[:100]}")
                 try:
                     async with message.process():
-                        logger.debug(f"Processing message: {message.body[:100]}")
+                        logger.debug(f"Processing message with delivery_tag: {message.delivery_tag}")
                         if message.correlation_id == test_correlation_id:
                             received_message = json.loads(message.body.decode())
                             logger.debug(f"Received test message: {received_message}")
                             test_message_received.set()
+                        else:
+                            logger.warning(f"Unexpected correlation_id: {message.correlation_id}, expected: {test_correlation_id}")
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON decode error in callback: {e}", exc_info=True)
                 except Exception as e:
@@ -179,13 +182,22 @@ async def test_rabbitmq_connection(
             )
             logger.info(f"Published test message to queue: {test_queue_name}, correlation_id: {test_correlation_id}")
 
-            # Check queue message count
             queue_state = await channel.get_queue(test_queue_name)
             logger.debug(f"Queue {test_queue_name} has {queue_state.message_count} messages")
 
-            # Increase timeout to 20 seconds
-            async with asyncio.timeout(20.0):
-                await test_message_received.wait()
+            @retry(
+                stop=stop_after_attempt(3),
+                wait=wait_fixed(5),
+                retry=retry_if_exception_type(asyncio.TimeoutError),
+                before_sleep=lambda retry_state: logger.info(
+                    f"Retrying message receipt (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+                )
+            )
+            async def wait_for_message():
+                async with asyncio.timeout(30.0):
+                    await test_message_received.wait()
+
+            await wait_for_message()
             
             if received_message and received_message.get("correlation_id") == test_correlation_id:
                 logger.info("RabbitMQ connection test successful: message sent and received correctly")
@@ -215,18 +227,4 @@ async def test_rabbitmq_connection(
     finally:
         try:
             if consumer:
-                await consumer.close()
-            if producer and producer.is_connected:
-                if producer.channel and not producer.channel.is_closed:
-                    try:
-                        await producer.channel.queue_delete(test_queue_name)
-                        logger.debug(f"Deleted test queue: {test_queue_name}")
-                    except:
-                        pass
-                await producer.close()
-        except Exception as e:
-            logger.warning(f"Error cleaning up test resources: {e}")
-        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        await asyncio.sleep(0.5)  # Increased to ensure task cancellation
+                await consumer.close
