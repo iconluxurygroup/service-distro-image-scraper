@@ -155,7 +155,7 @@ class RabbitMQProducer:
 
     async def check_connection(self):
         async with self._lock:
-            if not self.is_connected or not self.connection or self.connection.is_closed:
+            if not self.is_connected or not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
                 await self.connect()
             return self.is_connected
 
@@ -282,11 +282,14 @@ async def enqueue_db_update(
                 )
                 async def declare_queue():
                     try:
-                        return await channel.declare_queue(
+                        queue = await channel.declare_queue(
                             response_queue, durable=False, exclusive=False, auto_delete=True
                         )
-                    except aiormq.exceptions.ChannelNotFoundEntity:
-                        logger.warning(f"Queue {response_queue} not found, retrying declaration")
+                        await asyncio.sleep(0.1)  # Brief delay to ensure queue is ready
+                        return queue
+                    except aiormq.exceptions.ChannelLockedResource:
+                        logger.warning(f"Queue {response_queue} locked, attempting to delete and retry")
+                        await producer.cleanup_queue(response_queue)
                         raise
 
                 try:
@@ -353,6 +356,9 @@ async def enqueue_db_update(
 
 def setup_signal_handlers(loop):
     import signal
+    last_signal_time = 0
+    debounce_interval = 1.0  # seconds
+
     async def handle_shutdown():
         try:
             tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
@@ -361,13 +367,20 @@ def setup_signal_handlers(loop):
             await cleanup_producer()
             loop.stop()
             await loop.shutdown_asyncgens()
+            await loop.shutdown_default_executor()
         except Exception as e:
             default_logger.error(f"Error during shutdown: {e}", exc_info=True)
         finally:
             loop.close()
     
     def signal_handler():
-        default_logger.info("Received SIGINT, initiating graceful shutdown")
+        nonlocal last_signal_time
+        current_time = time.time()
+        if current_time - last_signal_time < debounce_interval:
+            default_logger.debug("Debouncing rapid SIGINT/SIGTERM")
+            return
+        last_signal_time = current_time
+        default_logger.info("Received SIGINT/SIGTERM, initiating graceful shutdown")
         asyncio.ensure_future(handle_shutdown())
     
     for sig in (signal.SIGINT, signal.SIGTERM):
