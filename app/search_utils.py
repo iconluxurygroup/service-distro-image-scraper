@@ -14,7 +14,7 @@ import psutil
 import pyodbc
 import re
 import urllib.parse
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update,get_producer
 import pandas as pd
 import asyncio
 import uuid
@@ -132,69 +132,28 @@ async def insert_search_results(
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
     global producer
-    if not producer or not producer.is_connected:
-        logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
-        try:
-            producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
-            async with asyncio.timeout(60):
-                await producer.connect()
-            logger.info(f"Worker PID {process.pid}: Successfully initialized RabbitMQ producer")
-        except Exception as e:
-            logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
-            raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
-    data = []
-    errors = []
-
-    for res in results:
-        try:
-            entry_id = int(res["EntryID"])
-        except (ValueError, TypeError) as e:
-            errors.append(f"Invalid EntryID value: {res.get('EntryID')}")
-            logger.error(f"Worker PID {process.pid}: {errors[-1]}")
-            continue
-
-        image_url = clean_url_string(res.get("ImageUrl", ""))
-        image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""))
-        image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False)
-        image_source = clean_url_string(res.get("ImageSource", ""))
-
-        if not image_url or not validate_url(image_url, logger):
-            errors.append(f"Invalid ImageUrl skipped: {image_url}")
-            logger.debug(f"Worker PID {process.pid}: {errors[-1]}")
-            continue
-        if image_url_thumbnail and not validate_url(image_url_thumbnail, logger):
-            image_url_thumbnail = None
-
-        data.append({
-            "EntryID": entry_id,
-            "ImageUrl": image_url,
-            "ImageDesc": image_desc or None,
-            "ImageSource": image_source or None,
-            "ImageUrlThumbnail": image_url_thumbnail or None,
-            "CreateTime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-
-    if not data:
-        logger.warning(f"Worker PID {process.pid}: No valid rows to insert. Errors: {errors}")
-        return False
-
-    connection = None
     try:
-        response_queue = f"select_response_{uuid.uuid4().hex}"
-        connection = await aio_pika.connect_robust(producer.amqp_url)
-        channel = await connection.channel()
-        queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
-        response_received = asyncio.Event()
-        response_data = []
+        async with asyncio.timeout(60):
+            if not producer or not producer.is_connected:
+                logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
+                producer = await get_producer(logger)
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
+        raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
+    channel = await producer.channel()
+    response_queue = f"select_response_{uuid.uuid4().hex}"
+    queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+    response_received = asyncio.Event()
+    response_data = []
 
-        async def consume_responses():
-            async with queue.iterator() as queue_iter:
-                async for message in queue_iter:
-                    async with message.process():
-                        if message.correlation_id == file_id:
-                            response_data.append(json.loads(message.body.decode()))
-                            response_received.set()
-                            logger.debug(f"Worker PID {process.pid}: Received response for FileID {file_id}")
+    async def consume_responses():
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    if message.correlation_id == file_id:
+                        response_data.append(json.loads(message.body.decode()))
+                        response_received.set()
+                        logger.debug(f"Worker PID {process.pid}: Received response for FileID {file_id}")
 
         entry_ids = list(set(row["EntryID"] for row in data))
         existing_keys = set()
