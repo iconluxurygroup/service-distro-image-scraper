@@ -269,7 +269,7 @@ class RabbitMQConsumer:
                 logger.info(f"Updated SortOrder for FileID: {file_id}, EntryID: {entry_id}, affected {rowcount} rows")
                 return rowcount > 0
         except SQLAlchemyError as e:
-            logger.error(f"Database error updating SortOrder for FileID {file_id}: {e}", exc_info=True)
+            logger.error(f"Database error updating SortOrder for FileID: {file_id}: {e}", exc_info=True)
             return False
         except Exception as e:
             logger.error(f"Unexpected error updating SortOrder for FileID {file_id}: {e}", exc_info=True)
@@ -344,7 +344,7 @@ async def main():
             await consumer.purge_queue()
             logger.info("Queue cleared")
             return
-        if args.delete_mismatched:
+        if args.delete-mismatched:
             logger.info("Checking and deleting queues with mismatched durability...")
             await consumer.connect()
             for queue_name in [consumer.queue_name, consumer.new_queue_name, consumer.response_queue_name]:
