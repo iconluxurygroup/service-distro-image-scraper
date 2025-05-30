@@ -165,9 +165,8 @@ class RabbitMQProducer:
             self.is_connected = False
             raise
 
-    async def publish_update(self, update_task: Dict[str, Any], routing_key: str = None):
-        """Publish an update task to the queue with persistent delivery."""
-        await self.publish_message(update_task, routing_key)
+    async def publish_update(self, update_task: Dict[str, Any], routing_key: str = None, correlation_id: Optional[str] = None):
+        await self.publish_message(update_task, routing_key, correlation_id)
 
     async def close(self):
         """Close the RabbitMQ connection and channel."""
