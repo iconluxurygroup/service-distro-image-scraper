@@ -543,9 +543,8 @@ async def process_restart_batch(
         if not producer or not producer.is_connected:
             logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
             try:
-                producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
-                async with asyncio.timeout(10):
-                    producer = await producer.connect()  # Assign return value
+                async with asyncio.timeout(20):  # Increased from 10 to 20 seconds
+                    producer = await get_producer(logger)  # Use get_producer
                 logger.info("Successfully initialized RabbitMQ producer")
             except Exception as e:
                 logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)

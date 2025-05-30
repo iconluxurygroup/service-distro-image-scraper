@@ -27,7 +27,7 @@ class RabbitMQProducer:
         self,
         amqp_url: str = RABBITMQ_URL,
         queue_name: str = "db_update_queue",
-        connection_timeout: float = 10.0,
+        connection_timeout: float = 15.0,  # Increased from 10.0
         operation_timeout: float = 5.0,
     ):
         self.amqp_url = amqp_url
@@ -38,8 +38,22 @@ class RabbitMQProducer:
         self.connection: Optional[aio_pika.RobustConnection] = None
         self.channel: Optional[aio_pika.RobustChannel] = None
         self.is_connected = False
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # For connection and publishing
+        self._cleanup_lock = asyncio.Lock()  # Separate lock for cleanup
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((
+            aio_pika.exceptions.AMQPError,
+            aio_pika.exceptions.ChannelClosed,
+            asyncio.TimeoutError,
+            asyncio.CancelledError,  # Retry on cancellation
+        )),
+        before_sleep=lambda retry_state: default_logger.info(
+            f"Retrying connect (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+        )
+    )
     async def connect(self) -> 'RabbitMQProducer':
         async with self._lock:
             if self.is_connected and self.connection and not self.connection.is_closed:
@@ -56,7 +70,10 @@ class RabbitMQProducer:
                     await self.channel.set_qos(prefetch_count=2)
                     await self.channel.declare_queue(self.queue_name, durable=True)
                     # Clean up response queue if it exists
-                    await self.cleanup_queue(self.response_queue_name)
+                    try:
+                        await self.cleanup_queue(self.response_queue_name)
+                    except Exception as e:
+                        default_logger.warning(f"Failed to cleanup queue during connect: {e}")
                     # Declare shared response queue
                     await self.channel.declare_queue(
                         self.response_queue_name, durable=False, exclusive=False, auto_delete=True
@@ -113,11 +130,16 @@ class RabbitMQProducer:
                 raise
 
     async def cleanup_queue(self, queue_name: str):
-        async with self._lock:
+        async with self._cleanup_lock:  # Use separate lock
             try:
                 if self.channel and not self.channel.is_closed:
-                    await self.channel.queue_delete(queue_name)
-                    default_logger.info(f"Deleted stale queue {queue_name}")
+                    # Check if queue exists before deleting
+                    try:
+                        await self.channel.get_queue(queue_name)
+                        await self.channel.queue_delete(queue_name)
+                        default_logger.info(f"Deleted stale queue {queue_name}")
+                    except aio_pika.exceptions.QueueEmpty:
+                        default_logger.debug(f"Queue {queue_name} does not exist, no cleanup needed")
             except Exception as e:
                 default_logger.warning(f"Failed to clean up queue {queue_name}: {e}")
 
@@ -146,7 +168,8 @@ class RabbitMQProducer:
     retry=retry_if_exception_type((
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
-        asyncio.TimeoutError
+        asyncio.TimeoutError,
+        asyncio.CancelledError,  # Retry on cancellation
     )),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying get_producer (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -163,7 +186,7 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
     async with asyncio.Lock():
         if producer is None or not producer.is_connected:
             try:
-                async with asyncio.timeout(10):
+                async with asyncio.timeout(15):  # Increased from 10
                     producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
                     await producer.connect()
                     logger.info(f"Worker PID {psutil.Process().pid}: Initialized RabbitMQ producer")
@@ -188,7 +211,8 @@ async def cleanup_producer():
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError,
-        aiormq.exceptions.ChannelLockedResource
+        aiormq.exceptions.ChannelLockedResource,
+        asyncio.CancelledError,  # Retry on cancellation
     )),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying enqueue_db_update for FileID {retry_state.kwargs.get('file_id')} "
@@ -312,24 +336,3 @@ async def enqueue_db_update(
     except Exception as e:
         logger.error(f"Error enqueuing task for FileID {file_id}: {e}", exc_info=True)
         raise
-
-def setup_signal_handlers(loop):
-    import signal
-    async def handle_shutdown():
-        try:
-            tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
-            for task in tasks:
-                task.cancel()
-            await cleanup_producer()
-            loop.stop()
-            await loop.shutdown_asyncgens()
-        except Exception as e:
-            default_logger.error(f"Error during shutdown: {e}", exc_info=True)
-        finally:
-            loop.close()
-    
-    def signal_handler():
-        asyncio.ensure_future(handle_shutdown())
-    
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
