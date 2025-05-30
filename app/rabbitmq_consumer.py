@@ -117,15 +117,35 @@ class RabbitMQConsumer:
                 if self.is_consuming:
                     self.is_consuming = False
                     logger.info("Stopped consuming messages")
+                
+                # Close channel
                 if self.channel and not self.channel.is_closed:
-                    await self.channel.close()
-                    logger.info("Closed RabbitMQ channel")
+                    try:
+                        await asyncio.wait_for(self.channel.close(), timeout=5.0)
+                        logger.info("Closed RabbitMQ channel")
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout closing RabbitMQ channel")
+                    except Exception as e:
+                        logger.error(f"Error closing channel: {e}", exc_info=True)
+                    finally:
+                        self.channel = None
+                
+                # Close connection
                 if self.connection and not self.connection.is_closed:
-                    await self.connection.close()
-                    logger.info("Closed RabbitMQ connection")
+                    try:
+                        await asyncio.wait_for(self.connection.close(), timeout=5.0)
+                        logger.info("Closed RabbitMQ connection")
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout closing RabbitMQ connection")
+                    except Exception as e:
+                        logger.error(f"Error closing connection: {e}", exc_info=True)
+                    finally:
+                        self.connection = None
+                
             except Exception as e:
-                logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
-            self.is_consuming = False
+                logger.error(f"Unexpected error during close: {e}", exc_info=True)
+            finally:
+                self.is_consuming = False
 
     async def purge_queue(self):
         try:
