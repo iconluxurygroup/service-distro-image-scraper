@@ -3,12 +3,13 @@ import logging
 import aio_pika
 import json
 import uuid
+import datetime
 from typing import Optional
 from rabbitmq_producer import RabbitMQProducer, get_producer
 from rabbitmq_consumer import RabbitMQConsumer
 from config import RABBITMQ_URL
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-import aiormq,datetime
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)  # Enable debug logging
@@ -99,7 +100,11 @@ async def test_rabbitmq_producer(
         except Exception as e:
             logger.warning(f"Error cleaning up test resources: {e}")
 
-async def test_rabbitmq_connection(timeout: float = 60.0) -> bool:  # Increased timeout
+async def test_rabbitmq_connection(
+    logger: Optional[logging.Logger] = None,
+    timeout: float = 60.0  # Increased timeout
+) -> bool:
+    logger = logger or logging.getLogger(__name__)
     test_queue_name = f"test_queue_{uuid.uuid4().hex}"
     test_correlation_id = str(uuid.uuid4())
     test_message_received = asyncio.Event()
@@ -218,7 +223,6 @@ async def test_rabbitmq_connection(timeout: float = 60.0) -> bool:  # Increased 
                 await producer.close()
         except Exception as e:
             logger.warning(f"Error cleaning up test resources: {e}")
-        # Cancel any lingering tasks
         tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
