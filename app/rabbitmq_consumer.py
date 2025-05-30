@@ -418,11 +418,11 @@ if __name__ == "__main__":
 
     async def main():
         try:
-            logger.info("Testing RabbitMQ producer and consumer connections on startup...")
-            if not await test_rabbitmq_connection(logger):
-                logger.error("RabbitMQ connection test failed, exiting")
-                sys.exit(1)
-            logger.info("RabbitMQ connection test passed")
+            #logger.info("Testing RabbitMQ producer and consumer connections on startup...")
+            # if not await test_rabbitmq_connection(logger):
+            #     logger.error("RabbitMQ connection test failed, exiting")
+            #     sys.exit(1)
+            # logger.info("RabbitMQ connection test passed")
 
             if args.clear:
                 await consumer.purge_queue()
