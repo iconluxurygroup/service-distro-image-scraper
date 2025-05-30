@@ -6,13 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from api import app
 import os
 from waitress import serve
-
+from rabbitmq_producer import cleanup_producer
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 def shutdown(signalnum, frame):
     logger.info("Received shutdown signal, stopping gracefully")
+    cleanup_producer()
     sys.exit(0)
 
 if __name__ == "__main__":

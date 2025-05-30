@@ -220,7 +220,12 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
                 raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
     
     return producer
-
+async def cleanup_producer():
+    global producer
+    if producer is not None and producer.is_connected:
+        await producer.close()
+        producer = None
+        default_logger.info("Cleaned up RabbitMQ producer")
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
