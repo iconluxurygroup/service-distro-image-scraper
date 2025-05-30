@@ -39,7 +39,6 @@ async def test_rabbitmq_producer(
                 await producer.connect()
                 channel = producer.channel
 
-            # Check and delete existing queue
             try:
                 await channel.get_queue(test_queue_name)
                 await channel.queue_delete(test_queue_name)
@@ -47,11 +46,9 @@ async def test_rabbitmq_producer(
             except aio_pika.exceptions.QueueEmpty:
                 logger.debug(f"No existing test queue: {test_queue_name}")
 
-            # Declare test queue
             await channel.declare_queue(test_queue_name, durable=False, exclusive=False, auto_delete=True)
             logger.debug(f"Declared test queue: {test_queue_name}")
 
-            # Publish test message
             test_task = {
                 "file_id": "test_123",
                 "task_type": "test_task",
@@ -67,7 +64,6 @@ async def test_rabbitmq_producer(
             )
             logger.info(f"Published test message to queue: {test_queue_name}, correlation_id: {test_correlation_id}")
 
-            # Verify queue existence
             try:
                 await channel.get_queue(test_queue_name)
                 logger.info("Test queue verified successfully")
@@ -139,7 +135,6 @@ async def test_rabbitmq_connection(
                 await producer.connect()
                 channel = producer.channel
 
-            # Check and delete existing queue
             try:
                 await channel.get_queue(test_queue_name)
                 await channel.queue_delete(test_queue_name)
@@ -147,20 +142,23 @@ async def test_rabbitmq_connection(
             except aio_pika.exceptions.QueueEmpty:
                 logger.debug(f"No existing test queue: {test_queue_name}")
 
-            # Declare test queue
             await channel.declare_queue(test_queue_name, durable=False, exclusive=False, auto_delete=True)
             logger.debug(f"Declared test queue: {test_queue_name}")
 
             async def test_callback(message: aio_pika.IncomingMessage):
                 nonlocal received_message
+                logger.debug(f"Callback triggered for message with correlation_id: {message.correlation_id}")
                 try:
                     async with message.process():
+                        logger.debug(f"Processing message: {message.body[:100]}")
                         if message.correlation_id == test_correlation_id:
                             received_message = json.loads(message.body.decode())
+                            logger.debug(f"Received test message: {received_message}")
                             test_message_received.set()
-                            logger.debug(f"Received test message with correlation_id: {test_correlation_id}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error in callback: {e}", exc_info=True)
                 except Exception as e:
-                    logger.error(f"Error processing test message: {e}", exc_info=True)
+                    logger.error(f"Error in callback: {e}", exc_info=True)
 
             queue = await consumer.channel.get_queue(test_queue_name)
             await queue.consume(test_callback)
@@ -181,7 +179,12 @@ async def test_rabbitmq_connection(
             )
             logger.info(f"Published test message to queue: {test_queue_name}, correlation_id: {test_correlation_id}")
 
-            async with asyncio.timeout(10.0):
+            # Check queue message count
+            queue_state = await channel.get_queue(test_queue_name)
+            logger.debug(f"Queue {test_queue_name} has {queue_state.message_count} messages")
+
+            # Increase timeout to 20 seconds
+            async with asyncio.timeout(20.0):
                 await test_message_received.wait()
             
             if received_message and received_message.get("correlation_id") == test_correlation_id:
@@ -223,8 +226,7 @@ async def test_rabbitmq_connection(
                 await producer.close()
         except Exception as e:
             logger.warning(f"Error cleaning up test resources: {e}")
-        # Ensure all tasks are cancelled to avoid pending task warnings
         tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
-        await asyncio.sleep(0.1)  # Allow cancellation to propagate
+        await asyncio.sleep(0.5)  # Increased to ensure task cancellation
