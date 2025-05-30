@@ -246,7 +246,9 @@ async def enqueue_db_update(
 
         if return_result and response_queue:
             try:
-                async with aio_pika.connect_robust(producer.amqp_url) as connection:
+                # Await the connect_robust coroutine
+                connection = await aio_pika.connect_robust(producer.amqp_url)
+                async with connection:
                     channel = await connection.channel()
                     queue = await channel.get_queue(response_queue)  # Use existing shared queue
                     response_received = asyncio.Event()
