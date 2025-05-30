@@ -49,22 +49,23 @@ class RabbitMQProducer:
         self._cleanup_lock = asyncio.Lock()
 
     async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool, delete_if_mismatched: bool = False) -> bool:
-        logger =default_logger
+        logger = default_logger
         try:
             queue = await channel.declare_queue(queue_name, passive=True)
-            is_durable = queue.durable  # Direct access to durable property
+            is_durable = queue.durable
             logger.debug(f"Queue {queue_name} exists with durable={is_durable}")
             if is_durable != expected_durable:
                 logger.warning(f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}.")
-                if delete_if_mismatched:
-                    try:
-                        await channel.queue_delete(queue_name)
-                        logger.info(f"Deleted queue {queue_name} due to mismatched durability")
-                        return True
-                    except Exception as e:
-                        logger.error(f"Failed to delete queue {queue_name}: {e}", exc_info=True)
-                        return False
-                return False
+                try:
+                    await channel.queue_delete(queue_name)
+                    logger.info(f"Deleted queue {queue_name} due to mismatched durability")
+                    # Recreate the queue with correct settings
+                    await channel.declare_queue(queue_name, durable=expected_durable)
+                    logger.info(f"Recreated queue {queue_name} with durable={expected_durable}")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to delete/recreate queue {queue_name}: {e}", exc_info=True)
+                    return False
             return True
         except (aio_pika.exceptions.QueueEmpty, aiormq.exceptions.ChannelNotFoundEntity):
             logger.debug(f"Queue {queue_name} does not exist")
