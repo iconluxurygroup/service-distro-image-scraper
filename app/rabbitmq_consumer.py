@@ -24,8 +24,8 @@ class RabbitMQConsumer:
         self,
         amqp_url: str = RABBITMQ_URL,
         queue_name: str = "db_update_queue",
-        connection_timeout: float = 30.0,  # Increased timeout
-        operation_timeout: float = 10.0,  # Increased timeout
+        connection_timeout: float = 30.0,
+        operation_timeout: float = 10.0,
         producer: Optional[RabbitMQProducer] = None
     ):
         self.amqp_url = amqp_url
@@ -45,8 +45,7 @@ class RabbitMQConsumer:
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((aiormq.exceptions.ChannelInvalidStateError, aio_pika.exceptions.AMQPError)),
         before_sleep=lambda retry_state: logger.info(
-            f"Retrying queue declaration for {retry_state.kwargs['queue_name']} "
-            f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+            f"Retrying queue declaration (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
         )
     )
     async def declare_queue_with_retry(self, channel, queue_name: str, durable: bool):
@@ -87,9 +86,9 @@ class RabbitMQConsumer:
                         await self.connection.close()
                     self.connection = await aio_pika.connect_robust(
                         self.amqp_url,
-                        connection_attempts=5,  # Increased attempts
+                        connection_attempts=5,
                         retry_delay=5,
-                        timeout=30  # Increased connection timeout
+                        timeout=30
                     )
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
