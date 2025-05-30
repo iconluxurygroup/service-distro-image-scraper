@@ -7,107 +7,25 @@ from typing import Optional, List, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from database_config import async_engine, sync_engine
+from database_config import async_engine
 from common import clean_string, normalize_model, generate_aliases
 from fastapi import BackgroundTasks
 import psutil
-import pyodbc
 import re
 import urllib.parse
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update,get_producer
-import pandas as pd
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update, get_producer
 import asyncio
 import uuid
 import aio_pika
 from config import RABBITMQ_URL
 from s3_utils import upload_file_to_space
-from tenacity import retry, stop_after_attempt, wait_fixed
-producer = None
+
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-import logging
-from typing import Optional
-import requests
-from requests.exceptions import RequestException, Timeout
-
-# Default logger setup
-default_logger = logging.getLogger(__name__)
-
-def validate_url(url: Optional[str], logger: Optional[logging.Logger] = None, timeout: int = 5) -> bool:
-    """
-    Validate a thumbnail URL by checking its format and accessibility.
-    Returns False if the URL is invalid, results in a 404, or times out.
-    
-    Args:
-        url: The URL to validate (optional string).
-        logger: Optional logger instance.
-        timeout: Timeout for the HTTP request in seconds (default: 5).
-    
-    Returns:
-        bool: True if the URL is valid and accessible, False otherwise.
-    """
-    logger = logger or default_logger
-    
-    # Basic string validation
-    if not url or url == '' or 'placeholder' in str(url).lower():
-        logger.debug(f"Invalid URL: {url}")
-        return False
-    if not str(url).startswith(('http://', 'https://')):
-        logger.debug(f"Non-HTT URL: {url}")
-        return False
-    
-    # HTTP request validation
-    try:
-        # Use HEAD request to minimize data transfer
-        response = requests.head(url, timeout=timeout, allow_redirects=True)
-        
-        # If HEAD is not allowed (405), fall back to GET
-        if response.status_code == 405:
-            response = requests.get(url, timeout=timeout, allow_redirects=True)
-        
-        # Check for 404 or other non-2xx status codes
-        if response.status_code == 404:
-            logger.debug(f"Thumbnail URL returned 404: {url}")
-            return False
-        if response.status_code >= 400:
-            logger.debug(f"Thumbnail URL returned status {response.status_code}: {url}")
-            return False
-        
-        logger.debug(f"Thumbnail URL validated successfully: {url}")
-        return True
-    
-    except Timeout:
-        logger.debug(f"Thumbnail URL timed out: {url}")
-        return False
-    except RequestException as e:
-        logger.debug(f"Failed to validate thumbnail URL {url}: {str(e)}")
-        return False
-
-def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
-    logger = default_logger
-    if not value:
-        return ""
-    cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
-    cleaned = re.sub(r'[\x00-\x1F\x7F]+', '', cleaned).strip()
-    if is_url:
-        cleaned = urllib.parse.unquote(cleaned)
-        try:
-            parsed = urllib.parse.urlparse(cleaned)
-            if not parsed.scheme or not parsed.netloc:
-                return ""
-            path = re.sub(r'/+', '/', parsed.path)
-            cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
-            if parsed.query:
-                cleaned += f"?{parsed.query}"
-            if parsed.fragment:
-                cleaned += f"#{parsed.fragment}"
-        except ValueError:
-            logger.debug(f"Invalid URL format: {cleaned}")
-            return ""
-    return cleaned
+producer = None
 
 @retry(
     stop=stop_after_attempt(3),
@@ -134,12 +52,16 @@ async def insert_search_results(
         return False
 
     global producer
-    async with asyncio.timeout(60):
-            if producer is None or not producer.is_connected or not producer.channel or producer.channel.is_closed:
-                logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
-                producer = await get_producer(logger) 
+    if producer is None or not producer.is_connected or not producer.channel or producer.channel.is_closed:
+        logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
+        try:
+            async with asyncio.timeout(60):
+                producer = await get_producer(logger)
+        except Exception as e:
+            logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
+            return False
 
-    channel = producer.channel  # Access channel attribute
+    channel = producer.channel
     if channel is None:
         logger.error(f"Worker PID {process.pid}: RabbitMQ channel is not available for FileID {file_id}")
         return False
@@ -149,7 +71,12 @@ async def insert_search_results(
 
     try:
         # Declare response queue
-        queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+        try:
+            queue = await channel.declare_queue(response_queue, durable=False, exclusive=False, auto_delete=True)
+            logger.debug(f"Declared response queue {response_queue}")
+        except Exception as e:
+            logger.error(f"Failed to declare response queue {response_queue}: {e}", exc_info=True)
+            return False
         
         # Deduplicate results
         entry_ids = list(set(row["EntryID"] for row in results))
@@ -162,33 +89,50 @@ async def insert_search_results(
                 WHERE EntryID IN ({placeholders})
             """
             params = {f"id{i}": entry_id for i, entry_id in enumerate(entry_ids)}
-            await enqueue_db_update(
-                file_id=file_id,
-                sql=select_query,
-                params=params,
-                background_tasks=background_tasks,
-                task_type="select_deduplication",
-                producer=producer,
-                response_queue=response_queue,
-                correlation_id=correlation_id,
-                return_result=True
-            )
-            logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+            try:
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=select_query,
+                    params=params,
+                    background_tasks=background_tasks,
+                    task_type="select_deduplication",
+                    producer=producer,
+                    response_queue=response_queue,
+                    correlation_id=correlation_id,
+                    return_result=True,
+                    logger=logger
+                )
+                logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
+            except Exception as e:
+                logger.error(f"Failed to enqueue deduplication query: {e}", exc_info=True)
+                return False
 
             response_received = asyncio.Event()
             response_data = None
 
-            async def consume_responses():
+            @retry(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=2, max=10),
+                retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
+                before_sleep=lambda retry_state: logger.info(
+                    f"Retrying consume_responses for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
+                )
+            )
+            async def consume_responses(queue):
                 nonlocal response_data
-                async with queue.iterator() as queue_iter:
-                    async for message in queue_iter:
-                        async with message.process():
-                            if message.correlation_id == correlation_id:
-                                response_data = json.loads(message.body.decode())
-                                response_received.set()
-                                break
+                try:
+                    async with queue.iterator() as queue_iter:
+                        async for message in queue_iter:
+                            async with message.process():
+                                if message.correlation_id == correlation_id:
+                                    response_data = json.loads(message.body.decode())
+                                    response_received.set()
+                                    break
+                except Exception as e:
+                    logger.error(f"Error in consume_responses for FileID {file_id}: {e}", exc_info=True)
+                    raise
 
-            consume_task = asyncio.create_task(consume_responses())
+            consume_task = asyncio.create_task(consume_responses(queue))
             try:
                 async with asyncio.timeout(120):
                     await response_received.wait()
@@ -197,12 +141,13 @@ async def insert_search_results(
                     logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
                 else:
                     logger.warning(f"Worker PID {process.pid}: No deduplication results received")
+                    return False
             except asyncio.TimeoutError:
                 logger.warning(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
                 return False
             finally:
                 consume_task.cancel()
-                await asyncio.sleep(0.1)  # Allow cleanup
+                await asyncio.sleep(0.1)
 
         # Prepare update and insert queries
         update_query = """
@@ -248,7 +193,8 @@ async def insert_search_results(
                     background_tasks=background_tasks,
                     task_type="update_search_result",
                     producer=producer,
-                    correlation_id=str(uuid.uuid4())
+                    correlation_id=str(uuid.uuid4()),
+                    logger=logger
                 )
         logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates")
 
@@ -262,7 +208,8 @@ async def insert_search_results(
                     background_tasks=background_tasks,
                     task_type="insert_search_result",
                     producer=producer,
-                    correlation_id=str(uuid.uuid4())
+                    correlation_id=str(uuid.uuid4()),
+                    logger=logger
                 )
         logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts")
 
@@ -274,10 +221,10 @@ async def insert_search_results(
     finally:
         try:
             if channel and not channel.is_closed:
-                await channel.delete_queue(response_queue)
+                await channel.queue_delete(response_queue)
+                logger.debug(f"Deleted response queue {response_queue}")
         except Exception as e:
             logger.warning(f"Worker PID {process.pid}: Failed to delete response queue {response_queue}: {e}")
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
