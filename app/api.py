@@ -627,7 +627,7 @@ async def process_restart_batch(
                     WHERE r.FileID = :file_id
                     AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
                     AND r.Step1 IS NULL
-                    AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.[Order] <= 0)
+                    AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.[SortOrder] <= 0)
                     ORDER BY r.EntryID
                 """)
                 result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
