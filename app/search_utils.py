@@ -141,9 +141,9 @@ async def insert_search_results(
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
         raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
-    channel = await producer.channel()
+    channel = producer.channel()
     response_queue = f"select_response_{uuid.uuid4().hex}"
-    queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+    queue = channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
     response_received = asyncio.Event()
     response_data = []
 
