@@ -212,7 +212,7 @@ def is_related_to_category(detected_label: str, expected_category: str) -> bool:
 
 async def process_image(row, session: aiohttp.ClientSession, logger: logging.Logger) -> Tuple[int, str, Optional[str], int, Optional[str]]:
     """Process a single image row with Gemini API, ensuring valid JSON output and thumbnail.
-    Sentiment score reflects linesheet/product shot quality (clean white background, front of product, no lifestyle).
+    Sentiment score reflects product shot quality (no person, solid background, optimal angle/orientation).
     Relevance score remains tied to match_score."""
     result_id = row.get("ResultID")
     default_result = (
@@ -282,39 +282,11 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         is_fashion = any(is_related_to_category(label, product_details["category"]) for label in labels if label)
         non_fashion_labels = [label for label in labels if label and not is_related_to_category(label, product_details["category"])]
 
-        person_detected = any(conf > 0.5 for conf in person_confidences)
+        person_detected_cv = any(conf > 0.5 for conf in person_confidences)
         cls_conf = float(re.search(r"Classification: \w+(?:\s+\w+)* \(confidence: ([\d.]+)\)", cv_description).group(1)) if cls_label else 0.0
         seg_conf = float(re.search(r"confidence: ([\d.]+), mask area:", cv_description).group(1)) if seg_label else 0.0
 
-        if len(detected_objects) > 1 and not is_fashion:
-            logger.info(f"Non-fashion objects detected for ResultID {result_id}: {non_fashion_labels}")
-            ai_json = json.dumps({
-                "description": f"Image contains multiple objects: {non_fashion_labels}, none of which are fashion-related.",
-                "extracted_features": {"brand": "Unknown", "category": "Multiple", "color": "Unknown", "model": "Unknown"},
-                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
-                "reasoning": f"Multiple non-fashion objects detected: {non_fashion_labels}.",
-                "cv_detection": cv_description,
-                "person_confidences": person_confidences,
-                "result_id": result_id,
-                "thumbnail": thumbnail_base64
-            })
-            return result_id, ai_json, "Non-fashion objects detected", 0, thumbnail_base64
-
-        if not person_detected and not is_fashion and max(cls_conf, seg_conf) < 0.2:
-            logger.info(f"No fashion items or persons for ResultID {result_id}")
-            ai_json = json.dumps({
-                "description": "Image lacks fashion items and persons with sufficient confidence.",
-                "extracted_features": {"brand": "Unknown", "category": "Unknown", "color": "Unknown", "model": "Unknown"},
-                "scores": {"sentiment": 0.0, "relevance": 0.0, "category": 0.0, "color": 0.0, "brand": 0.0, "model": 0.0},
-                "reasoning": "No person detected and low confidence in fashion detection.",
-                "cv_detection": cv_description,
-                "person_confidences": person_confidences,
-                "result_id": result_id,
-                "thumbnail": thumbnail_base64
-            })
-            return result_id, ai_json, "No fashion items detected", 0, thumbnail_base64
-
-        # Gemini analysis
+        # Gemini analysis for product details
         gemini_result = await analyze_image_with_gemini_async(base64_image, product_details, logger=logger, cv_description=cv_description)
         logger.debug(f"Gemini raw response for ResultID {result_id}: {json.dumps(gemini_result, indent=2)}")
 
@@ -344,59 +316,103 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             match_score = 0.5
         reasoning = features.get("reasoning", "No reasoning provided").encode('utf-8').decode('utf-8')
 
-        # Calculate linesheet sentiment score
-        sentiment_score = 0.0
+        # Gemini analysis for product shot criteria
+        product_shot_prompt = (
+            "Analyze the image for product shot suitability. Provide a JSON response with:\n"
+            "- person_present: boolean (true if a person is visible, false otherwise)\n"
+            "- background_type: string ('solid' for white/grey, 'multi-color' for varied colors, 'complex' for lifestyle/scenic)\n"
+            "- orientation: object with 'category' (e.g., 'shoe', 'shirt'), 'angle' (e.g., 'left-to-right', 'right-to-left', 'front-facing', 'side-facing', 'backwards'), and 'confidence' (0.0 to 1.0)\n"
+            f"Product details: {json.dumps(product_details)}"
+        )
+        gemini_product_shot_result = await analyze_image_with_gemini_async(
+            base64_image,
+            product_details,
+            logger=logger,
+            custom_prompt=product_shot_prompt,
+            expect_json=True
+        )
+        logger.debug(f"Gemini product shot response for ResultID {result_id}: {json.dumps(gemini_product_shot_result, indent=2)}")
+
+        # Parse Gemini product shot response
+        person_present = person_detected_cv  # Default to CV detection
+        background_type = "complex"
+        orientation_info = {"category": product_details["category"].lower(), "angle": "unknown", "confidence": 0.0}
         sentiment_reasoning = []
 
-        # 1. Check for clean white/plain background
-        background_score = 0.0
-        background_description = reasoning.lower() + description.lower()
-        if any(term in background_description for term in ["white background", "plain background", "clean background", "studio shot"]):
-            background_score = 1.0
-            sentiment_reasoning.append("Clean white/plain background detected")
-        elif any(term in background_description for term in ["complex background", "outdoor", "lifestyle", "cluttered"]):
-            background_score = 0.2
-            sentiment_reasoning.append("Complex or lifestyle background detected")
+        if gemini_product_shot_result.get("success", False):
+            product_shot_features = gemini_product_shot_result.get("features", {})
+            person_present = product_shot_features.get("person_present", person_detected_cv)
+            background_type = product_shot_features.get("background_type", "complex")
+            orientation_info = product_shot_features.get("orientation", orientation_info)
+            sentiment_reasoning.append(f"Gemini product shot analysis: person_present={person_present}, background_type={background_type}, orientation={orientation_info}")
         else:
-            # Basic background color check using image data
-            try:
-                image = Image.open(BytesIO(image_data)).convert("RGB")
-                pixels = image.getdata()
-                white_pixels = sum(1 for r, g, b in pixels if r > 240 and g > 240 and b > 240)
-                total_pixels = image.width * image.height
-                if white_pixels / total_pixels > 0.8:  # 80% white pixels
-                    background_score = 0.9
-                    sentiment_reasoning.append("Predominantly white background based on pixel analysis")
-                else:
-                    background_score = 0.5
-                    sentiment_reasoning.append("Neutral background; no clear white or complex indication")
-            except Exception as e:
-                logger.warning(f"Background pixel analysis failed for ResultID {result_id}: {e}")
-                background_score = 0.5
-                sentiment_reasoning.append("Background analysis inconclusive")
+            logger.warning(f"Gemini product shot analysis failed for ResultID {result_id}: {gemini_product_shot_result.get('error', 'No details')}")
+            sentiment_reasoning.append("Gemini product shot analysis failed; using CV defaults")
 
-        # 2. Check for no people
+        # Validate background and orientation
+        if background_type not in ["solid", "multi-color", "complex"]:
+            background_type = "complex"
+            sentiment_reasoning.append("Invalid background_type from Gemini; defaulting to complex")
+
+        if orientation_info.get("category", "").lower() not in product_details["category"].lower():
+            orientation_info = {"category": product_details["category"].lower(), "angle": "unknown", "confidence": 0.0}
+            sentiment_reasoning.append("Invalid orientation category from Gemini; defaulting to unknown")
+
+        # Calculate sentiment score
+        sentiment_score = 0.0
+
+        # 1. Solid background (40%)
+        background_score = 0.0
+        if background_type == "solid":
+            background_score = 1.0
+            sentiment_reasoning.append("Solid background (white/grey) detected")
+        elif background_type == "multi-color":
+            background_score = 0.5
+            sentiment_reasoning.append("Multi-color background detected")
+        else:  # complex
+            background_score = 0.2
+            sentiment_reasoning.append("Complex/lifestyle background detected")
+
+        # 2. No person (30%)
         people_score = 0.0
-        if not person_detected:
+        if not person_present:
             people_score = 1.0
-            sentiment_reasoning.append("No people detected")
+            sentiment_reasoning.append("No person detected")
         else:
             people_score = 0.3
-            sentiment_reasoning.append("People detected in image")
+            sentiment_reasoning.append("Person detected in image")
 
-        # 3. Check for single product focus
-        product_focus_score = 0.0
-        if len(detected_objects) <= 1 and is_fashion:
-            product_focus_score = 1.0
-            sentiment_reasoning.append("Single fashion product detected")
-        elif len(detected_objects) > 1:
-            product_focus_score = 0.4
-            sentiment_reasoning.append(f"Multiple objects detected: {non_fashion_labels}")
+        # 3. Optimal angle/orientation (20%)
+        angle_score = 0.0
+        angle = orientation_info.get("angle", "unknown").lower()
+        orientation_confidence = min(max(float(orientation_info.get("confidence", 0.0)), 0.0), 1.0)
+        category = orientation_info.get("category", "").lower()
+
+        if "shoe" in category or "footwear" in category:
+            if angle in ["side-facing", "left-to-right", "right-to-left"]:
+                angle_score = 0.9 * orientation_confidence + 0.1  # High score for side views
+                sentiment_reasoning.append(f"Shoe angle: {angle} (confidence: {orientation_confidence:.2f})")
+            elif angle == "front-facing":
+                angle_score = 0.7 * orientation_confidence + 0.1
+                sentiment_reasoning.append(f"Shoe angle: front-facing (confidence: {orientation_confidence:.2f})")
+            else:
+                angle_score = 0.3
+                sentiment_reasoning.append(f"Shoe angle: {angle} (confidence: {orientation_confidence:.2f})")
+        elif "shirt" in category or "top" in category:
+            if angle == "front-facing":
+                angle_score = 0.9 * orientation_confidence + 0.1
+                sentiment_reasoning.append(f"Shirt angle: front-facing (confidence: {orientation_confidence:.2f})")
+            elif angle == "backwards":
+                angle_score = 0.5 * orientation_confidence + 0.1
+                sentiment_reasoning.append(f"Shirt angle: backwards (confidence: {orientation_confidence:.2f})")
+            else:
+                angle_score = 0.3
+                sentiment_reasoning.append(f"Shirt angle: {angle} (confidence: {orientation_confidence:.2f})")
         else:
-            product_focus_score = 0.6
-            sentiment_reasoning.append("Single object but unclear if fashion-related")
+            angle_score = 0.5
+            sentiment_reasoning.append(f"Unknown or irrelevant category for orientation: {category}")
 
-        # 4. Check for image clarity (proxy via CV confidence)
+        # 4. Image clarity (10%)
         clarity_score = max(cls_conf, seg_conf, 0.5)
         sentiment_reasoning.append(f"Image clarity based on CV confidence: {clarity_score:.2f}")
 
@@ -404,7 +420,7 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
         sentiment_score = (
             0.4 * background_score +
             0.3 * people_score +
-            0.2 * product_focus_score +
+            0.2 * angle_score +
             0.1 * clarity_score
         )
         sentiment_reasoning_str = "; ".join(sentiment_reasoning)
@@ -442,7 +458,12 @@ async def process_image(row, session: aiohttp.ClientSession, logger: logging.Log
             "cv_detection": cv_description,
             "person_confidences": person_confidences,
             "result_id": result_id,
-            "thumbnail": thumbnail_base64
+            "thumbnail": thumbnail_base64,
+            "product_shot_analysis": {
+                "person_present": person_present,
+                "background_type": background_type,
+                "orientation": orientation_info
+            }
         })
         try:
             json.loads(ai_json)
