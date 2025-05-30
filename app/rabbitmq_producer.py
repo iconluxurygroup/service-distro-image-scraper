@@ -9,6 +9,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from config import RABBITMQ_URL
 from fastapi import BackgroundTasks
 import datetime
+import aiormq.exceptions  # Add this import
+
 producer = None
 # Configure default logger
 default_logger = logging.getLogger(__name__)
@@ -27,17 +29,9 @@ class RabbitMQProducer:
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
     ):
-        """
-        Initialize RabbitMQ producer with connection parameters.
-        
-        Args:
-            amqp_url: RabbitMQ connection URL.
-            queue_name: Name of the queue for database updates.
-            connection_timeout: Timeout for establishing connection (seconds).
-            operation_timeout: Timeout for publishing messages (seconds).
-        """
         self.amqp_url = amqp_url
         self.queue_name = queue_name
+        self.response_queue_name = "shared_response_queue"  # Shared response queue
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
         self.connection: Optional[aio_pika.RobustConnection] = None
@@ -46,16 +40,6 @@ class RabbitMQProducer:
         self._lock = asyncio.Lock()
 
     async def connect(self) -> 'RabbitMQProducer':
-        """
-        Establish a robust connection to RabbitMQ and declare a durable queue.
-        
-        Returns:
-            Self: The producer instance for method chaining.
-        
-        Raises:
-            asyncio.TimeoutError: If connection times out.
-            aio_pika.exceptions.AMQPError: For RabbitMQ connection or channel errors.
-        """
         async with self._lock:
             if self.is_connected and self.connection and not self.connection.is_closed:
                 default_logger.debug("RabbitMQ connection already established")
@@ -68,10 +52,14 @@ class RabbitMQProducer:
                         retry_delay=5,
                     )
                     self.channel = await self.connection.channel()
-                    await self.channel.set_qos(prefetch_count=2)  # Limit concurrent messages
+                    await self.channel.set_qos(prefetch_count=2)
                     await self.channel.declare_queue(self.queue_name, durable=True)
+                    # Declare shared response queue
+                    await self.channel.declare_queue(
+                        self.response_queue_name, durable=False, exclusive=False, auto_delete=True
+                    )
                     self.is_connected = True
-                    default_logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
+                    default_logger.info(f"Connected to RabbitMQ and declared queues: {self.queue_name}, {self.response_queue_name}")
                     return self
             except asyncio.TimeoutError:
                 default_logger.error("Timeout connecting to RabbitMQ")
@@ -85,7 +73,7 @@ class RabbitMQProducer:
                 )
                 self.is_connected = False
                 raise
-            except aio_pika.exceptions.AMQPConnectionError:
+            except aio_pika.exceptions.AMQPConnectionError as e:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 self.is_connected = False
                 raise
@@ -104,7 +92,8 @@ class RabbitMQProducer:
         retry=retry_if_exception_type((
             aio_pika.exceptions.AMQPError,
             aio_pika.exceptions.ChannelClosed,
-            asyncio.TimeoutError
+            asyncio.TimeoutError,
+            aiormq.exceptions.ChannelLockedResource
         )),
         before_sleep=lambda retry_state: default_logger.info(
             f"Retrying RabbitMQ publish (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -117,18 +106,6 @@ class RabbitMQProducer:
         correlation_id: Optional[str] = None,
         reply_to: Optional[str] = None
     ):
-        """
-        Publish a message to the specified queue.
-        
-        Args:
-            message: Dictionary to be serialized as JSON.
-            routing_key: Queue name (defaults to self.queue_name).
-            correlation_id: Optional correlation ID for tracking.
-            reply_to: Optional reply-to queue for responses.
-        
-        Raises:
-            Exception: If publishing fails after retries.
-        """
         async with self._lock:
             if not self.is_connected or not self.connection or self.connection.is_closed:
                 await self.connect()
@@ -136,10 +113,6 @@ class RabbitMQProducer:
                 async with asyncio.timeout(self.operation_timeout):
                     message_body = json.dumps(message)
                     queue_name = routing_key or self.queue_name
-                    if queue_name != self.queue_name and not queue_name.startswith("response_"):
-                        await self.channel.declare_queue(
-                            queue_name, durable=False, exclusive=True, auto_delete=True
-                        )
                     await self.channel.default_exchange.publish(
                         aio_pika.Message(
                             body=message_body.encode(),
@@ -160,9 +133,6 @@ class RabbitMQProducer:
                 raise
 
     async def close(self):
-        """
-        Close the RabbitMQ channel and connection gracefully.
-        """
         async with self._lock:
             try:
                 if self.channel and not self.channel.is_closed:
@@ -188,18 +158,6 @@ class RabbitMQProducer:
     )
 )
 async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProducer:
-    """
-    Ensure a connected RabbitMQ producer exists. If not, create and connect one.
-    
-    Args:
-        logger: Optional logger instance.
-    
-    Returns:
-        RabbitMQProducer: Connected producer instance.
-    
-    Raises:
-        ValueError: If RABBITMQ_URL is not set or connection fails.
-    """
     global producer
     logger = logger or default_logger
     
@@ -220,19 +178,22 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
                 raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
     
     return producer
+
 async def cleanup_producer():
     global producer
     if producer is not None and producer.is_connected:
         await producer.close()
         producer = None
         default_logger.info("Cleaned up RabbitMQ producer")
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
-        asyncio.TimeoutError
+        asyncio.TimeoutError,
+        aiormq.exceptions.ChannelLockedResource
     )),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying enqueue_db_update for FileID {retry_state.kwargs.get('file_id')} "
@@ -262,7 +223,7 @@ async def enqueue_db_update(
         
         # Convert SQLAlchemy text object to string if necessary
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
-        response_queue = response_queue or f"response_{file_id}_{correlation_id}" if return_result else None
+        response_queue = response_queue or producer.response_queue_name if return_result else None
 
         update_task = {
             "file_id": file_id,
@@ -285,10 +246,9 @@ async def enqueue_db_update(
 
         if return_result and response_queue:
             try:
-                connection = await aio_pika.connect_robust(producer.amqp_url)
-                async with connection:
+                async with aio_pika.connect_robust(producer.amqp_url) as connection:
                     channel = await connection.channel()
-                    queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+                    queue = await channel.get_queue(response_queue)  # Use existing shared queue
                     response_received = asyncio.Event()
                     response_data = None
 
