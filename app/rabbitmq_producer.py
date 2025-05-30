@@ -4,6 +4,7 @@ import psutil
 import datetime
 import asyncio
 import aio_pika
+import uuid
 from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -80,7 +81,7 @@ class RabbitMQProducer:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=2, min=2, max=10),
-        retry=retry_if_exception_type=(
+        retry=retry_if_exception_type(
             aio_pika.exceptions.AMQPError,
             aio_pika.exceptions.ChannelClosed,
             aio_pika.exceptions.ChannelAccessRefused,
@@ -145,7 +146,7 @@ class RabbitMQProducer:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type=(
+    retry=retry_if_exception_type(
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError
@@ -191,7 +192,7 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry_if_exception_type=(
+    retry=retry_if_exception_type(
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError
