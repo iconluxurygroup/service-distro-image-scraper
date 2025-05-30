@@ -3,7 +3,7 @@ import pandas as pd
 import pyodbc
 import asyncio
 import json
-import datetime
+import datetime,uuid
 import aio_pika
 import os
 import aiofiles
@@ -13,6 +13,7 @@ from typing import Optional, List, Dict
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from rabbitmq_producer import get_producer
 from database_config import conn_str, async_engine
 from s3_utils import upload_file_to_space
 producer = None
