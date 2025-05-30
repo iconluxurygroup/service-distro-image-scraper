@@ -689,12 +689,14 @@ async def process_restart_batch(
                     for attempt in range(1, MAX_ENTRY_RETRIES + 1):
                         try:
                             logger.debug(f"Processing EntryID {entry_id}, Attempt {attempt}/{MAX_ENTRY_RETRIES}")
+                            # Preprocess SKU to normalize search string, brand, model, and color
                             search_string, brand, model, color = await preprocess_sku(
                                 search_string=search_string,
                                 known_brand=brand,
                                 brand_rules=brand_rules,
                                 logger=logger
                             )
+                            # Generate search term variations
                             search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
                             variation_order = [
                                 "default", "brand_alias", "model_alias", "delimiter_variations",
@@ -712,6 +714,7 @@ async def process_restart_batch(
 
                             for term in search_terms:
                                 logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
+                                # Enforce a 30-second timeout for the search operation
                                 async with asyncio.timeout(30):
                                     results = await async_process_entry_search(
                                         search_string=term,
@@ -728,6 +731,7 @@ async def process_restart_batch(
                                 if not results:
                                     logger.debug(f"No results for term '{term}' in EntryID {entry_id}")
                                     continue
+                                # Filter valid results with required columns and non-placeholder URLs
                                 valid_results = [
                                     res for res in results
                                     if all(col in res for col in required_columns) and
@@ -743,6 +747,7 @@ async def process_restart_batch(
                                     logger.debug(f"No valid results for term '{term}' in EntryID {entry_id}")
                                     continue
                                 try:
+                                    # Insert search results into the database with a 30-second timeout
                                     async with asyncio.timeout(30):
                                         success = await insert_search_results(
                                             results=valid_results,
@@ -766,6 +771,7 @@ async def process_restart_batch(
 
                             if results_written:
                                 try:
+                                    # Update search sort order with a 30-second timeout
                                     async with asyncio.timeout(30):
                                         sort_results = await update_search_sort_order(
                                             file_id=str(file_id_db),
@@ -789,6 +795,7 @@ async def process_restart_batch(
                                     logger.error(f"Error updating search sort for EntryID {entry_id}: {e}", exc_info=True)
                                     continue
 
+                                # Fetch sorted results for AI analysis
                                 sql = """
                                     SELECT ResultID, AiJson
                                     FROM utb_ImageScraperResult
@@ -819,6 +826,7 @@ async def process_restart_batch(
                                         logger.debug(f"Running AI analysis for ResultID {result_id}, EntryID {entry_id}")
                                         for ai_attempt in range(1, 3):
                                             try:
+                                                # Perform AI analysis with a 60-second timeout
                                                 async with asyncio.timeout(60):
                                                     ai_result = await batch_vision_reason(
                                                         file_id=str(file_id_db),
@@ -866,6 +874,7 @@ async def process_restart_batch(
                                                     continue
                                                 break
 
+                                # Update Step1 timestamp to mark entry as processed
                                 sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                                 params = {"entry_id": entry_id}
                                 await enqueue_with_retry(
@@ -887,6 +896,7 @@ async def process_restart_batch(
                             continue
                     logger.warning(f"Failed to process EntryID {entry_id} after {MAX_ENTRY_RETRIES} attempts")
                     if not results_written:
+                        # Reset Step1 if no results were written
                         sql = "UPDATE utb_ImageScraperRecords SET Step1 = NULL WHERE EntryID = :entry_id"
                         params = {"entry_id": entry_id}
                         await enqueue_with_retry(
