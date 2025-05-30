@@ -9,7 +9,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from fastapi import BackgroundTasks
 import psutil
 from database_config import async_engine
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
+from rabbitmq_producer import RabbitMQProducer
+from db_utils import enqueue_db_update
 import uuid
 import aio_pika
 from common import clean_string, normalize_model, generate_aliases
