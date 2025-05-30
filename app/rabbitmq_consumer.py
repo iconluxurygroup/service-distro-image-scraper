@@ -218,24 +218,13 @@ class RabbitMQConsumer:
             logger.info(f"Worker PID {psutil.Process().pid}: {task_type} affected {rowcount} rows for FileID {file_id}")
             return {"rowcount": rowcount}
         except SQLAlchemyError as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Database error executing UPDATE/INSERT: {sql[:100]}, params: {params}, error: {str(e)}",
-                exc_info=True
-            )
+            logger.error(f"SQLAlchemyError for FileID {file_id}, TaskType {task_type}: {e}", exc_info=True)
             await conn.rollback()
             raise
         except Exception as e:
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Unexpected error executing UPDATE/INSERT: {sql[:100]}, params: {params}, error: {str(e)}",
-                exc_info=True
-            )
+            logger.error(f"Unexpected error for FileID {file_id}, TaskType {task_type}: {e}", exc_info=True)
             await conn.rollback()
             raise
-        finally:
-            if hasattr(conn, 'close'):
-                await conn.close()
 
     async def execute_select(self, task: Dict[str, Any], conn, logger: logging.Logger) -> Dict[str, Any]:
         file_id = task.get("file_id", "unknown")
