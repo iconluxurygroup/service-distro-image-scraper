@@ -432,13 +432,3 @@ def setup_signal_handlers(loop):
             loop.add_signal_handler(sig, signal_handler)
         except (NotImplementedError, ValueError):
             default_logger.warning(f"Signal handler for {sig} not supported on this platform")
-
-if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    setup_signal_handlers(loop)
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.run_until_complete(loop.shutdown_default_executor())
-        loop.close()
