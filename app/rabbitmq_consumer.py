@@ -67,11 +67,19 @@ class RabbitMQConsumer:
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=1)
                 if self.queue_name.startswith("select_response_"):
-                    # Use existing exclusive queue for response queues
-                    await self.channel.get_queue(self.queue_name)
-                    logger.debug(f"Connected to existing queue: {self.queue_name}")
+                    try:
+                        await self.channel.get_queue(self.queue_name)
+                        logger.debug(f"Connected to existing queue: {self.queue_name}")
+                    except aiormq.exceptions.ChannelNotFoundEntity:
+                        logger.warning(f"Queue {self.queue_name} not found, creating it")
+                        await self.channel.declare_queue(
+                            self.queue_name,
+                            exclusive=True,
+                            auto_delete=True,
+                            arguments={"x-expires": 300000}  # 5-minute expiration
+                        )
+                        logger.debug(f"Created response queue: {self.queue_name}")
                 else:
-                    # Declare durable queue for db_update_queue
                     await self.channel.declare_queue(self.queue_name, durable=True)
                 logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
         except asyncio.TimeoutError:
@@ -94,7 +102,13 @@ class RabbitMQConsumer:
                 exc_info=True
             )
             raise
-
+    async def get_channel(self) -> aio_pika.Channel:
+        """Get the RabbitMQ channel, connecting if necessary."""
+        if not self.channel or self.channel.is_closed:
+            await self.connect()
+        if not self.channel:
+            raise aio_pika.exceptions.AMQPConnectionError("Failed to establish channel")
+        return self.channel
     async def close(self):
         """Close the RabbitMQ connection and channel."""
         try:
