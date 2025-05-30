@@ -66,7 +66,13 @@ class RabbitMQConsumer:
                 )
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=1)
-                await self.channel.declare_queue(self.queue_name, durable=True)
+                if self.queue_name.startswith("select_response_"):
+                    # Use existing exclusive queue for response queues
+                    await self.channel.get_queue(self.queue_name)
+                    logger.debug(f"Connected to existing queue: {self.queue_name}")
+                else:
+                    # Declare durable queue for db_update_queue
+                    await self.channel.declare_queue(self.queue_name, durable=True)
                 logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
         except asyncio.TimeoutError:
             logger.error("Timeout connecting to RabbitMQ")
@@ -81,10 +87,10 @@ class RabbitMQConsumer:
         except aio_pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
             raise
-        except aiormq.exceptions.ChannelAccessRefused as e:
+        except aiormq.exceptions.ChannelLockedResource as e:
             logger.error(
-                f"Permissions error connecting to RabbitMQ: {e}. "
-                f"Ensure user has permissions on virtual host and default exchange.",
+                f"Resource locked error for queue {self.queue_name}: {e}. "
+                f"Ensure queue is not exclusively locked by another connection.",
                 exc_info=True
             )
             raise

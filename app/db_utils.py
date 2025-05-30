@@ -217,12 +217,7 @@ async def insert_search_results(
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     process = psutil.Process()
     logger.info(f"Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
-    if entry_ids:
-        async with async_engine.connect() as conn:
-            query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
-            result = await conn.execute(query, {"entry_ids": tuple(entry_ids)})
-            count = result.scalar()
-            logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {entry_ids}")
+
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
@@ -286,6 +281,15 @@ async def insert_search_results(
 
         entry_ids = list(set(row["EntryID"] for row in data))
         logger.debug(f"[{correlation_id}] Enqueuing SELECT for EntryIDs: {entry_ids}")
+
+        # Pre-check for existing rows
+        if entry_ids:
+            async with async_engine.connect() as conn:
+                query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
+                result = await conn.execute(query, {"entry_ids": tuple(entry_ids)})
+                count = result.scalar()
+                logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {entry_ids}")
+
         existing_keys = set()
         if entry_ids:
             placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
@@ -311,7 +315,7 @@ async def insert_search_results(
 
             consume_task = asyncio.create_task(consume_responses())
             try:
-                async with asyncio.timeout(120):  # Increased to 120 seconds
+                async with asyncio.timeout(120):
                     await response_received.wait()
                 if response_data:
                     existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
@@ -324,6 +328,7 @@ async def insert_search_results(
             finally:
                 consume_task.cancel()
                 await asyncio.sleep(0.5)
+        # ... (rest of the function remains unchanged)
 
         update_query = """
             UPDATE utb_ImageScraperResult
