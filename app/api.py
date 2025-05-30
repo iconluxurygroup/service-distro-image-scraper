@@ -687,8 +687,10 @@ async def process_restart_batch(
 
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
 
-        # Check RabbitMQ connectivity
-        producer = RabbitMQProducer()
+        global producer
+        if not producer:
+            logger.error("RabbitMQ producer not initialized")
+            raise ValueError("RabbitMQ producer not initialized")
         try:
             async with asyncio.timeout(10):
                 await producer.connect()

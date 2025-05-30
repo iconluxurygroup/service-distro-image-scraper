@@ -8,8 +8,20 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import asyncio
 import aiormq.exceptions
 import uuid
-logger = logging.getLogger(__name__)
 
+import uuid
+import datetime
+import json
+from typing import Dict, Any, Optional
+from fastapi import BackgroundTasks
+import logging
+import aio_pika
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+default_logger = logging.getLogger(__name__)
+
+# Global RabbitMQ producer
+producer = None
 class RabbitMQProducer:
     def __init__(
         self,
@@ -279,7 +291,15 @@ class RabbitMQProducer:
             self.is_connected = False
         except Exception as e:
             logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
-
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(aio_pika.exceptions.AMQPError),
+    before_sleep=lambda retry_state: default_logger.info(
+        f"Retrying enqueue_db_update for FileID {retry_state.kwargs.get('file_id')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def enqueue_db_update(
     file_id: str,
     sql: str,
@@ -290,18 +310,24 @@ async def enqueue_db_update(
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
     return_result: bool = False,
-):
-    """Enqueue a database update task to RabbitMQ and optionally wait for the result."""
-    should_close = False
+) -> Optional[int]:
+
+    global producer
     if producer is None:
-        producer = RabbitMQProducer()
-        should_close = True
+        default_logger.error("RabbitMQ producer not initialized")
+        raise ValueError("RabbitMQ producer not initialized")
 
     try:
-        await producer.connect()
+        # Ensure producer is connected
+        if producer.connection is None or producer.connection.is_closed:
+            await producer.connect()
+
+        # Convert SQLAlchemy text object to string if necessary
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
         correlation_id = correlation_id or str(uuid.uuid4())
-        response_queue = response_queue or f"select_response_{correlation_id}" if return_result else None
+
+        # Use a shared response queue for return_result tasks if not specified
+        response_queue = response_queue or f"response_{file_id}_{correlation_id}" if return_result else None
 
         update_task = {
             "file_id": file_id,
@@ -310,40 +336,59 @@ async def enqueue_db_update(
             "params": params,
             "timestamp": datetime.datetime.now().isoformat(),
             "response_queue": response_queue,
+            "correlation_id": correlation_id,
         }
 
-        if return_result:
-            # Set up a temporary response queue
-            async with producer.channel:
-                await producer.channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
-                # Publish the message
-                await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
-                logger.info(f"Enqueued database update with response queue for FileID: {file_id}, TaskType: {task_type}, CorrelationID: {correlation_id}")
+        # Publish the task to RabbitMQ
+        message_body = json.dumps(update_task).encode()
+        await producer.publish(
+            message=message_body,
+            routing_key="db_update_queue",  # Adjust to your queue name
+            correlation_id=correlation_id,
+            reply_to=response_queue
+        )
+        default_logger.debug(f"Enqueued task {task_type} for FileID {file_id}, CorrelationID: {correlation_id}")
 
-                # Wait for the response
-                async with producer.channel:
-                    queue = await producer.channel.get_queue(response_queue)
+        if return_result and response_queue:
+            connection = None
+            try:
+                connection = await aio_pika.connect_robust(producer.amqp_url)
+                channel = await connection.channel()
+                queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+                response_received = asyncio.Event()
+                response_data = None
+
+                async def consume_response():
+                    nonlocal response_data
                     async with queue.iterator() as queue_iter:
                         async for message in queue_iter:
-                            if message.correlation_id == correlation_id:
-                                async with message.process():
-                                    try:
-                                        response = json.loads(message.body.decode())
-                                        logger.info(f"Received response for FileID: {file_id}, CorrelationID: {correlation_id}")
-                                        return response.get("result", 0)  # Expecting rows affected or similar
-                                    except json.JSONDecodeError as e:
-                                        logger.error(f"Invalid response format for FileID: {file_id}: {e}")
-                                        raise
-        else:
-            # Standard enqueue without waiting for result
-            await producer.publish_update(update_task, correlation_id=correlation_id)
-            logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}, CorrelationID: {correlation_id}")
-            return None
+                            async with message.process():
+                                if message.correlation_id == correlation_id:
+                                    response_data = json.loads(message.body.decode())
+                                    response_received.set()
+                                    break
+
+                consume_task = asyncio.create_task(consume_response())
+                try:
+                    async with asyncio.timeout(60):  # Adjustable timeout
+                        await response_received.wait()
+                    if response_data and "result" in response_data:
+                        default_logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
+                        return response_data["result"]
+                    else:
+                        default_logger.warning(f"No valid response received for FileID {file_id}, CorrelationID: {correlation_id}")
+                        return 0
+                except asyncio.TimeoutError:
+                    default_logger.warning(f"Timeout waiting for response for FileID {file_id}, CorrelationID: {correlation_id}")
+                    return 0
+                finally:
+                    consume_task.cancel()
+                    await asyncio.sleep(0.5)
+            finally:
+                if connection and not connection.is_closed:
+                    await connection.close()
+        return None
 
     except Exception as e:
-        logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
+        default_logger.error(f"Error enqueuing task for FileID {file_id}: {e}", exc_info=True)
         raise
-    finally:
-        if should_close:
-            await producer.close()
-            logger.info(f"Closed RabbitMQ producer for FileID: {file_id}")

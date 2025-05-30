@@ -21,7 +21,7 @@ import uuid
 import aio_pika
 
 from tenacity import retry, stop_after_attempt, wait_fixed
-
+producer = None
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
