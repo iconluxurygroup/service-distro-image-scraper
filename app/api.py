@@ -1719,7 +1719,7 @@ async def api_reset_step1_no_results(
         global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized")
-             raise ValueError(f"RabbitMQ not initialized")
+            raise ValueError(f"RabbitMQ not initialized")
         try:
             async with asyncio.timeout(10):
                 await producer.connect()
