@@ -131,26 +131,17 @@ async def insert_search_results(
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
-    try:
-        if not RABBITMQ_URL:
-            logger.error("RABBITMQ_URL environment variable not set")
-            raise ValueError("RABBITMQ_URL not configured")
-        global producer
-        if not producer:
+    global producer
+    if not producer or not producer.is_connected:
+        logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
+        try:
             producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
-            async with asyncio.timeout(10):
+            async with asyncio.timeout(RABBITMQ_CONNECT_TIMEOUT):
                 await producer.connect()
             logger.info(f"Worker PID {process.pid}: Successfully initialized RabbitMQ producer")
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
-        log_public_url = await upload_file_to_space(
-            file_src=log_filename,
-            save_as=f"job_logs/job_{file_id}.log",
-            is_public=True,
-            logger=logger,
-            file_id=str(file_id)
-        )
-        raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
+        except Exception as e:
+            logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
+            raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
     data = []
     errors = []
 
