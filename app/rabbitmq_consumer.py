@@ -407,6 +407,8 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
 
 if __name__ == "__main__":
     import argparse
+    from rabbitmq_test import test_rabbitmq_connection
+
     parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
     parser.add_argument("--clear-queue", action="store_true", help="Manually clear the queue and exit")
     args = parser.parse_args()
@@ -416,31 +418,32 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     signal.signal(signal.SIGINT, signal_handler(consumer, loop))
     signal.signal(signal.SIGTERM, signal_handler(consumer, loop))
-    # ... rest of main ...
-
-    if args.clear_queue:
-        try:
-            loop.run_until_complete(consumer.purge_queue())
-            logger.info("Queue cleared successfully. Exiting.")
-            sys.exit(0)
-        except Exception as e:
-            logger.error(f"Failed to clear queue: {e}", exc_info=True)
-            sys.exit(1)
-
-    sample_task = {
-        "file_id": "321",
-        "task_type": "update_sort_order",
-        "sql": "UPDATE_SORT_ORDER",
-        "params": {
-            "entry_id": "119061",
-            "result_id": "1868277",
-            "sort_order": 1
-        },
-        "timestamp": "2025-05-21T12:34:08.307076"
-    }
 
     async def main():
         try:
+            # Test connections on startup
+            logger.info("Testing RabbitMQ connections on startup...")
+            if not await test_rabbitmq_connection(logger):
+                logger.error("RabbitMQ connection test failed, exiting")
+                sys.exit(1)
+            logger.info("RabbitMQ connection test passed")
+
+            if args.clear_queue:
+                await consumer.purge_queue()
+                logger.info("Queue cleared successfully. Exiting.")
+                sys.exit(0)
+
+            sample_task = {
+                "file_id": "321",
+                "task_type": "update_sort_order",
+                "sql": "UPDATE_SORT_ORDER",
+                "params": {
+                    "entry_id": "119061",
+                    "result_id": "1868277",
+                    "sort_order": 1
+                },
+                "timestamp": "2025-05-21T12:34:08.307076"
+            }
             await consumer.test_task(sample_task)
             await consumer.start_consuming()
         except KeyboardInterrupt:
