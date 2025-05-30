@@ -620,20 +620,20 @@ async def process_restart_batch(
         endpoint = SEARCH_PROXY_API_URL
         logger.debug(f"Using search endpoint: {endpoint}")
         async with async_engine.connect() as conn:
-            query = text("""
-                SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory
-                FROM utb_ImageScraperRecords r
-                LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
-                WHERE r.FileID = :file_id
-                AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
-                AND r.Step1 IS NULL
-                AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.Order <= 0)
-                ORDER BY r.EntryID
-            """)
-            result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
-            entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
-            logger.info(f"Found {len(entries)} entries needing processing for FileID {file_id_db}")
-            result.close()
+                query = text("""
+                    SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory
+                    FROM utb_ImageScraperRecords r
+                    LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+                    WHERE r.FileID = :file_id
+                    AND (:entry_id IS NULL OR r.EntryID >= :entry_id)
+                    AND r.Step1 IS NULL
+                    AND (t.EntryID IS NULL OR t.SortOrder IS NULL OR t.[Order] <= 0)
+                    ORDER BY r.EntryID
+                """)
+                result = await conn.execute(query, {"file_id": file_id_db_int, "entry_id": entry_id})
+                entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
+                logger.info(f"Found {len(entries)} entries needing processing for FileID {file_id_db}")
+                result.close()
 
         if not entries:
             logger.warning(f"No valid EntryIDs found for FileID {file_id_db}")
