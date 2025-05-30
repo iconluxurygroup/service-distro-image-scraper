@@ -652,12 +652,12 @@ import aio_pika
 import json
 import uuid
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from rabbitmq_producer import RabbitMQProducer
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 from database_config import async_engine
 from s3_utils import upload_file_to_space
 from email_utils import send_message_email
 from db_utils import get_send_to_email, fetch_last_valid_entry
-from search_utils import update_search_sort_order, update_sort_order
+from search_utils import update_sort_order
 from ai_utils import batch_vision_reason
 from common import generate_search_variations, fetch_brand_rules, preprocess_sku
 from logging_config import setup_job_logger
@@ -797,40 +797,21 @@ async def process_restart_batch(
                     f"Retrying enqueue for FileID {file_id_db}, TaskType {task_type}, CorrelationID {correlation_id} (attempt {retry_state.attempt_number}/3)"
                 )
             )
-            async def enqueue_with_retry(sql, params, task_type, correlation_id, response_queue=None):
+            async def enqueue_with_retry(sql, params, task_type, correlation_id, response_queue=None, return_result=False):
                 try:
                     async with asyncio.timeout(10):
-                        if task_type.startswith("select_"):
-                            response_queue_name = f"select_response_{correlation_id}"
-                            update_task = {
-                                "file_id": str(file_id_db),
-                                "task_type": task_type,
-                                "sql": sql,
-                                "params": params,
-                                "timestamp": datetime.datetime.now().isoformat(),
-                                "response_queue": response_queue_name
-                            }
-                            await producer.publish_update(update_task, routing_key=response_queue_name, correlation_id=correlation_id)
-                            async with aio_pika.connect_robust(producer.amqp_url) as conn:
-                                channel = await conn.channel()
-                                queue = await channel.declare_queue(response_queue_name, exclusive=True, auto_delete=True)
-                                async with queue.iterator() as queue_iter:
-                                    async for message in queue_iter:
-                                        async with message.process():
-                                            if message.correlation_id == correlation_id:
-                                                response = json.loads(message.body.decode())
-                                                return response.get("results", [])
-                        else:
-                            update_task = {
-                                "file_id": str(file_id_db),
-                                "task_type": task_type,
-                                "sql": sql,
-                                "params": params,
-                                "timestamp": datetime.datetime.now().isoformat(),
-                                "response_queue": response_queue
-                            }
-                            await producer.publish_update(update_task, correlation_id=correlation_id)
-                            return None
+                        result = await enqueue_db_update(
+                            file_id=str(file_id_db),
+                            sql=sql,
+                            params=params,
+                            background_tasks=background_tasks,
+                            task_type=task_type,
+                            producer=producer,
+                            response_queue=response_queue,
+                            correlation_id=correlation_id,
+                            return_result=return_result
+                        )
+                        return result
                 except asyncio.TimeoutError as te:
                     logger.error(f"Timeout enqueuing TaskType {task_type}, CorrelationID {correlation_id}: {te}", exc_info=True)
                     raise
@@ -897,48 +878,33 @@ async def process_restart_batch(
                                             logger.debug(f"No valid results for term '{term}' in EntryID {entry_id}")
                                             continue
 
-                                        for result in valid_results:
-                                            sql = """
-                                                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, SortOrder)
-                                                VALUES (:entry_id, :image_url, :image_desc, :image_source, :image_url_thumbnail, 0);
-                                                SELECT SCOPE_IDENTITY() AS ResultID;
-                                            """
-                                            params = {
-                                                "entry_id": result["EntryID"],
-                                                "image_url": result["ImageUrl"],
-                                                "image_desc": result["ImageDesc"],
-                                                "image_source": result["ImageSource"],
-                                                "image_url_thumbnail": result["ImageUrlThumbnail"]
-                                            }
-                                            correlation_id = str(uuid.uuid4())
-                                            try:
-                                                async with asyncio.timeout(10):
-                                                    result_id = await enqueue_with_retry(
-                                                        sql=sql,
-                                                        params=params,
-                                                        task_type="insert_result",
-                                                        correlation_id=correlation_id
-                                                    )
-                                                logger.debug(f"Enqueued result for EntryID {entry_id}, ResultID: {result_id}, CorrelationID: {correlation_id}")
-                                            except asyncio.TimeoutError as te:
-                                                logger.error(f"Timeout enqueuing result for EntryID {entry_id}, CorrelationID: {correlation_id}: {te}", exc_info=True)
-                                                continue
-                                            except Exception as e:
-                                                logger.error(f"Failed to enqueue result for EntryID {entry_id}, CorrelationID: {correlation_id}: {e}", exc_info=True)
-                                                continue
-
-                                            if not result_id:
-                                                logger.warning(f"No ResultID for EntryID {entry_id}, skipping")
-                                                continue
-
-                                            results_written = True
+                                        # Insert results
+                                        try:
+                                            async with asyncio.timeout(30):
+                                                success = await insert_search_results(
+                                                    results=valid_results,
+                                                    logger=logger,
+                                                    file_id=str(file_id_db),
+                                                    background_tasks=background_tasks
+                                                )
+                                            if success:
+                                                results_written = True
+                                                logger.info(f"Inserted {len(valid_results)} results for EntryID {entry_id}")
+                                            else:
+                                                logger.warning(f"Failed to insert results for EntryID {entry_id}")
+                                        except asyncio.TimeoutError as te:
+                                            logger.error(f"Timeout inserting results for EntryID {entry_id}: {te}", exc_info=True)
+                                            continue
+                                        except Exception as e:
+                                            logger.error(f"Error inserting results for EntryID {entry_id}: {e}", exc_info=True)
+                                            continue
 
                                         # Stop after valid results unless use_all_variations
                                         if valid_results and not use_all_variations:
                                             break
 
                                     if results_written:
-                                        # Perform search sort before AI analysis
+                                        # Enqueue search sort
                                         try:
                                             async with asyncio.timeout(30):
                                                 sort_results = await update_search_sort_order(
@@ -977,7 +943,9 @@ async def process_restart_batch(
                                                     sql=sql,
                                                     params=params,
                                                     task_type="select_sorted_results",
-                                                    correlation_id=correlation_id
+                                                    correlation_id=correlation_id,
+                                                    response_queue=f"select_response_{correlation_id}",
+                                                    return_result=True
                                                 )
                                         except asyncio.TimeoutError as te:
                                             logger.error(f"Timeout fetching sorted results for EntryID {entry_id}: {te}", exc_info=True)
@@ -1041,7 +1009,7 @@ async def process_restart_batch(
                                                             continue
                                                         break
 
-                                        # Update Step1 after sort and AI analysis
+                                        # Update Step1
                                         sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                                         params = {"entry_id": entry_id}
                                         await enqueue_with_retry(
@@ -1182,7 +1150,7 @@ async def process_restart_batch(
 
             logger.info(f"Starting search sort for FileID: {file_id_db}")
             try:
-                sort_result = await update_sort_order(str(file_id_db), logger=logger)
+                sort_result = await update_sort_order(str(file_id_db), logger=logger, background_tasks=background_tasks)
                 logger.info(f"Search sort completed for FileID {file_id_db}. Result: {sort_result}")
             except Exception as e:
                 logger.error(f"Error running search sort for FileID {file_id_db}: {e}", exc_info=True)
