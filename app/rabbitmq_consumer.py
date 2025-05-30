@@ -11,9 +11,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import psutil
 from typing import Optional, Dict, Any
 import uuid
-from database_config import async_engine  # Assume this is your SQLAlchemy async engine
-from config import RABBITMQ_URL  # Assume RABBITMQ_URL = "amqp://app_user:app_password@localhost:5672/app_vhost"
-from rabbitmq_producer import RabbitMQProducer
+from database_config import async_engine
+from config import RABBITMQ_URL
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -41,10 +41,7 @@ class RabbitMQConsumer:
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=30),
-        retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, aiormq.exceptions.ChannelInvalidStateError)),
-        before_sleep=lambda retry_state: logger.info(
-            f"Retrying connect (attempt {retry_state.attempt_number}/5) after {retry_state.next_action.sleep}s"
-        )
+        retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, aiormq.exceptions.ChannelInvalidStateError))
     )
     async def connect(self):
         async with self._lock:
@@ -57,13 +54,15 @@ class RabbitMQConsumer:
                 )
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=1)
+                await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
                 for queue_name, durable in [
                     (self.queue_name, True),
                     (self.new_queue_name, True),
                     (self.response_queue_name, True)
                 ]:
                     queue = await self.channel.declare_queue(queue_name, durable=durable)
-                    logger.info(f"Declared queue {queue_name} with durable={durable}")
+                    await queue.bind('logs')
+                    logger.info(f"Declared and bound queue {queue_name} to logs exchange")
                 logger.info("Successfully connected to RabbitMQ")
             except aio_pika.exceptions.AMQPError as e:
                 logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
@@ -221,7 +220,7 @@ class RabbitMQConsumer:
                     "correlation_id": correlation_id,
                     "result": len(results)
                 }
-                await self.producer.publish_message(response, routing_key=response_queue, correlation_id=correlation_id)
+                await self.producer.publish_message(response, routing_key='', correlation_id=correlation_id)
             return {"results": results}
         except SQLAlchemyError as e:
             logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
@@ -269,3 +268,96 @@ class RabbitMQConsumer:
         except Exception as e:
             logger.error(f"Error executing new_task for FileID {file_id}: {e}", exc_info=True)
             return False
+import asyncio
+import signal
+import logging
+import argparse
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
+    logger.info("Initiating shutdown...")
+    try:
+        tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.debug(f"Task {task.get_name()} cancelled or timed out")
+        await consumer.close()
+        await consumer.producer.close()
+        if loop.is_running():
+            loop.stop()
+        await loop.shutdown_asyncgens()
+        await loop.shutdown_default_executor()
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}", exc_info=True)
+    finally:
+        if not loop.is_closed():
+            loop.close()
+            logger.info("Event loop closed")
+        logger.info("Shutdown complete.")
+
+def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
+    import time
+    last_signal_time = 0
+    debounce_interval = 1.0
+
+    def handler(sig, frame):
+        nonlocal last_signal_time
+        current_time = time.time()
+        if current_time - last_signal_time < debounce_interval:
+            logger.debug("Debouncing rapid SIGINT/SIGTERM")
+            return
+        last_signal_time = current_time
+        logger.info(f"Received signal {sig}, shutting down...")
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(shutdown(consumer, loop)))
+
+    return handler
+
+async def main():
+    parser = argparse.ArgumentParser(description="RabbitMQ Consumer")
+    parser.add_argument("--clear", action="store_true", help="Purge the main queue and exit")
+    parser.add_argument("--delete-mismatched", action="store_true", help="Delete queues with mismatched durability")
+    args = parser.parse_args()
+
+    producer = await RabbitMQProducer.get_producer()
+    consumer = RabbitMQConsumer(producer=producer)
+
+    try:
+        if args.clear:
+            logger.info("Clearing queue...")
+            await consumer.purge_queue()
+            logger.info("Queue cleared")
+            return
+        if args.delete_mismatched:
+            logger.info("Checking and deleting queues with mismatched durability...")
+            await consumer.connect()
+            for queue_name in [consumer.queue_name, consumer.new_queue_name, consumer.response_queue_name]:
+                await consumer.channel.queue_delete(queue_name)
+                logger.info(f"Deleted queue {queue_name}")
+            await consumer.close()
+            return
+        logger.info("Starting consumer...")
+        await consumer.start_consuming()
+    except Exception as e:
+        logger.error(f"Error in main: {e}", exc_info=True)
+        await shutdown(consumer, loop)
+
+if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    producer = None
+    consumer = None
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt, shutting down...")
+        loop.run_until_complete(shutdown(consumer, loop))
+    finally:
+        if not loop.is_closed():
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+            loop.close()
