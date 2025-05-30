@@ -660,7 +660,6 @@ from search_utils import update_search_sort_order, update_sort_order
 from ai_utils import batch_vision_reason
 from common import generate_search_variations, fetch_brand_rules, preprocess_sku
 from logging_config import setup_job_logger
-from . import SearchClient, process_results, process_and_tag_results
 
 async def process_restart_batch(
     file_id_db: int,
