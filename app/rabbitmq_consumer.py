@@ -52,7 +52,14 @@ class RabbitMQConsumer:
         self.connection: Optional[aio_pika.RobustConnection] = None
         self.channel: Optional[aio_pika.Channel] = None
         self.is_consuming = False
-
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiormq.exceptions.ChannelInvalidStateError, aio_pika.exceptions.AMQPConnectionError))
+    )
+    async def declare_queue_with_retry(self, channel, queue_name, **kwargs):
+        """Declare a queue with retry logic."""
+        return await channel.declare_queue(queue_name, **kwargs)
     async def connect(self):
         """Establish an async robust connection to RabbitMQ."""
         if self.connection and not self.connection.is_closed:
