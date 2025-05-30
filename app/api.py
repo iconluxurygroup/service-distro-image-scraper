@@ -547,7 +547,7 @@ async def process_restart_batch(
         global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized, creating new instance")
-            producer = RabbitMQProducer()
+            ValueError("MQ producer not initialized, creating new instance")   
         try:
             async with asyncio.timeout(10):
                 await producer.connect()
