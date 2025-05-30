@@ -227,4 +227,18 @@ async def test_rabbitmq_connection(
     finally:
         try:
             if consumer:
-                await consumer.close
+                await consumer.close()
+            if producer and producer.is_connected:
+                if producer.channel and not producer.channel.is_closed:
+                    try:
+                        await producer.channel.queue_delete(test_queue_name)
+                        logger.debug(f"Deleted test queue: {test_queue_name}")
+                    except:
+                        pass
+                await producer.close()
+        except Exception as e:
+            logger.warning(f"Error cleaning up test resources: {e}")
+        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.sleep(0.5)
