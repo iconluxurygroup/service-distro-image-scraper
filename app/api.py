@@ -11,6 +11,7 @@ import urllib.parse
 import hashlib
 import time
 import httpx
+import aiohttp
 import pandas as pd
 from typing import Optional, List, Dict, Any, Callable
 from sqlalchemy.sql import text
@@ -25,7 +26,7 @@ import aio_pika
 from multiprocessing import cpu_count
 from math import ceil
 
-# Assume these imports are defined in their respective modules
+# Assume these are defined in their respective modules
 from icon_image_lib.google_parser import process_search_result
 from common import generate_search_variations, fetch_brand_rules, preprocess_sku
 from logging_config import setup_job_logger
@@ -103,6 +104,354 @@ async def lifespan(app: FastAPI):
 
 app.lifespan = lifespan
 
+class SearchClient:
+    def __init__(self, endpoint: str, logger: logging.Logger, max_concurrency: int = 10):
+        self.endpoint = endpoint
+        self.logger = logger
+        self.semaphore = asyncio.Semaphore(max_concurrency)
+        self.api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGRkZTIwZjAtNjlmZS00ODc2LWE0MmItMTY1YzM1YTk4MzMyIiwiaWF0IjoxNzQ3MDg5NzQ2LjgzMjU3OCwiZXhwIjoxNzc4NjI1NzQ2LjgzMjU4M30.pvPx3K8AIrV3gPnQqAC0BLGrlugWhLYLeYrgARkBG-g"
+        self.headers = {
+            "accept": "application/json",
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json"
+        }
+        self.regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
+
+    async def close(self):
+        pass
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError))
+    )
+    async def search(self, term: str, brand: str, entry_id: int) -> List[Dict]:
+        async with self.semaphore:
+            process = psutil.Process()
+            search_url = f"https://www.google.com/search?q={urllib.parse.quote(term)}&tbm=isch"
+            for region in self.regions:
+                fetch_endpoint = f"{self.endpoint}?region={region}"
+                self.logger.info(f"Worker PID {process.pid}: Fetching {search_url} via {fetch_endpoint} with region {region}")
+                try:
+                    async with aiohttp.ClientSession(headers=self.headers) as session:
+                        async with session.post(fetch_endpoint, json={"url": search_url}, timeout=60) as response:
+                            body_text = await response.text()
+                            body_preview = body_text[:200] if body_text else ""
+                            self.logger.debug(f"Worker PID {process.pid}: Response: status={response.status}, headers={response.headers}, body={body_preview}")
+                            if response.status in (429, 503):
+                                self.logger.warning(f"Worker PID {process.pid}: Rate limit or service unavailable (status {response.status}) for {fetch_endpoint}")
+                                raise aiohttp.ClientError(f"Rate limit or service unavailable: {response.status}")
+                            response.raise_for_status()
+                            result = await response.json()
+                            results = result.get("result")
+                            self.logger.debug(f"Worker PID {process.pid}: API result: {results[:200] if results else 'None'}")
+                            if not results:
+                                self.logger.warning(f"Worker PID {process.pid}: No results for term '{term}' in region {region}")
+                                continue
+                            results_html_bytes = results if isinstance(results, bytes) else results.encode("utf-8")
+                            formatted_results = process_search_result(results_html_bytes, results_html_bytes, entry_id, self.logger)
+                            self.logger.debug(f"Worker PID {process.pid}: Formatted results: {formatted_results.to_dict() if not formatted_results.empty else 'Empty'}")
+                            if not formatted_results.empty:
+                                self.logger.info(f"Worker PID {process.pid}: Found {len(formatted_results)} results for term '{term}' in region {region}")
+                                return [
+                                    {
+                                        "EntryID": entry_id,
+                                        "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
+                                        "ImageDesc": res.get("ImageDesc", ""),
+                                        "ImageSource": res.get("ImageSource", "N/A"),
+                                        "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail"))
+                                    }
+                                    for _, res in formatted_results.iterrows()
+                                ]
+                            self.logger.warning(f"Worker PID {process.pid}: Empty results for term '{term}' in region {region}")
+                except (aiohttp.ClientError, json.JSONDecodeError) as e:
+                    self.logger.warning(f"Worker PID {process.pid}: Failed for term '{term}' in region {region}: {e}")
+                    continue
+            self.logger.error(f"Worker PID {process.pid}: All regions failed for term '{term}'")
+            return []
+
+async def process_and_tag_results(
+    search_string: str,
+    brand: Optional[str] = None,
+    model: Optional[str] = None,
+    endpoint: str = None,
+    entry_id: int = None,
+    logger: Optional[logging.Logger] = None,
+    use_all_variations: bool = False,
+    file_id_db: Optional[int] = None
+) -> List[Dict]:
+    logger = logger or default_logger
+    process = psutil.Process()
+    try:
+        logger.debug(f"Worker PID {process.pid}: Processing results for EntryID {entry_id}, Search: {search_string}")
+        variations = await generate_search_variations(
+            search_string=search_string,
+            brand=brand,
+            model=model,
+            logger=logger
+        )
+        all_results = []
+        search_types = [
+            "default", "delimiter_variations", "color_variations",
+            "brand_alias", "no_color", "model_alias", "category_specific"
+        ]
+        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+        endpoint = endpoint or SEARCH_PROXY_API_URL
+        client = SearchClient(endpoint=endpoint, logger=logger)
+        try:
+            for search_type in search_types:
+                if search_type not in variations:
+                    logger.warning(f"Worker PID {process.pid}: Search type '{search_type}' not found for EntryID {entry_id}")
+                    continue
+                logger.info(f"Worker PID {process.pid}: Processing search type '{search_type}' for EntryID {entry_id}")
+                for variation in variations[search_type]:
+                    logger.debug(f"Worker PID {process.pid}: Searching variation '{variation}' for EntryID {entry_id}")
+                    search_results = await client.search(
+                        term=variation,
+                        brand=brand or "",
+                        entry_id=entry_id
+                    )
+                    if search_results:
+                        logger.info(f"Worker PID {process.pid}: Found {len(search_results)} results for variation '{variation}'")
+                        tagged_results = []
+                        for res in search_results:
+                            tagged_result = {
+                                "EntryID": entry_id,
+                                "ImageUrl": res.get("ImageUrl", "placeholder://no-image"),
+                                "ImageDesc": res.get("ImageDesc", ""),
+                                "ImageSource": res.get("ImageSource", "N/A"),
+                                "ImageUrlThumbnail": res.get("ImageUrlThumbnail", res.get("ImageUrl", "placeholder://no-thumbnail")),
+                                "ProductCategory": res.get("ProductCategory", "")
+                            }
+                            if all(col in tagged_result for col in required_columns):
+                                tagged_results.append(tagged_result)
+                            else:
+                                logger.warning(f"Worker PID {process.pid}: Skipping result with missing columns for EntryID {entry_id}")
+                        all_results.extend(tagged_results)
+                        logger.info(f"Worker PID {process.pid}: Added {len(tagged_results)} valid results for variation '{variation}'")
+                    else:
+                        logger.warning(f"Worker PID {process.pid}: No valid results for variation '{variation}' in search type '{search_type}'")
+                if all_results and not use_all_variations:
+                    logger.info(f"Worker PID {process.pid}: Stopping after {len(all_results)} results from '{search_type}' for EntryID {entry_id}")
+                    break
+        finally:
+            await client.close()
+        if not all_results:
+            logger.error(f"Worker PID {process.pid}: No valid results found across all search types for EntryID {entry_id}")
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No results found for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results",
+                "ProductCategory": ""
+            }]
+        return all_results
+    except Exception as e:
+        logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
+        return [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://error",
+            "ImageDesc": f"Error processing: {str(e)}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://error",
+            "ProductCategory": ""
+        }]
+
+async def process_results(
+    raw_results: List[Dict],
+    entry_id: int,
+    brand: str,
+    search_string: str,
+    logger: logging.Logger
+) -> List[Dict]:
+    results = []
+    required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+    tagged_results = await process_and_tag_results(
+        search_string=search_string,
+        brand=brand,
+        entry_id=entry_id,
+        logger=logger,
+        use_all_variations=False
+    )
+    for result in tagged_results:
+        image_url = result.get("ImageUrl")
+        if not image_url:
+            continue
+        thumbnail_url = await extract_thumbnail_url(image_url, logger=logger) or image_url
+        parsed_url = urlparse(image_url)
+        image_source = parsed_url.netloc or "unknown"
+        formatted_result = {
+            "EntryID": entry_id,
+            "ImageUrl": image_url,
+            "ImageDesc": result.get("ImageDesc", ""),
+            "ImageSource": image_source,
+            "ImageUrlThumbnail": thumbnail_url
+        }
+        if all(col in formatted_result for col in required_columns):
+            results.append(formatted_result)
+        else:
+            logger.warning(f"Result missing required columns for EntryID {entry_id}: {formatted_result}")
+    return results
+
+async def async_process_entry_search(
+    search_string: str,
+    brand: str,
+    endpoint: str,
+    entry_id: int,
+    use_all_variations: bool,
+    file_id_db: int,
+    logger: logging.Logger
+) -> List[Dict]:
+    logger.debug(f"Processing search for EntryID {entry_id}, FileID {file_id_db}, Use all variations: {use_all_variations}")
+    search_terms_dict = await generate_search_variations(search_string, brand, logger=logger)
+    search_terms = []
+    variation_types = [
+        "default", "delimiter_variations", "color_variations", "brand_alias",
+        "no_color", "model_alias", "category_specific"
+    ]
+    for variation_type in variation_types:
+        if variation_type in search_terms_dict:
+            search_terms.extend(search_terms_dict[variation_type])
+    search_terms = list(dict.fromkeys([term.lower().strip() for term in search_terms]))
+    logger.info(f"Generated {len(search_terms)} unique search terms for EntryID {entry_id}")
+    if not search_terms:
+        logger.warning(f"No search terms for EntryID {entry_id}")
+        return [{
+            "EntryID": entry_id,
+            "ImageUrl": "placeholder://no-search-terms",
+            "ImageDesc": f"No search terms generated for {search_string}",
+            "ImageSource": "N/A",
+            "ImageUrlThumbnail": "placeholder://no-search-terms",
+        }]
+    client = SearchClient(endpoint, logger)
+    try:
+        all_results = []
+        required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
+        for term in search_terms:
+            logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
+            results = await client.search(term, brand, entry_id)
+            if isinstance(results, Exception):
+                logger.error(f"Error for term '{term}' in EntryID {entry_id}: {results}")
+                continue
+            if not results:
+                logger.debug(f"No results for term '{term}' in EntryID {entry_id}")
+                continue
+            processed_results = await process_results(results, entry_id, brand, term, logger)
+            if not processed_results:
+                logger.debug(f"No processed results for term '{term}' in EntryID {entry_id}")
+                continue
+            valid_results = [
+                res for res in processed_results
+                if all(col in res for col in required_columns) and not res["ImageUrl"].startswith("placeholder://")
+            ]
+            if not valid_results:
+                logger.warning(f"No valid results for term '{term}' in EntryID {entry_id}. Sample result: {processed_results[0] if processed_results else 'None'}")
+                continue
+            all_results.extend(valid_results)
+            logger.info(f"Found {len(valid_results)} valid results for term '{term}' in EntryID {entry_id}")
+            if valid_results and (not use_all_variations or len(all_results) >= 10):
+                logger.info(f"Stopping search after valid results for term '{term}' in EntryID {entry_id}")
+                break
+        if not all_results:
+            logger.error(f"No valid results found across all search terms for EntryID {entry_id}")
+            return [{
+                "EntryID": entry_id,
+                "ImageUrl": "placeholder://no-results",
+                "ImageDesc": f"No results found for {search_string}",
+                "ImageSource": "N/A",
+                "ImageUrlThumbnail": "placeholder://no-results",
+            }]
+        logger.info(f"Processed {len(all_results)} total valid results for EntryID {entry_id}")
+        return all_results
+    finally:
+        await client.close()
+
+async def run_job_with_logging(job_func: Callable[..., Any], file_id: str, **kwargs) -> Dict:
+    file_id_str = str(file_id)
+    logger, log_file = setup_job_logger(job_id=file_id_str, console_output=True)
+    result = None
+    debug_info = {"memory_usage": {}, "log_file": log_file, "endpoint_errors": []}
+    try:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.info(f"Starting job {func_name} for FileID: {file_id}")
+        process = psutil.Process()
+        debug_info["memory_usage"]["before"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory before job {func_name}: RSS={debug_info['memory_usage']['before']:.2f} MB")
+        if asyncio.iscoroutinefunction(job_func) or hasattr(job_func, '_remote'):
+            result = await job_func(file_id, logger=logger, **kwargs)
+        else:
+            result = job_func(file_id, logger=logger, **kwargs)
+        debug_info["memory_usage"]["after"] = process.memory_info().rss / 1024 / 1024
+        logger.debug(f"Memory after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        if debug_info["memory_usage"]["after"] > 1000:
+            logger.warning(f"High memory usage after job {func_name}: RSS={debug_info['memory_usage']['after']:.2f} MB")
+        logger.info(f"Completed job {func_name} for FileID: {file_id}")
+        return {
+            "status_code": 200,
+            "message": f"Job {func_name} completed successfully for FileID: {file_id}",
+            "data": result,
+            "debug_info": debug_info
+        }
+    except Exception as e:
+        func_name = getattr(job_func, '_name', 'unknown_function') if hasattr(job_func, '_remote') else job_func.__name__
+        logger.error(f"Error in job {func_name} for FileID: {file_id}: {e}")
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        debug_info["error_traceback"] = traceback.format_exc()
+        if "placeholder://error" in str(e):
+            debug_info["endpoint_errors"].append({"error": str(e), "timestamp": datetime.datetime.now().isoformat()})
+            logger.warning(f"Detected placeholder error in job {func_name} for FileID: {file_id}")
+        return {
+            "status_code": 500,
+            "message": f"Error in job {func_name} for FileID {file_id}: {str(e)}",
+            "data": None,
+            "debug_info": debug_info
+        }
+    finally:
+        debug_info["log_url"] = await upload_log_file(file_id_str, log_file, logger)
+
+async def run_generate_download_file(file_id: str, logger: logging.Logger, log_filename: str, background_tasks: BackgroundTasks):
+    try:
+        JOB_STATUS[file_id] = {
+            "status": "running",
+            "message": "Job is running",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://icon7-8001.iconluxury.today/generate-download-file/?file_id={file_id}",
+                headers={"accept": "application/json"},
+                data=""
+            )
+            response.raise_for_status()
+            result = response.json()
+        if "error" in result:
+            JOB_STATUS[file_id] = {
+                "status": "failed",
+                "message": f"Error: {result['error']}",
+                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            logger.error(f"Job failed for FileID {file_id}: {result['error']}")
+        else:
+            JOB_STATUS[file_id] = {
+                "status": "completed",
+                "message": "Job completed successfully",
+                "public_url": result.get("public_url"),
+                "log_url": result.get("log_filename") if os.path.exists(result.get("log_filename", "")) else None,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            logger.info(f"Job completed for FileID {file_id}")
+    except Exception as e:
+        logger.error(f"Unexpected error in job for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        JOB_STATUS[file_id] = {
+            "status": "failed",
+            "message": f"Unexpected error: {str(e)}",
+            "log_url": log_public_url or None,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
 async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
     @retry(
         stop=stop_after_attempt(3),
@@ -116,16 +465,13 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
         if not os.path.exists(log_filename):
             logger.warning(f"Log file {log_filename} does not exist, skipping upload")
             return None
-
         file_hash = await asyncio.to_thread(hashlib.md5, open(log_filename, "rb").read())
         file_hash = file_hash.hexdigest()
         current_time = time.time()
         key = (log_filename, file_id)
-
         if key in LAST_UPLOAD and LAST_UPLOAD[key]["hash"] == file_hash and current_time - LAST_UPLOAD[key]["time"] < 60:
             logger.info(f"Skipping redundant upload for {log_filename}")
             return LAST_UPLOAD[key]["url"]
-
         try:
             upload_url = await upload_file_to_space(
                 file_src=log_filename,
@@ -144,7 +490,6 @@ async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logge
         except Exception as e:
             logger.error(f"Failed to upload log for FileID {file_id}: {e}", exc_info=True)
             raise
-
     try:
         return await try_upload()
     except Exception as e:
@@ -166,7 +511,6 @@ async def process_restart_batch(
         logger.setLevel(logging.DEBUG)
         process = psutil.Process()
         logger.debug(f"Logger initialized for FileID: {file_id_db}")
-
         def log_resource_usage():
             mem_info = process.memory_info()
             cpu_percent = process.cpu_percent(interval=None)
@@ -181,10 +525,8 @@ async def process_restart_batch(
                 logger.warning(f"High memory usage: RSS={mem_info.rss / 1024**2:.2f} MB")
             if cpu_percent > 80:
                 logger.warning(f"High CPU usage: {cpu_percent:.1f}%")
-
         logger.info(f"Starting processing for FileID: {file_id_db}, Workers: {num_workers}, Use all variations: {use_all_variations}")
         log_resource_usage()
-
         file_id_db_int = file_id_db
         TARGET_THROUGHPUT = 50
         BATCH_TIME = 0.1
@@ -193,13 +535,10 @@ async def process_restart_batch(
         MAX_CONCURRENCY = min(BATCH_SIZE, cpu_count_val * 2)
         MAX_ENTRY_RETRIES = 3
         RELEVANCE_THRESHOLD = 0.9
-
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
-
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
-
         try:
             async with asyncio.timeout(10):
                 await producer.connect()
@@ -209,7 +548,6 @@ async def process_restart_batch(
         except Exception as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
             return {"error": f"RabbitMQ connection error: {str(e)}", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
-
         async with async_engine.connect() as conn:
             result = await conn.execute(
                 text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
@@ -219,7 +557,6 @@ async def process_restart_batch(
                 logger.error(f"FileID {file_id_db} does not exist")
                 return {"error": f"FileID {file_id_db} does not exist", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
             result.close()
-
         if entry_id is None:
             entry_id = await fetch_last_valid_entry(str(file_id_db_int), logger)
             if entry_id is not None:
@@ -232,15 +569,12 @@ async def process_restart_batch(
                     entry_id = next_entry[0] if next_entry and next_entry[0] else None
                     logger.debug(f"Resuming from EntryID: {entry_id}")
                     result.close()
-
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched for FileID {file_id_db}")
             return {"message": "Failed to fetch brand rules", "file_id": str(file_id_db), "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
-
         endpoint = SEARCH_PROXY_API_URL
         logger.debug(f"Using search endpoint: {endpoint}")
-
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.EntryID, r.ProductModel, r.ProductBrand, r.ProductColor, r.ProductCategory 
@@ -256,19 +590,15 @@ async def process_restart_batch(
             entries = [(row[0], row[1], row[2], row[3], row[4]) for row in result.fetchall() if row[1] is not None]
             logger.info(f"Found {len(entries)} entries needing processing for FileID {file_id_db}")
             result.close()
-
         if not entries:
             logger.warning(f"No valid EntryIDs found for FileID {file_id_db}")
             return {"error": "No entries found", "log_filename": log_filename, "log_public_url": "", "last_entry_id": str(entry_id or "")}
-
         entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
         logger.info(f"Created {len(entry_batches)} batches of size {BATCH_SIZE} for FileID {file_id_db}")
-
         successful_entries = 0
         failed_entries = 0
         last_entry_id_processed = entry_id or 0
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
-
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
         @retry(
             stop=stop_after_attempt(3),
@@ -295,7 +625,6 @@ async def process_restart_batch(
             except Exception as e:
                 logger.error(f"Error enqueuing TaskType {task_type}, CorrelationID {correlation_id}: {e}", exc_info=True)
                 raise
-
         async def process_entry(entry):
             entry_id, search_string, brand, color, category = entry
             async with semaphore:
@@ -321,11 +650,9 @@ async def process_restart_batch(
                                     search_terms.extend(search_terms_dict[variation_type])
                             search_terms = [term.lower().strip() for term in search_terms]
                             logger.debug(f"Generated {len(search_terms)} search terms for EntryID {entry_id}")
-
                             if not search_terms:
                                 logger.warning(f"No search terms for EntryID {entry_id}")
                                 return entry_id, False
-
                             client = SearchClient(endpoint, logger, max_concurrency=1)
                             try:
                                 for term in search_terms:
@@ -350,11 +677,9 @@ async def process_restart_batch(
                                     ]
                                     if rejected_results:
                                         logger.debug(f"Rejected {len(rejected_results)} results for EntryID {entry_id}")
-
                                     if not valid_results:
                                         logger.debug(f"No valid results for term '{term}' in EntryID {entry_id}")
                                         continue
-
                                     try:
                                         async with asyncio.timeout(30):
                                             success = await insert_search_results(
@@ -374,10 +699,8 @@ async def process_restart_batch(
                                     except Exception as e:
                                         logger.error(f"Error inserting results for EntryID {entry_id}: {e}", exc_info=True)
                                         continue
-
                                     if valid_results and not use_all_variations:
                                         break
-
                                 if results_written:
                                     try:
                                         async with asyncio.timeout(30):
@@ -402,7 +725,6 @@ async def process_restart_batch(
                                     except Exception as e:
                                         logger.error(f"Error updating search sort for EntryID {entry_id}: {e}", exc_info=True)
                                         continue
-
                                     sql = """
                                         SELECT ResultID, AiJson
                                         FROM utb_ImageScraperResult
@@ -426,7 +748,6 @@ async def process_restart_batch(
                                     except Exception as e:
                                         logger.error(f"Error fetching sorted results for EntryID {entry_id}: {e}", exc_info=True)
                                         continue
-
                                     if sorted_results:
                                         for sorted_result in sorted_results:
                                             result_id = sorted_result["ResultID"]
@@ -479,7 +800,6 @@ async def process_restart_batch(
                                                         await asyncio.sleep(1)
                                                         continue
                                                     break
-
                                     sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
                                     params = {"entry_id": entry_id}
                                     await enqueue_with_retry(
@@ -515,16 +835,13 @@ async def process_restart_batch(
                 except Exception as e:
                     logger.error(f"Unexpected error processing EntryID {entry_id}: {e}", exc_info=True)
                     return entry_id, results_written
-
         for batch_idx, batch_entries in enumerate(entry_batches, 1):
             logger.info(f"Processing batch {batch_idx}/{len(entry_batches)} for FileID {file_id_db}")
             start_time = datetime.datetime.now()
-
             results = await asyncio.gather(
                 *(process_entry(entry) for entry in batch_entries),
                 return_exceptions=True
             )
-
             for entry, result in zip(batch_entries, results):
                 entry_id = entry[0]
                 if isinstance(result, Exception):
@@ -537,7 +854,6 @@ async def process_restart_batch(
                     last_entry_id_processed = entry_id
                 else:
                     failed_entries += 1
-
             async with async_engine.connect() as conn:
                 result = await conn.execute(
                     text("""
@@ -552,12 +868,10 @@ async def process_restart_batch(
                 if remaining_entries == 0:
                     logger.info(f"All entries processed for FileID {file_id_db}")
                     break
-
             elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
             logger.info(f"Completed batch {batch_idx} in {elapsed_time:.2f}s ({len(batch_entries) / elapsed_time:.2f} entries/s)")
             log_resource_usage()
             await asyncio.sleep(0.5)
-
         if successful_entries > 0:
             logger.info(f"Updating ImageCompleteTime for FileID {file_id_db}")
             sql = """
@@ -572,7 +886,6 @@ async def process_restart_batch(
                 task_type="update_file_image_complete_time",
                 correlation_id=str(uuid.uuid4())
             )
-
         async with async_engine.connect() as conn:
             result = await conn.execute(
                 text("""
@@ -594,7 +907,6 @@ async def process_restart_batch(
                 f"{positive_entries} with positive SortOrder, {null_entries} with NULL SortOrder for FileID {file_id_db}"
             )
             result.close()
-
         to_emails = await get_send_to_email(file_id_db, logger=logger)
         if to_emails:
             subject = f"Processing Completed for FileID: {file_id_db}"
@@ -608,7 +920,6 @@ async def process_restart_batch(
                 f"Workers: {num_workers}"
             )
             await send_message_email(to_emails, subject=subject, message=message, logger=logger)
-
         log_public_url = await upload_file_to_space(
             file_src=log_filename,
             save_as=f"job_logs/job_{file_id_db}.log",
@@ -616,7 +927,6 @@ async def process_restart_batch(
             logger=logger,
             file_id=str(file_id_db)
         )
-
         logger.info(f"Starting search sort for FileID: {file_id_db}")
         try:
             sort_result = await update_sort_order(str(file_id_db), logger=logger, background_tasks=background_tasks)
@@ -624,7 +934,6 @@ async def process_restart_batch(
         except Exception as e:
             logger.error(f"Error running search sort for FileID {file_id_db}: {e}", exc_info=True)
             sort_result = {"status_code": 500, "message": str(e)}
-
         logger.info(f"Queuing download file generation for FileID: {file_id_db}")
         try:
             if background_tasks is None:
@@ -663,7 +972,6 @@ async def process_restart_batch(
                     f"Workers: {num_workers}"
                 )
                 await send_message_email(to_emails, subject=subject, message=message, logger=logger)
-
         return {
             "message": "Search processing completed",
             "file_id": str(file_id_db),
@@ -698,7 +1006,6 @@ async def api_clear_ai_json(
 ):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
     logger.info(f"Clearing AiJson and AiCaption for FileID: {file_id}" + (f", EntryIDs: {entry_ids}" if entry_ids else ""))
-
     try:
         async with async_engine.connect() as conn:
             result = await conn.execute(
@@ -710,7 +1017,6 @@ async def api_clear_ai_json(
                 log_public_url = await upload_log_file(file_id, log_filename, logger)
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
             result.close()
-
         sql = """
             UPDATE utb_ImageScraperResult
             SET AiJson = NULL, AiCaption = NULL
@@ -723,11 +1029,9 @@ async def api_clear_ai_json(
         if entry_ids:
             sql += " AND t.EntryID IN :entry_ids"
             params["entry_ids"] = tuple(entry_ids)
-
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
-
         correlation_id = str(uuid.uuid4())
         rows_affected = await enqueue_db_update(
             file_id=file_id,
@@ -739,7 +1043,6 @@ async def api_clear_ai_json(
             return_result=True
         )
         logger.info(f"Enqueued AiJson and AiCaption clear for FileID: {file_id}, CorrelationID: {correlation_id}, Rows affected: {rows_affected}")
-
         verify_sql = """
             SELECT COUNT(*) 
             FROM utb_ImageScraperResult t
@@ -751,7 +1054,6 @@ async def api_clear_ai_json(
         if entry_ids:
             verify_sql += " AND t.EntryID IN :entry_ids"
             verify_params["entry_ids"] = tuple(entry_ids)
-
         verify_correlation_id = str(uuid.uuid4())
         await enqueue_db_update(
             file_id=file_id,
@@ -763,7 +1065,6 @@ async def api_clear_ai_json(
             return_result=True
         )
         logger.info(f"Enqueued verification for FileID: {file_id}, CorrelationID: {verify_correlation_id}")
-
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         return {
             "status": "success",
@@ -785,17 +1086,196 @@ async def api_clear_ai_json(
         await async_engine.dispose()
         logger.info(f"Disposed database engine for FileID {file_id}")
 
-# Update other endpoints similarly, removing local producer instances
-@router.post("/validate-images/{file_id}", tags=["Validation"])
-async def api_validate_images(
+@router.get("/sort-by-search/{file_id}", tags=["Sorting"])
+async def api_match_and_search_sort(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    result = await run_job_with_logging(update_sort_order, file_id)
+    if result["status_code"] != 200:
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=result["status_code"], detail=result["message"])
+    return result
+
+@router.get("/initial-sort/{file_id}", tags=["Sorting"])
+async def api_initial_sort(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    result = await run_job_with_logging(update_initial_sort_order, file_id)
+    if result["status_code"] != 200:
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=result["status_code"], detail=result["message"])
+    return result
+
+@router.get("/no-image-sort/{file_id}", tags=["Sorting"])
+async def api_no_image_sort(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    result = await run_job_with_logging(update_sort_no_image_entry, file_id)
+    if result["status_code"] != 200:
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=result["status_code"], detail=result["message"])
+    return result
+
+@router.post("/restart-job/{file_id}", tags=["Processing"])
+async def api_process_restart(file_id: str, entry_id: Optional[int] = None, background_tasks: BackgroundTasks = None):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else ""))
+    try:
+        if not entry_id:
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+        result = await process_restart_batch(
+            file_id_db=int(file_id),
+            logger=logger,
+            entry_id=entry_id,
+            num_workers=4
+        )
+        if "error" in result:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            raise HTTPException(status_code=500, detail=result["error"])
+        logger.info(f"Completed restart batch for FileID: {file_id}. Result: {result}")
+        return {"status_code": 200, "message": f"Processing restart completed for FileID: {file_id}", "data": result}
+    except Exception as e:
+        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error restarting batch for FileID {file_id}: {str(e)}")
+
+@router.post("/restart-search-all/{file_id}", tags=["Processing"])
+async def api_restart_search_all(
     file_id: str,
-    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to validate, if not all"),
-    concurrency: int = Query(10, description="Maximum concurrent image download tasks"),
+    entry_id: Optional[int] = None,
+    background_tasks: BackgroundTasks = None
+):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing restart of batch for FileID: {file_id}" + (f", EntryID: {entry_id}" if entry_id else "") + " with all variations")
+    try:
+        if not entry_id:
+            entry_id = await fetch_last_valid_entry(file_id, logger)
+            logger.info(f"Retrieved last EntryID: {entry_id} for FileID: {file_id}")
+        result = await run_job_with_logging(
+            process_restart_batch,
+            file_id,
+            entry_id=entry_id,
+            use_all_variations=True
+        )
+        if result["status_code"] != 200:
+            logger.error(f"Failed to process restart batch for FileID {file_id}: {result['message']}")
+            if "placeholder://error" in result["message"]:
+                logger.warning(f"Placeholder error detected; check endpoint logs for FileID {file_id}")
+                debug_info = result.get("debug_info", {})
+                endpoint_errors = debug_info.get("endpoint_errors", [])
+                for error in endpoint_errors:
+                    logger.error(f"Endpoint error: {error['error']} at {error['timestamp']}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            raise HTTPException(status_code=result["status_code"], detail=result["message"])
+        logger.info(f"Completed restart batch for FileID: {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Processing restart with all variations completed for FileID: {file_id}",
+            "data": result["data"]
+        }
+    except Exception as e:
+        logger.error(f"Error queuing restart batch for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error restarting batch with all variations for FileID {file_id}: {str(e)}")
+
+@router.post("/process-images-ai/{file_id}", tags=["Processing"])
+async def api_process_ai_images(
+    file_id: str,
+    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to process"),
+    step: int = Query(0, description="Retry step for logging"),
+    limit: int = Query(5000, description="Maximum number of images to process"),
+    concurrency: int = Query(10, description="Maximum concurrent threads"),
+    background_tasks: BackgroundTasks = None
+):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Queueing AI image processing for FileID: {file_id}, EntryIDs: {entry_ids}, Step: {step}")
+    try:
+        result = await run_job_with_logging(
+            batch_vision_reason,
+            file_id,
+            entry_ids=entry_ids,
+            step=step,
+            limit=limit,
+            concurrency=concurrency
+        )
+        if result["status_code"] != 200:
+            logger.error(f"Failed to process AI images for FileID {file_id}: {result['message']}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            raise HTTPException(status_code=result["status_code"], detail=result["message"])
+        logger.info(f"Completed AI image processing for FileID {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"AI image processing completed for FileID: {file_id}",
+            "data": result["data"]
+        }
+    except Exception as e:
+        logger.error(f"Error queuing AI image processing for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error processing AI images for FileID {file_id}: {str(e)}")
+
+@router.get("/get-images-excel-db/{file_id}", tags=["Database"])
+async def get_images_excel_db_endpoint(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Fetching Excel images for FileID: {file_id}")
+    try:
+        result = await get_images_excel_db(file_id, logger)
+        if result.empty:
+            return {"status_code": 200, "message": f"No images found for Excel export for FileID: {file_id}", "data": []}
+        return {"status_code": 200, "message": f"Fetched Excel images successfully for FileID: {file_id}", "data": result.to_dict(orient='records')}
+    except Exception as e:
+        logger.error(f"Error fetching Excel images for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error fetching Excel images for FileID {file_id}: {str(e)}")
+
+@router.get("/get-send-to-email/{file_id}", tags=["Database"])
+async def get_send_to_email_endpoint(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Retrieving email for FileID: {file_id}")
+    try:
+        result = await get_send_to_email(int(file_id), logger)
+        return {"status_code": 200, "message": f"Retrieved email successfully for FileID: {file_id}", "data": result}
+    except Exception as e:
+        logger.error(f"Error retrieving email for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error retrieving email for FileID {file_id}: {str(e)}")
+
+@router.post("/update-file-generate-complete/{file_id}", tags=["Database"])
+async def update_file_generate_complete_endpoint(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Updating file generate complete for FileID: {file_id}")
+    try:
+        await update_file_generate_complete(file_id, logger)
+        return {"status_code": 200, "message": f"Updated file generate complete successfully for FileID: {file_id}", "data": None}
+    except Exception as e:
+        logger.error(f"Error updating file generate complete for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error updating file generate complete for FileID {file_id}: {str(e)}")
+
+@router.post("/update-file-location-complete/{file_id}", tags=["Database"])
+async def update_file_location_complete_endpoint(file_id: str, file_location: str):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    logger.info(f"Updating file location complete for FileID: {file_id}, file_location: {file_location}")
+    try:
+        await update_file_location_complete(file_id, file_location, logger)
+        return {"status_code": 200, "message": f"Updated file location successfully for FileID: {file_id}", "data": None}
+    except Exception as e:
+        logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
+
+@router.post("/sort-by-relevance/{file_id}", tags=["Sorting"])
+async def api_sort_by_relevance(
+    file_id: str,
+    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to sort, if not all"),
+    use_softmax: bool = Query(False, description="Apply softmax normalization to composite scores"),
     background_tasks: BackgroundTasks = None
 ):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    logger.info(f"Validating images for FileID: {file_id}, EntryIDs: {entry_ids}, Concurrency: {concurrency}")
-
+    logger.info(
+        f"Sorting results by composite score per EntryID for FileID: {file_id}, "
+        f"EntryIDs: {entry_ids}, Use softmax: {use_softmax}"
+    )
     try:
         async with async_engine.connect() as conn:
             result = await conn.execute(
@@ -807,130 +1287,136 @@ async def api_validate_images(
                 log_public_url = await upload_log_file(file_id, log_filename, logger)
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
             result.close()
-
+        weights = {
+            "relevance": 0.4,
+            "category": 0.2,
+            "color": 0.15,
+            "brand": 0.15,
+            "sentiment": 0.05,
+            "model": 0.05
+        }
+        logger.debug(f"Using weights: {weights}")
         query = """
-            SELECT ResultID, EntryID, ImageUrl, ImageUrlThumbnail
+            SELECT ResultID, EntryID, AiJson
             FROM utb_ImageScraperResult
             WHERE EntryID IN (
                 SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
             )
-            AND ImageUrl IS NOT NULL
-            AND SortOrder >= 0
+            AND AiJson IS NOT NULL
         """
         params = {"file_id": int(file_id)}
         if entry_ids:
             query += " AND EntryID IN :entry_ids"
             params["entry_ids"] = tuple(entry_ids)
-
         async with async_engine.connect() as conn:
             result = await conn.execute(text(query), params)
-            results = [
-                {
-                    "ResultID": row[0],
-                    "EntryID": row[1],
-                    "ImageUrl": row[2],
-                    "ImageUrlThumbnail": row[3]
-                }
-                for row in result.fetchall()
-            ]
+            rows = result.fetchall()
             result.close()
-
-        if not results:
-            logger.warning(f"No valid images found for FileID {file_id}" + (f", EntryIDs {entry_ids}" if entry_ids else ""))
+        if not rows:
+            logger.warning(
+                f"No results with non-NULL AiJson found for FileID {file_id}" +
+                (f", EntryIDs {entry_ids}" if entry_ids else "")
+            )
             log_public_url = await upload_log_file(file_id, log_filename, logger)
             return {
                 "status": "success",
                 "status_code": 200,
-                "message": "No valid images found to validate",
-                "log_url": log_public_url,
-                "data": {"validated": 0, "invalid": 0}
+                "message": "No results with AiJson found to sort",
+                "log_url": log_public_url
             }
-
-        logger.info(f"Found {len(results)} images to validate for FileID {file_id}")
-
-        if not producer:
-            logger.error("RabbitMQ producer not initialized")
-            raise ValueError("RabbitMQ producer not initialized")
-
-        semaphore = asyncio.Semaphore(concurrency)
-        async def validate_image(result: dict) -> dict:
-            async with semaphore:
-                result_id = result["ResultID"]
-                entry_id = result["EntryID"]
-                image_url = result["ImageUrl"]
-                thumbnail_url = result["ImageUrlThumbnail"]
-                logger.debug(f"Validating ResultID {result_id}, EntryID {entry_id}, ImageUrl: {image_url}")
-
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    is_valid = False
+        results_by_entry = defaultdict(list)
+        for row in rows:
+            result_id, entry_id, ai_json = row
+            try:
+                ai_data = json.loads(ai_json)
+                scores = ai_data.get("scores", {})
+                score_values = {}
+                for key in weights:
                     try:
-                        response = await client.get(image_url, follow_redirects=True)
-                        if response.status_code == 200 and "image" in response.headers.get("content-type", "").lower():
-                            logger.debug(f"Valid image for ResultID {result_id}: {image_url}")
-                            is_valid = True
-                        else:
-                            logger.warning(f"Invalid image for ResultID {result_id}: Status {response.status_code}")
-                    except Exception as e:
-                        logger.warning(f"Failed to download image for ResultID {result_id}: {e}")
-
-                    if not is_valid and thumbnail_url and thumbnail_url != image_url:
-                        try:
-                            response = await client.get(thumbnail_url, follow_redirects=True)
-                            if response.status_code == 200 and "image" in response.headers.get("content-type", "").lower():
-                                logger.debug(f"Valid thumbnail for ResultID {result_id}: {thumbnail_url}")
-                                is_valid = True
-                            else:
-                                logger.warning(f"Invalid thumbnail for ResultID {result_id}: Status {response.status_code}")
-                        except Exception as e:
-                            logger.warning(f"Failed to download thumbnail for ResultID {result_id}: {e}")
-
-                    if not is_valid:
-                        sql = """
-                            UPDATE utb_ImageScraperResult
-                            SET SortOrder = -5
-                            WHERE ResultID = :result_id
-                        """
-                        params = {"result_id": result_id}
-                        correlation_id = str(uuid.uuid4())
-                        await enqueue_db_update(
-                            file_id=file_id,
-                            sql=sql,
-                            params=params,
-                            background_tasks=background_tasks,
-                            task_type="mark_invalid_image",
-                            correlation_id=correlation_id
-                        )
-                        logger.info(f"Enqueued SortOrder=-5 for ResultID {result_id}, EntryID {entry_id}, CorrelationID: {correlation_id}")
-                        return {"ResultID": result_id, "EntryID": entry_id, "valid": False}
-                    return {"ResultID": result_id, "EntryID": entry_id, "valid": True}
-
-        validation_results = await asyncio.gather(
-            *(validate_image(result) for result in results),
-            return_exceptions=True
-        )
-
-        validated_count = 0
-        invalid_count = 0
-        for res in validation_results:
-            if isinstance(res, Exception):
-                logger.error(f"Error validating image: {res}", exc_info=True)
-                invalid_count += 1
+                        score = float(scores.get(key, 0.0))
+                        score_values[key] = max(0.0, min(1.0, score))
+                    except (TypeError, ValueError):
+                        logger.warning(f"Invalid score for {key} in ResultID {result_id}: {scores.get(key)}")
+                        score_values[key] = 0.0
+                composite_score = sum(weights[key] * score_values[key] for key in weights)
+                results_by_entry[entry_id].append({
+                    "ResultID": result_id,
+                    "composite_score": composite_score,
+                    "score_details": score_values
+                })
+                logger.debug(
+                    f"ResultID {result_id}, EntryID {entry_id}: "
+                    f"Scores {score_values}, Composite Score {composite_score:.4f}"
+                )
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Invalid AiJson for ResultID {result_id}, EntryID {entry_id}: {e}")
                 continue
-            if res["valid"]:
-                validated_count += 1
-            else:
-                invalid_count += 1
-
-        logger.info(f"Validation complete for FileID {file_id}: {validated_count} valid, {invalid_count} invalid")
-
+        if not results_by_entry:
+            logger.warning(f"No valid AiJson data found for sorting in FileID {file_id}")
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            return {
+                "status": "success",
+                "status_code": 200,
+                "message": "No valid AiJson data found to sort",
+                "log_url": log_public_url
+            }
+        if use_softmax:
+            for entry_id, results in results_by_entry.items():
+                scores = [result["composite_score"] for result in results]
+                if not scores:
+                    continue
+                exp_scores = [math.exp(score) for score in scores]
+                sum_exp_scores = sum(exp_scores)
+                if sum_exp_scores == 0:
+                    softmax_scores = [0.0] * len(scores)
+                else:
+                    softmax_scores = [exp_score / sum_exp_scores for exp_score in exp_scores]
+                for result, softmax_score in zip(results, softmax_scores):
+                    result["composite_score"] = softmax_score
+                    logger.debug(
+                        f"ResultID {result['ResultID']}, EntryID {entry_id}: "
+                        f"Softmax Score {softmax_score:.4f}"
+                    )
+        updates = []
+        for entry_id, results in results_by_entry.items():
+            results.sort(key=lambda x: (x["composite_score"], -x["ResultID"]), reverse=True)
+            for sort_order, result in enumerate(results, 1):
+                updates.append({
+                    "result_id": result["ResultID"],
+                    "sort_order": sort_order,
+                    "entry_id": entry_id,
+                    "composite_score": result["composite_score"],
+                    "score_details": result["score_details"]
+                })
+            logger.debug(f"Assigned SortOrder for {len(results)} results in EntryID {entry_id}")
+        async with async_engine.connect() as conn:
+            for update in updates:
+                await conn.execute(
+                    text("""
+                        UPDATE utb_ImageScraperResult
+                        SET SortOrder = :sort_order
+                        WHERE ResultID = :result_id
+                    """),
+                    {
+                        "sort_order": update["sort_order"],
+                        "result_id": update["result_id"]
+                    }
+                )
+            await conn.commit()
+            logger.info(
+                f"Updated SortOrder for {len(updates)} results across "
+                f"{len(results_by_entry)} EntryIDs for FileID {file_id}"
+            )
         if background_tasks:
             sql = """
-                SELECT ResultID, EntryID, SortOrder
-                FROM utb_ImageScraperResult
+                SELECT EntryID, COUNT(*) 
+                FROM utb_ImageScraperResult 
                 WHERE EntryID IN (
                     SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
-                )
-                AND SortOrder = -5
+                ) 
+                AND AiJson IS NOT NULL 
+                AND SortOrder IS NOT NULL
+                GROUP BY EntryID
             """
             params = {"file_id": int(file_id)}
             correlation_id = str(uuid.uuid4())
@@ -939,40 +1425,42 @@ async def api_validate_images(
                 sql=sql,
                 params=params,
                 background_tasks=background_tasks,
-                task_type="verify_invalid_images",
+                task_type="verify_sort_order",
                 correlation_id=correlation_id
             )
-            logger.info(f"Enqueued verification of invalid images for FileID {file_id}, CorrelationID: {correlation_id}")
-
+            logger.info(f"Enqueued SortOrder verification for FileID {file_id}, CorrelationID: {correlation_id}")
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         return {
             "status": "success",
             "status_code": 200,
-            "message": f"Validated {len(results)} images for FileID {file_id}: {validated_count} valid, {invalid_count} invalid",
+            "message": (
+                f"Sorted {len(updates)} results by composite score across "
+                f"{len(results_by_entry)} EntryIDs for FileID {file_id}"
+                f"{' with softmax normalization' if use_softmax else ''}"
+            ),
             "log_url": log_public_url,
             "data": {
-                "validated": validated_count,
-                "invalid": invalid_count,
-                "results": [res for res in validation_results if not isinstance(res, Exception)]
+                "sorted_results": [
+                    {
+                        "ResultID": u["result_id"],
+                        "EntryID": u["entry_id"],
+                        "SortOrder": u["sort_order"],
+                        "CompositeScore": u["composite_score"],
+                        "ScoreDetails": u["score_details"]
+                    }
+                    for u in updates
+                ]
             }
         }
     except Exception as e:
-        logger.error(f"Error validating images for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Error sorting by relevance for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Error validating images for FileID {file_id}: {str(e)}")
-    finally:
-        await async_engine.dispose()
-        logger.info(f"Disposed database engine for FileID {file_id}")
+        raise HTTPException(status_code=500, detail=f"Error sorting by composite score: {str(e)}")
 
-@router.post("/reset-step1-no-results/{file_id}", tags=["Database"])
-async def api_reset_step1_no_results(
-    file_id: str,
-    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to check and reset Step1 for, if not all"),
-    background_tasks: BackgroundTasks = None
-):
+@router.post("/reset-step1/{file_id}", tags=["Database"])
+async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    logger.info(f"Resetting Step1 for entries with no results for FileID: {file_id}" + (f", EntryIDs: {entry_ids}" if entry_ids else ""))
-
+    logger.info(f"Resetting Step1 for FileID: {file_id}")
     try:
         async with async_engine.connect() as conn:
             result = await conn.execute(
@@ -981,138 +1469,39 @@ async def api_reset_step1_no_results(
             )
             if result.fetchone()[0] == 0:
                 logger.error(f"FileID {file_id} does not exist")
-                log_public_url = await upload_file_to_space(
-                    file_src=log_filename,
-                    save_as=f"job_logs/job_{file_id}.log",
-                    is_public=True,
-                    logger=logger,
-                    file_id=file_id
-                )
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
             result.close()
-
-        query = """
-            SELECT r.EntryID
-            FROM utb_ImageScraperRecords r
-            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
-            WHERE r.FileID = :file_id
-            AND t.EntryID IS NULL
-        """
-        params = {"file_id": int(file_id)}
-        if entry_ids:
-            placeholders = ",".join(f":entry_id_{i}" for i in range(len(entry_ids)))
-            query += f" AND r.EntryID IN ({placeholders})"
-            for i, entry_id in enumerate(entry_ids):
-                params[f"entry_id_{i}"] = entry_id
-
-        async with async_engine.connect() as conn:
-            result = await conn.execute(text(query), params)
-            entries_to_reset = [row[0] for row in result.fetchall()]
-            result.close()
-
-        if not entries_to_reset:
-            logger.info(f"No entries with zero results found for FileID: {file_id}")
-            log_public_url = await upload_file_to_space(
-                file_src=log_filename,
-                save_as=f"job_logs/job_{file_id}.log",
-                is_public=True,
-                logger=logger,
-                file_id=file_id
-            )
-            return {
-                "status": "success",
-                "status_code": 200,
-                "message": "No entries with zero results found to reset",
-                "log_url": log_public_url,
-                "data": {"entries_reset": 0, "entry_ids": []}
-            }
-
-        logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
-
-        if not producer:
-            logger.error("RabbitMQ producer not initialized")
-            raise ValueError("RabbitMQ producer not initialized")
-
         sql = """
             UPDATE utb_ImageScraperRecords
             SET Step1 = NULL
-            WHERE EntryID = :entry_id
+            WHERE FileID = :file_id
         """
-        correlation_id = str(uuid.uuid4())
-        rows_affected = 0
-        for entry_id in entries_to_reset:
-            params = {"entry_id": entry_id}
-            result = await enqueue_db_update(
-                file_id=file_id,
-                sql=sql,
-                params=params,
-                background_tasks=background_tasks,
-                task_type="reset_step1_no_results",
-                correlation_id=correlation_id,
-                return_result=True
-            )
-            rows_affected += result or 0
-            logger.debug(f"Enqueued Step1 reset for EntryID: {entry_id}, CorrelationID: {correlation_id}")
-
-        async def verify_updates():
-            async with async_engine.connect() as conn:
-                verify_query = """
-                    SELECT r.EntryID
-                    FROM utb_ImageScraperRecords r
-                    LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
-                    WHERE r.FileID = :file_id
-                    AND r.Step1 IS NULL
-                    AND t.EntryID IS NULL
-                """
-                verify_params = {"file_id": int(file_id)}
-                if entry_ids:
-                    placeholders = ",".join(f":entry_id_{i}" for i in range(len(entry_ids)))
-                    verify_query += f" AND r.EntryID IN ({placeholders})"
-                    for i, entry_id in enumerate(entry_ids):
-                        verify_params[f"entry_id_{i}"] = entry_id
-                result = await conn.execute(text(verify_query), verify_params)
-                verified_entries = [row[0] for row in result.fetchall()]
-                result.close()
-                if set(entries_to_reset).issubset(set(verified_entries)):
-                    logger.info(f"Verified {len(verified_entries)} entries with Step1 = NULL: {verified_entries}")
-                    return verified_entries
-                logger.warning(f"Verification failed: Expected {entries_to_reset}, got {verified_entries}")
-                raise Exception(f"Verification failed: Expected {entries_to_reset}, got {verified_entries}")
-
-        verified_entries = await verify_updates()
-
-        log_public_url = await upload_file_to_space(
-            file_src=log_filename,
-            save_as=f"job_logs/job_{file_id}.log",
-            is_public=True,
-            logger=logger,
-            file_id=file_id
+        params = {"file_id": int(file_id)}
+        if not producer:
+            logger.error("RabbitMQ producer not initialized")
+            raise ValueError("RabbitMQ producer not initialized")
+        await enqueue_db_update(
+            file_id=file_id,
+            sql=sql,
+            params=params,
+            background_tasks=background_tasks,
+            task_type="reset_step1",
         )
+        logger.info(f"Enqueued Step1 reset for FileID: {file_id}")
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
         return {
-            "status": "success",
             "status_code": 200,
-            "message": f"Enqueued Step1 reset for {rows_affected} entries with no results for FileID: {file_id}",
-            "log_url": log_public_url,
-            "data": {
-                "file_id": file_id,
-                "entries_reset": rows_affected,
-                "entry_ids": entries_to_reset,
-                "verified_entries": verified_entries,
-                "correlation_id": correlation_id
-            }
+            "message": f"Successfully enqueued Step1 reset for FileID: {file_id}",
+            "log_url": log_public_url or None,
+            "timestamp": datetime.datetime.now().isoformat()
         }
     except Exception as e:
-        logger.error(f"Error resetting Step1 for FileID {file_id}: {e}", exc_info=True)
-        log_public_url = await upload_file_to_space(
-            file_src=log_filename,
-            save_as=f"job_logs/job_{file_id}.log",
-            is_public=True,
-            logger=logger,
-            file_id=file_id
-        )
-        raise HTTPException(status_code=500, detail=f"Error resetting Step1 for FileID {file_id}: {str(e)}")
-    finally:
-        await async_engine.dispose()
-        logger.info(f"Disposed database engine for FileID {file_id}")
+        logger.error(f"Error enqueuing Step1 reset for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error enqueuing Step1 reset for FileID {file_id}: {str(e)}")
 
-app.include_router(router, prefix="/api/v4")
+
+
+
+app.include_router(router, prefix="/api/v5")
