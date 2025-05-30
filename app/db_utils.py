@@ -24,54 +24,7 @@ default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-# Configuration (consider moving to environment variables or config file)
-RESPONSE_TIMEOUT = 60  # seconds
-BATCH_SIZE = 100
-MAX_CONCURRENCY = 10
-CATEGORY_FILTERS = {
-    "footwear": ["appliance", "whirlpool", "parts"],
-    # Add more categories as needed
-}
 
-def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
-    """
-    Validates a thumbnail URL by checking for HTTP/HTTPS scheme and absence of placeholder values.
-    """
-    logger = logger or default_logger
-    if not url or not isinstance(url, str) or re.search(r'placeholder', url, re.IGNORECASE):
-        logger.debug(f"Invalid thumbnail URL: {url}")
-        return False
-    if not url.startswith(('http://', 'https://')):
-        logger.debug(f"Non-HTTP thumbnail URL: {url}")
-        return False
-    return True
-
-def clean_url_string(value: Optional[str], is_url: bool = True, logger: Optional[logging.Logger] = None) -> str:
-    """
-    Cleans a string, particularly URLs, by removing invalid characters and normalizing structure.
-    """
-    logger = logger or default_logger
-    if not value:
-        return ""
-    cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
-    cleaned = re.sub(r'[\x00-\x1F\x7F]+', '', cleaned).strip()
-    if is_url:
-        cleaned = urllib.parse.unquote(cleaned)
-        try:
-            parsed = urllib.parse.urlparse(cleaned)
-            if not parsed.scheme or not parsed.netloc:
-                logger.debug(f"Invalid URL format: {cleaned[:100]}")
-                return ""
-            path = re.sub(r'/+', '/', parsed.path)
-            cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
-            if parsed.query:
-                cleaned += f"?{parsed.query}"
-            if parsed.fragment:
-                cleaned += f"#{parsed.fragment}"
-        except ValueError as e:
-            logger.debug(f"Invalid URL format: {cleaned[:100]}, error: {e}")
-            return ""
-    return cleaned
 async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
     try:
