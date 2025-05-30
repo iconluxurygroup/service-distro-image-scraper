@@ -88,7 +88,6 @@ async def test_insert_search_result():
 
 def shutdown(signalnum, frame):
     logger.info("Received shutdown signal, stopping gracefully")
-    cleanup_producer()
     sys.exit(0)
 
 if __name__ == "__main__":
