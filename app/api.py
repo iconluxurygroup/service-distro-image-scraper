@@ -223,19 +223,8 @@ async def process_and_tag_results(
                 "ImageUrlThumbnail": "placeholder://no-results",
                 "ProductCategory": ""
             }]
-        
-        # Deduplicate results
-        deduplicated_results = []
-        seen_urls = set()
-        for res in all_results:
-            image_url = res["ImageUrl"]
-            if image_url not in seen_urls and image_url != "placeholder://no-results":
-                seen_urls.add(image_url)
-                deduplicated_results.append(res)
-        
-        logger.info(f"Worker PID {process.pid}: Deduplicated to {len(deduplicated_results)} results for EntryID {entry_id}")
-        
-        return deduplicated_results
+    
+        return all_results
     
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error processing results for EntryID {entry_id}: {e}", exc_info=True)
