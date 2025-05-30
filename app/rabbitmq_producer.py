@@ -9,10 +9,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from config import RABBITMQ_URL
 from fastapi import BackgroundTasks
 import datetime
-import aiormq.exceptions  # Add this import
+import aiormq.exceptions
 
-producer = None
-# Configure default logger
+# Logging setup
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -31,7 +30,7 @@ class RabbitMQProducer:
     ):
         self.amqp_url = amqp_url
         self.queue_name = queue_name
-        self.response_queue_name = "shared_response_queue"  # Shared response queue
+        self.response_queue_name = "shared_response_queue"
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
         self.connection: Optional[aio_pika.RobustConnection] = None
@@ -65,40 +64,11 @@ class RabbitMQProducer:
                 default_logger.error("Timeout connecting to RabbitMQ")
                 self.is_connected = False
                 raise
-            except aio_pika.exceptions.ProbableAuthenticationError as e:
-                default_logger.error(
-                    f"Authentication error connecting to RabbitMQ: {e}. "
-                    f"Check username, password, and virtual host in {self.amqp_url}.",
-                    exc_info=True
-                )
-                self.is_connected = False
-                raise
             except aio_pika.exceptions.AMQPConnectionError as e:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 self.is_connected = False
                 raise
-            except aio_pika.exceptions.InvalidStateError as e:
-                default_logger.error(
-                    f"Channel error connecting to RabbitMQ: {e}. "
-                    f"Ensure channel is properly configured.",
-                    exc_info=True
-                )
-                self.is_connected = False
-                raise
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=10),
-        retry=retry_if_exception_type((
-            aio_pika.exceptions.AMQPError,
-            aio_pika.exceptions.ChannelClosed,
-            asyncio.TimeoutError,
-            aiormq.exceptions.ChannelLockedResource
-        )),
-        before_sleep=lambda retry_state: default_logger.info(
-            f"Retrying RabbitMQ publish (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-        )
-    )
     async def publish_message(
         self,
         message: Dict[str, Any],
@@ -192,9 +162,8 @@ async def cleanup_producer():
     retry=retry_if_exception_type((
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
-        asyncio.TimeoutError,
-        aiormq.exceptions.ChannelLockedResource
-    )),
+        asyncio.TimeoutError
+    )),  # Removed ChannelLockedResource to handle explicitly
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying enqueue_db_update for FileID {retry_state.kwargs.get('file_id')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -246,16 +215,32 @@ async def enqueue_db_update(
 
         if return_result and response_queue:
             try:
-                # Await the connect_robust coroutine
-                connection = await aio_pika.connect_robust(producer.amqp_url)
-                async with connection:
-                    channel = await connection.channel()
-                    queue = await channel.get_queue(response_queue)  # Use existing shared queue
-                    response_received = asyncio.Event()
-                    response_data = None
+                # Use the producer's channel to avoid new connections
+                channel = producer.channel
+                if not channel or channel.is_closed:
+                    logger.debug(f"Reopening channel for FileID {file_id}")
+                    await producer.connect()
+                    channel = producer.channel
 
-                    async def consume_response():
-                        nonlocal response_data
+                # Declare the response queue explicitly
+                try:
+                    queue = await channel.declare_queue(
+                        response_queue, durable=False, exclusive=False, auto_delete=True
+                    )
+                except aiormq.exceptions.ChannelLockedResource as e:
+                    logger.warning(f"Queue {response_queue} locked: {e}. Attempting to reconnect.")
+                    await producer.close()
+                    await producer.connect()
+                    queue = await channel.declare_queue(
+                        response_queue, durable=False, exclusive=False, auto_delete=True
+                    )
+
+                response_received = asyncio.Event()
+                response_data = None
+
+                async def consume_response():
+                    nonlocal response_data
+                    try:
                         async with queue.iterator() as queue_iter:
                             async for message in queue_iter:
                                 async with message.process():
@@ -263,23 +248,31 @@ async def enqueue_db_update(
                                         response_data = json.loads(message.body.decode())
                                         response_received.set()
                                         break
+                    except Exception as e:
+                        logger.error(f"Error in consume_response for FileID {file_id}: {e}", exc_info=True)
+                        raise
 
-                    consume_task = asyncio.create_task(consume_response())
-                    try:
-                        async with asyncio.timeout(60):
-                            await response_received.wait()
-                        if response_data and "result" in response_data:
-                            logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
-                            return response_data["result"]
-                        else:
-                            logger.warning(f"No valid response received for FileID {file_id}, CorrelationID: {correlation_id}")
-                            return 0
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Timeout waiting for response for FileID {file_id}, CorrelationID: {correlation_id}")
+                consume_task = asyncio.create_task(consume_response())
+                try:
+                    async with asyncio.timeout(60):
+                        await response_received.wait()
+                    if response_data and "result" in response_data:
+                        logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
+                        return response_data["result"]
+                    else:
+                        logger.warning(f"No valid response received for FileID {file_id}, CorrelationID: {correlation_id}")
                         return 0
-                    finally:
-                        consume_task.cancel()
-                        await asyncio.sleep(0.1)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout waiting for response for FileID {file_id}, CorrelationID: {correlation_id}")
+                    return 0
+                finally:
+                    consume_task.cancel()
+                    try:
+                        await queue.delete(if_unused=False, if_empty=False)
+                        logger.debug(f"Deleted response queue {response_queue}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete response queue {response_queue}: {e}")
+                    await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error(f"Error consuming response for FileID {file_id}: {e}", exc_info=True)
                 return 0
@@ -288,3 +281,18 @@ async def enqueue_db_update(
     except Exception as e:
         logger.error(f"Error enqueuing task for FileID {file_id}: {e}", exc_info=True)
         raise
+
+# Signal handler for graceful shutdown
+def setup_signal_handlers(loop):
+    import signal
+    def handle_shutdown():
+        tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        loop.run_until_complete(cleanup_producer())
+        loop.stop()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+    
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, handle_shutdown)
