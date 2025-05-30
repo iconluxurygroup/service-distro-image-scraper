@@ -53,6 +53,8 @@ class RabbitMQProducer:
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=2)
                     await self.channel.declare_queue(self.queue_name, durable=True)
+                    # Clean up response queue if it exists
+                    await self.cleanup_queue(self.response_queue_name)
                     # Declare shared response queue
                     await self.channel.declare_queue(
                         self.response_queue_name, durable=False, exclusive=False, auto_delete=True
@@ -68,6 +70,10 @@ class RabbitMQProducer:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 self.is_connected = False
                 raise
+    def custom_json_serializer(obj):
+        if isinstance(obj, datetime.datetime):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
     async def publish_message(
         self,
@@ -79,10 +85,10 @@ class RabbitMQProducer:
         async with self._lock:
             if not self.is_connected or not self.connection or self.connection.is_closed:
                 await self.connect()
+            queue_name = routing_key or self.queue_name
             try:
                 async with asyncio.timeout(self.operation_timeout):
-                    message_body = json.dumps(message)
-                    queue_name = routing_key or self.queue_name
+                    message_body = json.dumps(message, default=custom_json_serializer)
                     await self.channel.default_exchange.publish(
                         aio_pika.Message(
                             body=message_body.encode(),
@@ -102,6 +108,14 @@ class RabbitMQProducer:
                 self.is_connected = False
                 raise
 
+    async def cleanup_queue(self, queue_name: str):
+        async with self._lock:
+            try:
+                if self.channel and not self.channel.is_closed:
+                    await self.channel.queue_delete(queue_name)
+                    default_logger.info(f"Deleted stale queue {queue_name}")
+            except Exception as e:
+                default_logger.warning(f"Failed to clean up queue {queue_name}: {e}")
     async def close(self):
         async with self._lock:
             try:
@@ -218,10 +232,16 @@ async def enqueue_db_update(
                     await producer.connect()
                     channel = producer.channel
 
-                # Declare shared response queue (non-exclusive)
-                queue = await channel.declare_queue(
-                    response_queue, durable=False, exclusive=False, auto_delete=True
-                )
+                # Check if queue exists before declaring
+                try:
+                    await channel.get_queue(response_queue)
+                    logger.debug(f"Reusing existing queue {response_queue}")
+                except aio_pika.exceptions.QueueEmpty:
+                    # Declare shared response queue (non-exclusive)
+                    queue = await channel.declare_queue(
+                        response_queue, durable=False, exclusive=False, auto_delete=True
+                    )
+                    logger.debug(f"Declared new queue {response_queue}")
 
                 response_received = asyncio.Event()
                 response_data = None
@@ -269,7 +289,6 @@ async def enqueue_db_update(
     except Exception as e:
         logger.error(f"Error enqueuing task for FileID {file_id}: {e}", exc_info=True)
         raise
-
 # Signal handler for graceful shutdown
 def setup_signal_handlers(loop):
     import signal
