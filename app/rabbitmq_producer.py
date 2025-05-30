@@ -80,11 +80,11 @@ class RabbitMQProducer:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=2, min=2, max=10),
-        retry_if_exception_type=(
+        retry=retry_if_exception_type((
             aio_pika.exceptions.AMQPError,
             aio_pika.exceptions.ChannelClosed,
             asyncio.TimeoutError
-        ),
+        )),
         before_sleep=lambda retry_state: default_logger.info(
             f"Retrying RabbitMQ operation (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
         )
@@ -144,11 +144,11 @@ class RabbitMQProducer:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry_if_exception_type=(
+    retry=retry_if_exception_type((
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError
-    ),
+    )),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying get_producer (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
@@ -190,11 +190,11 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry_if_exception_type=(
+    retry=retry_if_exception_type((
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError
-    ),
+    )),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying enqueue_db_update for FileID {retry_state.kwargs.get('file_id')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
