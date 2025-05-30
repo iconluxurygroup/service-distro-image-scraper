@@ -371,6 +371,7 @@ def setup_signal_handlers(loop):
     
     def signal_handler():
         nonlocal last_signal_time
+        import time
         current_time = time.time()
         if current_time - last_signal_time < debounce_interval:
             default_logger.debug("Debouncing rapid SIGINT/SIGTERM")
