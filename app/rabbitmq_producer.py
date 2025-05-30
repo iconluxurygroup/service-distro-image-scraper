@@ -194,7 +194,6 @@ async def enqueue_db_update(
     return_result: bool = False,
     logger: Optional[logging.Logger] = None,
 ):
-    logger = logger or default_logger
     should_close = False
     if producer is None:
         producer = RabbitMQProducer()
