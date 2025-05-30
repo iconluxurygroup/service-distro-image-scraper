@@ -281,15 +281,20 @@ async def enqueue_db_update(
                     )
                 )
                 async def declare_queue():
+                    logger.debug(f"Attempting to declare queue {response_queue}")
                     try:
                         queue = await channel.declare_queue(
                             response_queue, durable=False, exclusive=False, auto_delete=True
                         )
-                        await asyncio.sleep(0.1)  # Brief delay to ensure queue is ready
+                        logger.debug(f"Successfully declared queue {response_queue}")
+                        await asyncio.sleep(0.1)
                         return queue
                     except aiormq.exceptions.ChannelLockedResource:
                         logger.warning(f"Queue {response_queue} locked, attempting to delete and retry")
                         await producer.cleanup_queue(response_queue)
+                        raise
+                    except Exception as e:
+                        logger.error(f"Failed to declare queue {response_queue}: {e}", exc_info=True)
                         raise
 
                 try:
