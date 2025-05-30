@@ -709,16 +709,13 @@ async def enqueue_db_update(
     return_result: bool = False,
     logger: Optional[logging.Logger] = None,
 ):
-    logger = logger or default_logger  # Ensure a valid logger
-    if logger is None:
-        logger = logging.getLogger(__name__)  # Fallback to a new logger if default_logger is None
-        logger.setLevel(logging.INFO)
-        if not logger.handlers:
-            logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logger = logger or logging.getLogger(__name__)
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     should_close = False
     if producer is None:
-        producer = RabbitMQProducer()
+        producer = await RabbitMQProducer.get_producer(logger=logger)
         should_close = True
 
     try:
