@@ -136,7 +136,7 @@ async def insert_search_results(
         logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
         try:
             producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
-            async with asyncio.timeout(RABBITMQ_CONNECT_TIMEOUT):
+            async with asyncio.timeout(60):
                 await producer.connect()
             logger.info(f"Worker PID {process.pid}: Successfully initialized RabbitMQ producer")
         except Exception as e:
