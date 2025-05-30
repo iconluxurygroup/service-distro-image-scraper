@@ -645,9 +645,14 @@ async def enqueue_db_update(
             )
             try:
                 await consumer.connect()
+                logger.debug(f"[{correlation_id}] Connected to consumer for queue {response_queue}")
             except aiormq.exceptions.ChannelLockedResource as e:
                 logger.error(f"[{correlation_id}] Failed to connect to queue {response_queue}: {e}")
                 raise
+            except Exception as e:
+                logger.error(f"[{correlation_id}] Unexpected error connecting to queue {response_queue}: {e}")
+                raise
+
             result_future = asyncio.Future()
 
             async def temp_callback(message: aio_pika.IncomingMessage):
