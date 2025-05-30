@@ -185,12 +185,10 @@ async def enqueue_db_update(
     correlation_id = correlation_id or str(uuid.uuid4())
     
     try:
-        # Use provided producer or get one
         if producer is None or not producer.is_connected:
             logger.debug(f"Producer not provided or disconnected for FileID {file_id}, initializing new producer")
             producer = await get_producer(logger)
         
-        # Convert SQLAlchemy text object to string if necessary
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
         response_queue = response_queue or producer.response_queue_name if return_result else None
 
@@ -204,7 +202,6 @@ async def enqueue_db_update(
             "correlation_id": correlation_id,
         }
 
-        # Publish the task to RabbitMQ
         await producer.publish_message(
             message=update_task,
             routing_key="db_update_queue",
@@ -215,25 +212,16 @@ async def enqueue_db_update(
 
         if return_result and response_queue:
             try:
-                # Use the producer's channel to avoid new connections
                 channel = producer.channel
                 if not channel or channel.is_closed:
                     logger.debug(f"Reopening channel for FileID {file_id}")
                     await producer.connect()
                     channel = producer.channel
 
-                # Declare the response queue explicitly
-                try:
-                    queue = await channel.declare_queue(
-                        response_queue, durable=False, exclusive=False, auto_delete=True
-                    )
-                except aiormq.exceptions.ChannelLockedResource as e:
-                    logger.warning(f"Queue {response_queue} locked: {e}. Attempting to reconnect.")
-                    await producer.close()
-                    await producer.connect()
-                    queue = await channel.declare_queue(
-                        response_queue, durable=False, exclusive=False, auto_delete=True
-                    )
+                # Declare shared response queue (non-exclusive)
+                queue = await channel.declare_queue(
+                    response_queue, durable=False, exclusive=False, auto_delete=True
+                )
 
                 response_received = asyncio.Event()
                 response_data = None
@@ -268,7 +256,7 @@ async def enqueue_db_update(
                 finally:
                     consume_task.cancel()
                     try:
-                        await queue.delete(if_unused=False, if_empty=False)
+                        await channel.queue_delete(response_queue)
                         logger.debug(f"Deleted response queue {response_queue}")
                     except Exception as e:
                         logger.warning(f"Failed to delete response queue {response_queue}: {e}")

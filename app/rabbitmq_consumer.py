@@ -199,7 +199,6 @@ class RabbitMQConsumer:
                 await conn.close()
 
     async def execute_select(self, task: Dict[str, Any], conn, logger: logging.Logger) -> Dict[str, Any]:
-        """Execute a SELECT query and optionally send results to a response queue."""
         file_id = task.get("file_id", "unknown")
         select_sql = task.get("sql")
         params = task.get("params", {})
@@ -219,7 +218,7 @@ class RabbitMQConsumer:
                 producer = RabbitMQProducer(amqp_url=self.amqp_url)
                 try:
                     await producer.connect()
-                    response = {"file_id": file_id, "results": results, "correlation_id": correlation_id}
+                    response = {"file_id": file_id, "results": results, "correlation_id": correlation_id, "result": len(results)}
                     @retry(
                         stop=stop_after_attempt(3),
                         wait=wait_exponential(multiplier=1, min=2, max=10),
