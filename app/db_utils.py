@@ -206,6 +206,15 @@ async def update_file_generate_complete(file_id: str, logger: Optional[logging.L
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
@@ -280,20 +289,28 @@ async def insert_search_results(
                             logger.debug(f"[{correlation_id}] Received response for FileID {file_id}")
 
         entry_ids = list(set(row["EntryID"] for row in data))
-        logger.debug(f"[{correlation_id}] Enqueuing SELECT for EntryIDs: {entry_ids}")
+        logger.debug(f"[{correlation_id}] Raw EntryIDs: {entry_ids}, type: {type(entry_ids)}")
+        # Flatten entry_ids
+        flat_entry_ids = []
+        for id in entry_ids:
+            if isinstance(id, (list, tuple)):
+                flat_entry_ids.append(id[0])
+            elif isinstance(id, int):
+                flat_entry_ids.append(id)
+            else:
+                logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}")
+        logger.debug(f"[{correlation_id}] Flattened EntryIDs: {flat_entry_ids}")
 
         # Pre-check for existing rows
-        if entry_ids:
+        if flat_entry_ids:
             async with async_engine.connect() as conn:
-                flat_entry_ids = [id[0] if isinstance(id, (list, tuple)) else id for id in entry_ids]
                 query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
                 result = await conn.execute(query, {"entry_ids": tuple(flat_entry_ids)})
                 count = result.scalar()
                 logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {flat_entry_ids}")
 
         existing_keys = set()
-        if entry_ids:
-            flat_entry_ids = [id[0] if isinstance(id, (list, tuple)) else id for id in entry_ids]
+        if flat_entry_ids:
             select_query = text("""
                 SELECT EntryID, ImageUrl
                 FROM utb_ImageScraperResult
@@ -329,8 +346,6 @@ async def insert_search_results(
             finally:
                 consume_task.cancel()
                 await asyncio.sleep(0.5)
-
-        # ... (rest of the function remains unchanged)
 
         update_query = """
             UPDATE utb_ImageScraperResult
@@ -397,7 +412,7 @@ async def insert_search_results(
                 WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
             """)
             result = await conn.execute(query, {
-                "entry_ids": tuple(entry_ids),
+                "entry_ids": tuple(flat_entry_ids),
                 "create_time": min(row["CreateTime"] for row in data)
             })
             inserted_count = result.scalar()
