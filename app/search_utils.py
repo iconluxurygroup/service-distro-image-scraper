@@ -98,9 +98,9 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
 
         # Enqueue updates
-        producer = await RabbitMQProducer.get_producer(logger)
+        producer = await RabbitMQProducer.get_producer()
         if producer is None or not producer.is_connected:
-            producer = await RabbitMQProducer.get_producer(logger)
+            producer = await RabbitMQProducer.get_producer()
 
         update_data = []
         correlation_id = str(uuid.uuid4())

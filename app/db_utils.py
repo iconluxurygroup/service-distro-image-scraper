@@ -13,7 +13,7 @@ from typing import Optional, List, Dict
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from rabbitmq_producer import enqueue_db_update
+from rabbitmq_producer import enqueue_db_update, RabbitMQProducer
 from database_config import conn_str, async_engine
 from s3_utils import upload_file_to_space
 producer = None
@@ -216,12 +216,12 @@ async def insert_search_results(
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
-    producer = await RabbitMQProducer.get_producer(logger)
+    producer = await RabbitMQProducer.get_producer()
     if producer is None or not producer.is_connected or not producer.channel or producer.channel.is_closed:
         logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
         try:
             async with asyncio.timeout(60):
-                producer = await RabbitMQProducer.get_producer(logger)
+                producer = await RabbitMQProducer.get_producer()
         except Exception as e:
             logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
             raise RuntimeError(f"Failed to initialize RabbitMQ producer for FileID {file_id}: {str(e)}")
