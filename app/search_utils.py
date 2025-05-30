@@ -297,6 +297,7 @@ async def insert_search_results(
             await connection.close()
         await producer.close()
         logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer")
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -319,8 +320,9 @@ async def update_search_sort_order(
 ) -> List[Dict]:
     logger = logger or default_logger
     process = psutil.Process()
-    
+
     try:
+        # Fetch results
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
@@ -332,7 +334,6 @@ async def update_search_sort_order(
             rows = result.fetchall()
             columns = result.keys()
             result.close()
-            await conn.execute(text("SELECT 1"))  # Clear cursor state
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
@@ -341,13 +342,12 @@ async def update_search_sort_order(
         results = [dict(zip(columns, row)) for row in rows]
         logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
-        # Log input parameters for debugging
-        logger.debug(f"Worker PID {process.pid}: Input - Brand: {brand}, Model: {model}, Category: {category}, Brand Rules: {brand_rules}")
-
+        # Preprocess inputs
         brand_clean = clean_string(brand).lower() if brand else ""
         model_clean = normalize_model(model) if model else ""
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
+        # Generate aliases
         brand_aliases = []
         if brand and brand_rules and "brand_rules" in brand_rules:
             for rule in brand_rules["brand_rules"]:
@@ -362,18 +362,14 @@ async def update_search_sort_order(
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
-        if not brand_aliases and not model_aliases:
-            logger.warning(f"Worker PID {process.pid}: No valid aliases generated for EntryID {entry_id}")
-
+        # Assign priorities
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
             image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
-            logger.debug(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
 
             model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
-            logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
             if model_matched and brand_matched:
                 res["priority"] = 1
@@ -385,12 +381,18 @@ async def update_search_sort_order(
                 res["priority"] = 4
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
+        # Sort results
         sorted_results = sorted(results, key=lambda x: x["priority"])
         logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
+        # Enqueue updates
         producer = RabbitMQProducer()
         try:
             update_data = []
+            response_queue = f"select_response_{uuid.uuid4().hex}"
+            correlation_id = str(uuid.uuid4())
+            total_updated = 0
+
             for index, res in enumerate(sorted_results):
                 sort_order = -2 if res["priority"] == 4 else (index + 1)
                 params = {
@@ -398,59 +400,51 @@ async def update_search_sort_order(
                     "entry_id": entry_id,
                     "result_id": res["ResultID"]
                 }
-                async with async_engine.connect() as conn:
-                    try:
-                        update_query = text("""
-                            UPDATE utb_ImageScraperResult
-                            SET SortOrder = :sort_order
-                            WHERE EntryID = :entry_id AND ResultID = :result_id
-                        """)
-                        result = await conn.execute(update_query, params)
-                        await conn.commit()
-                        logger.info(
-                            f"Worker PID {process.pid}: Updated SortOrder to {sort_order} "
-                            f"for ResultID {res['ResultID']}, EntryID {entry_id}"
-                        )
-                    except SQLAlchemyError as e:
-                        logger.error(
-                            f"Worker PID {process.pid}: Failed to update SortOrder for ResultID {res['ResultID']}: {e}"
-                        )
-                        raise
-
+                update_query = """
+                    UPDATE utb_ImageScraperResult
+                    SET SortOrder = :sort_order
+                    WHERE EntryID = :entry_id AND ResultID = :result_id
+                """
+                # Enqueue update with response queue to track completion
                 await enqueue_db_update(
                     file_id=file_id,
-                    sql=str(update_query),
+                    sql=update_query,
                     params=params,
                     background_tasks=background_tasks,
                     task_type="update_sort_order",
                     producer=producer,
+                    response_queue=response_queue,
+                    correlation_id=correlation_id,
+                    return_result=True
                 )
                 update_data.append({
                     "ResultID": res["ResultID"],
                     "EntryID": entry_id,
                     "SortOrder": sort_order
                 })
-                logger.debug(
-                    f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}"
-                )
+                logger.debug(f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}")
 
-            if update_data:
-                logger.info(
-                    f"Worker PID {process.pid}: Processed SortOrder updates for {len(update_data)} rows for EntryID {entry_id}"
-                )
-                return update_data
-            else:
-                logger.warning(f"Worker PID {process.pid}: No updates processed for EntryID {entry_id}")
-                return []
+            # Wait for responses
+            async with aio_pika.connect_robust(producer.amqp_url) as connection:
+                channel = await connection.channel()
+                queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+                async with queue.iterator() as queue_iter:
+                    async for message in queue_iter:
+                        async with message.process():
+                            if message.correlation_id == correlation_id:
+                                response = json.loads(message.body.decode())
+                                total_updated += response.get("result", 0)
+                                break
+
+            logger.info(f"Worker PID {process.pid}: Processed SortOrder updates for {total_updated} rows for EntryID {entry_id}")
+            return update_data if total_updated > 0 else []
         finally:
-            if producer and producer.connection and not producer.connection.is_closed:
-                await producer.close()
+            await producer.close()
             logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         raise
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
