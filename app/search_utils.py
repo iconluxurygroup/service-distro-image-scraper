@@ -220,7 +220,7 @@ async def insert_search_results(
 
         update_batch = []
         insert_batch = []
-        create_time = datetime.datetime.now().isoformat()
+        create_time = datetime.datetime.now()
         for row in results:
             key = (row["EntryID"], row["ImageUrl"])
             params = {
