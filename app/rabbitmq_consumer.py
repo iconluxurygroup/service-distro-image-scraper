@@ -4,7 +4,7 @@ import logging
 import asyncio
 import signal
 import sys
-import datetime
+import uuid
 from rabbitmq_producer import RabbitMQProducer
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -65,6 +65,8 @@ class RabbitMQConsumer:
                     retry_delay=5,
                 )
                 self.channel = await self.connection.channel()
+                if not self.channel:
+                    raise aio_pika.exceptions.AMQPConnectionError("Failed to create channel")
                 await self.channel.set_qos(prefetch_count=1)
                 if self.queue_name.startswith("select_response_"):
                     try:
@@ -72,15 +74,20 @@ class RabbitMQConsumer:
                         logger.debug(f"Connected to existing queue: {self.queue_name}")
                     except aiormq.exceptions.ChannelNotFoundEntity:
                         logger.warning(f"Queue {self.queue_name} not found, creating it")
-                        await self.channel.declare_queue(
+                        await self.declare_queue_with_retry(
+                            self.channel,
                             self.queue_name,
                             exclusive=True,
                             auto_delete=True,
-                            arguments={"x-expires": 300000}  # 5-minute expiration
+                            arguments={"x-expires": 600000}
                         )
                         logger.debug(f"Created response queue: {self.queue_name}")
                 else:
-                    await self.channel.declare_queue(self.queue_name, durable=True)
+                    await self.declare_queue_with_retry(
+                        self.channel,
+                        self.queue_name,
+                        durable=True
+                    )
                 logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
         except asyncio.TimeoutError:
             logger.error("Timeout connecting to RabbitMQ")
@@ -95,13 +102,16 @@ class RabbitMQConsumer:
         except aio_pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
             raise
-        except aiormq.exceptions.ChannelLockedResource as e:
-            logger.error(
-                f"Resource locked error for queue {self.queue_name}: {e}. "
-                f"Ensure queue is not exclusively locked by another connection.",
-                exc_info=True
+        except aiormq.exceptions.ChannelLockedResource:
+            logger.warning(f"Queue {self.queue_name} is locked, generating new queue name")
+            self.queue_name = f"{self.queue_name}_{uuid.uuid4().hex[:8]}"
+            await self.declare_queue_with_retry(
+                self.channel,
+                self.queue_name,
+                exclusive=True,
+                auto_delete=True,
+                arguments={"x-expires": 600000}
             )
-            raise
     async def get_channel(self) -> aio_pika.Channel:
         """Get the RabbitMQ channel, connecting if necessary."""
         if not self.channel or self.channel.is_closed:
