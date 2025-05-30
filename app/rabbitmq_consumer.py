@@ -113,17 +113,17 @@ class RabbitMQConsumer:
             raise
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=10),
-        retry=retry_if_exception_type((
-            aio_pika.exceptions.AMQPError,
-            aio_pika.exceptions.ChannelClosed,
-            asyncio.TimeoutError
-        )),
-        before_sleep=lambda retry_state: logger.info(
-            f"Retrying start_consuming (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-        )
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((
+        aio_pika.exceptions.AMQPError,
+        aio_pika.exceptions.ChannelClosed,
+        asyncio.TimeoutError
+    )),
+    before_sleep=lambda retry_state: logger.info(
+        f"Retrying start_consuming (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
+)
     async def start_consuming(self):
         """Start consuming messages with robust reconnection."""
         try:
@@ -134,11 +134,10 @@ class RabbitMQConsumer:
             logger.info("Started consuming messages. To exit press CTRL+C")
             await asyncio.Event().wait()
         except (aio_pika.exceptions.AMQPConnectionError, aio_pika.exceptions.ChannelClosed, asyncio.TimeoutError) as e:
-            logger.error(f"Connection error: {e}, reconnecting in 5 seconds", exc_info=True)
+            logger.error(f"Connection error: {e}, attempting retry...", exc_info=True)
             self.is_consuming = False
             await self.close()
-            await asyncio.sleep(5)
-            await self.start_consuming()
+            raise  # Let tenacity handle retry
         except aio_pika.exceptions.ProbableAuthenticationError as e:
             logger.error(
                 f"Authentication error: {e}. "
@@ -150,23 +149,24 @@ class RabbitMQConsumer:
             raise
         except aio_pika.exceptions.ChannelInvalidStateError as e:
             logger.error(
-                f"Channel error: {e}. "
-                f"Ensure channel is properly configured.",
+                f"Channel invalid state: {e}. Reconnecting...",
                 exc_info=True
             )
             self.is_consuming = False
             await self.close()
-            raise
+            await asyncio.sleep(2)  # Brief delay to avoid rapid reconnection
+            raise  # Let tenacity handle retry
         except KeyboardInterrupt:
             logger.info("Received KeyboardInterrupt, shutting down consumer")
+            self.is_consuming = False
             await self.close()
             raise
         except Exception as e:
-            logger.error(f"Unexpected error in consumer: {e}, reconnecting in 5 seconds", exc_info=True)
+            logger.error(f"Unexpected error in consumer: {e}", exc_info=True)
             self.is_consuming = False
             await self.close()
-            await asyncio.sleep(5)
-            await self.start_consuming()
+            await asyncio.sleep(2)
+            raise
 
     async def execute_update(self, task: Dict[str, Any], conn, logger: logging.Logger) -> Dict[str, Any]:
         """Execute an UPDATE or INSERT query."""
