@@ -218,12 +218,26 @@ class RabbitMQConsumer:
                 try:
                     await producer.connect()
                     response = {"file_id": file_id, "results": results, "correlation_id": correlation_id}
-                    await producer.publish_message(
-                        response,
-                        routing_key=response_queue,
-                        correlation_id=correlation_id
+                    # Retry publishing with a new queue name if locked
+                    @retry(
+                        stop=stop_after_attempt(3),
+                        wait=wait_exponential(multiplier=1, min=2, max=10),
+                        retry=retry_if_exception_type(aio_pika.exceptions.ChannelLockedResource)
                     )
-                    logger.debug(f"Sent {len(results)} SELECT results to {response_queue} for FileID {file_id}")
+                    async def publish_with_retry():
+                        # Append a unique suffix to the response queue name
+                        unique_response_queue = f"{response_queue}_{str(uuid.uuid4())}"
+                        await producer.publish_message(
+                            response,
+                            routing_key=unique_response_queue,
+                            correlation_id=correlation_id
+                        )
+                        logger.debug(f"Sent {len(results)} SELECT results to {unique_response_queue} for FileID {file_id}")
+                    
+                    await publish_with_retry()
+                except aio_pika.exceptions.ChannelLockedResource as e:
+                    logger.error(f"Failed to publish to {response_queue} after retries: {e}", exc_info=True)
+                    raise
                 finally:
                     await producer.close()
             return {"results": results}
@@ -274,6 +288,12 @@ class RabbitMQConsumer:
 
     async def callback(self, message: aio_pika.IncomingMessage):
         """Process incoming messages from the queue."""
+        async with self._lock:
+            # Ensure channel is valid; reconnect if necessary
+            if not self.channel or self.channel.is_closed:
+                logger.warning("Channel is closed or invalid, attempting to reconnect")
+                await self.connect()
+        
         async with message.process(requeue=True, ignore_processed=True):
             try:
                 task = json.loads(message.body.decode())
@@ -343,11 +363,30 @@ class RabbitMQConsumer:
 
 async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     """Perform async shutdown of consumer and resources."""
-    await consumer.close()
-    await async_engine.dispose()
-    loop.stop()
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
+    try:
+        await consumer.close()
+        await async_engine.dispose()
+        # Cancel all running tasks except the current one
+        tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        # Wait for tasks to complete or cancel
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Shutdown async generators
+        await loop.shutdown_asyncgens()
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}", exc_info=True)
+    finally:
+        loop.stop()
+        loop.close()
+
+def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
+    """Create a signal handler for graceful shutdown."""
+    def handler(sig, frame):
+        logger.info(f"Received signal {sig}, shutting down gracefully...")
+        # Run shutdown in the existing loop
+        asyncio.ensure_future(shutdown(consumer, loop))
+    return handler
 
 def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     """Create a signal handler for graceful shutdown."""
@@ -389,10 +428,18 @@ if __name__ == "__main__":
     }
 
     try:
-        loop.run_until_complete(consumer.test_task(sample_task))
-        loop.run_until_complete(consumer.start_consuming())
+        # Run test_task and start_consuming as a single async main function
+        async def main():
+            await consumer.test_task(sample_task)
+            await consumer.start_consuming()
+
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt, initiating shutdown")
         loop.run_until_complete(shutdown(consumer, loop))
     except Exception as e:
         logger.error(f"Error in consumer: {e}", exc_info=True)
         loop.run_until_complete(shutdown(consumer, loop))
+    finally:
+        if not loop.is_closed():
+            loop.close()
