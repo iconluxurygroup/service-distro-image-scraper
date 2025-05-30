@@ -1,6 +1,7 @@
 import aio_pika
 import json
 import logging
+import psutil
 import datetime
 import asyncio
 from typing import Dict, Any, Optional
@@ -8,7 +9,7 @@ from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import aiormq.exceptions
 import uuid
-
+from config import RABBITMQ_URL
 # Configure default logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -138,7 +139,38 @@ class RabbitMQProducer:
                 self.is_connected = False
             except Exception as e:
                 default_logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
-
+async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProducer:
+    """
+    Ensure a connected RabbitMQ producer exists. If not, create and connect one.
+    
+    Args:
+        logger: Optional logger instance.
+    
+    Returns:
+        RabbitMQProducer: Connected producer instance.
+    
+    Raises:
+        ValueError: If RABBITMQ_URL is not set or connection fails.
+    """
+    global producer
+    logger = logger or default_logger
+    
+    if not RABBITMQ_URL:
+        logger.error("RABBITMQ_URL environment variable not set")
+        raise ValueError("RABBITMQ_URL not configured")
+    
+    if producer is None or not producer.is_connected:
+        try:
+            async with asyncio.timeout(10):
+                producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
+                await producer.connect()
+                logger.info(f"Worker PID {psutil.Process().pid}: Initialized RabbitMQ producer")
+        except Exception as e:
+            logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
+            producer = None  # Reset on failure to allow retry
+            raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
+    
+    return producer
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
