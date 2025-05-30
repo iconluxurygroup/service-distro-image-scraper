@@ -745,32 +745,32 @@ async def enqueue_db_update(
                     if message.correlation_id == correlation_id:
                         response = json.loads(message.body.decode())
                         result_future.set_result(response.get("results", []))
-                        logger.info(f"Received response for correlation_id {correlation_id} from {response_queue}")
+                        logger.info(f"[{correlation_id}] Received response for correlation_id {correlation_id} from {response_queue}")
 
-            await consumer.channel.declare_queue(response_queue, durable=False, exclusive=True, auto_delete=True)
+            # Do not re-declare the queue; use the existing exclusive queue
             queue = await consumer.channel.get_queue(response_queue)
             await queue.consume(temp_callback)
 
             await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
-            logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
+            logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
 
             try:
-                async with asyncio.timeout(30):
+                async with asyncio.timeout(120):
                     result = await result_future
-                    logger.info(f"Received deduplication result for FileID: {file_id}")
+                    logger.info(f"[{correlation_id}] Received deduplication result for FileID: {file_id}")
                     return result
             except asyncio.TimeoutError:
-                logger.error(f"Timeout waiting for deduplication response for FileID: {file_id}")
+                logger.error(f"[{correlation_id}] Timeout waiting for deduplication response for FileID: {file_id}")
                 raise
             finally:
                 await consumer.close()
         else:
             await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
-            logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
+            logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
     except Exception as e:
-        logger.error(f"Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
+        logger.error(f"[{correlation_id}] Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
         raise
     finally:
         if should_close:
             await producer.close()
-            logger.info(f"Closed RabbitMQ producer for FileID: {file_id}")
+            logger.info(f"[{correlation_id}] Closed RabbitMQ producer for FileID: {file_id}")
