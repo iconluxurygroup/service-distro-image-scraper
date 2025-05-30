@@ -19,6 +19,7 @@ import pandas as pd
 import asyncio
 import uuid
 import aio_pika
+from config import RABBITMQ_URL
 from s3_utils import upload_file_to_space
 from tenacity import retry, stop_after_attempt, wait_fixed
 producer = None
@@ -134,7 +135,7 @@ async def insert_search_results(
     # Initialize RabbitMQ producer per call
     producer = None
     try:
-        if not os.getenv("RABBITMQ_URL"):
+        if not RABBITMQ_URL:
             logger.error("RABBITMQ_URL environment variable not set")
             raise ValueError("RABBITMQ_URL not configured")
         
