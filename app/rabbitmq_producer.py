@@ -56,18 +56,21 @@ class RabbitMQProducer:
     )
     async def connect(self) -> 'RabbitMQProducer':
         async with self._lock:
-            if self.is_connected and self.connection and not self.connection.is_closed:
+            if self.is_connected and self.connection and not self.connection.is_closed and self.channel and not self.channel.is_closed:
                 default_logger.debug("RabbitMQ connection already established")
                 return self
             try:
                 async with asyncio.timeout(self.connection_timeout):
+                    # Close existing connection if open
+                    if self.connection and not self.connection.is_closed:
+                        await self.connection.close()
                     self.connection = await aio_pika.connect_robust(
                         self.amqp_url,
                         connection_attempts=3,
                         retry_delay=5,
                     )
                     self.channel = await self.connection.channel()
-                    await self.channel.set_qos(prefetch_count=2)
+                    await self.channel.set_qos(prefetch_count=1)  # Reduced to 1 to avoid contention
                     await self.channel.declare_queue(self.queue_name, durable=True)
                     try:
                         await self.cleanup_queue(self.response_queue_name)
@@ -79,11 +82,7 @@ class RabbitMQProducer:
                     self.is_connected = True
                     default_logger.info(f"Connected to RabbitMQ and declared queues: {self.queue_name}, {self.response_queue_name}")
                     return self
-            except asyncio.TimeoutError:
-                default_logger.error("Timeout connecting to RabbitMQ")
-                self.is_connected = False
-                raise
-            except aio_pika.exceptions.AMQPConnectionError as e:
+            except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 self.is_connected = False
                 raise
