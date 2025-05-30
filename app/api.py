@@ -50,7 +50,7 @@ from email_utils import send_message_email
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
 
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update,get_producer
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 
 
 app = FastAPI(title="super_scraper", version=VERSION)
@@ -95,7 +95,7 @@ from sqlalchemy.sql import text
 from database_config import async_engine
 from logging_config import setup_job_logger
 from db_utils import insert_search_results
-from rabbitmq_producer import get_producer, cleanup_producer
+from rabbitmq_producer import cleanup_producer
 from config import VERSION
 
 
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     try:
         # Initialize global RabbitMQ producer
         async with asyncio.timeout(10):
-            producer = await get_producer(default_logger)
+            producer = await RabbitMQProducer.get_producer(default_logger)
         if not producer or not producer.is_connected:
             default_logger.error("Failed to initialize RabbitMQ producer, shutting down")
             sys.exit(1)
@@ -628,7 +628,7 @@ async def process_restart_batch(
             logger.warning("RabbitMQ producer not initialized or disconnected, creating new instance")
             try:
                 async with asyncio.timeout(20):
-                    producer = await get_producer(logger)
+                    producer = await RabbitMQProducer.get_producer(logger)
                 logger.info("Successfully initialized RabbitMQ producer")
             except Exception as e:
                 logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
@@ -1658,7 +1658,7 @@ async def api_reset_step1(
     
     try:
         # Ensure producer is initialized
-        producer = await get_producer(logger)
+        producer = await RabbitMQProducer.get_producer(logger)
         logger.debug(f"Producer initialized for FileID: {file_id}, connected: {producer.is_connected}")
         
         # Validate FileID exists
@@ -1808,7 +1808,7 @@ async def api_reset_step1_no_results(
         logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
 
         # Ensure global producer is available
-        producer = await get_producer(logger)
+        producer = await RabbitMQProducer.get_producer(logger)
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError(f"RabbitMQ not initialized")
@@ -1980,7 +1980,7 @@ async def api_validate_images(
         logger.info(f"Found {len(results)} images to validate for FileID {file_id}")
 
         # Ensure global producer is available
-        producer = await get_producer(logger)
+        producer = await RabbitMQProducer.get_producer(logger)
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
@@ -2191,7 +2191,7 @@ async def api_reset_step1_no_results(
         logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
 
         # Ensure global producer is available
-        producer = await get_producer(logger)
+        producer = await RabbitMQProducer.get_producer(logger)
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
