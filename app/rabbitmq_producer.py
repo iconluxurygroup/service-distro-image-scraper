@@ -253,7 +253,7 @@ async def enqueue_db_update(
             producer = await get_producer(logger)
         
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
-        response_queue = response_queue or f"response_{correlation_id}" if return_result else None
+        response_queue = producer.response_queue_name if return_result else None
 
         # Sanitize params
         sanitized_params = {
@@ -287,38 +287,14 @@ async def enqueue_db_update(
                     await producer.connect()
                     channel = producer.channel
 
-                # Declare response queue without cleanup
-                @retry(
-                    stop=stop_after_attempt(3),
-                    wait=wait_exponential(multiplier=1, min=1, max=5),
-                    retry=retry_if_exception_type((aiormq.exceptions.ChannelLockedResource, aio_pika.exceptions.AMQPError)),
-                    before_sleep=lambda retry_state: logger.info(
-                        f"Retrying queue declaration for {response_queue} (attempt {retry_state.attempt_number}/3)"
-                    )
-                )
-                async def declare_queue():
-                    logger.debug(f"Attempting to declare queue {response_queue}")
-                    try:
-                        queue = await channel.declare_queue(
-                            response_queue, durable=False, exclusive=False, auto_delete=True
-                        )
-                        logger.debug(f"Successfully declared queue {response_queue}")
-                        await asyncio.sleep(0.1)
-                        return queue
-                    except aiormq.exceptions.ChannelLockedResource:
-                        logger.warning(f"Queue {response_queue} locked, attempting to delete and retry")
-                        await producer.cleanup_queue(response_queue)
-                        raise
-                    except Exception as e:
-                        logger.error(f"Failed to declare queue {response_queue}: {e}", exc_info=True)
-                        raise
-
+                # Ensure shared response queue exists
                 try:
-                    queue = await declare_queue()
-                    logger.debug(f"Declared response queue {response_queue} for FileID {file_id}")
-                except Exception as e:
-                    logger.error(f"Failed to declare response queue {response_queue} for FileID {file_id}: {e}", exc_info=True)
-                    return 0
+                    queue = await channel.get_queue(response_queue)
+                except aio_pika.exceptions.QueueEmpty:
+                    queue = await channel.declare_queue(
+                        response_queue, durable=False, exclusive=False, auto_delete=True
+                    )
+                    logger.debug(f"Declared shared response queue {response_queue} for FileID {file_id}")
 
                 response_received = asyncio.Event()
                 response_data = None
@@ -326,7 +302,11 @@ async def enqueue_db_update(
                 @retry(
                     stop=stop_after_attempt(3),
                     wait=wait_exponential(multiplier=1, min=2, max=10),
-                    retry=retry_if_exception_type((aio_pika.exceptions.AMQPError, asyncio.TimeoutError, aiormq.exceptions.ChannelNotFoundEntity)),
+                    retry=retry_if_exception_type((
+                        aio_pika.exceptions.AMQPError,
+                        asyncio.TimeoutError,
+                        aiormq.exceptions.ChannelNotFoundEntity
+                    )),
                     before_sleep=lambda retry_state: logger.info(
                         f"Retrying consume_response for FileID {file_id} (attempt {retry_state.attempt_number}/3)"
                     )
@@ -347,7 +327,7 @@ async def enqueue_db_update(
 
                 consume_task = asyncio.create_task(consume_response(queue))
                 try:
-                    async with asyncio.timeout(120):
+                    async with asyncio.timeout(300):  # Increased timeout
                         await response_received.wait()
                     if response_data and "result" in response_data:
                         logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
@@ -360,12 +340,7 @@ async def enqueue_db_update(
                     return 0
                 finally:
                     consume_task.cancel()
-                    try:
-                        await channel.queue_delete(response_queue)
-                        logger.debug(f"Deleted response queue {response_queue}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete response queue {response_queue}: {e}")
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)  # Allow cleanup
             except Exception as e:
                 logger.error(f"Error consuming response for FileID {file_id}: {e}", exc_info=True)
                 return 0
