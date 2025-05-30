@@ -33,6 +33,7 @@ class RabbitMQProducer:
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.response_queue_name = "shared_response_queue"
+        self.new_queue_name = "new_task_queue"
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
         self.connection: Optional[aio_pika.RobustConnection] = None
@@ -40,6 +41,23 @@ class RabbitMQProducer:
         self.is_connected = False
         self._lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
+
+    async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool) -> bool:
+        try:
+            queue = await channel.declare_queue(queue_name, passive=True)
+            is_durable = queue.declaration_result.fields.get('durable', False)
+            if is_durable != expected_durable:
+                default_logger.warning(
+                    f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}. "
+                    f"Consider deleting the queue or updating its properties."
+                )
+                return False
+            return True
+        except aio_pika.exceptions.QueueEmpty:
+            return True  # Queue doesn't exist, safe to create
+        except Exception as e:
+            default_logger.error(f"Error checking queue {queue_name} durability: {e}", exc_info=True)
+            return False
 
     @retry(
         stop=stop_after_attempt(3),
@@ -64,24 +82,41 @@ class RabbitMQProducer:
                     self.connection = await aio_pika.connect_robust(self.amqp_url, connection_attempts=3, retry_delay=5)
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
-                    # Declare fanout exchange
                     await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
-                    # Declare existing queues
-                    await self.channel.declare_queue(self.queue_name, durable=True)
-                    await self.channel.declare_queue(self.response_queue_name, durable=True)
-                    # Declare new queue
-                    new_queue_name = "new_task_queue"
-                    new_queue = await self.channel.declare_queue(new_queue_name, durable=True)
-                    # Bind new queue to logs exchange
-                    await new_queue.bind('logs')
+
+                    queues = [
+                        (self.queue_name, True),
+                        (self.response_queue_name, True),
+                        (self.new_queue_name, True),
+                    ]
+                    for queue_name, durable in queues:
+                        if not await self.check_queue_durability(self.channel, queue_name, durable):
+                            raise ValueError(
+                                f"Queue {queue_name} has mismatched durability settings. "
+                                f"Please delete the queue or update its properties in RabbitMQ."
+                            )
+                        queue = await self.channel.declare_queue(queue_name, durable=durable)
+                        await queue.bind('logs')
+                        default_logger.debug(f"Queue {queue_name} declared and bound to logs exchange")
+
                     self.is_connected = True
-                    default_logger.info(f"Connected to RabbitMQ, declared fanout exchange: logs, and queues: {self.queue_name}, {self.response_queue_name}, {new_queue_name}")
+                    default_logger.info(
+                        f"Connected to RabbitMQ, declared fanout exchange: logs, and queues: "
+                        f"{self.queue_name}, {self.response_queue_name}, {self.new_queue_name}"
+                    )
                     return self
             except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 self.is_connected = False
                 raise
-    async def publish_message(self, message: Dict[str, Any], routing_key: Optional[str] = None, correlation_id: Optional[str] = None, reply_to: Optional[str] = None):
+
+    async def publish_message(
+        self,
+        message: Dict[str, Any],
+        routing_key: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        reply_to: Optional[str] = None
+    ):
         async with self._lock:
             await self.check_connection()
             try:
@@ -98,7 +133,7 @@ class RabbitMQProducer:
                         ),
                         routing_key=''  # Ignored for fanout
                     )
-                    default_logger.info(f"Published message to exchange: logs, correlation_id: {correlation_id}")
+                    default_logger.info(f"Published message to exchange: logs, correlation_id: {correlation_id}, routing_key: {routing_key}")
             except Exception as e:
                 default_logger.error(f"Failed to publish message: {e}", exc_info=True)
                 self.is_connected = False
@@ -121,7 +156,6 @@ class RabbitMQProducer:
             ):
                 await self.connect()
             try:
-                # Verify channel usability
                 await self.channel.nop()
             except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
                 default_logger.warning(f"Channel invalid, reconnecting: {e}")
@@ -153,6 +187,7 @@ class RabbitMQProducer:
                 self.is_connected = False
             except Exception as e:
                 default_logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -220,7 +255,7 @@ async def enqueue_db_update(
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
     return_result: bool = False,
-    queue_name: str = "db_update_queue",  # Add queue_name parameter
+    queue_name: str = "db_update_queue",
     logger: Optional[logging.Logger] = None
 ) -> Optional[int]:
     logger = logger or default_logger
@@ -251,11 +286,14 @@ async def enqueue_db_update(
 
         await producer.publish_message(
             message=update_task,
-            routing_key=queue_name,  # Use specified queue_name
+            routing_key=queue_name,
             correlation_id=correlation_id,
             reply_to=response_queue
         )
-        logger.info(f"Enqueued task for FileID: {file_id}, TaskType: {task_type}, Queue: {queue_name}, CorrelationID: {correlation_id}")
+        logger.info(
+            f"Enqueued task for FileID: {file_id}, TaskType: {task_type}, "
+            f"Queue: {queue_name}, CorrelationID: {correlation_id}"
+        )
 
         if return_result and response_queue:
             try:
@@ -265,12 +303,11 @@ async def enqueue_db_update(
                     await producer.connect()
                     channel = producer.channel
 
-                # Ensure shared response queue exists
                 try:
                     queue = await channel.get_queue(response_queue)
                 except aio_pika.exceptions.QueueEmpty:
                     queue = await channel.declare_queue(
-                        response_queue, durable=False, exclusive=False, auto_delete=True
+                        response_queue, durable=True, exclusive=False, auto_delete=False
                     )
                     logger.debug(f"Declared shared response queue {response_queue} for FileID {file_id}")
 
@@ -323,9 +360,8 @@ async def enqueue_db_update(
                 logger.error(f"Error consuming response for FileID {file_id}: {e}", exc_info=True)
                 return 0
         return None
-
     except Exception as e:
-        logger.error(f"Error enqueuing task for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Error enqueuing task for FileID: {file_id}: {e}", exc_info=True)
         raise
 
 def setup_signal_handlers(loop):
@@ -339,6 +375,10 @@ def setup_signal_handlers(loop):
             tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
             for task in tasks:
                 task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    default_logger.debug(f"Task {task.get_name()} cancelled or timed out during shutdown")
             await cleanup_producer()
             loop.stop()
             await loop.shutdown_asyncgens()
@@ -346,8 +386,9 @@ def setup_signal_handlers(loop):
         except Exception as e:
             default_logger.error(f"Error during shutdown: {e}", exc_info=True)
         finally:
-            loop.close()
-    
+            if not loop.is_closed():
+                loop.close()
+
     def signal_handler():
         nonlocal last_signal_time
         current_time = time.time()
@@ -356,8 +397,8 @@ def setup_signal_handlers(loop):
             return
         last_signal_time = current_time
         default_logger.info("Received SIGINT/SIGTERM, initiating graceful shutdown")
-        asyncio.ensure_future(handle_shutdown())
-    
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(handle_shutdown()))
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, signal_handler)
