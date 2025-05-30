@@ -39,7 +39,43 @@ class RabbitMQConsumer:
         self.is_consuming = False
         self._lock = asyncio.Lock()
         self.producer = producer or RabbitMQProducer(amqp_url=amqp_url)
+    async def connect(self):
+        async with self._lock:
+            try:
+                # Close any existing connection or channel
+                if self.channel and not self.channel.is_closed:
+                    await self.channel.close()
+                if self.connection and not self.connection.is_closed:
+                    await self.connection.close()
 
+                # Establish new connection
+                self.connection = await aio_pika.connect_robust(
+                    self.amqp_url,
+                    timeout=self.connection_timeout
+                )
+                self.channel = await self.connection.channel()
+
+                # Check and declare queues with durability settings
+                for queue_name, durable in [
+                    (self.queue_name, True),
+                    (self.new_queue_name, True),
+                    (self.response_queue_name, True)
+                ]:
+                    # Check if queue exists and has correct durability
+                    should_declare = await self.check_queue_durability(
+                        self.channel, queue_name, durable, delete_if_mismatched=True
+                    )
+                    if should_declare:
+                        await self.declare_queue_with_retry(self.channel, queue_name, durable)
+                        logger.info(f"Declared queue {queue_name} with durable={durable}")
+
+                logger.info("Successfully connected to RabbitMQ")
+            except aio_pika.exceptions.AMQPError as e:
+                logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error during connection: {e}", exc_info=True)
+                raise
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
