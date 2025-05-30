@@ -87,11 +87,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global producer
     default_logger.info("Starting up FastAPI application")
     
     try:
-        producer = await get_producer(default_logger)
         
         loop = asyncio.get_running_loop()
         shutdown_event = asyncio.Event()
