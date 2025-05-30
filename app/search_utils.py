@@ -136,7 +136,8 @@ async def insert_search_results(
         async with asyncio.timeout(60):
             if not producer or not producer.is_connected:
                 logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
-                producer = await get_producer(logger)
+                producer = get_producer()  # Or however the producer is obtained
+        channel = producer.channel
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Failed to initialize RabbitMQ producer: {e}", exc_info=True)
         raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
