@@ -1413,6 +1413,23 @@ async def get_send_to_email_endpoint(file_id: str):
         logger.error(f"Error retrieving email for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error retrieving email for FileID {file_id}: {str(e)}")
+@app.post("/enqueue-task")
+async def enqueue_task(file_id: str, sql: str, background_tasks: BackgroundTasks):
+    logger, log_filename = setup_job_logger(job_id=file_id)
+    try:
+        await enqueue_db_update(
+            file_id=file_id,
+            sql=sql,
+            params={},
+            task_type="db_update",
+            queue_name="db_update_queue",
+            background_tasks=background_tasks,
+            logger=logger
+        )
+        return {"status": "Task enqueued"}
+    except Exception as e:
+        logger.error(f"Failed to enqueue task: {e}")
+        return {"status": "Error", "message": str(e)}
 
 @router.post("/update-file-generate-complete/{file_id}", tags=["Database"])
 async def update_file_generate_complete_endpoint(file_id: str):
