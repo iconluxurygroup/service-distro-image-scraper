@@ -536,6 +536,7 @@ async def process_restart_batch(
         MAX_ENTRY_RETRIES = 3
         RELEVANCE_THRESHOLD = 0.9
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
+        global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
