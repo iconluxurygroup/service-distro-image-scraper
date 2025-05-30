@@ -54,8 +54,8 @@ class RabbitMQConsumer:
     async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool, delete_if_mismatched: bool = False) -> bool:
         try:
             queue = await channel.declare_queue(queue_name, passive=True)
-            is_durable = queue.declaration_result.fields.get('durable', False)
-            logger.debug(f"Queue {queue_name} exists with durable={is_durable}, arguments={queue.declaration_result.fields}")
+            is_durable = queue.durable
+            logger.debug(f"Queue {queue_name} exists with durable={is_durable}")
             if is_durable != expected_durable:
                 logger.warning(f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}.")
                 if delete_if_mismatched:
