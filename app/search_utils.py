@@ -190,7 +190,7 @@ async def insert_search_results(
 
             consume_task = asyncio.create_task(consume_responses())
             try:
-                async with asyncio.timeout(30):
+                async with asyncio.timeout(120):
                     await response_received.wait()
                 if response_data and "results" in response_data:
                     existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data["results"]}
