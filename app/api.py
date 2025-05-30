@@ -84,16 +84,15 @@ async def lifespan(app: FastAPI):
         try:
             producer = RabbitMQProducer(amqp_url=rabbitmq_url)
             async with asyncio.timeout(10):
-                await producer.connect()
+                producer = await producer.connect()  # Assign return value
             default_logger.info("RabbitMQ producer connected")
             break
         except Exception as e:
             default_logger.error(f"Attempt {attempt}/{max_retries} failed to connect to RabbitMQ: {e}")
             if attempt == max_retries:
                 default_logger.error("Max retries reached, RabbitMQ connection failed")
-                producer = None  # Explicitly set to None to indicate failure
-                # Optionally, proceed without RabbitMQ if non-critical
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                producer = None
+            await asyncio.sleep(2 ** attempt)
     
     try:
         loop = asyncio.get_running_loop()

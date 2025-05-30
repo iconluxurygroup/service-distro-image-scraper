@@ -2,10 +2,13 @@ import logging
 import json
 import asyncio
 import aio_pika
+import psutil
+import uuid
 from typing import Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from config import RABBITMQ_URL
-
+from fastapi import BackgroundTasks
+import datetime
 # Configure default logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
