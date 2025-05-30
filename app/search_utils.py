@@ -35,21 +35,11 @@ producer = None
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
-    before_sleep=lambda retry_state: default_logger.info(
-        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
 async def insert_search_results(
     results: List[Dict],
     logger: Optional[logging.Logger] = None,
     file_id: str = None,
-    background_tasks: Optional[BackgroundTasks] = None,
-    producer: Optional[RabbitMQProducer] = None  # New parameter
+    background_tasks: Optional[BackgroundTasks] = None
 ) -> bool:
     logger = logger or default_logger
     process = psutil.Process()
@@ -59,32 +49,18 @@ async def insert_search_results(
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
 
-    # Use provided producer or global producer
-    local_producer = producer
-    global producer global_producer
-    if local_producer is None:
-        if global_producer is None or not global_producer.is_connected or not global_producer.channel or global_producer.channel.is_closed:
-            logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
-            try:
-                async with asyncio.timeout(60):
-                    global_producer = await get_producer(logger)
-                local_producer = global_producer
-            except Exception as e:
-                logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
-                return False
-        else:
-            local_producer = global_producer
-    elif not local_producer.is_connected or not local_producer.channel or local_producer.channel.is_closed:
-        logger.warning("Provided RabbitMQ producer disconnected, reconnecting")
+    global producer
+    if producer is None or not producer.is_connected or not producer.channel or producer.channel.is_closed:
+        logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
         try:
             async with asyncio.timeout(60):
-                await local_producer.connect()
+                producer = await get_producer(logger)
         except Exception as e:
-            logger.error(f"Failed to reconnect provided RabbitMQ producer: {e}", exc_info=True)
+            logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
             return False
 
     correlation_id = str(uuid.uuid4())
-    response_queue = local_producer.response_queue_name
+    response_queue = producer.response_queue_name
 
     try:
         # Deduplicate results
@@ -105,7 +81,7 @@ async def insert_search_results(
                     params=params,
                     background_tasks=background_tasks,
                     task_type="select_deduplication",
-                    producer=local_producer,  # Use local producer
+                    producer=producer,
                     response_queue=response_queue,
                     correlation_id=correlation_id,
                     return_result=True,
@@ -168,7 +144,7 @@ async def insert_search_results(
                     params=params,
                     background_tasks=background_tasks,
                     task_type="update_search_result",
-                    producer=local_producer,  # Use local producer
+                    producer=producer,
                     correlation_id=cid,
                     logger=logger
                 )
@@ -185,7 +161,7 @@ async def insert_search_results(
                     params=params,
                     background_tasks=background_tasks,
                     task_type="insert_search_result",
-                    producer=local_producer,  # Use local producer
+                    producer=producer,
                     correlation_id=cid,
                     logger=logger
                 )
