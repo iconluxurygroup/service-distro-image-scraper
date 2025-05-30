@@ -109,7 +109,6 @@ def clean_url_string(value: Optional[str], is_url: bool = True) -> str:
             return ""
     return cleaned
 
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -226,7 +225,7 @@ async def insert_search_results(
         update_batch = []
         insert_batch = []
         create_time = datetime.datetime.now().isoformat()
-        for row in results:  # Iterate over input results, not response_data
+        for row in results:
             key = (row["EntryID"], row["ImageUrl"])
             params = {
                 "EntryID": row["EntryID"],
@@ -282,6 +281,7 @@ async def insert_search_results(
                 await channel.delete_queue(response_queue)
         except Exception as e:
             logger.warning(f"Worker PID {process.pid}: Failed to delete response queue {response_queue}: {e}")
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
