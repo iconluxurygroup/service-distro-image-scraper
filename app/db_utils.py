@@ -248,7 +248,6 @@ async def insert_search_results(
                     background_tasks=background_tasks,
                     task_type="select_deduplication",
                     producer=producer,
-                    response_queue=response_queue,
                     correlation_id=correlation_id,
                     return_result=True,
                     logger=logger
