@@ -46,17 +46,41 @@ async def cleanup_temp_dirs(dirs: List[str], logger: Optional[logging.Logger] = 
             except Exception as e:
                 logger.error(f"Failed to remove temp directory {dir_path}: {e}", exc_info=True)
 
-@lru_cache(maxsize=32)
-def sync_load_config(file_key: str, url: str, config_name: str, expect_list: bool = False) -> Any:
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        config = response.json()
-        if expect_list and not isinstance(config, list):
-            raise ValueError(f"{config_name} must be a list")
-        return config
-    except Exception as e:
-        raise e
+class ConfigCache:
+    def __init__(self, ttl_seconds=300):
+        self.ttl = ttl_seconds
+        self.cache = {}
+        self.last_updated = {}
+
+    async def load_config(self, file_key: str, url: str, config_name: str, expect_list: bool = False, max_attempts: int = 3, timeout: float = 10, logger=None):
+        logger = logger or default_logger
+        cache_key = (file_key, url)
+        if cache_key in self.cache and self.last_updated.get(cache_key) and (datetime.now() - self.last_updated[cache_key]).total_seconds() < self.ttl:
+            logger.debug(f"Returning cached {config_name} from {url}")
+            return self.cache[cache_key]
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=timeout) as response:
+                        response.raise_for_status()
+                        config = await response.json()
+                        if expect_list and not isinstance(config, list):
+                            raise ValueError(f"{config_name} must be a list")
+                        self.cache[cache_key] = config
+                        self.last_updated[cache_key] = datetime.now()
+                        logger.info(f"Loaded {config_name} from {url} on attempt {attempt}")
+                        return config
+            except (aiohttp.ClientError, ValueError) as e:
+                logger.warning(f"Attempt {attempt}/{max_attempts} failed to load {config_name}: {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 * attempt)
+                else:
+                    logger.error(f"Failed to load {config_name} after {max_attempts} attempts")
+                    return [] if expect_list else {}
+        return [] if expect_list else {}
+
+config_cache = ConfigCache()
 
 async def load_config(
     file_key: str,
@@ -69,36 +93,8 @@ async def load_config(
 ) -> Any:
     logger = logger or default_logger
     url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
-    
-    try:
-        config = sync_load_config(file_key, url, config_name, expect_list)
-        logger.info(f"Loaded {config_name} from cache for {url}")
-        return config
-    except Exception:
-        logger.debug(f"Cache miss for {config_name}, attempting async load")
-
-    for attempt in range(1, retries + 1):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    response.raise_for_status()
-                    config = await response.json()
-                    if expect_list and not isinstance(config, list):
-                        raise ValueError(f"{config_name} must be a list")
-                    logger.info(f"Loaded {config_name} from {url} on attempt {attempt}")
-                    sync_load_config.cache_clear()
-                    sync_load_config(file_key, url, config_name, expect_list)
-                    return config
-        except (aiohttp.ClientError, ValueError, asyncio.TimeoutError) as e:
-            logger.warning(f"Failed to load {config_name} from {url} (attempt {attempt}/{retries}): {e}")
-            if attempt < retries:
-                await asyncio.sleep(backoff_factor * attempt)
-            else:
-                logger.info(f"Exhausted retries for {config_name}, using fallback")
-                return fallback
-    logger.error(f"Critical failure loading {config_name} from {url}, using fallback")
-    return fallback
-
+    config = await config_cache.load_config(file_key, url, config_name, expect_list, retries, backoff_factor, logger)
+    return config if config else fallback
 async def preprocess_sku(
     search_string: str,
     known_brand: Optional[str] = None,
@@ -283,39 +279,50 @@ def generate_aliases(model: Any, article_length: int = 8, model_length: int = 7,
     logger.debug(f"Generated aliases for model '{model}' with article_length={article_length}, color='{color}': {aliases}")
     return [a for a in aliases if a and len(a) >= 4]
 
+from datetime import datetime, timedelta
+import aiohttp
+
+class BrandRulesCache:
+    def __init__(self, ttl_seconds=300):
+        self.ttl = ttl_seconds
+        self.cache = None
+        self.last_updated = None
+
+    async def fetch_brand_rules(self, url: str, max_attempts: int = 3, timeout: float = 10, logger=None):
+        logger = logger or default_logger
+        if self.cache and self.last_updated and (datetime.now() - self.last_updated).total_seconds() < self.ttl:
+            logger.debug(f"Returning cached brand rules from {url}")
+            return self.cache
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=timeout) as response:
+                        response.raise_for_status()
+                        self.cache = await response.json()
+                        self.last_updated = datetime.now()
+                        logger.info(f"Successfully fetched and cached brand rules from {url} on attempt {attempt}")
+                        return self.cache
+            except (aiohttp.ClientError, ValueError) as e:
+                logger.warning(f"Attempt {attempt}/{max_attempts} failed to fetch brand rules: {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
+                    return {"brand_rules": []}
+        return {"brand_rules": []}
+
+brand_rules_cache = BrandRulesCache()
+
 async def fetch_brand_rules(
     file_key: str = "brand_rules",
     max_attempts: int = 3,
     timeout: int = 10,
     logger: Optional[logging.Logger] = None
-) -> Optional[Dict]:
+) -> Dict[str, Any]:
     logger = logger or default_logger
     url = f"{BASE_CONFIG_URL}{CONFIG_FILES.get(file_key, 'brand_rules.json')}"
-    
-    async with httpx.AsyncClient() as client:
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = await client.get(url, timeout=timeout)
-                response.raise_for_status()
-                brand_rules = response.json()
-                
-                if not isinstance(brand_rules, dict) or "brand_rules" not in brand_rules:
-                    logger.error(f"Invalid brand rules format from {url}")
-                    return {"brand_rules": []}
-                
-                logger.info(f"Successfully fetched brand rules from {url} on attempt {attempt}")
-                return brand_rules
-            
-            except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
-                logger.warning(f"Attempt {attempt}/{max_attempts} failed to fetch brand rules from {url}: {e}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
-                    return {"brand_rules": []}  # Fallback to empty rules
-
-    logger.error(f"Critical failure fetching brand rules from {url}")
-    return {"brand_rules": []}
+    return await brand_rules_cache.fetch_brand_rules(url, max_attempts, timeout, logger)
 
 def normalize_model(model: Any) -> str:
     if not isinstance(model, str):
