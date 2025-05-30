@@ -9,8 +9,21 @@ import asyncio
 import aiormq.exceptions
 
 logger = logging.getLogger(__name__)
+import aio_pika
+import json
+import logging
+import datetime
+from typing import Dict, Any, Optional
+from fastapi import BackgroundTasks
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import asyncio
+import aiormq.exceptions
+
 
 class RabbitMQProducer:
+    _instance = None
+    _lock = asyncio.Lock()  # Class-level lock for thread-safe singleton
+
     def __init__(
         self,
         amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
@@ -25,6 +38,36 @@ class RabbitMQProducer:
         self.connection: Optional[aio_pika.RobustConnection] = None
         self.channel: Optional[aio_pika.Channel] = None
         self.is_connected = False
+
+    @classmethod
+    async def get_producer(cls, **kwargs) -> 'RabbitMQProducer':
+        """Get or create a singleton RabbitMQProducer instance.
+
+        Args:
+            **kwargs: Optional overrides for amqp_url, queue_name, connection_timeout, operation_timeout.
+
+        Returns:
+            RabbitMQProducer: The singleton producer instance, connected to RabbitMQ.
+        """
+        async with cls._lock:
+            if cls._instance is None or not cls._instance.is_connected:
+                # Use default values or kwargs overrides
+                amqp_url = kwargs.get("amqp_url", "amqp://app_user:app_password@localhost:5672/app_vhost")
+                queue_name = kwargs.get("queue_name", "db_update_queue")
+                connection_timeout = kwargs.get("connection_timeout", 10.0)
+                operation_timeout = kwargs.get("operation_timeout", 5.0)
+
+                cls._instance = cls(
+                    amqp_url=amqp_url,
+                    queue_name=queue_name,
+                    connection_timeout=connection_timeout,
+                    operation_timeout=operation_timeout
+                )
+                await cls._instance.connect()
+                logger.info("Initialized new RabbitMQProducer instance")
+            else:
+                logger.debug("Reusing existing RabbitMQProducer instance")
+            return cls._instance
 
     async def connect(self):
         """Establish an async robust connection to RabbitMQ and declare a durable queue."""
