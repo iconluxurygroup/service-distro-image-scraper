@@ -217,12 +217,11 @@ class RabbitMQConsumer:
                     await producer.publish_message(response, routing_key=response_queue, correlation_id=file_id)
                     logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
                 finally:
-                    await producer.close()
+                    pass  # Do not close producer
             return results
         except SQLAlchemyError as e:
             logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
             raise
-
     async def execute_sort_order_update(self, params: dict, file_id: str):
         try:
             entry_id = params.get("entry_id")
