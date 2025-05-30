@@ -25,6 +25,7 @@ class RabbitMQConsumer:
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
     ):
+        logger.debug("Initializing RabbitMQConsumer")
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.connection_timeout = connection_timeout
@@ -190,7 +191,7 @@ class RabbitMQConsumer:
             results = [dict(zip(columns, row)) for row in rows]
             logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
             if response_queue:
-                producer = RabbitMQProducer(amqp_url=self.amqp_url)
+                producer = await RabbitMQProducer.get_producer(logger=logger)  # Updated
                 try:
                     await producer.connect()
                     response = {"file_id": file_id, "results": results}
