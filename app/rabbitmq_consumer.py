@@ -9,10 +9,12 @@ from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
 from database_config import async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import psutil
+import psutil 
 from typing import Optional, Dict, Any
 from rabbitmq_producer import RabbitMQProducer
-
+import aiormq.exceptions  # Add this import at the top of rabbitmq_consumer.py
+import uuid
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -222,20 +224,19 @@ class RabbitMQConsumer:
                     @retry(
                         stop=stop_after_attempt(3),
                         wait=wait_exponential(multiplier=1, min=2, max=10),
-                        retry=retry_if_exception_type(aio_pika.exceptions.ChannelLockedResource)
+                        retry=retry_if_exception_type(aiormq.exceptions.ChannelLockedResource)  # Updated exception
                     )
                     async def publish_with_retry():
-                        # Append a unique suffix to the response queue name
-                        unique_response_queue = f"{response_queue}_{str(uuid.uuid4())}"
+                        # Use the original response queue name
                         await producer.publish_message(
                             response,
-                            routing_key=unique_response_queue,
+                            routing_key=response_queue,
                             correlation_id=correlation_id
                         )
-                        logger.debug(f"Sent {len(results)} SELECT results to {unique_response_queue} for FileID {file_id}")
+                        logger.debug(f"Sent {len(results)} SELECT results to {response_queue} for FileID {file_id}")
                     
                     await publish_with_retry()
-                except aio_pika.exceptions.ChannelLockedResource as e:
+                except aiormq.exceptions.ChannelLockedResource as e:  # Updated exception
                     logger.error(f"Failed to publish to {response_queue} after retries: {e}", exc_info=True)
                     raise
                 finally:
