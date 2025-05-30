@@ -79,6 +79,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
 # ... other imports ...
 
+import sys
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+# ... other imports ...
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global producer
@@ -86,7 +91,7 @@ async def lifespan(app: FastAPI):
     
     try:
         default_logger.info("Testing RabbitMQ producer connection on startup...")
-        from rabbitmq_test import test_rabbitmq_producer
+        from app.rabbitmq_test import test_rabbitmq_producer
         if not await test_rabbitmq_producer(default_logger):
             default_logger.error("RabbitMQ producer test failed, shutting down application")
             sys.exit(1)
@@ -114,6 +119,8 @@ async def lifespan(app: FastAPI):
             default_logger.info("RabbitMQ producer closed")
         await async_engine.dispose()
         default_logger.info("Database engine disposed")
+
+# ... rest of main.py ...
 
 # ... rest of main.py ...
 
