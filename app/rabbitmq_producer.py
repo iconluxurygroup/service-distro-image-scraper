@@ -33,8 +33,8 @@ class RabbitMQProducer:
         self,
         amqp_url: str = RABBITMQ_URL,
         queue_name: str = "db_update_queue",
-        connection_timeout: float = 15.0,
-        operation_timeout: float = 5.0,
+        connection_timeout: float = 30.0,
+        operation_timeout: float = 10.0,
     ):
         self.amqp_url = amqp_url
         self.queue_name = queue_name
@@ -51,27 +51,25 @@ class RabbitMQProducer:
     async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool, delete_if_mismatched: bool = False) -> bool:
         try:
             queue = await channel.declare_queue(queue_name, passive=True)
-            is_durable = queue.declaration_result.fields.get('durable', False)
-            default_logger.debug(f"Queue {queue_name} exists with durable={is_durable}, arguments={queue.declaration_result.fields}")
+            is_durable = queue.durable  # Direct access to durable property
+            logger.debug(f"Queue {queue_name} exists with durable={is_durable}")
             if is_durable != expected_durable:
-                default_logger.warning(
-                    f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}."
-                )
+                logger.warning(f"Queue {queue_name} has durable={is_durable}, but expected durable={expected_durable}.")
                 if delete_if_mismatched:
                     try:
                         await channel.queue_delete(queue_name)
-                        default_logger.info(f"Deleted queue {queue_name} due to mismatched durability")
-                        return True  # Safe to recreate
+                        logger.info(f"Deleted queue {queue_name} due to mismatched durability")
+                        return True
                     except Exception as e:
-                        default_logger.error(f"Failed to delete queue {queue_name}: {e}", exc_info=True)
+                        logger.error(f"Failed to delete queue {queue_name}: {e}", exc_info=True)
                         return False
                 return False
             return True
-        except aio_pika.exceptions.QueueEmpty:
-            default_logger.debug(f"Queue {queue_name} does not exist")
-            return True  # Safe to create
+        except (aio_pika.exceptions.QueueEmpty, aiormq.exceptions.ChannelNotFoundEntity):
+            logger.debug(f"Queue {queue_name} does not exist")
+            return True
         except Exception as e:
-            default_logger.error(f"Error checking queue {queue_name} durability: {e}", exc_info=True)
+            logger.error(f"Error checking queue {queue_name} durability: {e}", exc_info=True)
             return False
 
     @retry(
@@ -94,7 +92,7 @@ class RabbitMQProducer:
                 return self
             try:
                 async with asyncio.timeout(self.connection_timeout):
-                    self.connection = await aio_pika.connect_robust(self.amqp_url, connection_attempts=3, retry_delay=5)
+                    self.connection = await aio_pika.connect_robust(self.amqp_url, connection_attempts=5, retry_delay=5, timeout=30)
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
                     await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
@@ -404,8 +402,8 @@ def setup_signal_handlers(loop):
             await cleanup_producer()
             if loop.is_running():
                 loop.stop()
-            await loop.shutdown_asyncgens()
-            await loop.shutdown_default_executor()
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
         except Exception as e:
             default_logger.error(f"Error during shutdown: {e}", exc_info=True)
         finally:
