@@ -593,7 +593,6 @@ async def process_restart_batch(
         brand_rules = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=10, logger=logger)
         if not brand_rules:
             logger.warning(f"No brand rules fetched for FileID {file_id_db}")
-            # Fallback to a default brand rule for known brands
             brand_rules = {
                 "Scotch & Soda": {
                     "aliases": ["Scotch and Soda", "S&S"],
@@ -655,7 +654,7 @@ async def process_restart_batch(
         )
         async def enqueue_with_retry(sql, params, task_type, correlation_id, response_queue=None, return_result=False):
             try:
-                async with asyncio.timeout(10):
+                async with asyncio.timeout(20):
                     result = await enqueue_db_update(
                         file_id=str(file_id_db),
                         sql=sql,
@@ -664,7 +663,8 @@ async def process_restart_batch(
                         task_type=task_type,
                         response_queue=response_queue,
                         correlation_id=correlation_id,
-                        return_result=return_result
+                        return_result=return_result,
+                        logger=logger
                     )
                     return result
             except asyncio.TimeoutError as te:
@@ -705,7 +705,7 @@ async def process_restart_batch(
 
                             for term in search_terms:
                                 logger.debug(f"Searching term '{term}' for EntryID {entry_id}")
-                                async with asyncio.timeout(120):  # Increased from 60 to 120 seconds
+                                async with asyncio.timeout(120):
                                     results = await async_process_entry_search(
                                         search_string=term,
                                         brand=brand,
@@ -736,7 +736,7 @@ async def process_restart_batch(
                                     logger.debug(f"No valid results for term '{term}' in EntryID {entry_id}")
                                     continue
                                 try:
-                                    async with asyncio.timeout(60):  # Increased from 30 to 60 seconds
+                                    async with asyncio.timeout(120):  # Increased from 60 to 120 seconds
                                         success = await insert_search_results(
                                             results=valid_results,
                                             logger=logger,
