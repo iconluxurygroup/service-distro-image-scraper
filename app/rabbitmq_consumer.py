@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any
 from rabbitmq_producer import RabbitMQProducer
 import uuid
 from config import RABBITMQ_URL
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class RabbitMQConsumer:
     ):
         self.amqp_url = amqp_url
         self.queue_name = queue_name
+        self.new_queue_name = "new_task_queue"  # New queue
         self.connection_timeout = connection_timeout
         self.operation_timeout = operation_timeout
         self.connection = None
@@ -53,30 +55,23 @@ class RabbitMQConsumer:
                     )
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
-                    # Use provided queue_name
-                    try:
-                        await self.channel.get_queue(self.queue_name)
-                        logger.debug(f"Queue {self.queue_name} already exists")
-                    except aio_pika.exceptions.QueueEmpty:
-                        if self.queue_name.startswith('test_queue_'):
-                            await self.channel.declare_queue(self.queue_name, durable=False, exclusive=False, auto_delete=True)
-                        else:
-                            await self.channel.declare_queue(self.queue_name, durable=True)
-                        logger.debug(f"Declared queue: {self.queue_name}")
-                    # Declare response queue for non-test scenarios
-                    if not self.queue_name.startswith('test_queue_'):
-                        try:
-                            await self.channel.get_queue(self.producer.response_queue_name)
-                        except aio_pika.exceptions.QueueEmpty:
-                            await self.channel.declare_queue(
-                                self.producer.response_queue_name, durable=True, exclusive=False, auto_delete=False
-                            )
-                    logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
+                    # Declare and bind existing queue
+                    queue = await self.channel.declare_queue(self.queue_name, durable=True)
+                    await queue.bind('logs')
+                    logger.debug(f"Queue {self.queue_name} declared and bound to logs exchange")
+                    # Declare and bind response queue
+                    response_queue = await self.channel.declare_queue(self.producer.response_queue_name, durable=True)
+                    await response_queue.bind('logs')
+                    # Declare and bind new queue
+                    new_queue = await self.channel.declare_queue(self.new_queue_name, durable=True)
+                    await new_queue.bind('logs')
+                    logger.debug(f"Queue {self.new_queue_name} declared and bound to logs exchange")
+                    logger.info(f"Connected to RabbitMQ, consuming from queues: {self.queue_name}, {self.new_queue_name}")
             except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
                 logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 raise
+
     async def close(self):
-        """Close the RabbitMQ connection and channel gracefully."""
         async with self._lock:
             try:
                 if self.is_consuming:
@@ -93,7 +88,6 @@ class RabbitMQConsumer:
             self.is_consuming = False
 
     async def purge_queue(self):
-        """Purge all messages from the queue."""
         try:
             if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
                 await self.connect()
@@ -118,13 +112,14 @@ class RabbitMQConsumer:
         )
     )
     async def start_consuming(self):
-        """Start consuming messages with robust reconnection."""
         try:
             await self.connect()
             self.is_consuming = True
             queue = await self.channel.get_queue(self.queue_name)
             await queue.consume(self.callback)
-            logger.info("Started consuming messages. To exit press CTRL+C")
+            new_queue = await self.channel.get_queue(self.new_queue_name)
+            await new_queue.consume(self.callback)
+            logger.info(f"Started consuming messages from {self.queue_name} and {self.new_queue_name}. To exit press CTRL+C")
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             logger.info("Consumer cancelled, shutting down...")
@@ -138,18 +133,14 @@ class RabbitMQConsumer:
             raise
         except aio_pika.exceptions.ProbableAuthenticationError as e:
             logger.error(
-                f"Authentication error: {e}. "
-                f"Check username, password, and virtual host in {self.amqp_url}.",
+                f"Authentication error: {e}. Check username, password, and virtual host in {self.amqp_url}.",
                 exc_info=True
             )
             self.is_consuming = False
             await self.close()
             raise
         except aio_pika.exceptions.ChannelInvalidStateError as e:
-            logger.error(
-                f"Channel invalid state: {e}. Reconnecting...",
-                exc_info=True
-            )
+            logger.error(f"Channel invalid state: {e}. Reconnecting...", exc_info=True)
             self.is_consuming = False
             await self.close()
             await asyncio.sleep(2)
@@ -167,7 +158,6 @@ class RabbitMQConsumer:
             raise
 
     async def execute_update(self, task: Dict[str, Any], conn, logger: logging.Logger) -> Dict[str, Any]:
-        """Execute an UPDATE or INSERT query."""
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
         try:
@@ -208,7 +198,6 @@ class RabbitMQConsumer:
         response_queue = task.get("response_queue", self.producer.response_queue_name)
         correlation_id = task.get("correlation_id")
         logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql[:100]}, params: {params}, response_queue: {response_queue}")
-    # ... rest of the function ...
         if not params:
             raise ValueError(f"No parameters provided for SELECT query: {select_sql}")
         try:
@@ -256,7 +245,6 @@ class RabbitMQConsumer:
                 await conn.close()
 
     async def execute_sort_order_update(self, params: Dict[str, Any], file_id: str) -> bool:
-        """Execute an update_sort_order task."""
         try:
             entry_id = params.get("entry_id")
             result_id = params.get("result_id")
@@ -297,6 +285,20 @@ class RabbitMQConsumer:
                 await conn.rollback()
             return False
 
+    async def execute_new_task(self, task: Dict[str, Any], logger: logging.Logger) -> bool:
+        file_id = task.get("file_id", "unknown")
+        try:
+            logger.info(f"Processing new_task for FileID {file_id}: {task}")
+            # Example: Perform a simple database operation
+            async with async_engine.connect() as conn:
+                result = await conn.execute(text("SELECT 1 AS test"))
+                row = result.fetchone()
+                logger.info(f"New task test query returned: {row}")
+                return True
+        except Exception as e:
+            logger.error(f"Error executing new_task for FileID {file_id}: {e}", exc_info=True)
+            return False
+
     async def callback(self, message: aio_pika.IncomingMessage):
         async with self._lock:
             for attempt in range(3):
@@ -311,7 +313,7 @@ class RabbitMQConsumer:
                             await message.nack(requeue=True)
                             return
                         await asyncio.sleep(2)
-            
+        
         async with message.process(requeue=True, ignore_processed=True):
             try:
                 task = json.loads(message.body.decode())
@@ -330,6 +332,8 @@ class RabbitMQConsumer:
                             success = True
                     elif task_type == "update_sort_order":
                         success = await self.execute_sort_order_update(task.get("params", {}), file_id)
+                    elif task_type == "new_task":
+                        success = await self.execute_new_task(task, logger)
                     else:
                         async with async_engine.begin() as conn:
                             await self.execute_update(task, conn, logger)
@@ -355,7 +359,6 @@ class RabbitMQConsumer:
                 await asyncio.sleep(2)
 
     async def test_task(self, task: Dict[str, Any]) -> bool:
-        """Test a task without consuming from the queue."""
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
         logger.info(f"Testing task for FileID: {file_id}, TaskType: {task_type}")
@@ -367,6 +370,8 @@ class RabbitMQConsumer:
                         success = bool(result["results"])
                 elif task_type == "update_sort_order":
                     success = await self.execute_sort_order_update(task.get("params", {}), file_id)
+                elif task_type == "new_task":
+                    success = await self.execute_new_task(task, logger)
                 else:
                     async with async_engine.begin() as conn:
                         result = await self.execute_update(task, conn, logger)
@@ -415,13 +420,8 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
             loop.close()
         logger.info("Shutdown complete.")
 
-# ... imports and class definition unchanged ...
-
 if __name__ == "__main__":
     import argparse
-    import sys
-    import asyncio
-    import signal
 
     parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
     parser.add_argument("--clear", action="store_true", help="Manually clear the queue and exit")
