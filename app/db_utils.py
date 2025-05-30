@@ -225,7 +225,7 @@ async def insert_search_results(
                 producer = await get_producer(logger)
         except Exception as e:
             logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
-            return False
+            raise RuntimeError(f"Failed to initialize RabbitMQ producer for FileID {file_id}: {str(e)}")
 
     correlation_id = str(uuid.uuid4())
     response_queue = producer.response_queue_name
@@ -264,7 +264,7 @@ async def insert_search_results(
                     return False
             except Exception as e:
                 logger.error(f"Failed to enqueue deduplication query: {e}", exc_info=True)
-                return False
+                raise RuntimeError(f"Deduplication query failed for FileID {file_id}: {str(e)}")
 
         # Prepare and enqueue updates/inserts
         update_query = """
@@ -349,7 +349,7 @@ async def insert_search_results(
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in insert_search_results for FileID {file_id}: {e}", exc_info=True)
-        return False
+        raise
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
