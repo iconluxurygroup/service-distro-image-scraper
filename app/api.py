@@ -642,6 +642,8 @@ from ai_utils import batch_vision_reason
 from common import generate_search_variations, fetch_brand_rules, preprocess_sku
 from logging_config import setup_job_logger
 producer = None
+
+app.lifespan = lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global producer
@@ -670,7 +672,7 @@ async def lifespan(app: FastAPI):
         await async_engine.dispose()
         default_logger.info("Database engine disposed")
 
-app.lifespan = lifespan
+
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
