@@ -49,6 +49,7 @@ class RabbitMQProducer:
         self._cleanup_lock = asyncio.Lock()
 
     async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool, delete_if_mismatched: bool = False) -> bool:
+        logger =default_logger
         try:
             queue = await channel.declare_queue(queue_name, passive=True)
             is_durable = queue.durable  # Direct access to durable property
