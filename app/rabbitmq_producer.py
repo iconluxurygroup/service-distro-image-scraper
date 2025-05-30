@@ -70,13 +70,6 @@ class RabbitMQProducer:
             except aio_pika.exceptions.AMQPConnectionError as e:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 raise
-            except aio_pika.exceptions.ChannelAccessRefused as e:
-                default_logger.error(
-                    f"Permissions error connecting to RabbitMQ: {e}. "
-                    f"Ensure user has permissions on virtual host and default exchange.",
-                    exc_info=True
-                )
-                raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -84,7 +77,6 @@ class RabbitMQProducer:
         retry=retry_if_exception_type(
             aio_pika.exceptions.AMQPError,
             aio_pika.exceptions.ChannelClosed,
-            aio_pika.exceptions.ChannelAccessRefused,
             asyncio.TimeoutError
         ),
         before_sleep=lambda retry_state: default_logger.info(
