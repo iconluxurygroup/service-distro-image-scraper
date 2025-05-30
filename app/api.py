@@ -638,6 +638,7 @@ import logging
 
 
 
+
 import multiprocessing
 import asyncio
 import logging
@@ -932,111 +933,124 @@ async def process_restart_batch(
 
                                             results_written = True
 
-                                            # Run AI analysis
-                                            logger.debug(f"Running AI analysis for ResultID {result_id}, EntryID {entry_id}")
-                                            for ai_attempt in range(1, 3):
-                                                try:
-                                                    async with asyncio.timeout(60):
-                                                        ai_result = await batch_vision_reason(
-                                                            file_id=str(file_id_db),
-                                                            entry_ids=[entry_id],
-                                                            step=0,
-                                                            limit=1,
-                                                            concurrency=1,
-                                                            logger=logger,
-                                                            background_tasks=background_tasks
-                                                        )
-                                                    if ai_result["status_code"] != 200:
-                                                        logger.warning(f"AI analysis failed for EntryID {entry_id}: {ai_result['message']}")
+                                        # Stop after valid results unless use_all_variations
+                                        if valid_results and not use_all_variations:
+                                            break
+
+                                    if results_written:
+                                        # Perform search sort before AI analysis
+                                        try:
+                                            async with asyncio.timeout(30):
+                                                sort_results = await update_search_sort_order(
+                                                    file_id=str(file_id_db),
+                                                    entry_id=str(entry_id),
+                                                    brand=brand,
+                                                    model=search_string,
+                                                    color=color,
+                                                    category=category,
+                                                    logger=logger,
+                                                    brand_rules=brand_rules,
+                                                    background_tasks=background_tasks
+                                                )
+                                            if sort_results:
+                                                logger.debug(f"Sort order updated for EntryID {entry_id}")
+                                            else:
+                                                logger.warning(f"Search sort failed for EntryID {entry_id}")
+                                        except asyncio.TimeoutError as te:
+                                            logger.error(f"Timeout updating search sort for EntryID {entry_id}: {te}", exc_info=True)
+                                            continue
+                                        except Exception as e:
+                                            logger.error(f"Error updating search sort for EntryID {entry_id}: {e}", exc_info=True)
+                                            continue
+
+                                        # Fetch sorted results for AI analysis
+                                        sql = """
+                                            SELECT ResultID, AiJson
+                                            FROM utb_ImageScraperResult
+                                            WHERE EntryID = :entry_id AND SortOrder > 0
+                                        """
+                                        params = {"entry_id": entry_id}
+                                        correlation_id = str(uuid.uuid4())
+                                        try:
+                                            async with asyncio.timeout(10):
+                                                sorted_results = await enqueue_with_retry(
+                                                    sql=sql,
+                                                    params=params,
+                                                    task_type="select_sorted_results",
+                                                    correlation_id=correlation_id
+                                                )
+                                        except asyncio.TimeoutError as te:
+                                            logger.error(f"Timeout fetching sorted results for EntryID {entry_id}: {te}", exc_info=True)
+                                            continue
+                                        except Exception as e:
+                                            logger.error(f"Error fetching sorted results for EntryID {entry_id}: {e}", exc_info=True)
+                                            continue
+
+                                        if sorted_results:
+                                            # Run AI analysis on sorted results
+                                            for sorted_result in sorted_results:
+                                                result_id = sorted_result["ResultID"]
+                                                logger.debug(f"Running AI analysis for ResultID {result_id}, EntryID {entry_id}")
+                                                for ai_attempt in range(1, 3):
+                                                    try:
+                                                        async with asyncio.timeout(60):
+                                                            ai_result = await batch_vision_reason(
+                                                                file_id=str(file_id_db),
+                                                                entry_ids=[entry_id],
+                                                                step=0,
+                                                                limit=1,
+                                                                concurrency=1,
+                                                                logger=logger,
+                                                                background_tasks=background_tasks
+                                                            )
+                                                        if ai_result["status_code"] != 200:
+                                                            logger.warning(f"AI analysis failed for EntryID {entry_id}, ResultID {result_id}: {ai_result['message']}")
+                                                            if ai_attempt < 2:
+                                                                await asyncio.sleep(1)
+                                                                continue
+                                                            break
+                                                        # Check relevance
+                                                        ai_data = json.loads(sorted_result["AiJson"]) if sorted_result["AiJson"] else {}
+                                                        relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
+                                                        logger.debug(f"Relevance score for ResultID {result_id}: {relevance}")
+                                                        if relevance >= RELEVANCE_THRESHOLD:
+                                                            logger.info(f"High-relevance image (score: {relevance}) for ResultID {result_id}, EntryID {entry_id}")
+                                                            sql = """
+                                                                UPDATE utb_ImageScraperResult
+                                                                SET SortOrder = :sort_order
+                                                                WHERE ResultID = :result_id
+                                                            """
+                                                            params = {"result_id": result_id, "sort_order": 1}
+                                                            await enqueue_with_retry(
+                                                                sql=sql,
+                                                                params=params,
+                                                                task_type="update_sort_order",
+                                                                correlation_id=str(uuid.uuid4())
+                                                            )
+                                                        break
+                                                    except asyncio.TimeoutError as te:
+                                                        logger.error(f"Timeout in AI analysis for EntryID {entry_id}, ResultID {result_id}, attempt {ai_attempt}: {te}", exc_info=True)
                                                         if ai_attempt < 2:
                                                             await asyncio.sleep(1)
                                                             continue
                                                         break
-                                                    break
-                                                except asyncio.TimeoutError as te:
-                                                    logger.error(f"Timeout in AI analysis for EntryID {entry_id}, attempt {ai_attempt}: {te}", exc_info=True)
-                                                    if ai_attempt < 2:
-                                                        await asyncio.sleep(1)
-                                                        continue
-                                                    break
-                                                except Exception as e:
-                                                    logger.error(f"AI analysis error for EntryID {entry_id}, attempt {ai_attempt}: {e}", exc_info=True)
-                                                    if ai_attempt < 2:
-                                                        await asyncio.sleep(1)
-                                                        continue
-                                                    break
+                                                    except Exception as e:
+                                                        logger.error(f"AI analysis error for EntryID {entry_id}, ResultID {result_id}, attempt {ai_attempt}: {e}", exc_info=True)
+                                                        if ai_attempt < 2:
+                                                            await asyncio.sleep(1)
+                                                            continue
+                                                        break
 
-                                            # Check relevance
-                                            sql = "SELECT AiJson FROM utb_ImageScraperResult WHERE ResultID = :result_id"
-                                            params = {"result_id": result_id}
-                                            correlation_id = str(uuid.uuid4())
-                                            try:
-                                                async with asyncio.timeout(10):
-                                                    ai_data_rows = await enqueue_with_retry(
-                                                        sql=sql,
-                                                        params=params,
-                                                        task_type="select_ai_json",
-                                                        correlation_id=correlation_id
-                                                    )
-                                                ai_data = json.loads(ai_data_rows[0]["AiJson"]) if ai_data_rows and ai_data_rows[0]["AiJson"] else {}
-                                                relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
-                                                logger.debug(f"Relevance score for ResultID {result_id}: {relevance}")
-                                                if relevance >= RELEVANCE_THRESHOLD:
-                                                    logger.info(f"High-relevance image (score: {relevance}) for ResultID {result_id}, EntryID {entry_id}")
-                                                    sql = """
-                                                        UPDATE utb_ImageScraperResult
-                                                        SET SortOrder = 1
-                                                        WHERE ResultID = :result_id
-                                                    """
-                                                    params = {"result_id": result_id}
-                                                    await enqueue_with_retry(
-                                                        sql=sql,
-                                                        params=params,
-                                                        task_type="update_sort_order",
-                                                        correlation_id=str(uuid.uuid4())
-                                                    )
-                                                    sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                                                    params = {"entry_id": entry_id}
-                                                    await enqueue_with_retry(
-                                                        sql=sql,
-                                                        params=params,
-                                                        task_type="update_step1",
-                                                        correlation_id=str(uuid.uuid4())
-                                                    )
-                                                    return entry_id, True
-                                            except asyncio.TimeoutError as te:
-                                                logger.error(f"Timeout fetching AiJson for ResultID {result_id}: {te}", exc_info=True)
-                                                continue
-                                            except (json.JSONDecodeError, ValueError) as e:
-                                                logger.warning(f"Invalid AiJson for ResultID {result_id}: {e}", exc_info=True)
-                                                continue
-                                            except Exception as e:
-                                                logger.error(f"Error fetching AiJson for ResultID {result_id}: {e}", exc_info=True)
-                                                continue
-
-                                        if results_written:
-                                            sort_results = await update_search_sort_order(
-                                                file_id=str(file_id_db),
-                                                entry_id=str(entry_id),
-                                                brand=brand,
-                                                model=search_string,
-                                                color=color,
-                                                category=category,
-                                                logger=logger,
-                                                brand_rules=brand_rules,
-                                                background_tasks=background_tasks
-                                            )
-                                            if sort_results:
-                                                logger.debug(f"Sort order updated for EntryID {entry_id}")
-                                                sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
-                                                params = {"entry_id": entry_id}
-                                                await enqueue_with_retry(
-                                                    sql=sql,
-                                                    params=params,
-                                                    task_type="update_step1",
-                                                    correlation_id=str(uuid.uuid4())
-                                                )
-                                                return entry_id, True
+                                        # Update Step1 after sort and AI analysis
+                                        sql = "UPDATE utb_ImageScraperRecords SET Step1 = GETDATE() WHERE EntryID = :entry_id"
+                                        params = {"entry_id": entry_id}
+                                        await enqueue_with_retry(
+                                            sql=sql,
+                                            params=params,
+                                            task_type="update_step1",
+                                            correlation_id=str(uuid.uuid4())
+                                        )
+                                        return entry_id, True
                                 finally:
                                     await client.close()
                             except asyncio.TimeoutError as te:
@@ -1241,7 +1255,6 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines for FileID {file_id_db}")
-
 
 
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
