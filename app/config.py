@@ -14,22 +14,29 @@ if not config:
     raise SystemExit(1)
 
 # Assign config values to variables
-VERSION = config['VERSION']
-SENDER_EMAIL = config['SENDER_EMAIL']
-SENDER_PASSWORD = config['SENDER_PASSWORD']
-SENDER_NAME = config['SENDER_NAME']
-GOOGLE_API_KEY = config['GOOGLE_API_KEY']
-GROK_API_KEY = config['GROK_API_KEY']
-GROK_ENDPOINT = config['GROK_ENDPOINT']
-SEARCH_PROXY_API_URL = config['SEARCH_PROXY_API_URL']
-BRAND_RULES_URL = config['BRAND_RULES_URL']
-AWS_ACCESS_KEY_ID = config['AWS_ACCESS_KEY_ID']
-AWS_SECRET_ACCESS_KEY = config['AWS_SECRET_ACCESS_KEY']
-REGION = config['REGION']
-S3_CONFIG = config['S3_CONFIG']
-DB_PASSWORD = config['DB_PASSWORD']
-BASE_CONFIG_URL = config['BASE_CONFIG_URL']
-RABBITMQ_URL="amqp://app_user:app_password@localhost:5672/app_vhost"
+VERSION = config['version']
+SENDER_EMAIL = config['email_settings']['sender_email']
+SENDER_PASSWORD = config['email_settings']['sender_password']
+SENDER_NAME = config['email_settings']['sender_name']
+GOOGLE_API_KEY = config['api_keys']['google_api_key']
+GROK_API_KEY = config['api_keys']['grok_api_key']
+GROK_ENDPOINT = config['api_keys']['grok_endpoint']
+SEARCH_PROXY_API_URL = config['proxy_settings']['search_proxy_api_url']
+BRAND_RULES_URL = config['brand_settings']['brand_rules_url']
+AWS_ACCESS_KEY_ID = config['aws_settings']['access_key_id']
+AWS_SECRET_ACCESS_KEY = config['aws_settings']['secret_access_key']
+REGION = config['aws_settings']['region']
+S3_CONFIG = config['s3_config']
+DB_PASSWORD = config['database_settings']['db_password']
+BASE_CONFIG_URL = config['base_config']['base_config_url']
+
+# RabbitMQ configuration
+RABBITMQ_URL = config['rabbitmq_settings']['url']
+RABBITMQ_USER = config['rabbitmq_settings']['user']
+RABBITMQ_PASSWORD = config['rabbitmq_settings']['password']
+RABBITMQ_HOST = config['rabbitmq_settings']['host']
+RABBITMQ_PORT = config['rabbitmq_settings']['port']
+RABBITMQ_VHOST = config['rabbitmq_settings']['vhost']
 
 # Example: Log loaded config for debugging
-logger.info(f"Loaded config: VERSION={VERSION}, BASE_CONFIG_URL={BASE_CONFIG_URL}")
+logger.info(f"Loaded config: VERSION={VERSION}, BASE_CONFIG_URL={BASE_CONFIG_URL}, RABBITMQ_URL={RABBITMQ_URL}")
