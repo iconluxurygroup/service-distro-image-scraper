@@ -1252,7 +1252,8 @@ async def api_process_restart(file_id: str, entry_id: Optional[int] = None, back
         result = await process_restart_batch(
             file_id_db=int(file_id),
             logger=logger,
-            entry_id=entry_id
+            entry_id=entry_id,
+            num_workers=4  # Increase to 4 workers
         )
         if "error" in result:
             logger.error(f"Failed to process restart batch for FileID {file_id}: {result['error']}")
