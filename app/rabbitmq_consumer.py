@@ -302,8 +302,8 @@ class RabbitMQConsumer:
                 task_type = task.get("task_type", "unknown")
                 correlation_id = message.correlation_id
                 logger.info(
-                    f"Received task for FileID: {file_id}, TaskType: {task_type}, "
-                    f"CorrelationID: {correlation_id}, Task: {json.dumps(task)[:200]}"
+                    f"Worker PID {psutil.Process().pid}: Received task for FileID: {file_id}, "
+                    f"TaskType: {task_type}, CorrelationID: {correlation_id}, Task: {json.dumps(task)[:200]}"
                 )
                 async with asyncio.timeout(self.operation_timeout):
                     success = False
@@ -385,15 +385,10 @@ def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     """Create a signal handler for graceful shutdown."""
     def handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        # Run shutdown in the existing loop
-        asyncio.ensure_future(shutdown(consumer, loop))
-    return handler
-
-def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
-    """Create a signal handler for graceful shutdown."""
-    def handler(sig, frame):
-        logger.info(f"Received signal {sig}, shutting down gracefully...")
-        asyncio.create_task(shutdown(consumer, loop))
+        # Ensure shutdown is awaited
+        task = asyncio.ensure_future(shutdown(consumer, loop))
+        loop.run_until_complete(task)
+        exit(0)
     return handler
 
 if __name__ == "__main__":
@@ -428,12 +423,11 @@ if __name__ == "__main__":
         "timestamp": "2025-05-21T12:34:08.307076"
     }
 
-    try:
-        # Run test_task and start_consuming as a single async main function
-        async def main():
-            await consumer.test_task(sample_task)
-            await consumer.start_consuming()
+    async def main():
+        await consumer.test_task(sample_task)
+        await consumer.start_consuming()
 
+    try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, initiating shutdown")
