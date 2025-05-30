@@ -1408,19 +1408,32 @@ import json
 from collections import defaultdict
 
 # Add to existing router in api.py
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, APIRouter
+from sqlalchemy.sql import text
+import json
+from collections import defaultdict
+import math
+import logging
+from typing import Optional, List, Dict, Any
+
 @router.post("/sort-by-relevance/{file_id}", tags=["Sorting"])
 async def api_sort_by_relevance(
     file_id: str,
     entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to sort, if not all"),
+    use_softmax: bool = Query(False, description="Apply softmax normalization to composite scores"),
     background_tasks: BackgroundTasks = None
 ):
     """
-    Sort results in utb_ImageScraperResult by relevance score from AiJson for a given FileID,
-    grouping by EntryID to assign consecutive SortOrder (1, 2, 3, ...) within each EntryID.
-    Only updates records with a non-NULL AiJson field.
+    Sort results in utb_ImageScraperResult by a composite score derived from AiJson scores
+    (sentiment, relevance, category, color, brand, model) for a given FileID, grouping by
+    EntryID to assign consecutive SortOrder (1, 2, 3, ...). Only updates records with a
+    non-NULL AiJson field. Supports weighted scoring and optional softmax normalization.
     """
     logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
-    logger.info(f"Sorting results by relevance per EntryID for FileID: {file_id}, EntryIDs: {entry_ids}")
+    logger.info(
+        f"Sorting results by composite score per EntryID for FileID: {file_id}, "
+        f"EntryIDs: {entry_ids}, Use softmax: {use_softmax}"
+    )
 
     try:
         # Validate FileID exists
@@ -1434,6 +1447,17 @@ async def api_sort_by_relevance(
                 log_public_url = await upload_log_file(file_id, log_filename, logger)
                 raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
             result.close()
+
+        # Define weights for each score
+        weights = {
+            "relevance": 0.4,
+            "category": 0.2,
+            "color": 0.15,
+            "brand": 0.15,
+            "sentiment": 0.05,
+            "model": 0.05
+        }
+        logger.debug(f"Using weights: {weights}")
 
         # Fetch results with non-NULL AiJson
         query = """
@@ -1467,20 +1491,36 @@ async def api_sort_by_relevance(
                 "log_url": log_public_url
             }
 
-        # Group results by EntryID
+        # Group results by EntryID and compute composite scores
         results_by_entry = defaultdict(list)
         for row in rows:
             result_id, entry_id, ai_json = row
             try:
                 ai_data = json.loads(ai_json)
-                relevance = float(ai_data.get("scores", {}).get("relevance", 0.0))
+                scores = ai_data.get("scores", {})
+                # Extract and validate scores
+                score_values = {}
+                for key in weights:
+                    try:
+                        score = float(scores.get(key, 0.0))
+                        score_values[key] = max(0.0, min(1.0, score))  # Clamp to [0, 1]
+                    except (TypeError, ValueError):
+                        logger.warning(f"Invalid score for {key} in ResultID {result_id}: {scores.get(key)}")
+                        score_values[key] = 0.0
+
+                # Compute composite score
+                composite_score = sum(weights[key] * score_values[key] for key in weights)
                 results_by_entry[entry_id].append({
                     "ResultID": result_id,
-                    "relevance": relevance
+                    "composite_score": composite_score,
+                    "score_details": score_values
                 })
+                logger.debug(
+                    f"ResultID {result_id}, EntryID {entry_id}: "
+                    f"Scores {score_values}, Composite Score {composite_score:.4f}"
+                )
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning(f"Invalid AiJson for ResultID {result_id}, EntryID {entry_id}: {e}")
-                # Skip records with invalid AiJson
                 continue
 
         if not results_by_entry:
@@ -1493,17 +1533,41 @@ async def api_sort_by_relevance(
                 "log_url": log_public_url
             }
 
+        # Apply softmax normalization if requested
+        if use_softmax:
+            for entry_id, results in results_by_entry.items():
+                # Extract composite scores
+                scores = [result["composite_score"] for result in results]
+                if not scores:
+                    continue
+                # Compute softmax
+                exp_scores = [math.exp(score) for score in scores]
+                sum_exp_scores = sum(exp_scores)
+                if sum_exp_scores == 0:
+                    softmax_scores = [0.0] * len(scores)  # Avoid division by zero
+                else:
+                    softmax_scores = [exp_score / sum_exp_scores for exp_score in exp_scores]
+                # Update composite scores with softmax values
+                for result, softmax_score in zip(results, softmax_scores):
+                    result["composite_score"] = softmax_score
+                    logger.debug(
+                        f"ResultID {result['ResultID']}, EntryID {entry_id}: "
+                        f"Softmax Score {softmax_score:.4f}"
+                    )
+
         # Sort and assign SortOrder per EntryID
         updates = []
         for entry_id, results in results_by_entry.items():
-            # Sort by relevance (descending), then by ResultID (ascending) for stable sorting
-            results.sort(key=lambda x: (x["relevance"], -x["ResultID"]), reverse=True)
+            # Sort by composite_score (descending), then by ResultID (ascending) for stable sorting
+            results.sort(key=lambda x: (x["composite_score"], -x["ResultID"]), reverse=True)
             # Assign consecutive SortOrder (1, 2, 3, ...)
             for sort_order, result in enumerate(results, 1):
                 updates.append({
                     "result_id": result["ResultID"],
                     "sort_order": sort_order,
-                    "entry_id": entry_id
+                    "entry_id": entry_id,
+                    "composite_score": result["composite_score"],
+                    "score_details": result["score_details"]
                 })
             logger.debug(f"Assigned SortOrder for {len(results)} results in EntryID {entry_id}")
 
@@ -1522,7 +1586,10 @@ async def api_sort_by_relevance(
                     }
                 )
             await conn.commit()
-            logger.info(f"Updated SortOrder for {len(updates)} results across {len(results_by_entry)} EntryIDs for FileID {file_id}")
+            logger.info(
+                f"Updated SortOrder for {len(updates)} results across "
+                f"{len(results_by_entry)} EntryIDs for FileID {file_id}"
+            )
 
         # Enqueue verification task
         if background_tasks:
@@ -1537,25 +1604,37 @@ async def api_sort_by_relevance(
                 GROUP BY EntryID
             """
             params = {"file_id": int(file_id)}
+            correlation_id = str(uuid.uuid4())
             await enqueue_db_update(
                 file_id=file_id,
                 sql=sql,
                 params=params,
                 background_tasks=background_tasks,
                 task_type="verify_sort_order",
-                producer=RabbitMQProducer()
+                producer=RabbitMQProducer(),
+                correlation_id=correlation_id
             )
-            logger.info(f"Enqueued SortOrder verification for FileID {file_id}")
+            logger.info(f"Enqueued SortOrder verification for FileID {file_id}, CorrelationID: {correlation_id}")
 
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         return {
             "status": "success",
             "status_code": 200,
-            "message": f"Sorted {len(updates)} results with AiJson by relevance across {len(results_by_entry)} EntryIDs for FileID {file_id}",
+            "message": (
+                f"Sorted {len(updates)} results by composite score across "
+                f"{len(results_by_entry)} EntryIDs for FileID {file_id}"
+                f"{' with softmax normalization' if use_softmax else ''}"
+            ),
             "log_url": log_public_url,
             "data": {
                 "sorted_results": [
-                    {"ResultID": u["result_id"], "EntryID": u["entry_id"], "SortOrder": u["sort_order"]}
+                    {
+                        "ResultID": u["result_id"],
+                        "EntryID": u["entry_id"],
+                        "SortOrder": u["sort_order"],
+                        "CompositeScore": u["composite_score"],
+                        "ScoreDetails": u["score_details"]
+                    }
                     for u in updates
                 ]
             }
@@ -1564,7 +1643,7 @@ async def api_sort_by_relevance(
     except Exception as e:
         logger.error(f"Error sorting by relevance for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
-        raise HTTPException(status_code=500, detail=f"Error sorting by relevance: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error sorting by composite score: {str(e)}")
 
 @router.post("/reset-step1/{file_id}", tags=["Database"])
 async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
