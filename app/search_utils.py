@@ -137,16 +137,10 @@ async def insert_search_results(
             missing_cols = required_columns - set(res.keys())
             logger.error(f"Worker PID {process.pid}: Missing required columns: {missing_cols}")
             return False
-
-    deduped_results = list(
-        {(res["EntryID"], res.get("ImageUrl", "")): res for res in results}.values()
-    )
-    logger.info(f"Worker PID {process.pid}: Deduplicated from {len(results)} to {len(deduped_results)} rows")
-
     data = []
     errors = []
 
-    for res in deduped_results:
+    for res in results:
         try:
             entry_id = int(res["EntryID"])
         except (ValueError, TypeError) as e:
