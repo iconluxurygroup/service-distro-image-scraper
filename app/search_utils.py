@@ -131,9 +131,13 @@ async def insert_search_results(
                 insert_batch.append((insert_query, params))
 
         batch_size = 100
+        update_correlation_ids = []
+        insert_correlation_ids = []
         for i in range(0, len(update_batch), batch_size):
             batch = update_batch[i:i + batch_size]
             for sql, params in batch:
+                cid = str(uuid.uuid4())
+                update_correlation_ids.append(cid)
                 await enqueue_db_update(
                     file_id=file_id,
                     sql=sql,
@@ -141,14 +145,16 @@ async def insert_search_results(
                     background_tasks=background_tasks,
                     task_type="update_search_result",
                     producer=producer,
-                    correlation_id=str(uuid.uuid4()),
+                    correlation_id=cid,
                     logger=logger
                 )
-        logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates")
+        logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates with correlation IDs: {update_correlation_ids}")
 
         for i in range(0, len(insert_batch), batch_size):
             batch = insert_batch[i:i + batch_size]
             for sql, params in batch:
+                cid = str(uuid.uuid4())
+                insert_correlation_ids.append(cid)
                 await enqueue_db_update(
                     file_id=file_id,
                     sql=sql,
@@ -156,12 +162,22 @@ async def insert_search_results(
                     background_tasks=background_tasks,
                     task_type="insert_search_result",
                     producer=producer,
-                    correlation_id=str(uuid.uuid4()),
+                    correlation_id=cid,
                     logger=logger
                 )
-        logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts")
+        logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with correlation IDs: {insert_correlation_ids}")
 
-        return len(insert_batch) > 0 or len(update_batch) > 0
+        # Verify database changes
+        async with async_engine.connect() as conn:
+            query = text("""
+                SELECT COUNT(*) FROM utb_ImageScraperResult
+                WHERE EntryID IN :entry_ids AND CreateTime = :create_time
+            """)
+            result = await conn.execute(query, {"entry_ids": tuple(entry_ids), "create_time": create_time})
+            inserted_count = result.scalar()
+            logger.info(f"Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
+
+        return inserted_count > 0 or len(update_batch) > 0
 
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in insert_search_results for FileID {file_id}: {e}", exc_info=True)
