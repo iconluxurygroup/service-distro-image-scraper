@@ -211,13 +211,10 @@ class RabbitMQConsumer:
             logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
             if response_queue:
                 producer = await RabbitMQProducer.get_producer(logger=logger)
-                try:
-                    await producer.connect()
-                    response = {"file_id": file_id, "results": results}
-                    await producer.publish_message(response, routing_key=response_queue, correlation_id=file_id)
-                    logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
-                finally:
-                    pass  # Do not close producer
+                await producer.connect()
+                response = {"file_id": file_id, "results": results}
+                await producer.publish_message(response, routing_key=response_queue, correlation_id=file_id)
+                logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
             return results
         except SQLAlchemyError as e:
             logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)

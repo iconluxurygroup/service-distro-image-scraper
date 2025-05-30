@@ -217,7 +217,12 @@ async def insert_search_results(
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     process = psutil.Process()
     logger.info(f"Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
-
+    if entry_ids:
+        async with async_engine.connect() as conn:
+            query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
+            result = await conn.execute(query, {"entry_ids": tuple(entry_ids)})
+            count = result.scalar()
+            logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {entry_ids}")
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
