@@ -4,14 +4,15 @@ import signal
 import sys
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import BackgroundTasks
 from api import app
 import os
 from waitress import serve
+from sqlalchemy.sql import text
 from rabbitmq_producer import cleanup_producer, get_producer
-from search_utils import insert_search_results
-from database_config import async_engine
 from logging_config import setup_job_logger
-from fastapi import BackgroundTasks
+from db_utils import insert_search_results
+from database_config import async_engine
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -36,8 +37,8 @@ async def test_insert_search_result():
         ]
 
         # Initialize RabbitMQ producer
-        producer = await get_producer(logger)
-        if not producer or not producer.is_connected:
+        local_producer = await get_producer(logger)
+        if not local_producer or not local_producer.is_connected:
             logger.error("Failed to initialize RabbitMQ producer for test")
             return
 
@@ -74,6 +75,11 @@ async def test_insert_search_result():
             else:
                 logger.warning(f"Verification failed: No records found for EntryID 9999")
 
+        # Clean up local producer
+        if local_producer and local_producer.is_connected:
+            await local_producer.close()
+            logger.info("Local RabbitMQ producer closed")
+
     except Exception as e:
         logger.error(f"Error during test insertion: {e}", exc_info=True)
     finally:
@@ -101,8 +107,8 @@ if __name__ == "__main__":
     )
 
     # Register shutdown handlers
-    signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
     # Run test insertion on startup
     asyncio.run(test_insert_search_result())
@@ -140,7 +146,7 @@ if __name__ == "__main__":
                 return self.application
 
         options = {
-            "bind": f"0.0.0.0:8080",
+            "bind": "0.0.0.0:8080",
             "workers": int(os.cpu_count() / 2 + 1),
             "worker_class": "uvicorn.workers.UvicornWorker",
             "loglevel": "info",
