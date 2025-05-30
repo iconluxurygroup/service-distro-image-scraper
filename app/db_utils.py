@@ -217,92 +217,278 @@ def flatten_entry_ids(entry_ids, logger, correlation_id):
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
-async def enqueue_db_update(
-    file_id: str,
-    sql: str,
-    params: Dict[str, Any],
-    background_tasks: BackgroundTasks,
-    task_type: str = "db_update",
-    producer: Optional[RabbitMQProducer] = None,
-    response_queue: Optional[str] = None,
-    correlation_id: Optional[str] = None,
-    return_result: bool = False,
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
+        f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
+        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
+async def insert_search_results(
+    results: List[Dict],
     logger: Optional[logging.Logger] = None,
-):
+    file_id: str = None,
+    background_tasks: Optional[BackgroundTasks] = None
+) -> bool:
     logger = logger or logging.getLogger(__name__)
     if not logger.handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    process = psutil.Process()
+    correlation_id = str(uuid.uuid4())
+    logger.info(f"[{correlation_id}] Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
 
-    should_close = False
+    if not results:
+        logger.warning(f"[{correlation_id}] Worker PID {process.pid}: Empty results provided")
+        return False
+
+    data = []
+    errors = []
+
+    logger.debug(f"[{correlation_id}] Input results: {results}")
+    for res in results:
+        try:
+            entry_id = int(res["EntryID"])
+            logger.debug(f"[{correlation_id}] EntryID: {entry_id}, type: {type(entry_id)}")
+        except (ValueError, TypeError) as e:
+            errors.append(f"Invalid EntryID value: {res.get('EntryID')}")
+            logger.error(f"[{correlation_id}] Worker PID {process.pid}: {errors[-1]}")
+            continue
+
+        category = res.get("ProductCategory", "").lower()
+        image_url = clean_url_string(res.get("ImageUrl", ""), logger=logger)
+        image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""), logger=logger)
+        image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False)
+        image_source = clean_url_string(res.get("ImageSource", ""), logger=logger)
+
+        if not image_url or not validate_thumbnail_url(image_url, logger):
+            errors.append(f"Invalid ImageUrl skipped: {image_url}")
+            logger.debug(f"[{correlation_id}] Worker PID {process.pid}: {errors[-1]}")
+            continue
+        if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
+            image_url_thumbnail = None
+
+        data.append({
+            "EntryID": entry_id,
+            "ImageUrl": image_url,
+            "ImageDesc": image_desc or None,
+            "ImageSource": image_source or None,
+            "ImageUrlThumbnail": image_url_thumbnail or None,
+            "CreateTime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    if not data:
+        logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No valid rows to insert. Errors: {errors}")
+        return False
+
+    producer = await RabbitMQProducer.get_producer(logger=logger)
     consumer = None
-    if producer is None:
-        producer = await RabbitMQProducer.get_producer(logger=logger)
-        should_close = True
+    consume_task = None
+    response_queue = None
+    register_shutdown_handler(producer, None, logger, correlation_id)
 
     try:
+        response_queue = f"select_response_{uuid.uuid4().hex}"
+        logger.debug(f"[{correlation_id}] Declaring response queue: {response_queue}")
         await producer.connect()
-        sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
-        update_task = {
-            "file_id": file_id,
-            "task_type": task_type,
-            "sql": sql_str,
-            "params": params,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "response_queue": response_queue,
-        }
-        if return_result and response_queue:
-            consumer = RabbitMQConsumer(
-                amqp_url=producer.amqp_url,
-                queue_name=response_queue,
-                connection_timeout=10.0,
-                operation_timeout=5.0,
-            )
+        channel = producer.channel
+        queue = await channel.declare_queue(
+            response_queue,
+            exclusive=True,
+            auto_delete=True,
+            arguments={"x-expires": 300000}  # Queue expires after 5 minutes
+        )
+        logger.debug(f"[{correlation_id}] Queue {response_queue} declared successfully")
+
+        response_received = asyncio.Event()
+        response_data = []
+
+        async def consume_responses():
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process():
+                        if message.correlation_id == correlation_id:
+                            response_data.append(json.loads(message.body.decode()))
+                            response_received.set()
+                            logger.debug(f"[{correlation_id}] Received response for FileID {file_id}")
+
+        def flatten_entry_ids(entry_ids, logger, correlation_id):
+            flat_ids = []
+            for id in entry_ids:
+                if isinstance(id, (list, tuple)):
+                    flat_ids.extend(flatten_entry_ids(id, logger, correlation_id))
+                elif isinstance(id, int):
+                    flat_ids.append(id)
+                else:
+                    logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}, type: {type(id)}")
+            return flat_ids
+
+        entry_ids = list(set(row["EntryID"] for row in data))
+        logger.debug(f"[{correlation_id}] Raw EntryIDs: {entry_ids}, type: {type(entry_ids)}")
+        flat_entry_ids = flatten_entry_ids(entry_ids, logger, correlation_id)
+        logger.debug(f"[{correlation_id}] Flattened EntryIDs: {flat_entry_ids}, type: {type(flat_entry_ids)}")
+        if not flat_entry_ids:
+            logger.warning(f"[{correlation_id}] No valid EntryIDs after flattening")
+            return False
+
+        # Pre-check for existing rows
+        if flat_entry_ids:
+            async with async_engine.connect() as conn:
+                if len(flat_entry_ids) == 1:
+                    query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id")
+                    result = await conn.execute(query, {"entry_id": flat_entry_ids[0]})
+                else:
+                    query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
+                    result = await conn.execute(query, {"entry_ids": tuple(flat_entry_ids)})
+                count = result.scalar()
+                logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {flat_entry_ids}")
+
+        existing_keys = set()
+        if flat_entry_ids:
+            if len(flat_entry_ids) == 1:
+                select_query = text("""
+                    SELECT EntryID, ImageUrl
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID = :entry_id
+                """)
+                params = {"entry_id": flat_entry_ids[0]}
+            else:
+                select_query = text("""
+                    SELECT EntryID, ImageUrl
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN :entry_ids
+                """)
+                params = {"entry_ids": tuple(flat_entry_ids)}
             try:
-                await consumer.connect()
-                logger.debug(f"[{correlation_id}] Connected to consumer for queue {response_queue}")
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=select_query,
+                    params=params,
+                    background_tasks=background_tasks,
+                    task_type="select_deduplication",
+                    producer=producer,
+                    response_queue=response_queue,
+                    correlation_id=correlation_id,
+                    return_result=True,
+                    logger=logger
+                )
+                logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued SELECT query for {len(flat_entry_ids)} EntryIDs")
             except aiormq.exceptions.ChannelLockedResource as e:
-                logger.error(f"[{correlation_id}] Failed to connect to queue {response_queue}: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"[{correlation_id}] Unexpected error connecting to queue {response_queue}: {e}")
+                logger.error(f"[{correlation_id}] Queue {response_queue} locked: {e}")
                 raise
 
-            result_future = asyncio.Future()
-
-            async def temp_callback(message: aio_pika.IncomingMessage):
-                async with message.process():
-                    if message.correlation_id == correlation_id:
-                        response = json.loads(message.body.decode())
-                        result_future.set_result(response.get("results", []))
-                        logger.info(f"[{correlation_id}] Received response for correlation_id {correlation_id} from {response_queue}")
-
-            queue = await consumer.channel.get_queue(response_queue)
-            await queue.consume(temp_callback)
-
-            await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
-            logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
-
+            consume_task = asyncio.create_task(consume_responses())
             try:
                 async with asyncio.timeout(120):
-                    result = await result_future
-                    logger.info(f"[{correlation_id}] Received deduplication result for FileID: {file_id}")
-                    return result
+                    await response_received.wait()
+                if response_data:
+                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
+                    logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                else:
+                    logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No deduplication results received")
             except asyncio.TimeoutError:
-                logger.error(f"[{correlation_id}] Timeout waiting for deduplication response for FileID: {file_id}")
+                logger.error(f"[{correlation_id}] Worker PID {process.pid}: Timeout waiting for SELECT results")
                 raise
-        else:
-            await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
-            logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
+            finally:
+                if consume_task:
+                    consume_task.cancel()
+                    await asyncio.sleep(0.5)
+
+        update_query = """
+            UPDATE utb_ImageScraperResult
+            SET ImageDesc = :ImageDesc,
+                ImageSource = :ImageSource,
+                ImageUrlThumbnail = :ImageUrlThumbnail,
+                CreateTime = :CreateTime
+            WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
+        """
+        insert_query = """
+            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+            VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
+        """
+
+        update_batch = []
+        insert_batch = []
+        for row in data:
+            key = (row["EntryID"], row["ImageUrl"])
+            if key in existing_keys:
+                update_batch.append((update_query, row))
+            else:
+                insert_batch.append((insert_query, row))
+
+        batch_size = 100
+        update_cids = []
+        insert_cids = []
+        for i in range(0, len(update_batch), batch_size):
+            batch = update_batch[i:i + batch_size]
+            for sql, params in batch:
+                cid = str(uuid.uuid4())
+                update_cids.append(cid)
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=sql,
+                    params=params,
+                    background_tasks=background_tasks,
+                    task_type="update_search_result",
+                    producer=producer,
+                    correlation_id=cid,
+                    logger=logger
+                )
+        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
+
+        for i in range(0, len(insert_batch), batch_size):
+            batch = insert_batch[i:i + batch_size]
+            for sql, params in batch:
+                cid = str(uuid.uuid4())
+                insert_cids.append(cid)
+                await enqueue_db_update(
+                    file_id=file_id,
+                    sql=sql,
+                    params=params,
+                    background_tasks=background_tasks,
+                    task_type="insert_search_result",
+                    producer=producer,
+                    correlation_id=cid,
+                    logger=logger
+                )
+        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
+
+        async with async_engine.connect() as conn:
+            if len(flat_entry_ids) == 1:
+                query = text("""
+                    SELECT COUNT(*) FROM utb_ImageScraperResult
+                    WHERE EntryID = :entry_id AND CreateTime >= :create_time
+                """)
+                result = await conn.execute(query, {
+                    "entry_id": flat_entry_ids[0],
+                    "create_time": min(row["CreateTime"] for row in data)
+                })
+            else:
+                query = text("""
+                    SELECT COUNT(*) FROM utb_ImageScraperResult
+                    WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
+                """)
+                result = await conn.execute(query, {
+                    "entry_ids": tuple(flat_entry_ids),
+                    "create_time": min(row["CreateTime"] for row in data)
+                })
+            inserted_count = result.scalar()
+            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
+
+        return len(insert_batch) > 0 or len(update_batch) > 0
+
     except Exception as e:
-        logger.error(f"[{correlation_id}] Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
+        logger.error(f"[{correlation_id}] Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         raise
     finally:
         if consumer:
             await consumer.close()
             logger.debug(f"[{correlation_id}] Closed RabbitMQ consumer for queue {response_queue}")
-        if should_close and producer:
+        if producer:
             await producer.close()
-            logger.debug(f"[{correlation_id}] Closed RabbitMQ producer for FileID: {file_id}")
+            logger.debug(f"[{correlation_id}] Closed RabbitMQ producer")
+        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Completed insert_search_results for FileID {file_id}")
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
