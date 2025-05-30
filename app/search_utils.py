@@ -434,6 +434,9 @@ async def update_search_sort_order(
 
             logger.info(f"Worker PID {process.pid}: Processed SortOrder updates for {total_updated} rows for EntryID {entry_id}")
             return update_data if total_updated > 0 else []
+        except Exception as e:
+            logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
+        raise
     except Exception as e:
         logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
         raise
