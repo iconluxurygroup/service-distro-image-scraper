@@ -221,7 +221,7 @@ class RabbitMQProducer:
 )
 async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProducer:
     logger = logger or default_logger
-
+    producer = None
     if not RABBITMQ_URL:
         logger.error("RABBITMQ_URL environment variable not set")
         raise ValueError("RABBITMQ_URL not configured")
