@@ -1502,6 +1502,374 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Error enqueuing Step1 reset for FileID {file_id}: {str(e)}")
 
 
+@router.post("/validate-images/{file_id}", tags=["Validation"])
+async def api_validate_images(
+    file_id: str,
+    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to validate, if not all"),
+    concurrency: int = Query(10, description="Maximum concurrent image download tasks"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Validates images in utb_ImageScraperResult for a given FileID by attempting to download them.
+    If the main ImageUrl fails, tries ImageUrlThumbnail. If both fail, sets SortOrder to -5 (invalid).
+    Only processes results with non-NULL ImageUrl and SortOrder >= 0.
+    """
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Validating images for FileID: {file_id}, EntryIDs: {entry_ids}, Concurrency: {concurrency}")
 
+    try:
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id} does not exist")
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
+
+        # Fetch results to validate (non-NULL ImageUrl, SortOrder >= 0)
+        query = """
+            SELECT ResultID, EntryID, ImageUrl, ImageUrlThumbnail
+            FROM utb_ImageScraperResult
+            WHERE EntryID IN (
+                SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
+            )
+            AND ImageUrl IS NOT NULL
+            AND SortOrder >= 0
+        """
+        params = {"file_id": int(file_id)}
+        if entry_ids:
+            query += " AND EntryID IN :entry_ids"
+            params["entry_ids"] = tuple(entry_ids)
+
+        async with async_engine.connect() as conn:
+            result = await conn.execute(text(query), params)
+            results = [
+                {
+                    "ResultID": row[0],
+                    "EntryID": row[1],
+                    "ImageUrl": row[2],
+                    "ImageUrlThumbnail": row[3]
+                }
+                for row in result.fetchall()
+            ]
+            result.close()
+
+        if not results:
+            logger.warning(
+                f"No valid images found for FileID {file_id}" +
+                (f", EntryIDs {entry_ids}" if entry_ids else "")
+            )
+            log_public_url = await upload_log_file(file_id, log_filename, logger)
+            return {
+                "status": "success",
+                "status_code": 200,
+                "message": "No valid images found to validate",
+                "log_url": log_public_url,
+                "data": {"validated": 0, "invalid": 0}
+            }
+
+        logger.info(f"Found {len(results)} images to validate for FileID {file_id}")
+
+        # Ensure global producer is available
+        if not producer:
+            logger.error("RabbitMQ producer not initialized")
+            raise ValueError("RabbitMQ producer not initialized")
+
+        # Semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def validate_image(result: dict) -> dict:
+            async with semaphore:
+                result_id = result["ResultID"]
+                entry_id = result["EntryID"]
+                image_url = result["ImageUrl"]
+                thumbnail_url = result["ImageUrlThumbnail"]
+                logger.debug(f"Validating ResultID {result_id}, EntryID {entry_id}, ImageUrl: {image_url}")
+
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    # Try main image
+                    is_valid = False
+                    try:
+                        response = await client.get(image_url, follow_redirects=True)
+                        if response.status_code == 200 and "image" in response.headers.get("content-type", "").lower():
+                            logger.debug(f"Valid image for ResultID {result_id}: {image_url}")
+                            is_valid = True
+                        else:
+                            logger.warning(
+                                f"Invalid image for ResultID {result_id}: "
+                                f"Status {response.status_code}, Content-Type {response.headers.get('content-type')}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to download image for ResultID {result_id}: {e}")
+
+                    # If main image fails, try thumbnail
+                    if not is_valid and thumbnail_url and thumbnail_url != image_url:
+                        try:
+                            response = await client.get(thumbnail_url, follow_redirects=True)
+                            if response.status_code == 200 and "image" in response.headers.get("content-type", "").lower():
+                                logger.debug(f"Valid thumbnail for ResultID {result_id}: {thumbnail_url}")
+                                is_valid = True
+                            else:
+                                logger.warning(
+                                    f"Invalid thumbnail for ResultID {result_id}: "
+                                    f"Status {response.status_code}, Content-Type {response.headers.get('content-type')}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to download thumbnail for ResultID {result_id}: {e}")
+
+                    if not is_valid:
+                        # Enqueue update to set SortOrder = -5
+                        sql = """
+                            UPDATE utb_ImageScraperResult
+                            SET SortOrder = -5
+                            WHERE ResultID = :result_id
+                        """
+                        params = {"result_id": result_id}
+                        correlation_id = str(uuid.uuid4())
+                        await enqueue_db_update(
+                            file_id=file_id,
+                            sql=sql,
+                            params=params,
+                            background_tasks=background_tasks,
+                            task_type="mark_invalid_image",
+                            correlation_id=correlation_id
+                        )
+                        logger.info(
+                            f"Enqueued SortOrder=-5 for ResultID {result_id}, "
+                            f"EntryID {entry_id}, CorrelationID: {correlation_id}"
+                        )
+                        return {"ResultID": result_id, "EntryID": entry_id, "valid": False}
+                    return {"ResultID": result_id, "EntryID": entry_id, "valid": True}
+
+        # Process images concurrently
+        validation_results = await asyncio.gather(
+            *(validate_image(result) for result in results),
+            return_exceptions=True
+        )
+
+        validated_count = 0
+        invalid_count = 0
+        for res in validation_results:
+            if isinstance(res, Exception):
+                logger.error(f"Error validating image: {res}", exc_info=True)
+                invalid_count += 1
+                continue
+            if res["valid"]:
+                validated_count += 1
+            else:
+                invalid_count += 1
+
+        logger.info(
+            f"Validation complete for FileID {file_id}: "
+            f"{validated_count} valid, {invalid_count} invalid"
+        )
+
+        # Enqueue verification task
+        if background_tasks:
+            sql = """
+                SELECT ResultID, EntryID, SortOrder
+                FROM utb_ImageScraperResult
+                WHERE EntryID IN (
+                    SELECT EntryID FROM utb_ImageScraperRecords WHERE FileID = :file_id
+                )
+                AND SortOrder = -5
+            """
+            params = {"file_id": int(file_id)}
+            correlation_id = str(uuid.uuid4())
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=sql,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="verify_invalid_images",
+                correlation_id=correlation_id
+            )
+            logger.info(f"Enqueued verification of invalid images for FileID {file_id}, CorrelationID: {correlation_id}")
+
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Validated {len(results)} images for FileID {file_id}: {validated_count} valid, {invalid_count} invalid",
+            "log_url": log_public_url,
+            "data": {
+                "validated": validated_count,
+                "invalid": invalid_count,
+                "results": [
+                    res for res in validation_results if not isinstance(res, Exception)
+                ]
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error validating images for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error validating images for FileID {file_id}: {str(e)}")
+    finally:
+        await async_engine.dispose()
+        logger.info(f"Disposed database engine for FileID {file_id}")
+
+@router.post("/reset-step1-no-results/{file_id}", tags=["Database"])
+async def api_reset_step1_no_results(
+    file_id: str,
+    entry_ids: Optional[List[int]] = Query(None, description="List of EntryIDs to check and reset Step1 for, if not all"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Checks utb_ImageScraperResult for each EntryID in the given FileID. If zero results are found,
+    sets Step1 to NULL in utb_ImageScraperRecords. Optionally restricts to specific EntryIDs.
+    """
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    logger.info(f"Resetting Step1 for entries with no results for FileID: {file_id}" + (f", EntryIDs: {entry_ids}" if entry_ids else ""))
+
+    try:
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id} does not exist")
+                log_public_url = await upload_file_to_space(
+                    file_src=log_filename,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
+
+        # Fetch EntryIDs with zero results in utb_ImageScraperResult
+        query = """
+            SELECT r.EntryID
+            FROM utb_ImageScraperRecords r
+            LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+            WHERE r.FileID = :file_id
+            AND t.EntryID IS NULL
+        """
+        params = {"file_id": int(file_id)}
+        if entry_ids:
+            placeholders = ",".join(f":entry_id_{i}" for i in range(len(entry_ids)))
+            query += f" AND r.EntryID IN ({placeholders})"
+            for i, entry_id in enumerate(entry_ids):
+                params[f"entry_id_{i}"] = entry_id
+
+        async with async_engine.connect() as conn:
+            result = await conn.execute(text(query), params)
+            entries_to_reset = [row[0] for row in result.fetchall()]
+            result.close()
+
+        if not entries_to_reset:
+            logger.info(f"No entries with zero results found for FileID: {file_id}")
+            log_public_url = await upload_file_to_space(
+                file_src=log_filename,
+                save_as=f"job_logs/job_{file_id}.log",
+                is_public=True,
+                logger=logger,
+                file_id=file_id
+            )
+            return {
+                "status": "success",
+                "status_code": 200,
+                "message": "No entries with zero results found to reset",
+                "log_url": log_public_url,
+                "data": {"entries_reset": 0, "entry_ids": []}
+            }
+
+        logger.info(f"Found {len(entries_to_reset)} entries with zero results to reset Step1 for FileID: {file_id}: {entries_to_reset}")
+
+        # Ensure global producer is available
+        if not producer:
+            logger.error("RabbitMQ producer not initialized")
+            raise ValueError("RabbitMQ producer not initialized")
+
+        # Enqueue Step1 reset for each EntryID
+        sql = """
+            UPDATE utb_ImageScraperRecords
+            SET Step1 = NULL
+            WHERE EntryID = :entry_id
+        """
+        correlation_id = str(uuid.uuid4())
+        rows_affected = 0
+        for entry_id in entries_to_reset:
+            params = {"entry_id": entry_id}
+            result = await enqueue_db_update(
+                file_id=file_id,
+                sql=sql,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="reset_step1_no_results",
+                correlation_id=correlation_id,
+                return_result=True
+            )
+            rows_affected += result or 0
+            logger.debug(f"Enqueued Step1 reset for EntryID: {entry_id}, CorrelationID: {correlation_id}")
+
+        # Verify updates
+        async def verify_updates():
+            async with async_engine.connect() as conn:
+                verify_query = """
+                    SELECT r.EntryID
+                    FROM utb_ImageScraperRecords r
+                    LEFT JOIN utb_ImageScraperResult t ON r.EntryID = t.EntryID
+                    WHERE r.FileID = :file_id
+                    AND r.Step1 IS NULL
+                    AND t.EntryID IS NULL
+                """
+                verify_params = {"file_id": int(file_id)}
+                if entry_ids:
+                    placeholders = ",".join(f":entry_id_{i}" for i in range(len(entry_ids)))
+                    verify_query += f" AND r.EntryID IN ({placeholders})"
+                    for i, entry_id in enumerate(entry_ids):
+                        verify_params[f"entry_id_{i}"] = entry_id
+                result = await conn.execute(text(verify_query), verify_params)
+                verified_entries = [row[0] for row in result.fetchall()]
+                result.close()
+                if set(entries_to_reset).issubset(set(verified_entries)):
+                    logger.info(f"Verified {len(verified_entries)} entries with Step1 = NULL: {verified_entries}")
+                    return verified_entries
+                logger.warning(f"Verification failed: Expected {entries_to_reset}, got {verified_entries}")
+                raise Exception(f"Verification failed: Expected {entries_to_reset}, got {verified_entries}")
+
+        verified_entries = await verify_updates()
+
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id}.log",
+            is_public=True,
+            logger=logger,
+            file_id=file_id
+        )
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Enqueued Step1 reset for {rows_affected} entries with no results for FileID: {file_id}",
+            "log_url": log_public_url,
+            "data": {
+                "file_id": file_id,
+                "entries_reset": rows_affected,
+                "entry_ids": entries_to_reset,
+                "verified_entries": verified_entries,
+                "correlation_id": correlation_id
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error resetting Step1 for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id}.log",
+            is_public=True,
+            logger=logger,
+            file_id=file_id
+        )
+        raise HTTPException(status_code=500, detail=f"Error resetting Step1 for FileID {file_id}: {str(e)}")
+    finally:
+        await async_engine.dispose()
+        logger.info(f"Disposed database engine for FileID {file_id}")
 
 app.include_router(router, prefix="/api/v5")
