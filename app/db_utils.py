@@ -15,7 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from database_config import conn_str, async_engine
 from s3_utils import upload_file_to_space
-
+producer = None
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
