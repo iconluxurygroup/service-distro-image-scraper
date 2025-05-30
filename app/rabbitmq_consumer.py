@@ -421,11 +421,15 @@ if __name__ == "__main__":
     import argparse
     import sys
     import asyncio
+    import signal
     from rabbitmq_test import test_rabbitmq_connection
 
     parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
     parser.add_argument("--clear", action="store_true", help="Manually clear the queue and exit")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
 
     producer = RabbitMQProducer()
     consumer = RabbitMQConsumer(producer=producer)
@@ -436,7 +440,7 @@ if __name__ == "__main__":
     async def main():
         try:
             logger.info("Testing RabbitMQ producer and consumer connections on startup...")
-            if not await test_rabbitmq_connection(logger):
+            if not await test_rabbitmq_connection(logger=logger):
                 logger.error("RabbitMQ connection test failed, exiting")
                 sys.exit(1)
             logger.info("RabbitMQ connection test passed")
@@ -457,7 +461,9 @@ if __name__ == "__main__":
                 },
                 "timestamp": "2025-05-21T12:34:08.307076"
             }
+            logger.info(f"Testing sample task: {sample_task}")
             await consumer.test_task(sample_task)
+            logger.info("Sample task completed, starting consumer...")
             await consumer.start_consuming()
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt in main, shutting down...")
@@ -471,14 +477,12 @@ if __name__ == "__main__":
 
     try:
         loop.run_until_complete(main())
-    except SystemExit as e:
-        # Handle exit without cleanup errors
+    except SystemExit:
         pass
     except Exception as e:
         logger.error(f"Error running main: {e}", exc_info=True)
     finally:
         try:
-            # Cancel tasks while loop is active
             tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
             for task in tasks:
                 task.cancel()
