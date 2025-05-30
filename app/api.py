@@ -1561,36 +1561,73 @@ async def api_sort_by_relevance(
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error sorting by composite score: {str(e)}")
 
-@router.post("/reset_step1/{file_id}")
-async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None):
+@router.post("/reset-step1/{file_id}", tags=["Database"])
+async def api_reset_step1(
+    file_id: str,
+    background_tasks: BackgroundTasks,
+    logger: Optional[logging.Logger] = None
+):
     logger = logger or default_logger
     logger.info(f"Resetting Step1 for FileID: {file_id}")
     
     try:
         # Ensure producer is initialized
         producer = await get_producer(logger)
+        logger.debug(f"Producer initialized for FileID: {file_id}, connected: {producer.is_connected}")
         
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"FileID {file_id} does not exist")
+                log_public_url = await upload_file_to_space(
+                    file_src=log_filename,
+                    save_as=f"job_logs/job_{file_id}.log",
+                    is_public=True,
+                    logger=logger,
+                    file_id=file_id
+                )
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
+
         # Enqueue the Step1 reset query
         reset_query = """
             UPDATE utb_ImageScraperRecords
-            SET Step1Status = 'pending'
+            SET Step1 = NULL
             WHERE FileID = :file_id
         """
+        correlation_id = str(uuid.uuid4())
         await enqueue_db_update(
             file_id=file_id,
             sql=reset_query,
-            params={"file_id": file_id},
+            params={"file_id": int(file_id)},
             background_tasks=background_tasks,
             task_type="reset_step1",
             producer=producer,
-            logger=logger  # Pass logger if enqueue_db_update accepts it
+            correlation_id=correlation_id,
+            logger=logger
         )
-        logger.info(f"Enqueued Step1 reset for FileID: {file_id}")
-        return {"status": "success", "file_id": file_id}
+        logger.info(f"Enqueued Step1 reset for FileID: {file_id}, CorrelationID: {correlation_id}")
+        log_public_url = await upload_file_to_space(
+            file_src=f"job_logs/job_{file_id}.log",
+            save_as=f"job_logs/job_{file_id}.log",
+            is_public=True,
+            logger=logger,
+            file_id=file_id
+        )
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Enqueued Step1 reset for FileID: {file_id}",
+            "log_url": log_public_url,
+            "data": {"file_id": file_id, "correlation_id": correlation_id}
+        }
     
     except ValueError as e:
         logger.error(f"Error enqueuing Step1 reset for FileID {file_id}: {e}", exc_info=True)
-        # Upload log file to R2 (as seen in logs)
         log_filename = f"job_logs/job_{file_id}.log"
         log_public_url = await upload_file_to_space(
             file_src=log_filename,
@@ -1602,8 +1639,19 @@ async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks, logge
         raise HTTPException(status_code=500, detail=f"Failed to reset Step1: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in Step1 reset for FileID {file_id}: {e}", exc_info=True)
+        log_filename = f"job_logs/job_{file_id}.log"
+        log_public_url = await upload_file_to_space(
+            file_src=log_filename,
+            save_as=f"job_logs/job_{file_id}.log",
+            is_public=True,
+            logger=logger,
+            file_id=file_id
+        )
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
+    finally:
+        await async_engine.dispose()
+        logger.info(f"Disposed database engine for FileID {file_id}")
+        
 @router.post("/reset-step1-no-results/{file_id}", tags=["Database"])
 async def api_reset_step1_no_results(
     file_id: str,
