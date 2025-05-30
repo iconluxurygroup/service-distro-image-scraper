@@ -641,7 +641,36 @@ from search_utils import update_sort_order
 from ai_utils import batch_vision_reason
 from common import generate_search_variations, fetch_brand_rules, preprocess_sku
 from logging_config import setup_job_logger
+producer = None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global producer
+    default_logger.info("Starting up FastAPI application")
+    producer = RabbitMQProducer()
+    try:
+        await producer.connect()
+        default_logger.info("RabbitMQ producer connected")
+        loop = asyncio.get_running_loop()
+        shutdown_event = asyncio.Event()
 
+        def handle_shutdown(signal_type):
+            default_logger.info(f"Received {signal_type}, initiating graceful shutdown")
+            shutdown_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_shutdown, sig.name)
+
+        yield
+    finally:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=None)
+        default_logger.info("Shutting down FastAPI application")
+        if producer:
+            await producer.close()
+            default_logger.info("RabbitMQ producer closed")
+        await async_engine.dispose()
+        default_logger.info("Database engine disposed")
+
+app.lifespan = lifespan
 async def process_restart_batch(
     file_id_db: int,
     entry_id: Optional[int] = None,
@@ -687,7 +716,6 @@ async def process_restart_batch(
 
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
 
-        global producer
         if not producer:
             logger.error("RabbitMQ producer not initialized")
             raise ValueError("RabbitMQ producer not initialized")
@@ -766,8 +794,6 @@ async def process_restart_batch(
         last_entry_id_processed = entry_id or 0
         required_columns = ["EntryID", "ImageUrl", "ImageDesc", "ImageSource", "ImageUrlThumbnail"]
 
-        # Initialize RabbitMQ producer
-        producer = RabbitMQProducer()
         try:
             semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
             @retry(
@@ -2189,33 +2215,5 @@ async def api_reset_step1_no_results(
         await async_engine.dispose()
         logger.info(f"Disposed database engine for FileID {file_id}")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global producer
-    default_logger.info("Starting up FastAPI application")
-    producer = RabbitMQProducer()
-    try:
-        await producer.connect()
-        default_logger.info("RabbitMQ producer connected")
-        loop = asyncio.get_running_loop()
-        shutdown_event = asyncio.Event()
 
-        def handle_shutdown(signal_type):
-            default_logger.info(f"Received {signal_type}, initiating graceful shutdown")
-            shutdown_event.set()
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, handle_shutdown, sig.name)
-
-        yield
-    finally:
-        await asyncio.wait_for(shutdown_event.wait(), timeout=None)
-        default_logger.info("Shutting down FastAPI application")
-        if producer:
-            await producer.close()
-            default_logger.info("RabbitMQ producer closed")
-        await async_engine.dispose()
-        default_logger.info("Database engine disposed")
-
-app.lifespan = lifespan
 app.include_router(router, prefix="/api/v4")
