@@ -360,24 +360,21 @@ class RabbitMQConsumer:
             logger.error(f"Error testing task for FileID: {file_id}, TaskType: {task_type}: {e}", exc_info=True)
             return False
 
-async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
-    """Perform async shutdown of consumer and resources."""
-    try:
-        await consumer.close()
-        await async_engine.dispose()
-        # Cancel all running tasks except the current one
-        tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        # Wait for tasks to complete or cancel
-        await asyncio.gather(*tasks, return_exceptions=True)
-        # Shutdown async generators
-        await loop.shutdown_asyncgens()
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}", exc_info=True)
-    finally:
-        loop.stop()
-        loop.close()
+async def shutdown(consumer, loop):
+    # Cancel all running tasks (except the current one)
+    tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    
+    # Stop the consumer and close the RabbitMQ connection
+    await consumer.stop()
+    
+    # Stop the event loop
+    loop.stop()
+    loop.run_until_complete(loop.shutdown_asyncgens())
+    
+    # Close the loop
+    loop.close()
 
 def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     """Create a signal handler for graceful shutdown."""
@@ -428,11 +425,6 @@ if __name__ == "__main__":
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
-        logger.info("Received KeyboardInterrupt, initiating shutdown")
-        loop.run_until_complete(shutdown(consumer, loop))
-    except Exception as e:
-        logger.error(f"Error in consumer: {e}", exc_info=True)
         loop.run_until_complete(shutdown(consumer, loop))
     finally:
-        if not loop.is_closed():
-            loop.close()
+        loop.close()
