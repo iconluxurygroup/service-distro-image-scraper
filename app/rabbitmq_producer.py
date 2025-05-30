@@ -101,8 +101,9 @@ class RabbitMQProducer:
         reply_to: Optional[str] = None
     ):
         async with self._lock:
-            await self.check_connection()  # Ensure connection and channel are valid
+            await self.check_connection()
             queue_name = routing_key or self.queue_name
+            default_logger.debug(f"Preparing to publish to queue: {queue_name}, correlation_id: {correlation_id}")
             try:
                 async with asyncio.timeout(self.operation_timeout):
                     message_body = json.dumps(message, default=self.custom_json_serializer)
@@ -116,14 +117,14 @@ class RabbitMQProducer:
                         ),
                         routing_key=queue_name,
                     )
-                    default_logger.debug(
-                        f"Published message to queue: {queue_name}, "
+                    default_logger.info(
+                        f"Successfully published message to queue: {queue_name}, "
                         f"correlation_id: {correlation_id}, task: {message_body[:200]}"
                     )
             except (aio_pika.exceptions.ChannelClosed, aiormq.exceptions.ConnectionChannelError) as e:
                 default_logger.error(f"Channel error during publish to {queue_name}: {e}", exc_info=True)
                 self.is_connected = False
-                await self.connect()  # Reconnect and retry
+                await self.connect()
                 raise
             except Exception as e:
                 default_logger.error(f"Failed to publish message to {queue_name}: {e}", exc_info=True)
@@ -351,6 +352,7 @@ async def enqueue_db_update(
 
 def setup_signal_handlers(loop):
     import signal
+    import time
     last_signal_time = 0
     debounce_interval = 1.0  # seconds
 
@@ -370,7 +372,6 @@ def setup_signal_handlers(loop):
     
     def signal_handler():
         nonlocal last_signal_time
-        import time
         current_time = time.time()
         if current_time - last_signal_time < debounce_interval:
             default_logger.debug("Debouncing rapid SIGINT/SIGTERM")
