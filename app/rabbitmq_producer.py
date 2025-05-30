@@ -153,7 +153,7 @@ class RabbitMQProducer:
     def custom_json_serializer(obj):
         if isinstance(obj, datetime.datetime):
             return obj.isoformat()
-        raise TypeError(f"Invalid type {type(obj).__name__} for JSON serialization"")
+        raise TypeError(f"Invalid type {type(obj).__name__} for JSON serialization")
 
     async def check_connection(self):
         async with self._lock:
@@ -181,7 +181,7 @@ class RabbitMQProducer:
                         await self.channel.queue_delete(queue_name)
                         default_logger.info(f"Deleted queue {queue_name} due to mismatched state")
                     except aio_pika.exceptions.QueueEmpty:
-                        default_logger.debug(f"Queue {queue_name} not found, no cleanup needed"")
+                        default_logger.debug(f"Queue {queue_name} not found, no cleanup needed")
                     except Exception as e:
                         default_logger.warning(f"Failed to delete queue {queue_name}: {e}")
             except Exception as e:
@@ -203,15 +203,15 @@ class RabbitMQProducer:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=4),
-    retry=retry_if_exception_type((
+    retry=retry_if_exception_type(
         aio_pika.exceptions.Error,
         aio_pika.exceptions.ErrorChannelClosed,
         asyncio.TimeoutError,
         asyncio.CancelledError,
     before_sleep=lambda retry: default_logger.debug(f"Retrying get_producer (attempt {retry.attempt_number}/3) after {retry.next_action.sleep}s")
-)
+))
 async def get_producer(logger: Optional[logging.Logger] = None) -> Optional[RabbitMQProducer]:
-global producer
+    global producer
     logger = logger or default_logger
 
     if not RABBITMQ_URL:
@@ -224,7 +224,7 @@ global producer
                 async with asyncio.timeout(15):
                     producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
                     await producer.connect()
-                    logger.info(f"Worker PID {psutil.process().pid}: {Initialized} RabbitMQ producer"")
+                    logger.info(f"Worker PID {psutil.process().pid}: {Initialized} RabbitMQ producer")
                 except Exception as e:
                     logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
                     producer = None
