@@ -439,31 +439,7 @@ if __name__ == "__main__":
 
     async def main():
         try:
-            logger.info("Testing RabbitMQ producer and consumer connections on startup...")
-            if not await test_rabbitmq_connection(logger=logger):
-                logger.error("RabbitMQ connection test failed, exiting")
-                sys.exit(1)
-            logger.info("RabbitMQ connection test passed")
-
-            if args.clear:
-                await consumer.purge_queue()
-                logger.info("Queue cleared successfully. Exiting.")
-                sys.exit(0)
-
-            sample_task = {
-                "file_id": "321",
-                "task_type": "update_sort_order",
-                "sql": "UPDATE_SORT_ORDER",
-                "params": {
-                    "entry_id": "134394",
-                    "result_id": "2323422",
-                    "sort_order": 1
-                },
-                "timestamp": "2025-05-21T12:34:08.307076"
-            }
-            logger.info(f"Testing sample task: {sample_task}")
-            await consumer.test_task(sample_task)
-            logger.info("Sample task completed, starting consumer...")
+            logger.info("Starting consumer...")
             await consumer.start_consuming()
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt in main, shutting down...")
