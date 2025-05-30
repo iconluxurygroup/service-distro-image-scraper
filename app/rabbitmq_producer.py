@@ -64,15 +64,23 @@ class RabbitMQProducer:
                     self.connection = await aio_pika.connect_robust(self.amqp_url, connection_attempts=3, retry_delay=5)
                     self.channel = await self.connection.channel()
                     await self.channel.set_qos(prefetch_count=1)
+                    # Declare fanout exchange
                     await self.channel.declare_exchange('logs', aio_pika.ExchangeType.FANOUT)
+                    # Declare existing queues
+                    await self.channel.declare_queue(self.queue_name, durable=True)
+                    await self.channel.declare_queue(self.response_queue_name, durable=True)
+                    # Declare new queue
+                    new_queue_name = "new_task_queue"
+                    new_queue = await self.channel.declare_queue(new_queue_name, durable=True)
+                    # Bind new queue to logs exchange
+                    await new_queue.bind('logs')
                     self.is_connected = True
-                    default_logger.info("Connected to RabbitMQ and declared fanout exchange: logs")
+                    default_logger.info(f"Connected to RabbitMQ, declared fanout exchange: logs, and queues: {self.queue_name}, {self.response_queue_name}, {new_queue_name}")
                     return self
             except (asyncio.TimeoutError, aio_pika.exceptions.AMQPConnectionError) as e:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 self.is_connected = False
                 raise
-
     async def publish_message(self, message: Dict[str, Any], routing_key: Optional[str] = None, correlation_id: Optional[str] = None, reply_to: Optional[str] = None):
         async with self._lock:
             await self.check_connection()
@@ -212,6 +220,7 @@ async def enqueue_db_update(
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
     return_result: bool = False,
+    queue_name: str = "db_update_queue",  # Add queue_name parameter
     logger: Optional[logging.Logger] = None
 ) -> Optional[int]:
     logger = logger or default_logger
@@ -225,7 +234,6 @@ async def enqueue_db_update(
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
         response_queue = producer.response_queue_name if return_result else None
 
-        # Sanitize params
         sanitized_params = {
             key: value.isoformat() if isinstance(value, datetime.datetime) else value
             for key, value in params.items()
@@ -243,11 +251,11 @@ async def enqueue_db_update(
 
         await producer.publish_message(
             message=update_task,
-            routing_key="db_update_queue",
+            routing_key=queue_name,  # Use specified queue_name
             correlation_id=correlation_id,
             reply_to=response_queue
         )
-        logger.info(f"Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}, CorrelationID: {correlation_id}")
+        logger.info(f"Enqueued task for FileID: {file_id}, TaskType: {task_type}, Queue: {queue_name}, CorrelationID: {correlation_id}")
 
         if return_result and response_queue:
             try:
