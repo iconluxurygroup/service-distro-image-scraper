@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any
 import uuid
 from database_config import async_engine
 from config import RABBITMQ_URL
-
+from rabbitmq_producer import RabbitMQProducer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
