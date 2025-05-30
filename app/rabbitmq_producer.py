@@ -1,15 +1,14 @@
-import aio_pika
 import json
 import logging
 import psutil
 import datetime
 import asyncio
+import aio_pika
 from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import aiormq.exceptions
-import uuid
 from config import RABBITMQ_URL
+
 # Configure default logger
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
@@ -18,11 +17,14 @@ if not default_logger.handlers:
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+
+# Global producer instance
 producer = None
+
 class RabbitMQProducer:
     def __init__(
         self,
-        amqp_url: str = "amqp://app_user:app_password@localhost:5672/app_vhost",
+        amqp_url: str = RABBITMQ_URL,
         queue_name: str = "db_update_queue",
         connection_timeout: float = 10.0,
         operation_timeout: float = 5.0,
@@ -37,43 +39,43 @@ class RabbitMQProducer:
         self._lock = asyncio.Lock()
 
     async def connect(self):
-            """Establish a robust connection to RabbitMQ and declare a durable queue."""
-            async with self._lock:
-                if self.is_connected and self.connection and not self.connection.is_closed:
-                    default_logger.debug("RabbitMQ connection already established")
-                    return
-                try:
-                    async with asyncio.timeout(self.connection_timeout):
-                        self.connection = await aio_pika.connect_robust(
-                            self.amqp_url,
-                            connection_attempts=3,
-                            retry_delay=5,
-                        )
-                        self.channel = await self.connection.channel()
-                        await self.channel.set_qos(prefetch_count=1)  # Fixed: Use set_qos
-                        await self.channel.declare_queue(self.queue_name, durable=True)
-                        self.is_connected = True
-                        default_logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
-                except asyncio.TimeoutError:
-                    default_logger.error("Timeout connecting to RabbitMQ")
-                    raise
-                except aio_pika.exceptions.ProbableAuthenticationError as e:
-                    default_logger.error(
-                        f"Authentication error connecting to RabbitMQ: {e}. "
-                        f"Check username, password, and virtual host in {self.amqp_url}.",
-                        exc_info=True
+        """Establish a robust connection to RabbitMQ and declare a durable queue."""
+        async with self._lock:
+            if self.is_connected and self.connection and not self.connection.is_closed:
+                default_logger.debug("RabbitMQ connection already established")
+                return
+            try:
+                async with asyncio.timeout(self.connection_timeout):
+                    self.connection = await aio_pika.connect_robust(
+                        self.amqp_url,
+                        connection_attempts=3,
+                        retry_delay=5,
                     )
-                    raise
-                except aio_pika.exceptions.AMQPConnectionError as e:
-                    default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-                    raise
-                except aiormq.exceptions.ChannelAccessRefused as e:
-                    default_logger.error(
-                        f"Permissions error connecting to RabbitMQ: {e}. "
-                        f"Ensure user has permissions on virtual host and default exchange.",
-                        exc_info=True
-                    )
-                    raise
+                    self.channel = await self.connection.channel()
+                    await self.channel.set_qos(prefetch_count=1)
+                    await self.channel.declare_queue(self.queue_name, durable=True)
+                    self.is_connected = True
+                    default_logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
+            except asyncio.TimeoutError:
+                default_logger.error("Timeout connecting to RabbitMQ")
+                raise
+            except aio_pika.exceptions.ProbableAuthenticationError as e:
+                default_logger.error(
+                    f"Authentication error connecting to RabbitMQ: {e}. "
+                    f"Check username, password, and virtual host in {self.amqp_url}.",
+                    exc_info=True
+                )
+                raise
+            except aio_pika.exceptions.AMQPConnectionError as e:
+                default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+                raise
+            except aio_pika.exceptions.ChannelAccessRefused as e:
+                default_logger.error(
+                    f"Permissions error connecting to RabbitMQ: {e}. "
+                    f"Ensure user has permissions on virtual host and default exchange.",
+                    exc_info=True
+                )
+                raise
 
     @retry(
         stop=stop_after_attempt(3),
@@ -81,7 +83,7 @@ class RabbitMQProducer:
         retry=retry_if_exception_type((
             aio_pika.exceptions.AMQPError,
             aio_pika.exceptions.ChannelClosed,
-            aiormq.exceptions.ChannelAccessRefused,
+            aio_pika.exceptions.ChannelAccessRefused,
             asyncio.TimeoutError
         )),
         before_sleep=lambda retry_state: default_logger.info(
@@ -139,6 +141,19 @@ class RabbitMQProducer:
                 self.is_connected = False
             except Exception as e:
                 default_logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((
+        aio_pika.exceptions.AMQPError,
+        aio_pika.exceptions.ChannelClosed,
+        asyncio.TimeoutError
+    )),
+    before_sleep=lambda retry_state: default_logger.info(
+        f"Retrying get_producer (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+    )
+)
 async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProducer:
     """
     Ensure a connected RabbitMQ producer exists. If not, create and connect one.
@@ -159,26 +174,28 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
         logger.error("RABBITMQ_URL environment variable not set")
         raise ValueError("RABBITMQ_URL not configured")
     
-    if producer is None or not producer.is_connected:
-        try:
-            async with asyncio.timeout(10):
-                producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
-                await producer.connect()
-                logger.info(f"Worker PID {psutil.Process().pid}: Initialized RabbitMQ producer")
-        except Exception as e:
-            logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
-            producer = None  # Reset on failure to allow retry
-            raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
+    async with asyncio.Lock():
+        if producer is None or not producer.is_connected:
+            try:
+                async with asyncio.timeout(10):
+                    producer = RabbitMQProducer(amqp_url=RABBITMQ_URL)
+                    await producer.connect()
+                    logger.info(f"Worker PID {psutil.Process().pid}: Initialized RabbitMQ producer")
+            except Exception as e:
+                logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
+                producer = None
+                raise ValueError(f"Failed to initialize RabbitMQ producer: {str(e)}")
     
     return producer
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((
+    retry=retry_if_exception_type=(
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError
-    )),
+    ),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying enqueue_db_update for FileID {retry_state.kwargs.get('file_id')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -188,7 +205,7 @@ async def enqueue_db_update(
     file_id: str,
     sql: str,
     params: Dict[str, Any],
-    background_tasks: BackgroundTasks,
+    background_tasks: Optional[BackgroundTasks] = None,
     task_type: str = "db_update",
     producer: Optional[RabbitMQProducer] = None,
     response_queue: Optional[str] = None,
@@ -196,20 +213,17 @@ async def enqueue_db_update(
     return_result: bool = False,
     logger: Optional[logging.Logger] = None
 ) -> Optional[int]:
-    if producer is None:
-        default_logger.error("RabbitMQ producer not initialized")
-        raise ValueError("RabbitMQ producer not initialized")
-
+    logger = logger or default_logger
+    correlation_id = correlation_id or str(uuid.uuid4())
+    
     try:
-        # Ensure producer is connected
-        if not producer.is_connected or not producer.connection or producer.connection.is_closed:
-            await producer.connect()
-
+        # Use provided producer or get one
+        if producer is None or not producer.is_connected:
+            logger.debug(f"Producer not provided or disconnected for FileID {file_id}, initializing new producer")
+            producer = await get_producer(logger)
+        
         # Convert SQLAlchemy text object to string if necessary
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
-        correlation_id = correlation_id or str(uuid.uuid4())
-
-        # Use a shared response queue for return_result tasks if not specified
         response_queue = response_queue or f"response_{file_id}_{correlation_id}" if return_result else None
 
         update_task = {
@@ -229,11 +243,12 @@ async def enqueue_db_update(
             correlation_id=correlation_id,
             reply_to=response_queue
         )
-        default_logger.debug(f"Enqueued task {task_type} for FileID {file_id}, CorrelationID: {correlation_id}")
+        logger.debug(f"Enqueued task {task_type} for FileID {file_id}, CorrelationID: {correlation_id}")
 
         if return_result and response_queue:
             try:
-                async with producer.channel as channel:
+                async with aio_pika.connect_robust(producer.amqp_url) as connection:
+                    channel = await connection.channel()
                     queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
                     response_received = asyncio.Event()
                     response_data = None
@@ -253,22 +268,22 @@ async def enqueue_db_update(
                         async with asyncio.timeout(60):
                             await response_received.wait()
                         if response_data and "result" in response_data:
-                            default_logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
+                            logger.debug(f"Received response for FileID {file_id}, CorrelationID: {correlation_id}")
                             return response_data["result"]
                         else:
-                            default_logger.warning(f"No valid response received for FileID {file_id}, CorrelationID: {correlation_id}")
+                            logger.warning(f"No valid response received for FileID {file_id}, CorrelationID: {correlation_id}")
                             return 0
                     except asyncio.TimeoutError:
-                        default_logger.warning(f"Timeout waiting for response for FileID {file_id}, CorrelationID: {correlation_id}")
+                        logger.warning(f"Timeout waiting for response for FileID {file_id}, CorrelationID: {correlation_id}")
                         return 0
                     finally:
                         consume_task.cancel()
                         await asyncio.sleep(0.1)
             except Exception as e:
-                default_logger.error(f"Error consuming response for FileID {file_id}: {e}", exc_info=True)
+                logger.error(f"Error consuming response for FileID {file_id}: {e}", exc_info=True)
                 return 0
         return None
 
     except Exception as e:
-        default_logger.error(f"Error enqueuing task for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Error enqueuing task for FileID {file_id}: {e}", exc_info=True)
         raise
