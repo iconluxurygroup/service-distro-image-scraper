@@ -3,7 +3,7 @@ import logging
 import aio_pika
 import json
 import uuid
-import datetime
+import datetime,aiormq
 from typing import Optional
 from rabbitmq_producer import RabbitMQProducer, get_producer
 from rabbitmq_consumer import RabbitMQConsumer
