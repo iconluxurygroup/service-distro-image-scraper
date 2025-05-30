@@ -111,6 +111,7 @@ async def lifespan(app: FastAPI):
             default_logger.info("RabbitMQ producer closed")
         await async_engine.dispose()
         default_logger.info("Database engine disposed")
+        
 app.lifespan = lifespan
 
 class SearchClient:
