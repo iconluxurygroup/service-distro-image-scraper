@@ -4,7 +4,6 @@ import psutil
 import datetime
 import asyncio
 import aio_pika
-import uuid
 from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -70,18 +69,25 @@ class RabbitMQProducer:
             except aio_pika.exceptions.AMQPConnectionError as e:
                 default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
                 raise
+            except aio_pika.exceptions.ChannelInvalidStateError as e:
+                default_logger.error(
+                    f"Channel error connecting to RabbitMQ: {e}. "
+                    f"Ensure channel is properly configured.",
+                    exc_info=True
+                )
+                raise
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=2, min=2, max=10),
-        retry=retry_if_exception_type(
+        retry_if_exception_type=(
             aio_pika.exceptions.AMQPError,
             aio_pika.exceptions.ChannelClosed,
             asyncio.TimeoutError
         ),
         before_sleep=lambda retry_state: default_logger.info(
             f"Retrying RabbitMQ operation (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-        ),
+        )
     )
     async def publish_message(
         self,
@@ -138,7 +144,7 @@ class RabbitMQProducer:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(
+    retry_if_exception_type=(
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError
@@ -184,7 +190,7 @@ async def get_producer(logger: Optional[logging.Logger] = None) -> RabbitMQProdu
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(
+    retry_if_exception_type=(
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         asyncio.TimeoutError
