@@ -3,6 +3,7 @@ import logging
 import psutil
 import datetime
 import asyncio
+import uuid
 import aio_pika
 from typing import Dict, Any, Optional
 from fastapi import BackgroundTasks
