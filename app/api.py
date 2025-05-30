@@ -665,13 +665,11 @@ async def process_restart_batch(
         log_memory_usage()
 
         file_id_db_int = file_id_db
-        #BATCH_SIZE = 10  # Hardcode to 10 entries per batch
+        BATCH_SIZE = 5  # Hardcode to 10 entries per batch
+        MAX_CONCURRENCY = 20
         MAX_ENTRY_RETRIES = 3
         RELEVANCE_THRESHOLD = 0.9
-        TARGET_THROUGHPUT = 100  # Increase to 200 records per secondAdd commentMore actions
-        BATCH_TIME = 1        # Increase to 0.2 seconds
-        BATCH_SIZE = max(10, ceil((TARGET_THROUGHPUT / num_workers) * BATCH_TIME))
-        MAX_CONCURRENCY = BATCH_SIZE
+
         logger.debug(f"Config: BATCH_SIZE={BATCH_SIZE}, MAX_CONCURRENCY={MAX_CONCURRENCY}, Workers={num_workers}")
 
         # Validate FileID
