@@ -40,7 +40,6 @@ class RabbitMQProducer:
         self.channel = None
         self.is_connected = False
         self._lock = asyncio.Lock()
-        self._cleanup_lock = asyncio.Lock()
 
     @classmethod
     async def get_producer(cls, logger: Optional[logging.Logger] = None) -> 'RabbitMQProducer':
@@ -79,7 +78,10 @@ class RabbitMQProducer:
             aio_pika.exceptions.ChannelClosed,
             asyncio.TimeoutError,
             aiormq.exceptions.ChannelInvalidStateError,
-        ))
+        )),
+        before_sleep=lambda retry_state: default_logger.info(
+            f"Retrying connect (attempt {retry_state.attempt_number}/5) after {retry_state.next_action.sleep}s"
+        )
     )
     async def connect(self) -> 'RabbitMQProducer':
         async with self._lock:
@@ -149,6 +151,7 @@ class RabbitMQProducer:
             except Exception as e:
                 default_logger.error(f"Failed to publish message: {e}", exc_info=True)
                 self.is_connected = False
+                await self.close()
                 raise
 
     @staticmethod
@@ -191,21 +194,6 @@ class RabbitMQProducer:
                 self.channel = None
                 self.connection = None
 
-    async def cleanup_queue(self, queue_name: str):
-        async with self._lock:
-            try:
-                if self.channel and not self.channel.is_closed:
-                    try:
-                        await self.channel.get_queue(queue_name)
-                        await self.channel.queue_delete(queue_name)
-                        default_logger.info(f"Deleted queue {queue_name} due to mismatched state")
-                    except aio_pika.exceptions.QueueEmpty:
-                        default_logger.debug(f"Queue {queue_name} not found, no cleanup needed")
-                    except Exception as e:
-                        default_logger.warning(f"Failed to delete queue {queue_name}: {e}")
-            except Exception as e:
-                default_logger.error(f"Error during queue cleanup for {queue_name}: {e}")
-
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -233,6 +221,7 @@ async def enqueue_db_update(
     correlation_id = correlation_id or str(uuid.uuid4())
     try:
         producer = producer or await RabbitMQProducer.get_producer(logger)
+        await producer.check_connection()
         sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
         response_queue = producer.response_queue_name if return_result and not response_queue else response_queue
 
@@ -253,13 +242,13 @@ async def enqueue_db_update(
 
         await producer.publish_message(
             message=update_task,
-            routing_key=queue_name,
+            routing_key='',  # Fanout exchange ignores routing_key
             correlation_id=correlation_id,
             reply_to=response_queue
         )
         logger.info(
             f"Enqueued task for FileID: {file_id}, TaskType: {task_type}, "
-            f"Queue: {queue_name}, CorrelationID: {correlation_id}"
+            f"Exchange: logs, CorrelationID: {correlation_id}"
         )
 
         if return_result and response_queue:
@@ -276,7 +265,8 @@ async def enqueue_db_update(
                     queue = await channel.declare_queue(
                         response_queue, durable=True, exclusive=False, auto_delete=False
                     )
-                    logger.debug(f"Declared response queue {response_queue} for FileID {file_id}")
+                    await queue.bind('logs')  # Bind to logs exchange
+                    logger.debug(f"Declared and bound response queue {response_queue} for FileID {file_id}")
 
                 response_received = asyncio.Event()
                 response_data = None
