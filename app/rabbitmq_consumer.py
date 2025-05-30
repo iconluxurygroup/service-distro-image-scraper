@@ -82,6 +82,18 @@ class RabbitMQConsumer:
                             arguments={"x-expires": 600000}
                         )
                         logger.debug(f"Created response queue: {self.queue_name}")
+                    except aiormq.exceptions.ChannelLockedResource:
+                        logger.warning(f"Queue {self.queue_name} is locked, generating new queue name")
+                        self.queue_name = f"{self.queue_name}_{uuid.uuid4().hex[:8]}"
+                        logger.debug(f"Attempting to create new queue: {self.queue_name}")
+                        await self.declare_queue_with_retry(
+                            self.channel,
+                            self.queue_name,
+                            exclusive=True,
+                            auto_delete=True,
+                            arguments={"x-expires": 600000}
+                        )
+                        logger.debug(f"Created new response queue: {self.queue_name}")
                 else:
                     await self.declare_queue_with_retry(
                         self.channel,
