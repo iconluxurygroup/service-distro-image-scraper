@@ -47,7 +47,9 @@ from config import BRAND_RULES_URL, VERSION, SEARCH_PROXY_API_URL,RABBITMQ_URL,D
 from email_utils import send_message_email
 from urllib.parse import urlparse
 from url_extract import extract_thumbnail_url
+
 from rabbitmq_producer import RabbitMQProducer, enqueue_db_update,get_producer
+
 
 app = FastAPI(title="super_scraper", version=VERSION)
 
@@ -1559,7 +1561,7 @@ async def api_sort_by_relevance(
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error sorting by composite score: {str(e)}")
 
-@app.post("/reset_step1/{file_id}")
+@router.post("/reset_step1/{file_id}")
 async def api_reset_step1(file_id: str, background_tasks: BackgroundTasks, logger: Optional[logging.Logger] = None):
     logger = logger or default_logger
     logger.info(f"Resetting Step1 for FileID: {file_id}")
