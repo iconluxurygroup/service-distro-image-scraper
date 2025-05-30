@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks
 import psutil
 import re
 import urllib.parse
-from rabbitmq_producer import RabbitMQProducer, enqueue_db_update, get_producer
+from rabbitmq_producer import RabbitMQProducer, enqueue_db_update
 import asyncio
 import uuid
 import aio_pika
@@ -98,9 +98,9 @@ async def update_search_sort_order(
         sorted_results = sorted(results, key=lambda x: x["priority"])
 
         # Enqueue updates
-        producer = await get_producer(logger)
+        producer = await RabbitMQProducer.get_producer(logger)
         if producer is None or not producer.is_connected:
-            producer = await get_producer(logger)
+            producer = await RabbitMQProducer.get_producer(logger)
 
         update_data = []
         correlation_id = str(uuid.uuid4())
