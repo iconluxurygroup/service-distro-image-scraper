@@ -164,8 +164,13 @@ async def analyze_image_with_gemini_async(
     mime_type: str = "image/jpeg",
     logger: Optional[logging.Logger] = None,
     cv_description: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    expect_json: bool = True,
     max_retries: int = 3
 ) -> Dict[str, Optional[dict]]:
+    """Analyze an image using Google Gemini with an optional custom prompt.
+    Returns a dictionary with status_code, success, and features.
+    If custom_prompt is provided, it overrides the default prompt."""
     logger = logger or default_logger
     if not api_key:
         logger.error("No API key provided for Gemini")
@@ -179,39 +184,45 @@ async def analyze_image_with_gemini_async(
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name=model_name)
-    brand = product_details.get("brand", "None") if product_details else "None"
-    category = product_details.get("category", "None") if product_details else "None"
-    color = product_details.get("color", "None") if product_details else "None"
-    cv_info = cv_description if cv_description else "No prior detection available."
 
-    prompt = f"""
-    Analyze this image and return a single JSON object with:
-    {{
-      "description": "One-sentence description of the image (brand, category, color).",
-      "extracted_features": {{
-        "brand": "Extracted brand or 'Unknown'.",
-        "category": "Extracted category or 'Unknown'.",
-        "color": "Primary color or 'Unknown'."
-      }},
-      "match_score": "Score (0–1) for match with provided details.",
-      "reasoning": "Brief explanation of match score."
-    }}
-    Provided details:
-    - Brand: {brand}
-    - Category: {category}
-    - Color: {color}
-    Computer vision detection: {cv_info}
-    If details are 'None', assume match for that field.
-    Use computer vision results to guide analysis.
-    Return valid JSON only as a single object.
-    """
+    # Default prompt for product detail matching
+    if custom_prompt is None:
+        brand = product_details.get("brand", "None") if product_details else "None"
+        category = product_details.get("category", "None") if product_details else "None"
+        color = product_details.get("color", "None") if product_details else "None"
+        cv_info = cv_description if cv_description else "No prior detection available."
+        prompt = f"""
+        Analyze this image and return a single JSON object with:
+        {{
+          "description": "One-sentence description of the image (brand, category, color).",
+          "extracted_features": {{
+            "brand": "Extracted brand or 'Unknown'.",
+            "category": "Extracted category or 'Unknown'.",
+            "color": "Primary color or 'Unknown'."
+          }},
+          "match_score": "Score (0–1) for match with provided details.",
+          "reasoning": "Brief explanation of match score."
+        }}
+        Provided details:
+        - Brand: {brand}
+        - Category: {category}
+        - Color: {color}
+        Computer vision detection: {cv_info}
+        If details are 'None', assume match for that field.
+        Use computer vision results to guide analysis.
+        Return valid JSON only as a single object.
+        """
+    else:
+        prompt = custom_prompt
 
     contents = [{"mime_type": mime_type, "data": image_bytes}, prompt]
     for attempt in range(1, max_retries + 1):
         try:
             response = await model.generate_content_async(
                 contents,
-                generation_config=genai.types.GenerationConfig(response_mime_type="application/json")
+                generation_config=genai.types.GenerationConfig(
+                    response_mime_type="application/json" if expect_json else "text/plain"
+                )
             )
             response_text = None
             if isinstance(response, list):
@@ -225,7 +236,7 @@ async def analyze_image_with_gemini_async(
 
             if response_text:
                 try:
-                    features = json.loads(response_text)
+                    features = json.loads(response_text) if expect_json else {"raw_response": response_text}
                     if isinstance(features, list):
                         logger.info(f"Parsed JSON is a list; selecting first element")
                         features = features[0] if features else {}
@@ -237,22 +248,22 @@ async def analyze_image_with_gemini_async(
                             "match_score": 0.0,
                             "reasoning": "Unexpected response structure from Gemini."
                         }
-                    match_score = float(features.get("match_score", 0.0))
-                    extracted = features.get("extracted_features", {})
-                    if not isinstance(extracted, dict):
-                        logger.warning(f"Invalid extracted_features format: {extracted}")
-                        extracted = {"brand": "Unknown", "category": "Unknown", "color": "Unknown"}
-
-                    if match_score < 0.1 and product_details:
-                        valid_details = sum(1 for v in product_details.values() if v != "None")
-                        matches = sum(
-                            1 for k, v in product_details.items()
-                            if v != "None" and v.lower() in str(extracted.get(k, "")).lower()
-                        )
-                        heuristic_score = matches / max(1, valid_details) if valid_details > 0 else 1.0
-                        features["match_score"] = max(match_score, heuristic_score)
-                        features["reasoning"] = features.get("reasoning", "") + f" Adjusted with heuristic: {heuristic_score:.2f}"
-
+                    if custom_prompt is None:  # Apply heuristic only for default prompt
+                        match_score = float(features.get("match_score", 0.0))
+                        extracted = features.get("extracted_features", {})
+                        if not isinstance(extracted, dict):
+                            logger.warning(f"Invalid extracted_features format: {extracted}")
+                            extracted = {"brand": "Unknown", "category": "Unknown", "color": "Unknown"}
+                            features["extracted_features"] = extracted
+                        if match_score < 0.1 and product_details:
+                            valid_details = sum(1 for v in product_details.values() if v != "None")
+                            matches = sum(
+                                1 for k, v in product_details.items()
+                                if v != "None" and v.lower() in str(extracted.get(k, "")).lower()
+                            )
+                            heuristic_score = matches / max(1, valid_details) if valid_details > 0 else 1.0
+                            features["match_score"] = max(match_score, heuristic_score)
+                            features["reasoning"] = features.get("reasoning", "") + f" Adjusted with heuristic: {heuristic_score:.2f}"
                     logger.info(f"Gemini analysis succeeded (attempt {attempt})")
                     return {"status_code": 200, "success": True, "features": features}
                 except json.JSONDecodeError as e:
