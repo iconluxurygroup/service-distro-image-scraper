@@ -19,7 +19,7 @@ import pandas as pd
 import asyncio
 import uuid
 import aio_pika
-
+from s3_utils import upload_file_to_space
 from tenacity import retry, stop_after_attempt, wait_fixed
 producer = None
 default_logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ async def insert_search_results(
     logger = logger or default_logger
     process = psutil.Process()
     logger.info(f"Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
-
+    log_filename = f"job_logs/job_{file_id}.log"
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
