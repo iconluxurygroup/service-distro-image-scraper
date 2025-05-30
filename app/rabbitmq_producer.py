@@ -36,43 +36,43 @@ class RabbitMQProducer:
         self._lock = asyncio.Lock()
 
     async def connect(self):
-        """Establish a robust connection to RabbitMQ and declare a durable queue."""
-        async with self._lock:
-            if self.is_connected and self.connection and not self.connection.is_closed:
-                default_logger.debug("RabbitMQ connection already established")
-                return
-            try:
-                async with asyncio.timeout(self.connection_timeout):
-                    self.connection = await aio_pika.connect_robust(
-                        self.amqp_url,
-                        connection_attempts=3,
-                        retry_delay=5,
+            """Establish a robust connection to RabbitMQ and declare a durable queue."""
+            async with self._lock:
+                if self.is_connected and self.connection and not self.connection.is_closed:
+                    default_logger.debug("RabbitMQ connection already established")
+                    return
+                try:
+                    async with asyncio.timeout(self.connection_timeout):
+                        self.connection = await aio_pika.connect_robust(
+                            self.amqp_url,
+                            connection_attempts=3,
+                            retry_delay=5,
+                        )
+                        self.channel = await self.connection.channel()
+                        await self.channel.set_qos(prefetch_count=1)  # Fixed: Use set_qos
+                        await self.channel.declare_queue(self.queue_name, durable=True)
+                        self.is_connected = True
+                        default_logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
+                except asyncio.TimeoutError:
+                    default_logger.error("Timeout connecting to RabbitMQ")
+                    raise
+                except aio_pika.exceptions.ProbableAuthenticationError as e:
+                    default_logger.error(
+                        f"Authentication error connecting to RabbitMQ: {e}. "
+                        f"Check username, password, and virtual host in {self.amqp_url}.",
+                        exc_info=True
                     )
-                    self.channel = await self.connection.channel()
-                    await self.channel.set("prefetch_count", 1)
-                    await self.channel.declare(self.queue_name, durable=True)
-                    self.is_connected = True
-                    default_logger.info(f"Connected to RabbitMQ and declared queue: {self.queue_name}")
-            except asyncio.TimeoutError:
-                default_logger.error("Timeout connecting to RabbitMQ")
-                raise
-            except aio_pika.exceptions.ProbableAuthenticationError as e:
-                default_logger.error(
-                    f"Authentication error connecting to RabbitMQ: {e}. "
-                    f"Check username, password, and virtual host in {self.amqp_url}.",
-                    exc_info=True
-                )
-                raise
-            except aio_pika.exceptions.AMQPConnectionError as e:
-                default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-                raise
-            except aiormq.exceptions.ChannelAccessRefused as e:
-                default_logger.error(
-                    f"Permissions error connecting to RabbitMQ: {e}. "
-                    f"Ensure user has permissions on virtual host and default exchange.",
-                    exc_info=True
-                )
-                raise
+                    raise
+                except aio_pika.exceptions.AMQPConnectionError as e:
+                    default_logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
+                    raise
+                except aiormq.exceptions.ChannelAccessRefused as e:
+                    default_logger.error(
+                        f"Permissions error connecting to RabbitMQ: {e}. "
+                        f"Ensure user has permissions on virtual host and default exchange.",
+                        exc_info=True
+                    )
+                    raise
 
     @retry(
         stop=stop_after_attempt(3),
