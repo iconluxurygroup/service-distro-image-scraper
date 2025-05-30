@@ -23,7 +23,54 @@ default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# Configuration (consider moving to environment variables or config file)
+RESPONSE_TIMEOUT = 60  # seconds
+BATCH_SIZE = 100
+MAX_CONCURRENCY = 10
+CATEGORY_FILTERS = {
+    "footwear": ["appliance", "whirlpool", "parts"],
+    # Add more categories as needed
+}
 
+def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
+    """
+    Validates a thumbnail URL by checking for HTTP/HTTPS scheme and absence of placeholder values.
+    """
+    logger = logger or default_logger
+    if not url or not isinstance(url, str) or re.search(r'placeholder', url, re.IGNORECASE):
+        logger.debug(f"Invalid thumbnail URL: {url}")
+        return False
+    if not url.startswith(('http://', 'https://')):
+        logger.debug(f"Non-HTTP thumbnail URL: {url}")
+        return False
+    return True
+
+def clean_url_string(value: Optional[str], is_url: bool = True, logger: Optional[logging.Logger] = None) -> str:
+    """
+    Cleans a string, particularly URLs, by removing invalid characters and normalizing structure.
+    """
+    logger = logger or default_logger
+    if not value:
+        return ""
+    cleaned = str(value).replace('\\', '').replace('%5C', '').replace('%5c', '')
+    cleaned = re.sub(r'[\x00-\x1F\x7F]+', '', cleaned).strip()
+    if is_url:
+        cleaned = urllib.parse.unquote(cleaned)
+        try:
+            parsed = urllib.parse.urlparse(cleaned)
+            if not parsed.scheme or not parsed.netloc:
+                logger.debug(f"Invalid URL format: {cleaned[:100]}")
+                return ""
+            path = re.sub(r'/+', '/', parsed.path)
+            cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
+            if parsed.query:
+                cleaned += f"?{parsed.query}"
+            if parsed.fragment:
+                cleaned += f"#{parsed.fragment}"
+        except ValueError as e:
+            logger.debug(f"Invalid URL format: {cleaned[:100]}, error: {e}")
+            return ""
+    return cleaned
 async def get_records_to_search(file_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     logger = logger or default_logger
     try:
@@ -200,7 +247,7 @@ async def update_file_generate_complete(file_id: str, logger: Optional[logging.L
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
     retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)),
-    before_sleep=lambda retry_state: default_logger.info(
+    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying insert_search_results for FileID {retry_state.kwargs.get('file_id')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
@@ -214,141 +261,192 @@ async def insert_search_results(
     logger = logger or default_logger
     process = psutil.Process()
     logger.info(f"Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
-    
+
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
-    producer = await RabbitMQProducer.get_producer()
-    if producer is None or not producer.is_connected or not producer.channel or producer.channel.is_closed:
-        logger.warning("RabbitMQ producer not initialized or disconnected, reconnecting")
+
+    data = []
+    errors = []
+    category_filters = {
+        "footwear": ["appliance", "whirlpool", "parts"]
+    }
+
+    for res in results:
         try:
-            async with asyncio.timeout(60):
-                producer = await RabbitMQProducer.get_producer()
-        except Exception as e:
-            logger.error(f"Failed to initialize RabbitMQ producer: {e}", exc_info=True)
-            raise RuntimeError(f"Failed to initialize RabbitMQ producer for FileID {file_id}: {str(e)}")
+            entry_id = int(res["EntryID"])
+        except (ValueError, TypeError) as e:
+            errors.append(f"Invalid EntryID value: {res.get('EntryID')}")
+            logger.error(f"Worker PID {process.pid}: {errors[-1]}")
+            continue
 
-    correlation_id = str(uuid.uuid4())
+        category = res.get("ProductCategory", "").lower()
+        image_url = clean_url_string(res.get("ImageUrl", ""), logger=logger)
+        image_url_thumbnail = clean_url_string(res.get("ImageUrlThumbnail", ""), logger=logger)
+        image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False)
+        image_source = clean_url_string(res.get("ImageSource", ""), logger=logger)
 
+        if not image_url or not validate_thumbnail_url(image_url, logger):
+            errors.append(f"Invalid ImageUrl skipped: {image_url}")
+            logger.debug(f"Worker PID {process.pid}: {errors[-1]}")
+            continue
+        if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
+            image_url_thumbnail = None
+
+        if category in category_filters and any(
+            keyword in image_url.lower() for keyword in category_filters[category]
+        ):
+            logger.debug(f"Worker PID {process.pid}: Filtered out irrelevant URL: {image_url}")
+            continue
+
+        data.append({
+            "EntryID": entry_id,
+            "ImageUrl": image_url,
+            "ImageDesc": image_desc or None,
+            "ImageSource": image_source or None,
+            "ImageUrlThumbnail": image_url_thumbnail or None,
+            "CreateTime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    if not data:
+        logger.warning(f"Worker PID {process.pid}: No valid rows to insert. Errors: {errors}")
+        return False
+
+    producer = await RabbitMQProducer.get_producer()
     try:
-        # Deduplicate results
-        entry_ids = list(set(row["EntryID"] for row in results))
-        existing_keys = set()
-        if entry_ids:
-            placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
-            select_query = f"""
-                SELECT EntryID, ImageUrl
-                FROM utb_ImageScraperResult
-                WHERE EntryID IN ({placeholders})
-            """
-            params = {f"id{i}": entry_id for i, entry_id in enumerate(entry_ids)}
-            try:
-                result = await enqueue_db_update(
+        correlation_id = str(uuid.uuid4())
+        response_queue = f"select_response_{uuid.uuid4().hex}"
+        async with aio_pika.connect_robust(producer.amqp_url) as connection:
+            channel = await connection.channel()
+            queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
+            response_received = asyncio.Event()
+            response_data = []
+
+            async def consume_responses():
+                async with queue.iterator() as queue_iter:
+                    async for message in queue_iter:
+                        async with message.process():
+                            if message.correlation_id == correlation_id:
+                                response_data.append(json.loads(message.body.decode()))
+                                response_received.set()
+                                logger.debug(f"Worker PID {process.pid}: Received response for correlation_id {correlation_id}")
+
+            entry_ids = list(set(row["EntryID"] for row in data))
+            existing_keys = set()
+            if entry_ids:
+                placeholders = ",".join([f":id{i}" for i in range(len(entry_ids))])
+                select_query = f"""
+                    SELECT EntryID, ImageUrl
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN ({placeholders})
+                """
+                params = {f"id{i}": entry_id for i, entry_id in enumerate(entry_ids)}
+                await enqueue_db_update(
                     file_id=file_id,
                     sql=select_query,
                     params=params,
                     background_tasks=background_tasks,
                     task_type="select_deduplication",
                     producer=producer,
-                    correlation_id=correlation_id,
-                    return_result=True,
-                    logger=logger
+                    response_queue=response_queue,
+                    correlation_id=correlation_id
                 )
                 logger.info(f"Worker PID {process.pid}: Enqueued SELECT query for {len(entry_ids)} EntryIDs")
-                if result and isinstance(result, list):
-                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in result}
-                    logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+
+                consume_task = asyncio.create_task(consume_responses())
+                try:
+                    async with asyncio.timeout(60):  # Increased timeout
+                        await response_received.wait()
+                    if response_data:
+                        existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
+                        logger.info(f"Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                    else:
+                        logger.warning(f"Worker PID {process.pid}: No deduplication results received")
+                except asyncio.TimeoutError:
+                    logger.error(f"Worker PID {process.pid}: Timeout waiting for SELECT results")
+                    raise
+                finally:
+                    consume_task.cancel()
+                    await asyncio.sleep(0.5)
+
+            update_query = """
+                UPDATE utb_ImageScraperResult
+                SET ImageDesc = :ImageDesc,
+                    ImageSource = :ImageSource,
+                    ImageUrlThumbnail = :ImageUrlThumbnail,
+                    CreateTime = :CreateTime
+                WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
+            """
+            insert_query = """
+                INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
+                VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
+            """
+
+            update_batch = []
+            insert_batch = []
+            for row in data:
+                key = (row["EntryID"], row["ImageUrl"])
+                if key in existing_keys:
+                    update_batch.append((update_query, row))
                 else:
-                    logger.warning(f"Worker PID {process.pid}: No deduplication results received")
-                    return False
-            except Exception as e:
-                logger.error(f"Failed to enqueue deduplication query: {e}", exc_info=True)
-                raise RuntimeError(f"Deduplication query failed for FileID {file_id}: {str(e)}")
+                    insert_batch.append((insert_query, row))
 
-        # Prepare and enqueue updates/inserts
-        update_query = """
-            UPDATE utb_ImageScraperResult
-            SET ImageDesc = :ImageDesc,
-                ImageSource = :ImageSource,
-                ImageUrlThumbnail = :ImageUrlThumbnail,
-                CreateTime = :CreateTime
-            WHERE EntryID = :EntryID AND ImageUrl = :ImageUrl
-        """
-        insert_query = """
-            INSERT INTO utb_ImageScraperResult (EntryID, ImageUrl, ImageDesc, ImageSource, ImageUrlThumbnail, CreateTime)
-            VALUES (:EntryID, :ImageUrl, :ImageDesc, :ImageSource, :ImageUrlThumbnail, :CreateTime)
-        """
+            batch_size = 100
+            update_cids = []
+            insert_cids = []
+            for i in range(0, len(update_batch), batch_size):
+                batch = update_batch[i:i + batch_size]
+                for sql, params in batch:
+                    cid = str(uuid.uuid4())
+                    update_cids.append(cid)
+                    await enqueue_db_update(
+                        file_id=file_id,
+                        sql=sql,
+                        params=params,
+                        background_tasks=background_tasks,
+                        task_type="update_search_result",
+                        producer=producer,
+                        correlation_id=cid
+                    )
+            logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
 
-        update_batch = []
-        insert_batch = []
-        create_time = datetime.datetime.now()
-        for row in results:
-            key = (row["EntryID"], row["ImageUrl"])
-            params = {
-                "EntryID": row["EntryID"],
-                "ImageUrl": row["ImageUrl"],
-                "ImageDesc": row.get("ImageDesc", ""),
-                "ImageSource": row.get("ImageSource", ""),
-                "ImageUrlThumbnail": row.get("ImageUrlThumbnail", ""),
-                "CreateTime": create_time
-            }
-            if key in existing_keys:
-                update_batch.append((update_query, params))
-            else:
-                insert_batch.append((insert_query, params))
+            for i in range(0, len(insert_batch), batch_size):
+                batch = insert_batch[i:i + batch_size]
+                for sql, params in batch:
+                    cid = str(uuid.uuid4())
+                    insert_cids.append(cid)
+                    await enqueue_db_update(
+                        file_id=file_id,
+                        sql=sql,
+                        params=params,
+                        background_tasks=background_tasks,
+                        task_type="insert_search_result",
+                        producer=producer,
+                        correlation_id=cid
+                    )
+            logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
 
-        batch_size = 100
-        update_correlation_ids = []
-        insert_correlation_ids = []
-        for i in range(0, len(update_batch), batch_size):
-            batch = update_batch[i:i + batch_size]
-            for sql, params in batch:
-                cid = str(uuid.uuid4())
-                update_correlation_ids.append(cid)
-                await enqueue_db_update(
-                    file_id=file_id,
-                    sql=sql,
-                    params=params,
-                    background_tasks=background_tasks,
-                    task_type="update_search_result",
-                    producer=producer,
-                    correlation_id=cid,
-                    logger=logger
-                )
-        logger.info(f"Worker PID {process.pid}: Enqueued {len(update_batch)} updates with correlation IDs: {update_correlation_ids}")
+            # Verify enqueued tasks (optional)
+            async with async_engine.connect() as conn:
+                query = text("""
+                    SELECT COUNT(*) FROM utb_ImageScraperResult
+                    WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
+                """)
+                result = await conn.execute(query, {
+                    "entry_ids": tuple(entry_ids),
+                    "create_time": min(row["CreateTime"] for row in data)
+                })
+                inserted_count = result.scalar()
+                logger.info(f"Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
 
-        for i in range(0, len(insert_batch), batch_size):
-            batch = insert_batch[i:i + batch_size]
-            for sql, params in batch:
-                cid = str(uuid.uuid4())
-                insert_correlation_ids.append(cid)
-                await enqueue_db_update(
-                    file_id=file_id,
-                    sql=sql,
-                    params=params,
-                    background_tasks=background_tasks,
-                    task_type="insert_search_result",
-                    producer=producer,
-                    correlation_id=cid,
-                    logger=logger
-                )
-        logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with correlation IDs: {insert_correlation_ids}")
-
-        # Verify database changes
-        async with async_engine.connect() as conn:
-            query = text("""
-                SELECT COUNT(*) FROM utb_ImageScraperResult
-                WHERE EntryID IN :entry_ids AND CreateTime = :create_time
-            """)
-            result = await conn.execute(query, {"entry_ids": tuple(entry_ids), "create_time": create_time})
-            inserted_count = result.scalar()
-            logger.info(f"Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
-
-        return inserted_count > 0 or len(update_batch) > 0
+            return len(insert_batch) > 0 or len(update_batch) > 0
 
     except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Error in insert_search_results for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Worker PID {process.pid}: Error enqueuing results for FileID {file_id}: {e}", exc_info=True)
         raise
+    finally:
+        await producer.close()
+        logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer")
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),

@@ -125,7 +125,6 @@ async def update_search_sort_order(
                 background_tasks=background_tasks,
                 task_type="update_sort_order",
                 producer=producer,
-                response_queue=response_queue,
                 correlation_id=correlation_id,
                 return_result=True,
                 logger=logger
