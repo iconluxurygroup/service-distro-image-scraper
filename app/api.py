@@ -81,14 +81,16 @@ async def lifespan(app: FastAPI):
     for attempt in range(1, max_retries + 1):
         try:
             producer = RabbitMQProducer(amqp_url=rabbitmq_url)
-            await producer.connect()
+            async with asyncio.timeout(10):
+                await producer.connect()
             default_logger.info("RabbitMQ producer connected")
             break
         except Exception as e:
             default_logger.error(f"Attempt {attempt}/{max_retries} failed to connect to RabbitMQ: {e}")
             if attempt == max_retries:
                 default_logger.error("Max retries reached, RabbitMQ connection failed")
-                raise
+                producer = None  # Explicitly set to None to indicate failure
+                # Optionally, proceed without RabbitMQ if non-critical
             await asyncio.sleep(2 ** attempt)  # Exponential backoff
     
     try:
@@ -106,12 +108,11 @@ async def lifespan(app: FastAPI):
         
     finally:
         default_logger.info("Shutting down FastAPI application")
-        if producer:
+        if producer and producer.is_connected:
             await producer.close()
             default_logger.info("RabbitMQ producer closed")
         await async_engine.dispose()
         default_logger.info("Database engine disposed")
-
 app.lifespan = lifespan
 
 class SearchClient:
