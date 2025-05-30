@@ -12,7 +12,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_t
 from image_vision import detect_objects_with_computer_vision_async, analyze_image_with_gemini_async
 from vision_utils import fetch_missing_images
 from config import BASE_CONFIG_URL
-from common import clean_string, generate_aliases, generate_brand_aliases, load_config, CONFIG_FILES
+from common import clean_string, generate_aliases, generate_brand_aliases, load_config, CONFIG_FILES,create_predefined_aliases
 import pandas as pd
 import pyodbc
 from database_config import conn_str
