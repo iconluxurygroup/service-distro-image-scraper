@@ -202,7 +202,7 @@ async def cleanup_producer():
         default_logger.info("Cleaned up RabbitMQ producer")
 
 @retry(
-    stop=stop_after_attempt(3),
+    stop=stop_after_attempt(5),  # Increased from 3 to 5
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((
         aio_pika.exceptions.AMQPError,
@@ -213,7 +213,7 @@ async def cleanup_producer():
     )),
     before_sleep=lambda retry_state: default_logger.info(
         f"Retrying enqueue_db_update for FileID {retry_state.kwargs.get('file_id')} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
+        f"(attempt {retry_state.attempt_number}/5) after {retry_state.next_action.sleep}s"
     )
 )
 async def enqueue_db_update(
@@ -273,11 +273,33 @@ async def enqueue_db_update(
                     await producer.connect()
                     channel = producer.channel
 
-                # Declare response queue
+                # Attempt to clean up stale queue
                 try:
-                    queue = await channel.declare_queue(
-                        response_queue, durable=False, exclusive=False, auto_delete=True
+                    await producer.cleanup_queue(response_queue)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up response queue {response_queue} before declaration: {e}")
+
+                # Declare response queue with retries
+                @retry(
+                    stop=stop_after_attempt(3),
+                    wait=wait_exponential(multiplier=1, min=1, max=5),
+                    retry=retry_if_exception_type((aiormq.exceptions.ChannelLockedResource, aio_pika.exceptions.AMQPError)),
+                    before_sleep=lambda retry_state: logger.info(
+                        f"Retrying queue declaration for {response_queue} (attempt {retry_state.attempt_number}/3)"
                     )
+                )
+                async def declare_queue():
+                    try:
+                        return await channel.declare_queue(
+                            response_queue, durable=False, exclusive=False, auto_delete=True
+                        )
+                    except aiormq.exceptions.ChannelLockedResource:
+                        logger.warning(f"Queue {response_queue} locked, attempting to delete and retry")
+                        await producer.cleanup_queue(response_queue)
+                        raise  # Retry declaration
+
+                try:
+                    queue = await declare_queue()
                     logger.debug(f"Declared response queue {response_queue} for FileID {file_id}")
                 except Exception as e:
                     logger.error(f"Failed to declare response queue {response_queue} for FileID {file_id}: {e}", exc_info=True)
