@@ -47,7 +47,15 @@ class RabbitMQProducer:
         self.is_connected = False
         self._lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
-
+    @classmethod
+    async def get_producer(cls, logger: Optional[logging.Logger] = None) -> 'RabbitMQProducer':
+        logger = logger or logging.getLogger(__name__)
+        async with cls._lock:
+            if cls._instance is None or not cls._instance.is_connected:
+                cls._instance = cls()
+                await cls._instance.connect()
+                logger.info("Initialized RabbitMQProducer")
+            return cls._instance
     async def check_queue_durability(self, channel, queue_name: str, expected_durable: bool, delete_if_mismatched: bool = False) -> bool:
         logger = default_logger
         try:
