@@ -408,6 +408,7 @@ async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
 
 if __name__ == "__main__":
     import argparse
+    import sys
     from rabbitmq_test import test_rabbitmq_connection
 
     parser = argparse.ArgumentParser(description="RabbitMQ Consumer with manual queue clear")
@@ -422,14 +423,13 @@ if __name__ == "__main__":
 
     async def main():
         try:
-            # Test connections on startup
-            logger.info("Testing RabbitMQ connections on startup...")
+            logger.info("Testing RabbitMQ producer and consumer connections on startup...")
             if not await test_rabbitmq_connection(logger):
                 logger.error("RabbitMQ connection test failed, exiting")
                 sys.exit(1)
             logger.info("RabbitMQ connection test passed")
 
-            if args.clear_queue:
+            if args.clear:  # Fixed to match --clear
                 await consumer.purge_queue()
                 logger.info("Queue cleared successfully. Exiting.")
                 sys.exit(0)
@@ -459,5 +459,9 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Error running main: {e}", exc_info=True)
     finally:
+        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        loop.run_until_complete(loop.shutdown_asyncgens())
         if not loop.is_closed():
             loop.close()
