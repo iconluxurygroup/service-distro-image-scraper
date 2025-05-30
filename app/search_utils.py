@@ -131,9 +131,6 @@ async def insert_search_results(
     if not results:
         logger.warning(f"Worker PID {process.pid}: Empty results provided")
         return False
-
-    # Initialize RabbitMQ producer per call
-    producer = None
     try:
         if not RABBITMQ_URL:
             logger.error("RABBITMQ_URL environment variable not set")
