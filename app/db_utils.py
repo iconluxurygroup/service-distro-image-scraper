@@ -261,7 +261,8 @@ async def insert_search_results(
     try:
         correlation_id = str(uuid.uuid4())
         response_queue = f"select_response_{uuid.uuid4().hex}"
-        async with aio_pika.connect_robust(producer.amqp_url) as connection:
+        # Correct usage of aio_pika.connect_robust
+        async with await aio_pika.connect_robust(producer.amqp_url) as connection:
             channel = await connection.channel()
             queue = await channel.declare_queue(response_queue, exclusive=True, auto_delete=True)
             response_received = asyncio.Event()
@@ -300,7 +301,7 @@ async def insert_search_results(
 
                 consume_task = asyncio.create_task(consume_responses())
                 try:
-                    async with asyncio.timeout(60):  # Increased timeout
+                    async with asyncio.timeout(60):
                         await response_received.wait()
                     if response_data:
                         existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
@@ -371,7 +372,6 @@ async def insert_search_results(
                     )
             logger.info(f"Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
 
-            # Verify enqueued tasks (optional)
             async with async_engine.connect() as conn:
                 query = text("""
                     SELECT COUNT(*) FROM utb_ImageScraperResult
