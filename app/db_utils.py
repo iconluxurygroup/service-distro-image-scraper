@@ -342,24 +342,21 @@ async def insert_search_results(
             return False
 
         # Pre-check for existing rows
+        count = 0  # Initialize to avoid downstream issues
         if flat_entry_ids:
             async with async_engine.connect() as conn:
-                if len(flat_entry_ids) == 1:
-                    select_query = text("""
-                        SELECT EntryID, ImageUrl
-                        FROM utb_ImageScraperResult
-                        WHERE EntryID = :entry_id
-                    """)
-                    params = {"entry_id": flat_entry_ids[0]}
-                else:
-                    select_query = text("""
-                        SELECT EntryID, ImageUrl
-                        FROM utb_ImageScraperResult
-                        WHERE EntryID IN :entry_ids
-                    """)
-                    params = {"entry_ids": tuple(flat_entry_ids)}
-                count = result.scalar()
-                logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {flat_entry_ids}")
+                try:
+                    if len(flat_entry_ids) == 1:
+                        query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id")
+                        result = await conn.execute(query, {"entry_id": flat_entry_ids[0]})
+                    else:
+                        query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
+                        result = await conn.execute(query, {"entry_ids": tuple(flat_entry_ids)})
+                    count = result.scalar()
+                    logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {flat_entry_ids}")
+                except SQLAlchemyError as e:
+                    logger.error(f"[{correlation_id}] Failed to check existing rows for EntryIDs {flat_entry_ids}: {e}", exc_info=True)
+                    count = 0  # Fallback to 0 to allow processing to continue
 
         existing_keys = set()
         if flat_entry_ids:
@@ -377,17 +374,16 @@ async def insert_search_results(
                     WHERE EntryID IN :entry_ids
                 """)
                 params = {"entry_ids": tuple(flat_entry_ids)}
-            # In insert_search_results, replace the deduplication block (lines ~373-395) with:
+
             try:
                 async with asyncio.timeout(180):
                     await response_received.wait()
                 if response_data:
                     if isinstance(response_data[0], dict) and "results" in response_data[0]:
-                        # Verify correlation ID matches
                         if response_data[0].get("correlation_id") == correlation_id:
                             existing_keys = {
-                                (row["EntryID"], row["ImageUrl"]) 
-                                for row in response_data[0]["results"] 
+                                (row["EntryID"], row["ImageUrl"])
+                                for row in response_data[0]["results"]
                                 if isinstance(row, dict) and "EntryID" in row and "ImageUrl" in row
                             }
                             logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
@@ -402,7 +398,7 @@ async def insert_search_results(
                     existing_keys = set()
             except asyncio.TimeoutError:
                 logger.error(f"[{correlation_id}] Timeout waiting for SELECT results")
-                existing_keys = set()  # Fallback to avoid blocking
+                existing_keys = set()
             finally:
                 if consume_task:
                     consume_task.cancel()
@@ -472,23 +468,27 @@ async def insert_search_results(
         logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
 
         async with async_engine.connect() as conn:
-            if len(flat_entry_ids) == 1:
-                query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id AND CreateTime >= :create_time")
-                result = await conn.execute(query, {
-                    "entry_id": flat_entry_ids[0],
-                    "create_time": min(row["CreateTime"] for row in data)
-                })
-            else:
-                query = text("""
-                    SELECT COUNT(*) FROM utb_ImageScraperResult
-                    WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
-                """)
-                result = await conn.execute(query, {
-                    "entry_ids": tuple(flat_entry_ids),
-                    "create_time": min(row["CreateTime"] for row in data)
-                })
-            inserted_count = result.scalar()
-            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
+            try:
+                if len(flat_entry_ids) == 1:
+                    query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id AND CreateTime >= :create_time")
+                    result = await conn.execute(query, {
+                        "entry_id": flat_entry_ids[0],
+                        "create_time": min(row["CreateTime"] for row in data)
+                    })
+                else:
+                    query = text("""
+                        SELECT COUNT(*) FROM utb_ImageScraperResult
+                        WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
+                    """)
+                    result = await conn.execute(query, {
+                        "entry_ids": tuple(flat_entry_ids),
+                        "create_time": min(row["CreateTime"] for row in data)
+                    })
+                inserted_count = result.scalar()
+                logger.info(f"[{correlation_id}] Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
+            except SQLAlchemyError as e:
+                logger.error(f"[{correlation_id}] Failed to verify inserted records for FileID {file_id}: {e}", exc_info=True)
+                inserted_count = 0
 
         return len(insert_batch) > 0 or len(update_batch) > 0
 
