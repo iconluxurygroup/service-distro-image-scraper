@@ -74,59 +74,48 @@ class RabbitMQConsumer:
                 self.channel = await self.connection.channel()
                 if not self.channel:
                     raise aio_pika.exceptions.AMQPConnectionError("Failed to create channel")
-                await self.channel.set_qos(prefetch_count=1)
+                await self.channel.set_qos(prefetch_count=1)  # Limit to 1 message at a time
+
                 if self.queue_name.startswith("select_response_"):
                     try:
-                        await self.channel.get_queue(self.queue_name)
-                        logger.debug(f"Connected to existing queue: {self.queue_name}")
+                        # Use non-exclusive, temporary queues for responses
+                        await self.declare_queue_with_retry(
+                            self.channel,
+                            self.queue_name,
+                            exclusive=False,
+                            auto_delete=True,
+                            arguments={"x-expires": 600000}  # 10-minute expiration
+                        )
+                        logger.debug(f"Declared response queue: {self.queue_name}")
                     except aiormq.exceptions.ChannelNotFoundEntity:
                         logger.warning(f"Queue {self.queue_name} not found, creating it")
                         await self.declare_queue_with_retry(
                             self.channel,
                             self.queue_name,
-                            exclusive=True,
+                            exclusive=False,
                             auto_delete=True,
                             arguments={"x-expires": 600000}
                         )
                         logger.debug(f"Created response queue: {self.queue_name}")
-                    except aiormq.exceptions.ChannelLockedResource:
-                        logger.warning(f"Queue {self.queue_name} is locked, generating new queue name")
-                        self.queue_name = f"{self.queue_name}_{uuid.uuid4().hex[:8]}"
-                        logger.debug(f"Attempting to create new queue: {self.queue_name}")
-                        await self.declare_queue_with_retry(
-                            self.channel,
-                            self.queue_name,
-                            exclusive=True,
-                            auto_delete=True,
-                            arguments={"x-expires": 600000}
-                        )
-                        logger.debug(f"Created new response queue: {self.queue_name}")
                 else:
+                    # Main queue is durable and non-exclusive
                     await self.declare_queue_with_retry(
                         self.channel,
                         self.queue_name,
-                        durable=True
+                        durable=True,
+                        exclusive=False,
+                        auto_delete=False
                     )
+                    logger.debug(f"Declared durable queue: {self.queue_name}")
                 logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
         except asyncio.TimeoutError:
             logger.error("Timeout connecting to RabbitMQ")
             raise
         except aio_pika.exceptions.ProbableAuthenticationError as e:
-            logger.error(
-                f"Authentication error connecting to RabbitMQ: {e}. "
-                f"Check username, password, and virtual host in {self.amqp_url}.",
-                exc_info=True
-            )
+            logger.error(f"Authentication error: {e}", exc_info=True)
             raise
         except aio_pika.exceptions.AMQPConnectionError as e:
             logger.error(f"Failed to connect to RabbitMQ: {e}", exc_info=True)
-            raise
-        except aiormq.exceptions.ChannelLockedResource as e:
-            logger.error(
-                f"Resource locked error for queue {self.queue_name}: {e}. "
-                f"Ensure queue is not exclusively locked by another connection.",
-                exc_info=True
-            )
             raise
     async def get_channel(self) -> aio_pika.Channel:
         """Get the RabbitMQ channel, connecting if necessary."""
