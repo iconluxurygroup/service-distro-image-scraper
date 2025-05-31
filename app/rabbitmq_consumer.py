@@ -74,17 +74,17 @@ class RabbitMQConsumer:
                 self.channel = await self.connection.channel()
                 if not self.channel:
                     raise aio_pika.exceptions.AMQPConnectionError("Failed to create channel")
-                await self.channel.set_qos(prefetch_count=1)  # Limit to 1 message at a time
+                await self.channel.set_qos(prefetch_count=1)
 
                 if self.queue_name.startswith("select_response_"):
                     try:
-                        # Use non-exclusive, temporary queues for responses
                         await self.declare_queue_with_retry(
                             self.channel,
                             self.queue_name,
+                            durable=False,  # Consistent with producer
                             exclusive=False,
                             auto_delete=True,
-                            arguments={"x-expires": 600000}  # 10-minute expiration
+                            arguments={"x-expires": 600000}
                         )
                         logger.debug(f"Declared response queue: {self.queue_name}")
                     except aiormq.exceptions.ChannelNotFoundEntity:
@@ -92,13 +92,25 @@ class RabbitMQConsumer:
                         await self.declare_queue_with_retry(
                             self.channel,
                             self.queue_name,
+                            durable=False,
                             exclusive=False,
                             auto_delete=True,
                             arguments={"x-expires": 600000}
                         )
                         logger.debug(f"Created response queue: {self.queue_name}")
+                    except aiormq.exceptions.ChannelPreconditionFailed:
+                        logger.warning(f"Queue {self.queue_name} has incompatible settings, generating new name")
+                        self.queue_name = f"{self.queue_name}_{uuid.uuid4().hex[:8]}"
+                        await self.declare_queue_with_retry(
+                            self.channel,
+                            self.queue_name,
+                            durable=False,
+                            exclusive=False,
+                            auto_delete=True,
+                            arguments={"x-expires": 600000}
+                        )
+                        logger.debug(f"Created new response queue: {self.queue_name}")
                 else:
-                    # Main queue is durable and non-exclusive
                     await self.declare_queue_with_retry(
                         self.channel,
                         self.queue_name,
@@ -106,7 +118,7 @@ class RabbitMQConsumer:
                         exclusive=False,
                         auto_delete=False
                     )
-                    logger.debug(f"Declared durable queue: {self.queue_name}")
+                    logger.debug(f"Declared main queue: {self.queue_name}")
                 logger.info(f"Connected to RabbitMQ, consuming from queue: {self.queue_name}")
         except asyncio.TimeoutError:
             logger.error("Timeout connecting to RabbitMQ")
