@@ -369,14 +369,23 @@ async def insert_search_results(
                     WHERE EntryID IN :entry_ids
                 """)
                 params = {"entry_ids": tuple(flat_entry_ids)}
-            # In insert_search_results, replace the existing deduplication block with:
+            # In insert_search_results, replace the deduplication block (lines ~373-395) with:
             try:
                 async with asyncio.timeout(180):
                     await response_received.wait()
                 if response_data:
                     if isinstance(response_data[0], dict) and "results" in response_data[0]:
-                        existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"] if "EntryID" in row and "ImageUrl" in row}
-                        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                        # Verify correlation ID matches
+                        if response_data[0].get("correlation_id") == correlation_id:
+                            existing_keys = {
+                                (row["EntryID"], row["ImageUrl"]) 
+                                for row in response_data[0]["results"] 
+                                if isinstance(row, dict) and "EntryID" in row and "ImageUrl" in row
+                            }
+                            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                        else:
+                            logger.warning(f"[{correlation_id}] Worker PID {process.pid}: Mismatched correlation ID in response: {response_data[0].get('correlation_id')}")
+                            existing_keys = set()
                     else:
                         logger.warning(f"[{correlation_id}] Worker PID {process.pid}: Unexpected response format: {response_data[0]}")
                         existing_keys = set()
@@ -386,10 +395,13 @@ async def insert_search_results(
             except asyncio.TimeoutError:
                 logger.error(f"[{correlation_id}] Timeout waiting for SELECT results")
                 existing_keys = set()  # Fallback to avoid blocking
-                # Optionally, raise or retry based on requirements
             finally:
                 if consume_task:
                     consume_task.cancel()
+                    try:
+                        await asyncio.wait_for(consume_task, timeout=1.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[{correlation_id}] Consume task did not cancel within 1 second")
                     await asyncio.sleep(0.5)
 
         update_query = """
