@@ -345,11 +345,19 @@ async def insert_search_results(
         if flat_entry_ids:
             async with async_engine.connect() as conn:
                 if len(flat_entry_ids) == 1:
-                    query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id")
-                    result = await conn.execute(query, {"entry_id": flat_entry_ids[0]})
+                    select_query = text("""
+                        SELECT EntryID, ImageUrl
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID = :entry_id
+                    """)
+                    params = {"entry_id": flat_entry_ids[0]}
                 else:
-                    query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
-                    result = await conn.execute(query, {"entry_ids": tuple(flat_entry_ids)})
+                    select_query = text("""
+                        SELECT EntryID, ImageUrl
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID IN :entry_ids
+                    """)
+                    params = {"entry_ids": tuple(flat_entry_ids)}
                 count = result.scalar()
                 logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {flat_entry_ids}")
 

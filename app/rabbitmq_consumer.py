@@ -253,29 +253,35 @@ class RabbitMQConsumer:
         select_sql = task.get("sql")
         params = task.get("params", {})
         response_queue = task.get("response_queue")
-        logger.debug(f"Executing SELECT for FileID {file_id}: {select_sql}, params: {params}")
+        logger.debug(f"[{task.get('correlation_id', 'N/A')}] Executing SELECT for FileID {file_id}: {select_sql}, params: {params}")
         if not params:
             raise ValueError(f"No parameters provided for SELECT query: {select_sql}")
         if any(k.startswith("id") for k in params.keys()):
-            logger.debug(f"Detected named placeholder parameters: {params}")
+            logger.debug(f"[{task.get('correlation_id', 'N/A')}] Detected named placeholder parameters: {params}")
         else:
             raise ValueError(f"Invalid parameters for SELECT query, expected named placeholders (e.g., id0), got: {params}")
         try:
+            start_time = datetime.datetime.now()
             result = await conn.execute(text(select_sql), params)
             rows = result.fetchall()
             columns = result.keys()
             result.close()
             results = [dict(zip(columns, row)) for row in rows]
-            logger.info(f"Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id}")
+            elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+            logger.info(f"[{task.get('correlation_id', 'N/A')}] Worker PID {psutil.Process().pid}: SELECT returned {len(results)} rows for FileID {file_id} in {elapsed_time:.2f}s")
             if response_queue:
                 producer = await RabbitMQProducer.get_producer(logger=logger)
                 await producer.connect()
-                response = {"file_id": file_id, "results": results}
-                await producer.publish_message(response, routing_key=response_queue, correlation_id=file_id)
-                logger.debug(f"Sent SELECT results to {response_queue} for FileID {file_id}")
+                response = {
+                    "file_id": file_id,
+                    "results": results,
+                    "correlation_id": task.get("correlation_id", str(uuid.uuid4()))
+                }
+                await producer.publish_message(response, routing_key=response_queue, correlation_id=task.get("correlation_id"))
+                logger.debug(f"[{task.get('correlation_id', 'N/A')}] Sent SELECT results to {response_queue} for FileID {file_id}")
             return results
         except SQLAlchemyError as e:
-            logger.error(f"Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
+            logger.error(f"[{task.get('correlation_id', 'N/A')}] Database error executing SELECT for FileID {file_id}: {e}", exc_info=True)
             raise
     async def execute_sort_order_update(self, params: dict, file_id: str):
         try:
