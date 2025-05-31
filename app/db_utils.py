@@ -795,94 +795,80 @@ async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logge
         logger.error(f"Unexpected error for FileID {file_id}: {e}", exc_info=True)
         return None
     
-async def enqueue_db_update(
-    file_id: str,
-    sql: str,
-    params: Dict[str, Any],
-    background_tasks: BackgroundTasks,
-    task_type: str = "db_update",
-    producer: Optional[RabbitMQProducer] = None,
-    response_queue: Optional[str] = None,
-    correlation_id: Optional[str] = None,
-    return_result: bool = False,
-    consumer: Optional[RabbitMQConsumer] = None,
-    logger: Optional[logging.Logger] = None,
-):
-    logger = logger or logging.getLogger(__name__)
-    should_close_producer = False
-    should_close_consumer = False
-    if producer is None:
-        producer = await RabbitMQProducer.get_producer(logger=logger)
-        should_close_producer = True
+import aio_pika
+import uuid
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import aiormq.exceptions
 
+logger = logging.getLogger(__name__)
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((
+        aio_pika.exceptions.AMQPError,
+        aio_pika.exceptions.ChannelClosed,
+        aiormq.exceptions.ChannelAccessRefused,
+        aiormq.exceptions.ChannelPreconditionFailed
+    )),
+)
+async def enqueue_db_update(consumer, task, response_queue=None):
+    """Enqueue a database update task to RabbitMQ."""
     try:
-        await producer.connect()
-        sql_str = str(sql) if hasattr(sql, '__clause_element__') else sql
-        update_task = {
-            "file_id": file_id,
-            "task_type": task_type,
-            "sql": sql_str,
-            "params": params,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "response_queue": response_queue,
-        }
-        if return_result and response_queue:
-            if consumer is None:
-                consumer = RabbitMQConsumer(
-                    amqp_url=producer.amqp_url,
-                    queue_name=response_queue,
-                    connection_timeout=30.0,
-                    operation_timeout=15.0,
-                )
-                should_close_consumer = True
-                await consumer.connect()
-                logger.debug(f"[{correlation_id}] Created and connected consumer for queue {response_queue}")
-            else:
-                logger.debug(f"[{correlation_id}] Using provided consumer for queue {response_queue}")
+        channel = await consumer.get_channel()
+        queue_name = response_queue or consumer.queue_name
 
-            # Explicitly declare the queue
-            channel = consumer.channel
+        # For response queues, ensure consistent non-durable, non-exclusive settings
+        if queue_name.startswith("select_response_"):
+            try:
+                # Check if queue exists with compatible settings
+                await channel.get_queue(queue_name)
+                logger.debug(f"Using existing response queue: {queue_name}")
+            except aiormq.exceptions.ChannelNotFoundEntity:
+                # Declare new queue with consistent settings
+                await channel.declare_queue(
+                    queue_name,
+                    durable=False,  # Non-durable for temporary response queues
+                    exclusive=False,  # Allow multiple connections
+                    auto_delete=True,  # Clean up after use
+                    arguments={"x-expires": 600000}  # 10-minute expiration
+                )
+                logger.debug(f"Declared new response queue: {queue_name}")
+            except aiormq.exceptions.ChannelPreconditionFailed:
+                # Queue exists with incompatible settings; generate new queue name
+                logger.warning(f"Queue {queue_name} has incompatible settings, generating new name")
+                queue_name = f"{queue_name}_{uuid.uuid4().hex[:8]}"
+                await channel.declare_queue(
+                    queue_name,
+                    durable=False,
+                    exclusive=False,
+                    auto_delete=True,
+                    arguments={"x-expires": 600000}
+                )
+                logger.debug(f"Declared new response queue: {queue_name}")
+        else:
+            # Main queue is durable and non-exclusive
             await channel.declare_queue(
-                response_queue,
-                exclusive=False,
+                queue_name,
                 durable=True,
+                exclusive=False,
                 auto_delete=False
             )
-            logger.debug(f"[{correlation_id}] Declared queue {response_queue}")
+            logger.debug(f"Declared main queue: {queue_name}")
 
-            result_future = asyncio.Future()
-
-            async def temp_callback(message: aio_pika.IncomingMessage):
-                async with message.process():
-                    if message.correlation_id == correlation_id:
-                        response = json.loads(message.body.decode())
-                        result_future.set_result(response.get("results", []))
-                        logger.info(f"[{correlation_id}] Received response for correlation_id {correlation_id} from {response_queue}")
-
-            queue = await consumer.channel.get_queue(response_queue)
-            await queue.consume(temp_callback)
-
-            await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
-            logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
-
-            try:
-                async with asyncio.timeout(180):
-                    result = await result_future
-                    logger.info(f"[{correlation_id}] Received deduplication result for FileID: {file_id}")
-                    return result
-            except asyncio.TimeoutError:
-                logger.error(f"[{correlation_id}] Timeout waiting for deduplication response for FileID: {file_id}")
-                raise
-        else:
-            await producer.publish_update(update_task, routing_key=producer.queue_name, correlation_id=correlation_id)
-            logger.info(f"[{correlation_id}] Enqueued database update for FileID: {file_id}, TaskType: {task_type}, SQL: {sql_str[:100]}")
+        # Publish the task
+        message_body = json.dumps(task)
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=message_body.encode(),
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                content_type="application/json",
+            ),
+            routing_key=queue_name,
+        )
+        logger.info(f"Enqueued task to {queue_name}: {message_body[:200]}")
+        return queue_name
     except Exception as e:
-        logger.error(f"[{correlation_id}] Error enqueuing database update for FileID: {file_id}: {e}", exc_info=True)
+        logger.error(f"Error enqueuing task to {queue_name}: {e}", exc_info=True)
         raise
-    finally:
-        if should_close_consumer and consumer:
-            await consumer.close()
-            logger.debug(f"[{correlation_id}] Closed RabbitMQ consumer for queue {response_queue}")
-        if should_close_producer and producer:
-            await producer.close()
-            logger.debug(f"[{correlation_id}] Closed RabbitMQ producer for FileID: {file_id}")
