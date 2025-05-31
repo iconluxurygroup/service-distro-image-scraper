@@ -302,7 +302,7 @@ class RabbitMQConsumer:
                 response_queue = task.get("response_queue")
                 logger.info(
                     f"Received task for FileID: {file_id}, TaskType: {task_type}, "
-                    f"CorrelationID: {message.correlation_id}, Task: {json.dumps(task)[:200]}"
+                    f"CorrelationID: {message.correlation_id}"
                 )
                 async with asyncio.timeout(self.operation_timeout):
                     if task_type == "select_deduplication":
@@ -312,7 +312,6 @@ class RabbitMQConsumer:
                             if response_queue:
                                 producer = await RabbitMQProducer.get_producer(logger=logger, amqp_url=self.amqp_url)
                                 try:
-                                    await producer.connect()
                                     await producer.publish_message(
                                         response,
                                         routing_key=response_queue,
@@ -322,10 +321,9 @@ class RabbitMQConsumer:
                                         f"Sent {len(result)} deduplication results to {response_queue} "
                                         f"for FileID: {file_id}"
                                     )
-                                finally:
-                                    # Do not close producer to maintain singleton connection
-                                    pass
-                        success = True
+                                except Exception as e:
+                                    logger.error(f"Failed to publish response for FileID: {file_id}: {e}", exc_info=True)
+                                    raise
                     elif task_type == "update_sort_order" and task.get("sql") == "UPDATE_SORT_ORDER":
                         success = await self.execute_sort_order_update(task.get("params", {}), file_id)
                     else:
@@ -335,6 +333,8 @@ class RabbitMQConsumer:
                     if success:
                         await message.ack()
                         logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
+                        # Add a small delay to control processing rate
+                        await asyncio.sleep(0.1)  # Adjust delay as needed (e.g., 0.1s)
                     else:
                         logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
                         await message.nack(requeue=True)

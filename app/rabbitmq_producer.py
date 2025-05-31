@@ -106,18 +106,16 @@ class RabbitMQProducer:
             raise
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=10),
-        retry=retry_if_exception_type((
-            aio_pika.exceptions.AMQPError,
-            aio_pika.exceptions.ChannelClosed,
-            aiormq.exceptions.ChannelAccessRefused,
-            asyncio.TimeoutError
-        )),
-        before_sleep=lambda retry_state: logger.info(
-            f"Retrying RabbitMQ operation (attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-        ),
-    )
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((
+        aio_pika.exceptions.AMQPError,
+        aio_pika.exceptions.ChannelClosed,
+        aiormq.exceptions.ChannelAccessRefused,
+        asyncio.TimeoutError,
+        aiormq.exceptions.ChannelNotFoundEntity
+    )),
+)
     async def publish_message(self, message: Dict[str, Any], routing_key: str = None, correlation_id: Optional[str] = None):
         """Publish a message to the queue with optional correlation_id."""
         if not self.is_connected or not self.connection or self.connection.is_closed:
@@ -127,9 +125,28 @@ class RabbitMQProducer:
             async with asyncio.timeout(self.operation_timeout):
                 message_body = json.dumps(message)
                 queue_name = routing_key or self.queue_name
-                if queue_name != self.queue_name and not queue_name.startswith("select_response_"):
-                    await self.channel.declare_queue(queue_name, durable=False, exclusive=True, auto_delete=True)
-                
+                # Declare queue dynamically for response queues
+                if queue_name != self.queue_name and queue_name.startswith("select_response_"):
+                    try:
+                        await self.channel.declare_queue(
+                            queue_name,
+                            durable=False,
+                            exclusive=False,
+                            auto_delete=True,
+                            arguments={"x-expires": 600000}
+                        )
+                        logger.debug(f"Declared response queue: {queue_name}")
+                    except aiormq.exceptions.ChannelNotFoundEntity:
+                        logger.warning(f"Queue {queue_name} not found, declared anew")
+                elif queue_name == self.queue_name:
+                    # Ensure main queue is declared
+                    await self.channel.declare_queue(
+                        queue_name,
+                        durable=True,
+                        exclusive=False,
+                        auto_delete=False
+                    )
+
                 await self.channel.default_exchange.publish(
                     aio_pika.Message(
                         body=message_body.encode(),
@@ -144,18 +161,10 @@ class RabbitMQProducer:
                     f"correlation_id: {correlation_id}, task: {message_body[:200]}"
                 )
         except aio_pika.exceptions.ProbableAuthenticationError as e:
-            logger.error(
-                f"Authentication error publishing to queue {queue_name}: {e}. "
-                f"Check username, password, and virtual host in {self.amqp_url}.",
-                exc_info=True
-            )
+            logger.error(f"Authentication error: {e}", exc_info=True)
             raise
         except aiormq.exceptions.ChannelAccessRefused as e:
-            logger.error(
-                f"Permissions error publishing to queue {queue_name}: {e}. "
-                f"Ensure user has write permissions on the default exchange.",
-                exc_info=True
-            )
+            logger.error(f"Permissions error: {e}", exc_info=True)
             raise
         except asyncio.TimeoutError:
             logger.error(f"Timeout publishing message to {queue_name}")
