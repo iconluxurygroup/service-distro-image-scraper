@@ -802,7 +802,7 @@ import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import aiormq.exceptions
 from typing import Any, Optional
-from sqlalchemy.sql import TextClause
+from sqlalchemy.sql.expression import TextClause
 
 logger = logging.getLogger(__name__)
 
