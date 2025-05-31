@@ -369,36 +369,24 @@ async def insert_search_results(
                     WHERE EntryID IN :entry_ids
                 """)
                 params = {"entry_ids": tuple(flat_entry_ids)}
-            try:
-                await enqueue_db_update(
-                    file_id=file_id,
-                    sql=select_query,
-                    params=params,
-                    background_tasks=background_tasks,
-                    task_type="select_deduplication",
-                    producer=producer,
-                    response_queue=response_queue,
-                    correlation_id=correlation_id,
-                    return_result=True,
-                    logger=logger
-                )
-                logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued SELECT query for {len(flat_entry_ids)} EntryIDs")
-            except (aiormq.exceptions.ChannelNotFoundEntity, aiormq.exceptions.ChannelLockedResource) as e:
-                logger.error(f"[{correlation_id}] Queue {response_queue} error: {e}")
-                raise
-
-            consume_task = asyncio.create_task(consume_responses())
+            # In insert_search_results, replace the existing deduplication block with:
             try:
                 async with asyncio.timeout(180):
                     await response_received.wait()
                 if response_data:
-                    existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"]}
-                    logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                    if isinstance(response_data[0], dict) and "results" in response_data[0]:
+                        existing_keys = {(row["EntryID"], row["ImageUrl"]) for row in response_data[0]["results"] if "EntryID" in row and "ImageUrl" in row}
+                        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                    else:
+                        logger.warning(f"[{correlation_id}] Worker PID {process.pid}: Unexpected response format: {response_data[0]}")
+                        existing_keys = set()
                 else:
                     logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No deduplication results received")
+                    existing_keys = set()
             except asyncio.TimeoutError:
                 logger.error(f"[{correlation_id}] Timeout waiting for SELECT results")
-                raise
+                existing_keys = set()  # Fallback to avoid blocking
+                # Optionally, raise or retry based on requirements
             finally:
                 if consume_task:
                     consume_task.cancel()
