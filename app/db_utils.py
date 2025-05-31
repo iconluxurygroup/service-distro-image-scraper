@@ -796,10 +796,13 @@ async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logge
         return None
     
 import aio_pika
+import json
 import uuid
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import aiormq.exceptions
+from typing import Any, Optional
+from sqlalchemy.sql import TextClause
 
 logger = logging.getLogger(__name__)
 
@@ -815,7 +818,7 @@ logger = logging.getLogger(__name__)
 )
 async def enqueue_db_update(
     file_id: str,
-    sql: str,
+    sql: Any,  # Allow TextClause or string
     params: dict,
     background_tasks: Any = None,
     task_type: str = "db_update",
@@ -828,6 +831,20 @@ async def enqueue_db_update(
     """Enqueue a database update task to RabbitMQ."""
     logger = logger or logging.getLogger(__name__)
     try:
+        # Convert sql to string if it's a TextClause
+        if isinstance(sql, TextClause):
+            sql = str(sql)
+            logger.debug(f"[{correlation_id or 'N/A'}] Converted TextClause to string: {sql[:100]}...")
+
+        # Ensure params are JSON-serializable
+        serializable_params = {}
+        for key, value in params.items():
+            if isinstance(value, tuple):
+                serializable_params[key] = list(value)  # Convert tuples to lists
+            else:
+                serializable_params[key] = value
+        params = serializable_params
+
         # Initialize producer if not provided
         if not producer or not producer.is_connected:
             from rabbitmq_producer import RabbitMQProducer
