@@ -813,31 +813,58 @@ logger = logging.getLogger(__name__)
         aiormq.exceptions.ChannelPreconditionFailed
     )),
 )
-async def enqueue_db_update(consumer, task, response_queue=None):
+async def enqueue_db_update(
+    file_id: str,
+    sql: str,
+    params: dict,
+    background_tasks: Any = None,
+    task_type: str = "db_update",
+    producer: Optional[aio_pika.Connection] = None,
+    response_queue: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    return_result: bool = False,
+    logger: Optional[logging.Logger] = None
+) -> Any:
     """Enqueue a database update task to RabbitMQ."""
+    logger = logger or logging.getLogger(__name__)
     try:
-        channel = await consumer.get_channel()
-        queue_name = response_queue or consumer.queue_name
+        # Initialize producer if not provided
+        if not producer or not producer.is_connected:
+            from rabbitmq_producer import RabbitMQProducer
+            producer = await RabbitMQProducer.get_producer(logger=logger)
+            logger.debug(f"[{correlation_id or 'N/A'}] Initialized new RabbitMQ producer for FileID {file_id}")
 
-        # For response queues, ensure consistent non-durable, non-exclusive settings
+        # Construct task dictionary
+        task = {
+            "file_id": file_id,
+            "sql": sql,
+            "params": params,
+            "task_type": task_type,
+            "correlation_id": correlation_id or str(uuid.uuid4()),
+            "return_result": return_result,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+        # Determine queue name
+        queue_name = response_queue or "db_update_queue"
+        channel = await producer.connection.channel()
+
+        # Handle response queues (temporary, non-durable)
         if queue_name.startswith("select_response_"):
             try:
-                # Check if queue exists with compatible settings
                 await channel.get_queue(queue_name)
-                logger.debug(f"Using existing response queue: {queue_name}")
+                logger.debug(f"[{task['correlation_id']}] Using existing response queue: {queue_name}")
             except aiormq.exceptions.ChannelNotFoundEntity:
-                # Declare new queue with consistent settings
                 await channel.declare_queue(
                     queue_name,
-                    durable=False,  # Non-durable for temporary response queues
-                    exclusive=False,  # Allow multiple connections
-                    auto_delete=True,  # Clean up after use
+                    durable=False,
+                    exclusive=False,
+                    auto_delete=True,
                     arguments={"x-expires": 600000}  # 10-minute expiration
                 )
-                logger.debug(f"Declared new response queue: {queue_name}")
+                logger.debug(f"[{task['correlation_id']}] Declared new response queue: {queue_name}")
             except aiormq.exceptions.ChannelPreconditionFailed:
-                # Queue exists with incompatible settings; generate new queue name
-                logger.warning(f"Queue {queue_name} has incompatible settings, generating new name")
+                logger.warning(f"[{task['correlation_id']}] Queue {queue_name} has incompatible settings, generating new name")
                 queue_name = f"{queue_name}_{uuid.uuid4().hex[:8]}"
                 await channel.declare_queue(
                     queue_name,
@@ -846,29 +873,32 @@ async def enqueue_db_update(consumer, task, response_queue=None):
                     auto_delete=True,
                     arguments={"x-expires": 600000}
                 )
-                logger.debug(f"Declared new response queue: {queue_name}")
+                logger.debug(f"[{task['correlation_id']}] Declared new response queue: {queue_name}")
         else:
-            # Main queue is durable and non-exclusive
+            # Main queue (durable)
             await channel.declare_queue(
                 queue_name,
                 durable=True,
                 exclusive=False,
                 auto_delete=False
             )
-            logger.debug(f"Declared main queue: {queue_name}")
+            logger.debug(f"[{task['correlation_id']}] Declared main queue: {queue_name}")
 
-        # Publish the task
+        # Publish task
         message_body = json.dumps(task)
         await channel.default_exchange.publish(
             aio_pika.Message(
                 body=message_body.encode(),
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 content_type="application/json",
+                correlation_id=task["correlation_id"]
             ),
-            routing_key=queue_name,
+            routing_key=queue_name
         )
-        logger.info(f"Enqueued task to {queue_name}: {message_body[:200]}")
-        return queue_name
+        logger.info(f"[{task['correlation_id']}] Enqueued task to {queue_name} for FileID {file_id}: {message_body[:200]}")
+        
+        # Return queue name or simulated rows affected
+        return queue_name if not return_result else 1
     except Exception as e:
-        logger.error(f"Error enqueuing task to {queue_name}: {e}", exc_info=True)
+        logger.error(f"[{correlation_id or 'N/A'}] Error enqueuing task to {queue_name} for FileID {file_id}: {e}", exc_info=True)
         raise
