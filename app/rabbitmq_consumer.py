@@ -131,15 +131,23 @@ class RabbitMQConsumer:
                 self.is_consuming = False
                 logger.info("Stopped consuming messages")
             if self.channel and not self.channel.is_closed:
-                await self.channel.close()
-                logger.info("Closed RabbitMQ channel")
+                try:
+                    await asyncio.wait_for(self.channel.close(), timeout=5)
+                    logger.info("Closed RabbitMQ channel")
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout closing RabbitMQ channel")
             if self.connection and not self.connection.is_closed:
-                await self.connection.close()
-                logger.info("Closed RabbitMQ connection")
+                try:
+                    await asyncio.wait_for(self.connection.close(), timeout=5)
+                    logger.info("Closed RabbitMQ connection")
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout closing RabbitMQ connection")
         except Exception as e:
             logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
-        self.is_consuming = False
-
+        finally:
+            self.is_consuming = False
+            self.channel = None
+            self.connection = None
     async def purge_queue(self):
         """Purge all messages from the queue."""
         try:
