@@ -356,8 +356,7 @@ class RabbitMQConsumer:
                     if success:
                         await message.ack()
                         logger.info(f"Successfully processed {task_type} for FileID: {file_id}, Acknowledged")
-                        # Add a small delay to control processing rate
-                        await asyncio.sleep(0.1)  # Adjust delay as needed (e.g., 0.1s)
+                        await asyncio.sleep(0.1)  # Adjustable delay for pacing
                     else:
                         logger.warning(f"Failed to process {task_type} for FileID: {file_id}; re-queueing")
                         await message.nack(requeue=True)
@@ -366,6 +365,10 @@ class RabbitMQConsumer:
                 logger.error(f"Timeout processing message for FileID: {file_id}, TaskType: {task_type}")
                 await message.nack(requeue=True)
                 await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                logger.info(f"Task cancelled for FileID: {file_id}, TaskType: {task_type}, re-queueing")
+                await message.nack(requeue=True)
+                raise
             except Exception as e:
                 logger.error(
                     f"Error processing message for FileID: {file_id}, TaskType: {task_type}: {e}",
@@ -397,17 +400,29 @@ class RabbitMQConsumer:
             return False
 
 async def shutdown(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
-    """Helper function to perform async shutdown."""
-    await consumer.close()
-    await async_engine.dispose()
-    loop.stop()
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
-
+    """Perform async shutdown gracefully."""
+    try:
+        await consumer.close()
+        await async_engine.dispose()
+        tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.warning(f"Task {task.get_name()} did not complete during shutdown")
+        loop.stop()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}", exc_info=True)
+    finally:
+        loop.close()
 def signal_handler(consumer: RabbitMQConsumer, loop: asyncio.AbstractEventLoop):
     def handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down gracefully...")
-        asyncio.create_task(shutdown(consumer, loop))
+        task = asyncio.create_task(shutdown(consumer, loop))
+        loop.run_until_complete(task)
+        sys.exit(0)
     return handler
 
 if __name__ == "__main__":

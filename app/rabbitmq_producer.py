@@ -178,14 +178,26 @@ class RabbitMQProducer:
         await self.publish_message(update_task, routing_key, correlation_id)
 
     async def close(self):
-        """Close the RabbitMQ connection and channel."""
+        """Close the RabbitMQ connection and channel gracefully."""
         try:
             if self.channel and not self.channel.is_closed:
-                await self.channel.close()
-                logger.info("Closed RabbitMQ channel")
+                try:
+                    await asyncio.wait_for(self.channel.close(), timeout=5)
+                    logger.info("Closed RabbitMQ channel")
+                except (asyncio.TimeoutError, aio_pika.exceptions.AMQPError) as e:
+                    logger.warning(f"Error closing channel: {e}")
             if self.connection and not self.connection.is_closed:
-                await self.connection.close()
-                logger.info("Closed RabbitMQ connection")
-            self.is_connected = False
+                try:
+                    await asyncio.wait_for(self.connection.close(), timeout=5)
+                    logger.info("Closed RabbitMQ connection")
+                except (asyncio.TimeoutError, aio_pika.exceptions.AMQPError) as e:
+                    logger.warning(f"Error closing connection: {e}")
+        except asyncio.CancelledError:
+            logger.info("Close operation cancelled, ensuring cleanup")
+            raise
         except Exception as e:
             logger.error(f"Error closing RabbitMQ connection: {e}", exc_info=True)
+        finally:
+            self.is_connected = False
+            self.channel = None
+            self.connection = None
