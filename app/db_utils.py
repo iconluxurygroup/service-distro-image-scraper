@@ -728,7 +728,8 @@ logger = logging.getLogger(__name__)
         aio_pika.exceptions.AMQPError,
         aio_pika.exceptions.ChannelClosed,
         aiormq.exceptions.ChannelAccessRefused,
-        aiormq.exceptions.ChannelPreconditionFailed
+        aiormq.exceptions.ChannelPreconditionFailed,
+        SQLAlchemyError,
     )),
 )
 async def enqueue_db_update(
@@ -743,13 +744,15 @@ async def enqueue_db_update(
     return_result: bool = False,
     logger: Optional[logging.Logger] = None
 ) -> Any:
-    """Enqueue a database update task to RabbitMQ."""
+    """Enqueue a database update task to RabbitMQ or execute SELECT queries directly."""
     logger = logger or logging.getLogger(__name__)
+    correlation_id = correlation_id or str(uuid.uuid4())
+    
     try:
         # Convert sql to string if it's a TextClause
         if isinstance(sql, TextClause):
             sql = str(sql)
-            logger.debug(f"[{correlation_id or 'N/A'}] Converted TextClause to string: {sql[:100]}...")
+            logger.debug(f"[{correlation_id}] Converted TextClause to string: {sql[:100]}...")
 
         # Ensure params are JSON-serializable
         serializable_params = {}
@@ -760,11 +763,21 @@ async def enqueue_db_update(
                 serializable_params[key] = value
         params = serializable_params
 
+        # Handle SELECT queries directly if return_result is True
+        if return_result and sql.strip().upper().startswith("SELECT"):
+            logger.debug(f"[{correlation_id}] Executing SELECT query directly for FileID {file_id}")
+            async with async_engine.connect() as conn:
+                result = await conn.execute(text(sql), params)
+                rows = [dict(row) for row in result.mappings()]
+                result.close()
+                logger.info(f"[{correlation_id}] Retrieved {len(rows)} rows for FileID {file_id}")
+                return rows
+
         # Initialize producer if not provided
         if not producer or not producer.is_connected:
             from rabbitmq_producer import RabbitMQProducer
             producer = await RabbitMQProducer.get_producer(logger=logger)
-            logger.debug(f"[{correlation_id or 'N/A'}] Initialized new RabbitMQ producer for FileID {file_id}")
+            logger.debug(f"[{correlation_id}] Initialized new RabbitMQ producer for FileID {file_id}")
 
         # Construct task dictionary
         task = {
@@ -772,7 +785,7 @@ async def enqueue_db_update(
             "sql": sql,
             "params": params,
             "task_type": task_type,
-            "correlation_id": correlation_id or str(uuid.uuid4()),
+            "correlation_id": correlation_id,
             "return_result": return_result,
             "timestamp": datetime.datetime.now().isoformat()
         }
@@ -785,7 +798,7 @@ async def enqueue_db_update(
         if queue_name.startswith("select_response_"):
             try:
                 await channel.get_queue(queue_name)
-                logger.debug(f"[{task['correlation_id']}] Using existing response queue: {queue_name}")
+                logger.debug(f"[{correlation_id}] Using existing response queue: {queue_name}")
             except aiormq.exceptions.ChannelNotFoundEntity:
                 await channel.declare_queue(
                     queue_name,
@@ -794,9 +807,9 @@ async def enqueue_db_update(
                     auto_delete=True,
                     arguments={"x-expires": 600000}  # 10-minute expiration
                 )
-                logger.debug(f"[{task['correlation_id']}] Declared new response queue: {queue_name}")
+                logger.debug(f"[{correlation_id}] Declared new response queue: {queue_name}")
             except aiormq.exceptions.ChannelPreconditionFailed:
-                logger.warning(f"[{task['correlation_id']}] Queue {queue_name} has incompatible settings, generating new name")
+                logger.warning(f"[{correlation_id}] Queue {queue_name} has incompatible settings, generating new name")
                 queue_name = f"{queue_name}_{uuid.uuid4().hex[:8]}"
                 await channel.declare_queue(
                     queue_name,
@@ -805,7 +818,7 @@ async def enqueue_db_update(
                     auto_delete=True,
                     arguments={"x-expires": 600000}
                 )
-                logger.debug(f"[{task['correlation_id']}] Declared new response queue: {queue_name}")
+                logger.debug(f"[{correlation_id}] Declared new response queue: {queue_name}")
         else:
             # Main queue (durable)
             await channel.declare_queue(
@@ -814,7 +827,7 @@ async def enqueue_db_update(
                 exclusive=False,
                 auto_delete=False
             )
-            logger.debug(f"[{task['correlation_id']}] Declared main queue: {queue_name}")
+            logger.debug(f"[{correlation_id}] Declared main queue: {queue_name}")
 
         # Publish task
         message_body = json.dumps(task)
@@ -823,14 +836,14 @@ async def enqueue_db_update(
                 body=message_body.encode(),
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 content_type="application/json",
-                correlation_id=task["correlation_id"]
+                correlation_id=correlation_id
             ),
             routing_key=queue_name
         )
-        logger.info(f"[{task['correlation_id']}] Enqueued task to {queue_name} for FileID {file_id}: {message_body[:200]}")
+        logger.info(f"[{correlation_id}] Enqueued task to {queue_name} for FileID {file_id}: {message_body[:200]}")
         
         # Return queue name or simulated rows affected
         return queue_name if not return_result else 1
     except Exception as e:
-        logger.error(f"[{correlation_id or 'N/A'}] Error enqueuing task to {queue_name} for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"[{correlation_id}] Error enqueuing task to {queue_name} for FileID {file_id}: {e}", exc_info=True)
         raise
