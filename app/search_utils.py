@@ -71,7 +71,7 @@ async def update_search_sort_order(
         logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
         # Preprocess inputs
-        brand_clean = clean_string(brand, logger=logger).lower() if brand else ""
+        brand_clean = clean_string(brand).lower() if brand else ""
         model_clean = normalize_model(model, logger=logger) if model else ""
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
@@ -84,7 +84,7 @@ async def update_search_sort_order(
                     break
         if not brand_aliases and brand_clean:
             brand_aliases = [brand_clean, brand_clean.replace(" & ", " and "), brand_clean.replace(" ", "")]
-        brand_aliases = [clean_string(alias, logger=logger).lower() for alias in brand_aliases if alias]
+        brand_aliases = [clean_string(alias).lower() for alias in brand_aliases if alias]
         model_aliases = generate_aliases(model_clean, logger=logger) if model_clean else []
         if model_clean and not model_aliases:
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
@@ -95,9 +95,9 @@ async def update_search_sort_order(
 
         # Assign priorities
         for res in results:
-            image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False, logger=logger).lower()
-            image_source = clean_string(res.get("ImageSource", ""), preserve_url=True, logger=logger).lower()
-            image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True, logger=logger).lower()
+            image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
+            image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
+            image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
             logger.debug(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
 
             model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
