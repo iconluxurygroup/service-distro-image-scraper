@@ -1407,6 +1407,11 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
 from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Optional
+from fastapi import HTTPException, BackgroundTasks
+from sqlalchemy.sql import text
+import logging
+import datetime
+import uuid
 
 # Pydantic model for input validation
 class SearchResult(BaseModel):
@@ -1458,18 +1463,31 @@ async def api_test_insert_results(
                     status_code=400,
                     detail="EntryIDs in results must be a subset of provided entry_ids"
                 )
-            async with async_engine.connect() as conn:
+
+            # Create dynamic placeholders for IN clause
+            if request.entry_ids:
+                placeholders = ",".join(f":entry_id_{i}" for i in range(len(request.entry_ids)))
+                query = text(f"""
+                    SELECT EntryID
+                    FROM utb_ImageScraperRecords
+                    WHERE FileID = :file_id AND EntryID IN ({placeholders})
+                """)
+                params = {"file_id": int(file_id)}
+                for i, entry_id in enumerate(request.entry_ids):
+                    params[f"entry_id_{i}"] = entry_id
+            else:
                 query = text("""
                     SELECT EntryID
                     FROM utb_ImageScraperRecords
-                    WHERE FileID = :file_id AND EntryID IN :entry_ids
+                    WHERE FileID = :file_id
                 """)
-                result = await conn.execute(
-                    query,
-                    {"file_id": int(file_id), "entry_ids": tuple(request.entry_ids)}
-                )
+                params = {"file_id": int(file_id)}
+
+            async with async_engine.connect() as conn:
+                result = await conn.execute(query, params)
                 valid_entry_ids = set(row[0] for row in result.fetchall())
                 result.close()
+
                 if not entry_ids_from_results.issubset(valid_entry_ids):
                     logger.error(f"[{correlation_id}] Invalid EntryIDs: {entry_ids_from_results - valid_entry_ids}")
                     log_public_url = await upload_log_file(file_id, log_filename, logger)
@@ -1513,10 +1531,26 @@ async def api_test_insert_results(
                 for res in results
                 if "CreateTime" in res
             ) if results else datetime.datetime.now()
-            result = await conn.execute(
-                query,
-                {"entry_ids": tuple(entry_ids), "create_time": min_create_time}
-            )
+            # Fix for IN clause in verification query
+            if entry_ids:
+                placeholders = ",".join(f":entry_id_{i}" for i in range(len(entry_ids)))
+                query = text(f"""
+                    SELECT COUNT(*)
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN ({placeholders}) AND CreateTime >= :create_time
+                """)
+                params = {"create_time": min_create_time}
+                for i, entry_id in enumerate(entry_ids):
+                    params[f"entry_id_{i}"] = entry_id
+            else:
+                query = text("""
+                    SELECT COUNT(*)
+                    FROM utb_ImageScraperResult
+                    WHERE CreateTime >= :create_time
+                """)
+                params = {"create_time": min_create_time}
+
+            result = await conn.execute(query, params)
             inserted_count = result.scalar()
             result.close()
             logger.info(f"[{correlation_id}] Verified {inserted_count} inserted records for FileID {file_id}")
@@ -1529,7 +1563,7 @@ async def api_test_insert_results(
             return {
                 "status": "warning",
                 "status_code": 200,
-                "message": f"Insertion failed or no records inserted for FileID {file_id}",
+                "message": f"Insertion failed or no records inserted for FileID: {file_id}",
                 "log_url": log_public_url,
                 "data": {
                     "file_id": file_id,
@@ -1542,7 +1576,7 @@ async def api_test_insert_results(
         return {
             "status": "success",
             "status_code": 200,
-            "message": f"Successfully inserted {inserted_count} results for FileID {file_id}",
+            "message": f"Successfully inserted {inserted_count} results for FileID: {file_id}",
             "log_url": log_public_url,
             "data": {
                 "file_id": file_id,
