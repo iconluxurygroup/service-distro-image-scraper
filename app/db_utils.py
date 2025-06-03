@@ -235,7 +235,6 @@ import uuid
 import aio_pika
 import os
 import aiormq
-import aiofiles
 import psutil
 from fastapi import BackgroundTasks
 from typing import Optional, List, Dict
@@ -248,10 +247,6 @@ from database_config import conn_str, async_engine
 from typing import Any
 from common import clean_string, clean_url_string, validate_thumbnail_url
 
-default_logger = logging.getLogger(__name__)
-if not default_logger.handlers:
-    default_logger.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 def flatten_entry_ids(entry_ids, logger, correlation_id):
     flat_ids = []

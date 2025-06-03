@@ -1412,6 +1412,13 @@ from sqlalchemy.sql import text
 import logging
 import datetime
 import uuid
+from pydantic import BaseModel, HttpUrl, Field
+from typing import List, Optional
+from fastapi import HTTPException, BackgroundTasks
+from sqlalchemy.sql import text
+import logging
+import datetime
+import uuid
 
 # Pydantic model for input validation
 class SearchResult(BaseModel):
@@ -1440,6 +1447,9 @@ async def api_test_insert_results(
     correlation_id = str(uuid.uuid4())
     logger.info(f"[{correlation_id}] Starting test insertion for FileID: {file_id}, Results: {len(request.results)}")
 
+    # Record start time for verification
+    start_time = datetime.datetime.now()
+
     try:
         # Validate FileID exists
         async with async_engine.connect() as conn:
@@ -1465,23 +1475,15 @@ async def api_test_insert_results(
                 )
 
             # Create dynamic placeholders for IN clause
-            if request.entry_ids:
-                placeholders = ",".join(f":entry_id_{i}" for i in range(len(request.entry_ids)))
-                query = text(f"""
-                    SELECT EntryID
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = :file_id AND EntryID IN ({placeholders})
-                """)
-                params = {"file_id": int(file_id)}
-                for i, entry_id in enumerate(request.entry_ids):
-                    params[f"entry_id_{i}"] = entry_id
-            else:
-                query = text("""
-                    SELECT EntryID
-                    FROM utb_ImageScraperRecords
-                    WHERE FileID = :file_id
-                """)
-                params = {"file_id": int(file_id)}
+            placeholders = ",".join(f":entry_id_{i}" for i in range(len(request.entry_ids)))
+            query = text(f"""
+                SELECT EntryID
+                FROM utb_ImageScraperRecords
+                WHERE FileID = :file_id AND EntryID IN ({placeholders})
+            """)
+            params = {"file_id": int(file_id)}
+            for i, entry_id in enumerate(request.entry_ids):
+                params[f"entry_id_{i}"] = entry_id
 
             async with async_engine.connect() as conn:
                 result = await conn.execute(query, params)
@@ -1521,17 +1523,6 @@ async def api_test_insert_results(
         # Verify insertion
         entry_ids = list(set(res["EntryID"] for res in results))
         async with async_engine.connect() as conn:
-            query = text("""
-                SELECT COUNT(*)
-                FROM utb_ImageScraperResult
-                WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
-            """)
-            min_create_time = min(
-                datetime.datetime.strptime(res["CreateTime"], "%Y-%m-%d %H:%M:%S")
-                for res in results
-                if "CreateTime" in res
-            ) if results else datetime.datetime.now()
-            # Fix for IN clause in verification query
             if entry_ids:
                 placeholders = ",".join(f":entry_id_{i}" for i in range(len(entry_ids)))
                 query = text(f"""
@@ -1539,7 +1530,7 @@ async def api_test_insert_results(
                     FROM utb_ImageScraperResult
                     WHERE EntryID IN ({placeholders}) AND CreateTime >= :create_time
                 """)
-                params = {"create_time": min_create_time}
+                params = {"create_time": start_time}
                 for i, entry_id in enumerate(entry_ids):
                     params[f"entry_id_{i}"] = entry_id
             else:
@@ -1548,7 +1539,7 @@ async def api_test_insert_results(
                     FROM utb_ImageScraperResult
                     WHERE CreateTime >= :create_time
                 """)
-                params = {"create_time": min_create_time}
+                params = {"create_time": start_time}
 
             result = await conn.execute(query, params)
             inserted_count = result.scalar()
