@@ -85,7 +85,7 @@ async def update_search_sort_order(
         if not brand_aliases and brand_clean:
             brand_aliases = [brand_clean, brand_clean.replace(" & ", " and "), brand_clean.replace(" ", "")]
         brand_aliases = [clean_string(alias).lower() for alias in brand_aliases if alias]
-        model_aliases = generate_aliases(model_clean, logger=logger) if model_clean else []
+        model_aliases = generate_aliases(model_clean) if model_clean else []
         if model_clean and not model_aliases:
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
