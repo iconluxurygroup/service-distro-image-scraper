@@ -260,6 +260,7 @@ async def insert_search_results(
     process = psutil.Process()
     correlation_id = str(uuid.uuid4())
     logger.info(f"[{correlation_id}] Worker PID {process.pid}: Starting insert_search_results for FileID {file_id}")
+    logger.debug(f"[{correlation_id}] Input results count: {len(results)}, Sample: {results[:1] if results else 'None'}")
 
     if not results:
         logger.warning(f"[{correlation_id}] Worker PID {process.pid}: Empty results provided")
@@ -268,7 +269,7 @@ async def insert_search_results(
     data = []
     errors = []
 
-    logger.debug(f"[{correlation_id}] Input results: {results}")
+    logger.debug(f"[{correlation_id}] Processing input results")
     for res in results:
         try:
             entry_id = int(res["EntryID"])
@@ -284,11 +285,13 @@ async def insert_search_results(
         image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False)
         image_source = clean_url_string(res.get("ImageSource", ""), logger=logger)
 
+        logger.debug(f"[{correlation_id}] Validating ImageUrl: {image_url}")
         if not image_url or not validate_thumbnail_url(image_url, logger):
             errors.append(f"Invalid ImageUrl skipped: {image_url}")
-            logger.debug(f"[{correlation_id}] Worker PID {process.pid}: {errors[-1]}")
+            logger.warning(f"[{correlation_id}] Worker PID {process.pid}: {errors[-1]}")
             continue
         if image_url_thumbnail and not validate_thumbnail_url(image_url_thumbnail, logger):
+            logger.debug(f"[{correlation_id}] Invalid thumbnail URL, setting to None: {image_url_thumbnail}")
             image_url_thumbnail = None
 
         data.append({
@@ -300,8 +303,12 @@ async def insert_search_results(
             "CreateTime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
 
+    logger.info(f"[{correlation_id}] Valid rows to insert: {len(data)}, Errors: {len(errors)}")
+    if errors:
+        logger.warning(f"[{correlation_id}] Skipped rows due to errors: {errors}")
+
     if not data:
-        logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No valid rows to insert. Errors: {errors}")
+        logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No valid rows to insert")
         return False
 
     producer = await RabbitMQProducer.get_producer(logger=logger)
@@ -334,49 +341,44 @@ async def insert_search_results(
                             logger.debug(f"[{correlation_id}] Received response for FileID {file_id}")
 
         entry_ids = list(set(row["EntryID"] for row in data))
-        logger.debug(f"[{correlation_id}] Raw EntryIDs: {entry_ids}, type: {type(entry_ids)}")
+        logger.debug(f"[{correlation_id}] Raw EntryIDs: {entry_ids}")
         flat_entry_ids = flatten_entry_ids(entry_ids, logger, correlation_id)
-        logger.debug(f"[{correlation_id}] Flattened EntryIDs: {flat_entry_ids}, type: {type(flat_entry_ids)}")
+        logger.debug(f"[{correlation_id}] Flattened EntryIDs: {flat_entry_ids}")
+
         if not flat_entry_ids:
             logger.warning(f"[{correlation_id}] No valid EntryIDs after flattening")
             return False
 
         # Pre-check for existing rows
-        count = 0  # Initialize to avoid downstream issues
+        count = 0
         if flat_entry_ids:
             async with async_engine.connect() as conn:
                 try:
-                    if len(flat_entry_ids) == 1:
-                        query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id")
-                        result = await conn.execute(query, {"entry_id": flat_entry_ids[0]})
-                    else:
-                        query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID IN :entry_ids")
-                        result = await conn.execute(query, {"entry_ids": tuple(flat_entry_ids)})
+                    placeholders = ",".join(f":entry_id_{i}" for i in range(len(flat_entry_ids)))
+                    query = text(f"""
+                        SELECT COUNT(*)
+                        FROM utb_ImageScraperResult
+                        WHERE EntryID IN ({placeholders})
+                    """)
+                    params = {f"entry_id_{i}": eid for i, eid in enumerate(flat_entry_ids)}
+                    result = await conn.execute(query, params)
                     count = result.scalar()
                     logger.debug(f"[{correlation_id}] Found {count} existing rows for EntryIDs {flat_entry_ids}")
                 except SQLAlchemyError as e:
-                    logger.error(f"[{correlation_id}] Failed to check existing rows for EntryIDs {flat_entry_ids}: {e}", exc_info=True)
-                    count = 0  # Fallback to 0 to allow processing to continue
+                    logger.error(f"[{correlation_id}] Failed to check existing rows: {e}", exc_info=True)
+                    count = 0
 
         existing_keys = set()
         if flat_entry_ids:
-            if len(flat_entry_ids) == 1:
-                select_query = text("""
-                    SELECT EntryID, ImageUrl
-                    FROM utb_ImageScraperResult
-                    WHERE EntryID = :entry_id
-                """)
-                params = {"entry_id": flat_entry_ids[0]}
-            else:
-                select_query = text("""
-                    SELECT EntryID, ImageUrl
-                    FROM utb_ImageScraperResult
-                    WHERE EntryID IN :entry_ids
-                """)
-                params = {"entry_ids": tuple(flat_entry_ids)}
-
+            placeholders = ",".join(f":entry_id_{i}" for i in range(len(flat_entry_ids)))
+            select_query = text(f"""
+                SELECT EntryID, ImageUrl
+                FROM utb_ImageScraperResult
+                WHERE EntryID IN ({placeholders})
+            """)
+            params = {f"entry_id_{i}": eid for i, eid in enumerate(flat_entry_ids)}
             try:
-                async with asyncio.timeout(180):
+                async with asyncio.timeout(300):  # Increased timeout
                     await response_received.wait()
                 if response_data:
                     if isinstance(response_data[0], dict) and "results" in response_data[0]:
@@ -386,16 +388,13 @@ async def insert_search_results(
                                 for row in response_data[0]["results"]
                                 if isinstance(row, dict) and "EntryID" in row and "ImageUrl" in row
                             }
-                            logger.info(f"[{correlation_id}] Worker PID {process.pid}: Received {len(existing_keys)} deduplication results")
+                            logger.info(f"[{correlation_id}] Received {len(existing_keys)} deduplication results")
                         else:
-                            logger.warning(f"[{correlation_id}] Worker PID {process.pid}: Mismatched correlation ID in response: {response_data[0].get('correlation_id')}")
-                            existing_keys = set()
+                            logger.warning(f"[{correlation_id}] Mismatched correlation ID: {response_data[0].get('correlation_id')}")
                     else:
-                        logger.warning(f"[{correlation_id}] Worker PID {process.pid}: Unexpected response format: {response_data[0]}")
-                        existing_keys = set()
+                        logger.warning(f"[{correlation_id}] Unexpected response format: {response_data[0]}")
                 else:
-                    logger.warning(f"[{correlation_id}] Worker PID {process.pid}: No deduplication results received")
-                    existing_keys = set()
+                    logger.warning(f"[{correlation_id}] No deduplication results received")
             except asyncio.TimeoutError:
                 logger.error(f"[{correlation_id}] Timeout waiting for SELECT results")
                 existing_keys = set()
@@ -448,7 +447,7 @@ async def insert_search_results(
                     correlation_id=cid,
                     logger=logger
                 )
-        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
+        logger.info(f"[{correlation_id}] Enqueued {len(update_batch)} updates with {len(update_cids)} correlation IDs")
 
         for i in range(0, len(insert_batch), batch_size):
             batch = insert_batch[i:i + batch_size]
@@ -465,29 +464,25 @@ async def insert_search_results(
                     correlation_id=cid,
                     logger=logger
                 )
-        logger.info(f"[{correlation_id}] Worker PID {process.pid}: Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
+        logger.info(f"[{correlation_id}] Enqueued {len(insert_batch)} inserts with {len(insert_cids)} correlation IDs")
 
         async with async_engine.connect() as conn:
             try:
-                if len(flat_entry_ids) == 1:
-                    query = text("SELECT COUNT(*) FROM utb_ImageScraperResult WHERE EntryID = :entry_id AND CreateTime >= :create_time")
-                    result = await conn.execute(query, {
-                        "entry_id": flat_entry_ids[0],
-                        "create_time": min(row["CreateTime"] for row in data)
-                    })
-                else:
-                    query = text("""
-                        SELECT COUNT(*) FROM utb_ImageScraperResult
-                        WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
-                    """)
-                    result = await conn.execute(query, {
-                        "entry_ids": tuple(flat_entry_ids),
-                        "create_time": min(row["CreateTime"] for row in data)
-                    })
+                placeholders = ",".join(f":entry_id_{i}" for i in range(len(flat_entry_ids)))
+                query = text(f"""
+                    SELECT COUNT(*)
+                    FROM utb_ImageScraperResult
+                    WHERE EntryID IN ({placeholders}) AND CreateTime >= :create_time
+                """)
+                params = {
+                    "create_time": min(row["CreateTime"] for row in data),
+                    **{f"entry_id_{i}": eid for i, eid in enumerate(flat_entry_ids)}
+                }
+                result = await conn.execute(query, params)
                 inserted_count = result.scalar()
-                logger.info(f"[{correlation_id}] Worker PID {process.pid}: Verified {inserted_count} records in database for FileID {file_id}")
+                logger.info(f"[{correlation_id}] Verified {inserted_count} records in database for FileID {file_id}")
             except SQLAlchemyError as e:
-                logger.error(f"[{correlation_id}] Failed to verify inserted records for FileID {file_id}: {e}", exc_info=True)
+                logger.error(f"[{correlation_id}] Failed to verify inserted records: {e}", exc_info=True)
                 inserted_count = 0
 
         return len(insert_batch) > 0 or len(update_batch) > 0
