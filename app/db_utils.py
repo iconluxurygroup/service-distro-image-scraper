@@ -197,17 +197,6 @@ async def update_file_generate_complete(file_id: str, logger: Optional[logging.L
     except ValueError as e:
         logger.error(f"Invalid file_id format: {e}")
         raise
-def flatten_entry_ids(entry_ids, logger, correlation_id):
-    flat_ids = []
-    for id in entry_ids:
-        if isinstance(id, (list, tuple)):
-            # Recursively flatten nested structures
-            flat_ids.extend(flatten_entry_ids(id, logger, correlation_id))
-        elif isinstance(id, int):
-            flat_ids.append(id)
-        else:
-            logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}, type: {type(id)}")
-    return flat_ids
 import signal
 import asyncio
 
@@ -236,9 +225,49 @@ def register_shutdown_handler(producer, consumer, logger, correlation_id):
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, shutdown_callback)
 from tenacity import retry_if_exception
+import logging
+import pandas as pd
+import pyodbc
+import asyncio
+import json
+import datetime
+import uuid
+import aio_pika
+import os
+import aiormq
+import aiofiles
+import psutil
+from fastapi import BackgroundTasks
+from typing import Optional, List, Dict
+from sqlalchemy.sql import text
+from sqlalchemy.exc import SQLAlchemyError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from rabbitmq_producer import RabbitMQProducer
+from rabbitmq_consumer import RabbitMQConsumer
+from database_config import conn_str, async_engine
+from typing import Any
+from common import clean_string, clean_url_string, validate_thumbnail_url
+
+default_logger = logging.getLogger(__name__)
+if not default_logger.handlers:
+    default_logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+def flatten_entry_ids(entry_ids, logger, correlation_id):
+    flat_ids = []
+    for id in entry_ids:
+        if isinstance(id, (list, tuple)):
+            flat_ids.extend(flatten_entry_ids(id, logger, correlation_id))
+        elif isinstance(id, int):
+            flat_ids.append(id)
+        else:
+            logger.warning(f"[{correlation_id}] Invalid EntryID skipped: {id}, type: {type(id)}")
+    return flat_ids
+
 def is_retryable_exception(exception):
     return isinstance(exception, (SQLAlchemyError, aio_pika.exceptions.AMQPError, asyncio.TimeoutError)) and \
            not isinstance(exception, (aiormq.exceptions.ChannelNotFoundEntity, aiormq.exceptions.ChannelLockedResource))
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
