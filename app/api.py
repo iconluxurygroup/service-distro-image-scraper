@@ -1405,7 +1405,164 @@ async def update_file_location_complete_endpoint(file_id: str, file_location: st
         logger.error(f"Error updating file location for FileID {file_id}: {e}", exc_info=True)
         log_public_url = await upload_log_file(file_id, log_filename, logger)
         raise HTTPException(status_code=500, detail=f"Error updating file location for FileID {file_id}: {str(e)}")
+from pydantic import BaseModel, HttpUrl, Field
+from typing import List, Optional
 
+# Pydantic model for input validation
+class SearchResult(BaseModel):
+    EntryID: int = Field(..., description="Unique identifier for the entry")
+    ImageUrl: HttpUrl = Field(..., description="URL of the main image")
+    ImageDesc: Optional[str] = Field(None, description="Description of the image")
+    ImageSource: Optional[HttpUrl] = Field(None, description="Source URL of the image")
+    ImageUrlThumbnail: Optional[HttpUrl] = Field(None, description="URL of the thumbnail image")
+    ProductCategory: Optional[str] = Field(None, description="Category of the product")
+
+class InsertResultsRequest(BaseModel):
+    results: List[SearchResult] = Field(..., description="List of search results to insert")
+    entry_ids: Optional[List[int]] = Field(None, description="Optional list of EntryIDs to restrict insertion")
+
+@router.post("/test-insert-results/{file_id}", tags=["Testing"])
+async def api_test_insert_results(
+    file_id: str,
+    request: InsertResultsRequest,
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Test endpoint to insert search results into utb_ImageScraperResult for a given FileID.
+    Useful for debugging insertion issues.
+    """
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    correlation_id = str(uuid.uuid4())
+    logger.info(f"[{correlation_id}] Starting test insertion for FileID: {file_id}, Results: {len(request.results)}")
+
+    try:
+        # Validate FileID exists
+        async with async_engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM utb_ImageScraperFiles WHERE ID = :file_id"),
+                {"file_id": int(file_id)}
+            )
+            if result.fetchone()[0] == 0:
+                logger.error(f"[{correlation_id}] FileID {file_id} does not exist")
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                raise HTTPException(status_code=404, detail=f"FileID {file_id} not found")
+            result.close()
+
+        # Validate EntryIDs exist in utb_ImageScraperRecords if provided
+        if request.entry_ids:
+            entry_ids_from_results = set(res.EntryID for res in request.results)
+            if not entry_ids_from_results.issubset(set(request.entry_ids)):
+                logger.error(f"[{correlation_id}] Some EntryIDs in results are not in provided entry_ids")
+                log_public_url = await upload_log_file(file_id, log_filename, logger)
+                raise HTTPException(
+                    status_code=400,
+                    detail="EntryIDs in results must be a subset of provided entry_ids"
+                )
+            async with async_engine.connect() as conn:
+                query = text("""
+                    SELECT EntryID
+                    FROM utb_ImageScraperRecords
+                    WHERE FileID = :file_id AND EntryID IN :entry_ids
+                """)
+                result = await conn.execute(
+                    query,
+                    {"file_id": int(file_id), "entry_ids": tuple(request.entry_ids)}
+                )
+                valid_entry_ids = set(row[0] for row in result.fetchall())
+                result.close()
+                if not entry_ids_from_results.issubset(valid_entry_ids):
+                    logger.error(f"[{correlation_id}] Invalid EntryIDs: {entry_ids_from_results - valid_entry_ids}")
+                    log_public_url = await upload_log_file(file_id, log_filename, logger)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid EntryIDs: {entry_ids_from_results - valid_entry_ids}"
+                    )
+
+        # Prepare results for insertion
+        results = [
+            {
+                "EntryID": res.EntryID,
+                "ImageUrl": str(res.ImageUrl),
+                "ImageDesc": res.ImageDesc,
+                "ImageSource": str(res.ImageSource) if res.ImageSource else None,
+                "ImageUrlThumbnail": str(res.ImageUrlThumbnail) if res.ImageUrlThumbnail else None,
+                "ProductCategory": res.ProductCategory
+            }
+            for res in request.results
+        ]
+        logger.debug(f"[{correlation_id}] Prepared {len(results)} results for insertion: {results[:1] if results else 'None'}")
+
+        # Call insert_search_results
+        success = await insert_search_results(
+            results=results,
+            logger=logger,
+            file_id=file_id,
+            background_tasks=background_tasks
+        )
+
+        # Verify insertion
+        entry_ids = list(set(res["EntryID"] for res in results))
+        async with async_engine.connect() as conn:
+            query = text("""
+                SELECT COUNT(*)
+                FROM utb_ImageScraperResult
+                WHERE EntryID IN :entry_ids AND CreateTime >= :create_time
+            """)
+            min_create_time = min(
+                datetime.datetime.strptime(res["CreateTime"], "%Y-%m-%d %H:%M:%S")
+                for res in results
+                if "CreateTime" in res
+            ) if results else datetime.datetime.now()
+            result = await conn.execute(
+                query,
+                {"entry_ids": tuple(entry_ids), "create_time": min_create_time}
+            )
+            inserted_count = result.scalar()
+            result.close()
+            logger.info(f"[{correlation_id}] Verified {inserted_count} inserted records for FileID {file_id}")
+
+        # Upload log file
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+
+        if not success or inserted_count == 0:
+            logger.warning(f"[{correlation_id}] Insertion failed or no records inserted for FileID {file_id}")
+            return {
+                "status": "warning",
+                "status_code": 200,
+                "message": f"Insertion failed or no records inserted for FileID {file_id}",
+                "log_url": log_public_url,
+                "data": {
+                    "file_id": file_id,
+                    "inserted_count": inserted_count,
+                    "correlation_id": correlation_id
+                }
+            }
+
+        logger.info(f"[{correlation_id}] Successfully inserted {inserted_count} results for FileID {file_id}")
+        return {
+            "status": "success",
+            "status_code": 200,
+            "message": f"Successfully inserted {inserted_count} results for FileID {file_id}",
+            "log_url": log_public_url,
+            "data": {
+                "file_id": file_id,
+                "inserted_count": inserted_count,
+                "correlation_id": correlation_id
+            }
+        }
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"[{correlation_id}] Error inserting test results for FileID {file_id}: {e}", exc_info=True)
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error inserting test results for FileID {file_id}: {str(e)}"
+        )
+    finally:
+        await async_engine.dispose()
+        logger.info(f"[{correlation_id}] Disposed database engine for FileID {file_id}")
 @router.post("/sort-by-relevance/{file_id}", tags=["Sorting"])
 async def api_sort_by_relevance(
     file_id: str,
