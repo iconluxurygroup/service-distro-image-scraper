@@ -72,7 +72,7 @@ async def update_search_sort_order(
 
         # Preprocess inputs
         brand_clean = clean_string(brand).lower() if brand else ""
-        model_clean = normalize_model(model, logger=logger) if model else ""
+        model_clean = normalize_model(model) if model else ""
         logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
         # Generate aliases
