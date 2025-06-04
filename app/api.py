@@ -676,8 +676,21 @@ async def process_restart_batch(
             )
             return {"success": False, "error": "No entries found", "log_filename": log_filename, "log_public_url": log_public_url or "", "last_entry_id": str(entry_id or "")}
 
-        entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
-        logger.info(f"Created {len(entry_batches)} batches of size {BATCH_SIZE} for FileID {file_id_db}")
+        if len(entries) < BATCH_SIZE:
+            # If total number of entries is less than BATCH_SIZE, each entry becomes its own batch.
+            # This aligns with "1 row 1 batch, 2 rows 2 batches, etc." when total N < BATCH_SIZE.
+            entry_batches = [[entry] for entry in entries] 
+            logger.info(
+                f"Total entries ({len(entries)}) is less than BATCH_SIZE ({BATCH_SIZE}). "
+                f"Creating {len(entry_batches)} individual entry batches (each of size 1). FileID: {file_id_db_int}."
+            )
+        else: # len(entries) >= BATCH_SIZE
+            # Standard batching. The last batch may be smaller than BATCH_SIZE.
+            entry_batches = [entries[i:i + BATCH_SIZE] for i in range(0, len(entries), BATCH_SIZE)]
+            logger.info(
+                f"Created {len(entry_batches)} batches for {len(entries)} entries, "
+                f"with up to {BATCH_SIZE} entries per batch. FileID: {file_id_db_int}."
+            )
 
         successful_entries = 0
         failed_entries = 0
