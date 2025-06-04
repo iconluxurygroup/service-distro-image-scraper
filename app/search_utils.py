@@ -322,19 +322,6 @@ async def update_sort_order(
     except Exception as e:
         logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
         return [] # Or re-raise based on desired behavior
-    finally:
-        # IMPORTANT CHANGE: Do NOT close the producer here.
-        # The producer is a singleton managing a robust connection.
-        # It should be closed at the application level during shutdown.
-        #
-        # if producer:
-        #     try:
-        #         await producer.close() # <<< THIS LINE IS REMOVED/COMMENTED
-        #         logger.info(f"Closed shared RabbitMQ producer after processing FileID {file_id}")
-        #     except Exception as e_close:
-        #         logger.error(f"Error closing shared RabbitMQ producer for FileID {file_id}: {e_close}", exc_info=True)
-        if producer: # We still log that we finished using it for this operation
-             logger.info(f"Finished using shared RabbitMQ producer for FileID {file_id}. Producer connection remains open for application use.")
 
 @retry(
     stop=stop_after_attempt(3),
