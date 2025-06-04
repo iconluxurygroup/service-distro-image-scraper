@@ -1040,7 +1040,6 @@ WAREHOUSE_MODEL_SOURCE_COLUMN = "ModelSource"
 WAREHOUSE_CREATE_DATE_COLUMN = "CreateDate"
 WAREHOUSE_UPDATE_DATE_COLUMN = "UpdateDate"
 
-
 @router.post("/populate-distro-pics/{file_id}", tags=["Database"])
 async def api_populate_distro_pics_final(
     request: Request,
@@ -1097,6 +1096,7 @@ async def api_populate_distro_pics_final(
                   AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} <> ''
                 ORDER BY isr.{SCRAPER_PK_COLUMN}; -- Process in a consistent order
             """)
+            
             source_records_cursor = await conn.execute(
                 fetch_source_sql,
                 {"file_id_param": file_id, "limit_param": limit}
