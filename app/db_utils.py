@@ -712,7 +712,7 @@ async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logge
     
 import aio_pika
 import aiormq.exceptions
-from sqlalchemy.sql import text, TextClause # Make sure to import TextClause and text
+from sqlalchemy.sql import text # Make sure to import TextClause and text
 from sqlalchemy.exc import SQLAlchemyError # Make sure to import SQLAlchemyError
 @retry(
     stop=stop_after_attempt(3),
@@ -742,7 +742,7 @@ async def enqueue_db_update(
     correlation_id = correlation_id or str(uuid.uuid4())
 
     try:
-        if isinstance(sql, TextClause):
+        if isinstance(sql, text):
             sql = str(sql)
 
         serializable_params = {
