@@ -1088,11 +1088,11 @@ async def api_populate_distro_pics_final(
                     iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} AS WarehouseModelFolder
                 FROM {SCRAPER_TABLE_NAME} isr
                 INNER JOIN {WAREHOUSE_TABLE_NAME} iwi
-                    ON isr.{SCRAPER_PRODUCT_MODEL_COLUMN} = iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} -- Key join condition!
+                    ON isr.{SCRAPER_PRODUCT_MODEL_COLUMN} = iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN}
                     -- Or: ON isr.ProductModel = iwi.ModelNumber if that's the match
                     -- Or: ON LTRIM(RTRIM(isr.ProductModel)) = LTRIM(RTRIM(iwi.ModelClean)) for robust matching
                 WHERE isr.{SCRAPER_FILE_ID_COLUMN} = :file_id_param
-                  AND (isr.{SCRAPER_ENTRY_STATUS_COLUMN} = 0 OR isr.{SCRAPER_ENTRY_STATUS_COLUMN} IS NULL) -- Process pending
+                  AND (isr.{SCRAPER_ENTRY_STATUS_COLUMN} = 0 OR isr.{SCRAPER_ENTRY_STATUS_COLUMN} IS NULL)
                   AND iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} <> ''
                   AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} <> ''
                 ORDER BY isr.{SCRAPER_PK_COLUMN}; -- Process in a consistent order
