@@ -60,7 +60,7 @@ if not default_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 router = APIRouter()
-
+global_producer: Optional[RabbitMQProducer] = None
 JOB_STATUS = {}
 LAST_UPLOAD = {}
 
@@ -1023,285 +1023,270 @@ async def process_restart_batch(
     finally:
         await async_engine.dispose()
         logger.info(f"Disposed database engines for FileID {file_id_db}")
+SCRAPER_RECORDS_TABLE_NAME = "utb_ImageScraperRecords"
+SCRAPER_RECORDS_PK_COLUMN = "EntryID"
+SCRAPER_RECORDS_FILE_ID_FK_COLUMN = "FileID"
+SCRAPER_RECORDS_EXCEL_ROW_ID_COLUMN = "ExcelRowID"
+SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN = "ProductModel"
+SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN = "ProductBrand"
+SCRAPER_RECORDS_CREATE_TIME_COLUMN = "CreateTime"
+SCRAPER_RECORDS_STEP1_COLUMN = "Step1"
+SCRAPER_RECORDS_STEP2_COLUMN = "Step2"
+SCRAPER_RECORDS_STEP3_COLUMN = "Step3"
+SCRAPER_RECORDS_STEP4_COLUMN = "Step4"
+SCRAPER_RECORDS_COMPLETE_TIME_COLUMN = "CompleteTime"
+SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN = "ProductColor"
+SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN = "ProductCategory"
+SCRAPER_RECORDS_EXCEL_ROW_IMAGE_REF_COLUMN = "ExcelRowImageRef"
+SCRAPER_RECORDS_ENTRY_STATUS_COLUMN = "EntryStatus"
+SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN = "WarehouseMatchTime" # For tracking warehouse match step
 
-# Constants for table and column names for clarity
-SCRAPER_TABLE_NAME = "utb_ImageScraperRecords"
-SCRAPER_PK_COLUMN = "EntryID"
-SCRAPER_FILE_ID_COLUMN = "FileID"
-SCRAPER_PRODUCT_MODEL_COLUMN = "ProductModel"
-SCRAPER_ENTRY_STATUS_COLUMN = "EntryStatus"
+# --- Constants for utb_ImageScraperResult ---
+IMAGE_SCRAPER_RESULT_TABLE_NAME = "utb_ImageScraperResult"
+IMAGE_SCRAPER_RESULT_PK_COLUMN = "ResultID"
+IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN = "EntryID"
+IMAGE_SCRAPER_RESULT_IMAGE_URL_COLUMN = "ImageUrl"
+IMAGE_SCRAPER_RESULT_IMAGE_DESC_COLUMN = "ImageDesc"
+IMAGE_SCRAPER_RESULT_IMAGE_SOURCE_COLUMN = "ImageSource"
+IMAGE_SCRAPER_RESULT_CREATE_TIME_COLUMN = "CreateTime"
+IMAGE_SCRAPER_RESULT_IMAGE_URL_THUMBNAIL_COLUMN = "ImageUrlThumbnail"
+IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN = "SortOrder"
+IMAGE_SCRAPER_RESULT_IMAGE_IS_FASHION_COLUMN = "ImageIsFashion"
+IMAGE_SCRAPER_RESULT_AI_CAPTION_COLUMN = "AiCaption"
+IMAGE_SCRAPER_RESULT_AI_JSON_COLUMN = "AiJson"
+IMAGE_SCRAPER_RESULT_AI_LABEL_COLUMN = "AiLabel"
+IMAGE_SCRAPER_RESULT_UPDATE_TIME_COLUMN = "UpdateTime"
+IMAGE_SCRAPER_RESULT_SOURCE_TYPE_COLUMN = "SourceType"
 
-WAREHOUSE_TABLE_NAME = "utb_IconWarehouseImages"
-WAREHOUSE_PK_COLUMN = "ID"
-WAREHOUSE_MODEL_CLEAN_COLUMN = "ModelClean"
-WAREHOUSE_MODEL_NUMBER_COLUMN = "ModelNumber"
-WAREHOUSE_MODEL_FOLDER_COLUMN = "ModelFolder"
-WAREHOUSE_MODEL_SOURCE_COLUMN = "ModelSource"
-WAREHOUSE_CREATE_DATE_COLUMN = "CreateDate"
-WAREHOUSE_UPDATE_DATE_COLUMN = "UpdateDate"
+# --- Constants for utb_IconWarehouseImages ---
+WAREHOUSE_IMAGES_TABLE_NAME = "utb_IconWarehouseImages"
+WAREHOUSE_IMAGES_PK_COLUMN = "ID"
+WAREHOUSE_IMAGES_MODEL_NUMBER_COLUMN = "ModelNumber"
+WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN = "ModelClean"
+WAREHOUSE_IMAGES_CREATE_DATE_COLUMN = "CreateDate"
+WAREHOUSE_IMAGES_UPDATE_DATE_COLUMN = "UpdateDate"
+WAREHOUSE_IMAGES_MODEL_IMAGE_COLUMN = "ModelImage"
+WAREHOUSE_IMAGES_MODEL_SOURCE_COLUMN = "ModelSource"
+WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN = "ModelFolder"
 
-NEW_IMAGE_RESULT_TABLE_NAME = "utb_ImageScraperResult" # The new table from your INSERT
-NEW_IMAGE_RESULT_PK_COLUMN = "EntryID" # Assuming it's also EntryID
-NEW_IMAGE_RESULT_URL_COLUMN = "ImageUrl"
-NEW_IMAGE_RESULT_DESC_COLUMN = "ImageDesc" # From utb_ImageScraperResult
-NEW_IMAGE_RESULT_SOURCE_COLUMN = "ImageSource" # From utb_ImageScraperResult
+# --- Constants for utb_ImageScraperFiles (Master File Log Table) ---
+IMAGE_SCRAPER_FILES_TABLE_NAME = "utb_ImageScraperFiles"
+IMAGE_SCRAPER_FILES_PK_COLUMN = "ID"
+IMAGE_SCRAPER_FILES_LOG_FILE_URL_COLUMN = "LogFileUrl"
+IMAGE_SCRAPER_FILES_LOG_UPLOAD_TIME_COLUMN = "LogUploadTime"
+IMAGE_SCRAPER_FILES_IMAGE_COMPLETE_TIME_COLUMN = "ImageCompleteTime"
+# Add other columns like FileName, UploadTime, UserID, SendToEmail, etc.
 
+# --- Status Values for SCRAPER_RECORDS_ENTRY_STATUS_COLUMN ---
+STATUS_PENDING_WAREHOUSE_CHECK = 0
+STATUS_WAREHOUSE_CHECK_NO_MATCH = 1
+STATUS_WAREHOUSE_RESULT_POPULATED = 2 # This endpoint will set this status
+STATUS_PENDING_GOOGLE_SEARCH = 3
+STATUS_GOOGLE_SEARCH_COMPLETE = 4
 
-@router.post("/populate-distro-pics/{file_id}", tags=["Database"])
-async def api_populate_distro_pics_final(
+@router.post("/populate-results-from-warehouse/{file_id}", tags=["Processing", "Warehouse"])
+async def api_populate_results_from_warehouse(
     request: Request,
-    file_id: str, # This is utb_ImageScraperRecords.FileID
-    limit: Optional[int] = Query(1000, description=f"Max records from {SCRAPER_TABLE_NAME} to process"),
+    file_id: str, # This is utb_ImageScraperFiles.ID (original file process ID)
+    limit: Optional[int] = Query(1000, description=f"Max records from {SCRAPER_RECORDS_TABLE_NAME} to process for this FileID"),
+    base_image_url: str = Query("https://cms.rtsplusdev.com/files/icon_warehouse_images", description="Base URL for constructing image paths from warehouse data, if applicable")
 ):
-    job_specific_id = f"populate_distro_final_{file_id}_{uuid.uuid4().hex[:8]}"
+    """
+    Processes records from utb_ImageScraperRecords for a given FileID.
+    For each record, it attempts to find a match in utb_IconWarehouseImages.
+    If a match is found, it constructs image data (URL, description, source)
+    and inserts a new entry into utb_ImageScraperResult with SourceType='Warehouse'.
+    It also updates the status of the processed record in utb_ImageScraperRecords.
+    """
+    job_specific_id = f"warehouse_results_for_{file_id}_{uuid.uuid4().hex[:8]}"
     logger, log_filename = setup_job_logger(job_id=job_specific_id, console_output=True)
 
-    logger.info(f"[{job_specific_id}] API: Starting DistroPics population. Source: {SCRAPER_TABLE_NAME}, New Image Source: {NEW_IMAGE_RESULT_TABLE_NAME}. Limit: {limit}. Context FileID: {file_id}")
+    logger.info(f"[{job_specific_id}] API: Starting population of '{IMAGE_SCRAPER_RESULT_TABLE_NAME}' from '{WAREHOUSE_IMAGES_TABLE_NAME}' for original FileID: {file_id}. Limit: {limit}")
 
-    enqueued_tasks_count = 0
-    error_count = 0
-    processed_scraper_records = 0
-    # base_image_url = "https://cms.rtsplusdev.com/files/icon_warehouse_images" # This is now superseded by NEW_IMAGE_RESULT_TABLE_NAME.ImageUrl
+    inserted_results_count = 0
+    scraper_records_queried = 0
+    warehouse_matches_found = 0
+    tasks_enqueued_for_scraper_status_update = 0
+    errors_in_loop = 0
 
-    current_producer_instance = await RabbitMQProducer.get_producer()
+    current_producer_instance = global_producer
 
     try:
-        if not current_producer_instance or not current_producer_instance.is_connected: # Mock will be false
-            logger.error(f"[{job_specific_id}] API: RabbitMQ producer is not available or not connected.")
-            # ... (error handling as before)
+        if not current_producer_instance or not current_producer_instance.is_connected:
+            logger.error(f"[{job_specific_id}] API: Global RabbitMQ producer is not available or not connected.")
+            await upload_log_file(file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id)
             raise HTTPException(status_code=503, detail="RabbitMQ service unavailable.")
-        logger.info(f"[{job_specific_id}] API: Using RabbitMQ. Connected: {current_producer_instance.is_connected}")
+        logger.info(f"[{job_specific_id}] API: Using global RabbitMQ producer. Connected: {current_producer_instance.is_connected}")
 
-        async with async_engine.connect() as conn:
-            # Step 1: Fetch records from SCRAPER_TABLE_NAME, joining with WAREHOUSE_TABLE_NAME
-            #         AND the NEW_IMAGE_RESULT_TABLE_NAME.
-            # We use LEFT JOIN for NEW_IMAGE_RESULT_TABLE_NAME in case some entries don't have a result yet,
-            # though your request implies ImageUrl from NEW_IMAGE_RESULT_TABLE_NAME is the target.
-            # If an entry in NEW_IMAGE_RESULT_TABLE_NAME is mandatory, change to INNER JOIN.
-            fetch_source_sql = text(f"""
+        # Validate original FileID exists in utb_ImageScraperFiles
+        async with async_engine.connect() as conn_validate:
+            validate_file_sql = text(f"SELECT COUNT(*) FROM {IMAGE_SCRAPER_FILES_TABLE_NAME} WHERE {IMAGE_SCRAPER_FILES_PK_COLUMN} = :file_id_param")
+            val_result = await conn_validate.execute(validate_file_sql, {"file_id_param": file_id}) # file_id here is string, ensure DB column matches or cast
+            if val_result.scalar_one() == 0:
+                logger.error(f"[{job_specific_id}] Original FileID '{file_id}' does not exist in {IMAGE_SCRAPER_FILES_TABLE_NAME}.")
+                await upload_log_file(file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id)
+                raise HTTPException(status_code=404, detail=f"Original FileID {file_id} not found.")
+
+        async with async_engine.connect() as conn_fetch:
+            fetch_scraper_records_sql = text(f"""
                 SELECT TOP (:limit_param)
-                    isr.{SCRAPER_PK_COLUMN} AS ScraperEntryID,
-                    isr.{SCRAPER_PRODUCT_MODEL_COLUMN} AS ScraperProductModel,
-                    isr.{SCRAPER_FILE_ID_COLUMN} AS ScraperFileID,
+                    isr.{SCRAPER_RECORDS_PK_COLUMN} AS ScraperEntryID,
+                    isr.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} AS ScraperProductModel,
+                    isr.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} AS ScraperFileID_fk,
+                    isr.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN} AS ScraperProductBrand,
 
-                    iwi.{WAREHOUSE_PK_COLUMN} AS WarehouseDatawarehouseID,
-                    iwi.{WAREHOUSE_MODEL_NUMBER_COLUMN} AS WarehouseModelNumber,
-                    iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} AS WarehouseModelClean,
-                    iwi.{WAREHOUSE_CREATE_DATE_COLUMN} AS WarehouseCreateDate,
-                    iwi.{WAREHOUSE_UPDATE_DATE_COLUMN} AS WarehouseUpdateDate,
-                    iwi.{WAREHOUSE_MODEL_SOURCE_COLUMN} AS WarehouseModelSource,
-                    iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} AS WarehouseModelFolder,
-
-                    uisr.{NEW_IMAGE_RESULT_URL_COLUMN} AS FinalImageUrl -- From utb_ImageScraperResult
-                    -- uisr.{NEW_IMAGE_RESULT_DESC_COLUMN} AS UisrImageDesc, -- If needed directly
-                    -- uisr.{NEW_IMAGE_RESULT_SOURCE_COLUMN} AS UisrImageSource -- If needed directly
-
-                FROM {SCRAPER_TABLE_NAME} isr
-                INNER JOIN {WAREHOUSE_TABLE_NAME} iwi
-                    ON isr.{SCRAPER_PRODUCT_MODEL_COLUMN} = iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN}
-                INNER JOIN {NEW_IMAGE_RESULT_TABLE_NAME} uisr -- Assuming a result MUST exist to proceed
-                    ON isr.{SCRAPER_PK_COLUMN} = uisr.{NEW_IMAGE_RESULT_PK_COLUMN}
-                WHERE isr.{SCRAPER_FILE_ID_COLUMN} = :file_id_param
-                  AND (isr.{SCRAPER_ENTRY_STATUS_COLUMN} = 0 OR isr.{SCRAPER_ENTRY_STATUS_COLUMN} IS NULL)
-                  AND iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} <> ''
-                  -- AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} <> '' -- Folder might not be needed if URL is direct
-                  AND uisr.{NEW_IMAGE_RESULT_URL_COLUMN} IS NOT NULL AND uisr.{NEW_IMAGE_RESULT_URL_COLUMN} <> '' -- Ensure the new image URL exists
-                ORDER BY isr.{SCRAPER_PK_COLUMN};
+                    iwi.{WAREHOUSE_IMAGES_PK_COLUMN} AS WarehousePK_ID,
+                    iwi.{WAREHOUSE_IMAGES_MODEL_NUMBER_COLUMN} AS WarehouseModelNumber,
+                    iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} AS WarehouseModelClean,
+                    iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} AS WarehouseModelFolder,
+                    iwi.{WAREHOUSE_IMAGES_MODEL_SOURCE_COLUMN} AS WarehouseModelSource
+                FROM {SCRAPER_RECORDS_TABLE_NAME} isr
+                INNER JOIN {WAREHOUSE_IMAGES_TABLE_NAME} iwi
+                    ON isr.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} = iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN}
+                WHERE isr.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} = :file_id_param
+                  AND (isr.{SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_PENDING_WAREHOUSE_CHECK} OR isr.{SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} IS NULL)
+                  AND iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} <> ''
+                  AND iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} <> ''
+                ORDER BY isr.{SCRAPER_RECORDS_PK_COLUMN};
             """)
 
-            source_records_cursor = await conn.execute(
-                fetch_source_sql,
+            scraper_records_cursor = await conn_fetch.execute(
+                fetch_scraper_records_sql,
                 {"file_id_param": file_id, "limit_param": limit}
             )
-            source_records_to_process = source_records_cursor.fetchall()
-            processed_scraper_records = len(source_records_to_process)
+            records_to_process = scraper_records_cursor.fetchall()
+            scraper_records_queried = len(records_to_process)
+            warehouse_matches_found = scraper_records_queried
 
-        if not source_records_to_process:
-            logger.info(f"[{job_specific_id}] API: No pending records found in {SCRAPER_TABLE_NAME} for FileID '{file_id}' that match required criteria in other tables.")
-            # ... (return logic as before)
+        if not records_to_process:
+            logger.info(f"[{job_specific_id}] API: No records pending warehouse check in {SCRAPER_RECORDS_TABLE_NAME} for FileID '{file_id}' found matching warehouse criteria.")
             log_public_url = await upload_log_file(
                 file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id
             )
             return {
                 "status": "success",
-                "message": f"No new/pending records for FileID '{file_id}' to process into DistroPics.",
-                "tasks_enqueued": 0, "scraper_records_found_for_processing": 0, "processing_errors_in_loop": 0,
+                "message": f"No new/pending records for FileID '{file_id}' found for warehouse-to-result processing.",
+                "scraper_records_queried": 0,
+                "warehouse_matches_found": 0,
+                "results_inserted_or_merged": 0,
                 "log_url": log_public_url
             }
 
-        logger.info(f"[{job_specific_id}] API: Found {len(source_records_to_process)} combined records for DistroPics processing.")
+        logger.info(f"[{job_specific_id}] API: Found {scraper_records_queried} records from {SCRAPER_RECORDS_TABLE_NAME} (original FileID '{file_id}') with warehouse matches to process into {IMAGE_SCRAPER_RESULT_TABLE_NAME}.")
 
-        for record in source_records_to_process:
-            correlation_task_id = str(uuid.uuid4())
+        results_to_batch_insert = []
+
+        for record in records_to_process:
             try:
                 scraper_entry_id = record.ScraperEntryID
-                product_model_from_scraper = record.ScraperProductModel
-                warehouse_dw_id = record.WarehouseDatawarehouseID
                 
-                # New image URL from utb_ImageScraperResult
-                distro_image_url = record.FinalImageUrl
-
-                # Data for DistroPics.ImageSource and DistroPics.ImageDesc from Warehouse
-                distro_pics_image_source = record.WarehouseModelSource
-                # Using WarehouseModelNumber for DistroPics.ImageDesc as an example
-                distro_pics_image_desc = record.WarehouseModelNumber # Or any other relevant description from warehouse data
-
-                if not distro_image_url: # Should be caught by SQL's IS NOT NULL, but good practice
-                    logger.warning(f"[{job_specific_id}][{correlation_task_id}] Skipping ScraperEntryID {scraper_entry_id}: FinalImageUrl is missing from {NEW_IMAGE_RESULT_TABLE_NAME}.")
-                    error_count += 1
+                if not record.WarehouseModelClean or not record.WarehouseModelFolder:
+                    logger.warning(f"[{job_specific_id}] Skipping ScraperEntryID {scraper_entry_id}: WarehouseModelClean or Folder missing for WarehousePK_ID {record.WarehousePK_ID}.")
+                    errors_in_loop +=1
                     continue
+                
+                model_clean_for_url = record.WarehouseModelClean.replace('.png', '').replace('.jpg', '').replace('.jpeg', '')
+                image_url_from_warehouse = f"{base_image_url}/{record.WarehouseModelFolder}/{model_clean_for_url}.png" # Assumes PNG, adjust if needed
+                
+                image_desc = f"{record.ScraperProductBrand or 'Brand'} {record.WarehouseModelNumber or record.ScraperProductModel or 'Product'}"
+                image_source_domain = urlparse(base_image_url).netloc if base_image_url else "warehouse_internal"
+                image_actual_source = record.WarehouseModelSource or image_source_domain
 
-                # Task 1: Deprioritize others
-                deprio_sql_str = text(f"""
-                    UPDATE DistroPics
-                    SET SortOrder = SortOrder + 1000,
-                        DistroUpdateTime = GETUTCDATE() -- Using GETUTCDATE() as per original traceback log
-                    WHERE ProductModel = :product_model
-                      AND SortOrder = 1
-                      -- Optional: AND ScraperEntryID_fk != :scraper_id -- Not currently active
-                      -- Optional: AND DatawarehouseID_fk != :dw_id    -- Not currently active
-                      ;
-                """) # Note: GETDATE() was in your code, GETUTCDATE() in log. Adjusted to log.
-                await enqueue_db_update(
-                    file_id=job_specific_id,
-                    sql=deprio_sql_str.text,
-                    params={"product_model": product_model_from_scraper},
-                    task_type="distro_deprioritize_others",
-                    producer_instance=current_producer_instance,
-                    correlation_id=f"{correlation_task_id}_deprio", logger_param=logger,
-                )
-                enqueued_tasks_count += 1
-
-                # Task 2: MERGE into DistroPics
-                # Added ImageSource and ImageDesc to the MERGE statement
-                merge_sql_str = text(f"""
-                    MERGE DistroPics AS target
-                    USING (
-                        SELECT
-                            :scraper_id AS ScraperEntryID_fk,
-                            :dw_id AS DatawarehouseID_fk,
-                            :p_model AS ProductModel,
-                            1 AS SortOrder,
-                            :wh_model_num AS WarehouseModelNumber,
-                            :wh_model_clean AS WarehouseModelClean,
-                            :wh_create_date AS WarehouseCreateDate,
-                            GETUTCDATE() AS CurrentTime,
-                            :distro_img_url AS DistroImageURL,
-                            :wh_model_source AS WarehouseModelSource, -- Original Warehouse Source
-                            :wh_model_folder AS WarehouseModelFolder,
-                            :distro_img_src AS FinalImageSource,      -- For DistroPics.ImageSource
-                            :distro_img_desc AS FinalImageDescription  -- For DistroPics.ImageDesc
-                    ) AS source
-                    ON (target.ScraperEntryID_fk = source.ScraperEntryID_fk AND target.DatawarehouseID_fk = source.DatawarehouseID_fk)
-
-                    WHEN MATCHED THEN
-                        UPDATE SET
-                            target.ProductModel = source.ProductModel,
-                            target.SortOrder = source.SortOrder,
-                            target.WarehouseModelNumber = source.WarehouseModelNumber,
-                            target.WarehouseModelClean = source.WarehouseModelClean,
-                            target.WarehouseCreateDate = source.WarehouseCreateDate,
-                            target.DistroImageURL = source.DistroImageURL,
-                            target.WarehouseModelSource = source.WarehouseModelSource,
-                            target.WarehouseModelFolder = source.WarehouseModelFolder,
-                            target.ImageSource = source.FinalImageSource,         -- Update ImageSource
-                            target.ImageDesc = source.FinalImageDescription,     -- Update ImageDesc
-                            target.DistroUpdateTime = source.CurrentTime
-                    WHEN NOT MATCHED BY TARGET THEN
-                        INSERT (
-                            ScraperEntryID_fk, DatawarehouseID_fk, ProductModel, SortOrder,
-                            WarehouseModelNumber, WarehouseModelClean, WarehouseCreateDate,
-                            DistroImageURL, WarehouseModelSource, WarehouseModelFolder,
-                            ImageSource, ImageDesc, -- Add new columns to INSERT
-                            DistroCreateTime, DistroUpdateTime
-                        ) VALUES (
-                            source.ScraperEntryID_fk, source.DatawarehouseID_fk, source.ProductModel, source.SortOrder,
-                            source.WarehouseModelNumber, source.WarehouseModelClean, source.WarehouseCreateDate,
-                            source.DistroImageURL, source.WarehouseModelSource, source.WarehouseModelFolder,
-                            source.FinalImageSource, source.FinalImageDescription, -- Add new values
-                            source.CurrentTime, source.CurrentTime
-                        );
-                """)
-
-                merge_params = {
-                    "scraper_id": scraper_entry_id,
-                    "dw_id": warehouse_dw_id,
-                    "p_model": product_model_from_scraper,
-                    "wh_model_num": record.WarehouseModelNumber,
-                    "wh_model_clean": record.WarehouseModelClean,
-                    "wh_create_date": record.WarehouseCreateDate,
-                    "distro_img_url": distro_image_url, # The new URL from utb_ImageScraperResult
-                    "wh_model_source": record.WarehouseModelSource, # Original warehouse source
-                    "wh_model_folder": record.WarehouseModelFolder,
-                    "distro_img_src": distro_pics_image_source, # For DistroPics.ImageSource
-                    "distro_img_desc": distro_pics_image_desc,   # For DistroPics.ImageDesc
-                }
-
-                await enqueue_db_update(
-                    file_id=job_specific_id,
-                    sql=merge_sql_str.text,
-                    params=merge_params,
-                    task_type="distro_upsert_primary",
-                    producer_instance=current_producer_instance,
-                    correlation_id=correlation_task_id, logger_param=logger,
-                )
-                enqueued_tasks_count += 1
-
-                # Task 3: Update status in SCRAPER_TABLE_NAME
-                update_scraper_status_sql = text(f"""
-                    UPDATE {SCRAPER_TABLE_NAME}
-                    SET {SCRAPER_ENTRY_STATUS_COLUMN} = 1,
-                        CompleteTime = GETUTCDATE() -- Using GETUTCDATE() for consistency
-                    WHERE {SCRAPER_PK_COLUMN} = :scraper_id;
-                """)
-                await enqueue_db_update(
-                    file_id=job_specific_id, # Use job_specific_id for consistency in logs if needed, or original file_id
-                    sql=update_scraper_status_sql.text,
-                    params={"scraper_id": scraper_entry_id},
-                    task_type="distro_update_scraper_status",
-                    producer_instance=current_producer_instance,
-                    correlation_id=f"{correlation_task_id}_status", logger_param=logger,
-                )
-                enqueued_tasks_count += 1
-
-                logger.debug(f"[{job_specific_id}][{correlation_task_id}] Enqueued 3 tasks for ScraperEntryID {scraper_entry_id}, ProductModel {product_model_from_scraper}, DW_ID {warehouse_dw_id}.")
+                results_to_batch_insert.append({
+                    # Map to keys expected by insert_search_results, or adapt insert_search_results
+                    # Assuming insert_search_results takes a dict similar to utb_ImageScraperResult structure
+                    "EntryID": scraper_entry_id, # This becomes IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN
+                    "ImageUrl": image_url_from_warehouse,
+                    "ImageDesc": image_desc,
+                    "ImageSource": image_actual_source,
+                    "ImageUrlThumbnail": image_url_from_warehouse, # Default to main image
+                    IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN: 0, # Default sort order
+                    IMAGE_SCRAPER_RESULT_SOURCE_TYPE_COLUMN: 'Warehouse',
+                    # CreateTime and UpdateTime are typically handled by insert_search_results or DB
+                })
 
             except Exception as e_loop:
-                error_count += 1
+                errors_in_loop += 1
                 scraper_id_log = getattr(record, 'ScraperEntryID', 'Unknown')
-                logger.error(f"[{job_specific_id}][{correlation_task_id}] Error preparing DB tasks for ScraperEntryID {scraper_id_log}: {e_loop}", exc_info=True)
+                logger.error(f"[{job_specific_id}] Error preparing data for ScraperEntryID {scraper_id_log}: {e_loop}", exc_info=True)
 
-        logger.info(f"[{job_specific_id}] API: DistroPics population tasks enqueued. Scraper Records Processed: {processed_scraper_records}. Total Tasks Enqueued: {enqueued_tasks_count}, Loop Errors: {error_count}")
+        if results_to_batch_insert:
+            logger.info(f"[{job_specific_id}] Attempting to batch insert {len(results_to_batch_insert)} results into {IMAGE_SCRAPER_RESULT_TABLE_NAME}.")
+            
+            background_tasks_for_insert = BackgroundTasks() # If insert_search_results uses it
+            success_insert = await insert_search_results( # This function needs to handle these dicts
+                results=results_to_batch_insert, # List of dicts
+                logger=logger,
+                file_id=file_id, # Original FileID context for logging/grouping within insert_search_results
+                background_tasks=background_tasks_for_insert
+            )
 
-        final_log_url = await upload_log_file(
-            file_id=job_specific_id, log_filename=log_filename,
-            logger=logger, db_record_file_id_to_update=file_id
+            if success_insert: # Assuming insert_search_results returns a boolean or count
+                inserted_results_count = len(results_to_batch_insert) # Or actual count if returned
+                logger.info(f"[{job_specific_id}] Successfully enqueued/processed batch insertion of {inserted_results_count} results from warehouse.")
+
+                entry_ids_processed = [res["EntryID"] for res in results_to_batch_insert]
+                if entry_ids_processed:
+                    update_scraper_status_sql_batch = text(f"""
+                        UPDATE {SCRAPER_RECORDS_TABLE_NAME}
+                        SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED},
+                            {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
+                        WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :entry_ids_list;
+                    """)
+                    
+                    batch_update_params = {"entry_ids_list": tuple(entry_ids_processed)}
+                    status_update_correlation_id = str(uuid.uuid4())
+
+                    await enqueue_db_update(
+                        file_id=job_specific_id,
+                        sql=update_scraper_status_sql_batch.text,
+                        params=batch_update_params,
+                        task_type="batch_update_scraper_status_warehouse_complete",
+                        producer_instance=current_producer_instance,
+                        correlation_id=status_update_correlation_id,
+                        logger_param=logger
+                    )
+                    tasks_enqueued_for_scraper_status_update = 1
+                    logger.info(f"[{job_specific_id}] Enqueued batch status update for {len(entry_ids_processed)} scraper records. CorrelationID: {status_update_correlation_id}")
+            else:
+                logger.error(f"[{job_specific_id}] Batch insertion of warehouse results into {IMAGE_SCRAPER_RESULT_TABLE_NAME} reported failure.")
+        
+        final_message = (
+            f"Warehouse-to-Result processing for original FileID '{file_id}' initiated. "
+            f"Scraper Records Queried: {scraper_records_queried}, "
+            f"Warehouse Matches Found: {warehouse_matches_found}, "
+            f"Results Prepared for '{IMAGE_SCRAPER_RESULT_TABLE_NAME}': {len(results_to_batch_insert)} (actual insertion via insert_search_results), "
+            f"Scraper Status Update Tasks Enqueued: {tasks_enqueued_for_scraper_status_update}, "
+            f"Errors in Loop: {errors_in_loop}."
+        )
+        logger.info(f"[{job_specific_id}] API: {final_message}")
+
+        log_public_url = await upload_log_file(
+            file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id
         )
         return {
             "status": "success",
-            "message": f"DistroPics tasks for FileID '{file_id}' enqueued. Scraper Records Processed: {processed_scraper_records}. Total Tasks Enqueued: {enqueued_tasks_count}. Errors in Loop: {error_count}.",
-            "tasks_enqueued": enqueued_tasks_count,
-            "scraper_records_processed_count": processed_scraper_records,
-            "processing_errors_in_loop": error_count,
-            "log_url": final_log_url
+            "message": final_message,
+            "job_specific_id": job_specific_id,
+            "original_file_id": file_id,
+            "scraper_records_queried": scraper_records_queried,
+            "warehouse_matches_found": warehouse_matches_found,
+            "results_prepared_for_insertion": len(results_to_batch_insert),
+            "scraper_status_updates_enqueued": tasks_enqueued_for_scraper_status_update,
+            "processing_errors_in_loop": errors_in_loop,
+            "log_url": log_public_url
         }
 
     except HTTPException:
         raise
     except Exception as e_critical:
-        logger.error(f"[{job_specific_id}] API: Critical error: {e_critical}", exc_info=True)
-        critical_log_url = None
-        # ... (critical error handling as before)
-        if log_filename and os.path.exists(log_filename): # Check if log_filename was initialized
-            critical_log_url = await upload_log_file(
-                file_id=job_specific_id, log_filename=log_filename, # Use job_specific_id for log context
-                logger=logger, db_record_file_id_to_update=file_id
-            )
-        raise HTTPException(status_code=500, detail=f"Critical error during DistroPics population. Log: {critical_log_url or 'Log upload failed or N/A'}")
+        logger.error(f"[{job_specific_id}] API: Critical error during warehouse-to-result processing for FileID '{file_id}': {e_critical}", exc_info=True)
+        critical_log_url = await upload_log_file(
+            file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id
+        )
+        raise HTTPException(status_code=500, detail=f"Critical error during warehouse-to-result processing. Log: {critical_log_url or 'Log upload failed or N/A'}")
     finally:
-        logger.info(f"[{job_specific_id}] API: Endpoint finished processing for context FileID: {file_id}.")
-        # if current_producer_instance: # Close producer if opened here, or manage globally
-        #     await current_producer_instance.close()
+        logger.info(f"[{job_specific_id}] API: Endpoint finished processing for original FileID: {file_id}.")
 
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(
