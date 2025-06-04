@@ -1142,7 +1142,7 @@ async def api_populate_distro_pics_final(
                 deprio_sql_str = text(f"""
                     UPDATE DistroPics
                     SET SortOrder = SortOrder + 1000, -- Or any value > 1, e.g., 99
-                        DistroUpdateTime = GETUTCDATE()
+                        DistroUpdateTime = GETDATE()
                     WHERE ProductModel = :product_model 
                       AND SortOrder = 1
                       ; 
