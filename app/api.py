@@ -1190,7 +1190,7 @@ async def api_populate_distro_pics_final(
                             target.SortOrder = source.SortOrder,
                             target.WarehouseModelNumber = source.WarehouseModelNumber,
                             target.WarehouseModelClean = source.WarehouseModelClean,
-                            target.WarehouseCreateDate = source.WarehouseCreateDate, -- Keep original warehouse create date
+                            target.WarehouseCreateDate = source.WarehouseCreateDate,
                             target.DistroImageURL = source.DistroImageURL,
                             target.WarehouseModelSource = source.WarehouseModelSource,
                             target.WarehouseModelFolder = source.WarehouseModelFolder,
