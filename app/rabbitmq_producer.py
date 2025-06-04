@@ -7,7 +7,10 @@ from typing import Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import asyncio
 import aiormq.exceptions
-
+def datetime_converter(o: Any) -> str:
+    if isinstance(o, datetime.datetime) or isinstance(o, datetime.date):
+        return o.isoformat()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
 logger = logging.getLogger(__name__)
 
 class RabbitMQProducer:
@@ -156,7 +159,7 @@ class RabbitMQProducer:
             # No need to re-declare self.queue_name here, connect() and RobustConnection handle it.
 
             async with asyncio.timeout(self.operation_timeout):
-                message_body = json.dumps(message)
+                message_body = json.dumps(message, default=datetime_converter)
                 await self.channel.default_exchange.publish(
                     aio_pika.Message(
                         body=message_body.encode(),
