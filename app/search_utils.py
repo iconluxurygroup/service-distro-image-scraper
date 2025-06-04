@@ -25,7 +25,8 @@ MAX_CONCURRENCY = 10
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError)),
+    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError,
+    RuntimeError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"

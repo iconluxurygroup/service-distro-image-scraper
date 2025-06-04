@@ -730,6 +730,7 @@ logger = logging.getLogger(__name__)
         aiormq.exceptions.ChannelAccessRefused,
         aiormq.exceptions.ChannelPreconditionFailed,
         SQLAlchemyError,
+        RuntimeError,
     )),
 )
 async def enqueue_db_update(
