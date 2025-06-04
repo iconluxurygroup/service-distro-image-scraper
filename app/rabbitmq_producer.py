@@ -151,11 +151,7 @@ class RabbitMQProducer:
                 logger.debug(f"Declared dynamic/response queue: {actual_routing_key}")
 
             async with asyncio.timeout(self.operation_timeout):
-                # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-                # MODIFIED LINE: Add the 'default' argument to json.dumps
-                # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                 message_body = json.dumps(message, default=datetime_converter)
-                # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                 await self.channel.default_exchange.publish(
                     aio_pika.Message(
                         body=message_body.encode(),
