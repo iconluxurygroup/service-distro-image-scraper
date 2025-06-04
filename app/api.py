@@ -1024,6 +1024,156 @@ async def process_restart_batch(
         await async_engine.dispose()
         logger.info(f"Disposed database engines for FileID {file_id_db}")
 
+@router.post("/populate-distro-pics/{file_id}", tags=["Database", "NewFeature"])
+async def api_populate_distro_pics(
+    file_id: str, # Used for logging context, not direct data filtering here
+    limit: Optional[int] = Query(1000, description="Maximum number of new records to process in this run"),
+    background_tasks: BackgroundTasks = None # Keep for consistency if needed by enqueue_db_update
+):
+    """
+    Populates the DistroPics table from utb_IconWarehouseImages.
+    Constructs ModelImage URL based on ModelFolder and ModelClean.
+    Only processes records not already in DistroPics.
+    """
+    # Use a unique job_id for logging this specific task, can be related to file_id
+    job_specific_id = f"populate_distro_pics_{file_id}_{uuid.uuid4().hex[:8]}"
+    logger, log_filename = setup_job_logger(job_id=job_specific_id, console_output=True)
+    
+    logger.info(f"Starting population of DistroPics. Processing up to {limit} new records. Context FileID: {file_id}")
+
+    processed_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    base_image_url = "https://cms.rtsplusdev.com/files/icon_warehouse_images"
+
+    try:
+        # Ensure RabbitMQ producer is available if enqueue_db_update relies on global one
+        # or pass it explicitly if the function signature allows/requires.
+        # Based on your code, enqueue_db_update seems to handle producer internally.
+        global producer 
+        if not producer or not producer.is_connected:
+            logger.warning("Global RabbitMQ producer not initialized or connected. Attempting to get a new one.")
+            # producer = await RabbitMQProducer.get_producer() # Already done in lifespan
+            if not producer or not producer.is_connected:
+                logger.error("Failed to get a connected RabbitMQ producer.")
+                raise HTTPException(status_code=500, detail="RabbitMQ producer unavailable.")
+        
+        async with async_engine.connect() as conn:
+            # Fetch records from utb_IconWarehouseImages that are not yet in DistroPics
+            # and have non-empty, non-null ModelClean and ModelFolder
+            # SQL Server uses TOP for limit
+            fetch_query_sql = text(f"""
+                SELECT TOP ({limit})
+                    iwi.DatawarehouseID,
+                    iwi.ModelNumber,
+                    iwi.ModelClean,
+                    iwi.CreateDate,
+                    iwi.UpdateDate,
+                    iwi.ModelSource,
+                    iwi.ModelFolder
+                FROM utb_IconWarehouseImages iwi
+                LEFT JOIN DistroPics dp ON iwi.DatawarehouseID = dp.DatawarehouseID
+                WHERE dp.DatawarehouseID IS NULL
+                  AND iwi.ModelClean IS NOT NULL AND iwi.ModelClean <> ''
+                  AND iwi.ModelFolder IS NOT NULL AND iwi.ModelFolder <> ''
+                ORDER BY iwi.DatawarehouseID; -- Optional: process in a consistent order
+            """)
+            
+            source_records_cursor = await conn.execute(fetch_query_sql)
+            source_records = source_records_cursor.fetchall()
+            await source_records_cursor.close()
+
+        if not source_records:
+            logger.info("No new records found in utb_IconWarehouseImages to populate into DistroPics.")
+            log_public_url = await upload_log_file(job_specific_id, log_filename, logger)
+            return {
+                "status": "success",
+                "message": "No new records to process.",
+                "processed_count": 0,
+                "log_url": log_public_url
+            }
+
+        logger.info(f"Found {len(source_records)} new records to process for DistroPics.")
+
+        for record in source_records:
+            try:
+                datawarehouse_id = record.DatawarehouseID
+                model_clean = record.ModelClean
+                model_folder = record.ModelFolder # This is the year
+
+                if not model_clean or not model_folder:
+                    logger.warning(f"Skipping DatawarehouseID {datawarehouse_id}: ModelClean or ModelFolder is missing/empty.")
+                    skipped_count += 1
+                    continue
+
+                # Construct the ModelImage URL
+                # Ensure ModelClean doesn't already have .png and handle potential slashes
+                clean_filename = model_clean.replace('.png', '')
+                model_image_url = f"{base_image_url}/{model_folder}/{clean_filename}.png"
+                
+                # Prepare parameters for insertion
+                insert_params = {
+                    "DatawarehouseID": datawarehouse_id,
+                    "ModelNumber": record.ModelNumber,
+                    "ModelClean": model_clean,
+                    "CreateDate": record.CreateDate,
+                    "UpdateDate": record.UpdateDate,
+                    "ModelImage": model_image_url,
+                    "ModelSource": record.ModelSource,
+                    "ModelFolder": model_folder
+                    # ProcessedDate has a DEFAULT GETDATE() in the table definition
+                }
+
+                insert_sql = """
+                INSERT INTO DistroPics (
+                    DatawarehouseID, ModelNumber, ModelClean, CreateDate, UpdateDate,
+                    ModelImage, ModelSource, ModelFolder
+                ) VALUES (
+                    :DatawarehouseID, :ModelNumber, :ModelClean, :CreateDate, :UpdateDate,
+                    :ModelImage, :ModelSource, :ModelFolder
+                );
+                """
+                # Enqueue the database update
+                # Using job_specific_id for the file_id parameter of enqueue_db_update for log association
+                await enqueue_db_update(
+                    file_id=job_specific_id, 
+                    sql=insert_sql,
+                    params=insert_params,
+                    task_type="populate_distro_pics_insert",
+                    correlation_id=str(uuid.uuid4()), # Unique ID for this specific task
+                    logger_param=logger # Pass the logger
+                )
+                processed_count += 1
+                logger.debug(f"Enqueued insertion for DatawarehouseID {datawarehouse_id} into DistroPics.")
+
+            except Exception as e:
+                error_count += 1
+                logger.error(f"Error processing record (DatawarehouseID: {record.DatawarehouseID if record else 'N/A'}) for DistroPics: {e}", exc_info=True)
+        
+        logger.info(f"Finished DistroPics population attempt. Processed: {processed_count}, Skipped: {skipped_count}, Errors: {error_count}")
+        
+        log_public_url = await upload_log_file(job_specific_id, log_filename, logger)
+        
+        return {
+            "status": "success",
+            "message": f"DistroPics population task enqueued. Records attempted: {len(source_records)}. Enqueued for insert: {processed_count}. Skipped: {skipped_count}. Errors: {error_count}.",
+            "processed_count": processed_count,
+            "skipped_count": skipped_count,
+            "error_count": error_count,
+            "log_url": log_public_url
+        }
+
+    except HTTPException: # Re-raise HTTPExceptions
+        raise
+    except Exception as e:
+        logger.error(f"Critical error during DistroPics population: {e}", exc_info=True)
+        log_public_url = await upload_log_file(job_specific_id, log_filename, logger)
+        raise HTTPException(status_code=500, detail=f"Error populating DistroPics: {str(e)}")
+    finally:
+        # await async_engine.dispose() # This is handled by lifespan
+        logger.info(f"DistroPics population endpoint call for FileID {file_id} finished.")
+
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(
     file_id: str,
