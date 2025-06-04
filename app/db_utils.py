@@ -733,118 +733,89 @@ logger = logging.getLogger(__name__)
         RuntimeError,
     )),
 )
-async def enqueue_db_update(
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception_type((
+        aio_pika.exceptions.AMQPError,
+        # aio_pika.exceptions.ChannelClosed, # Generally covered by AMQPError
+        # aiormq.exceptions.ChannelAccessRefused, # Should be caught on connect by producer
+        # aiormq.exceptions.ChannelPreconditionFailed, # Should be handled by producer
+        SQLAlchemyError, # For direct DB operations
+        RuntimeError, # Catch-all for unexpected issues including RMQ connection
+        asyncio.TimeoutError, # For timeouts during RMQ operations
+    )),
+)
+async def enqueue_db_update_option_a( # Renamed for clarity
     file_id: str,
-    sql: Any,  # Allow TextClause or string
+    sql: Any,
     params: dict,
-    background_tasks: Any = None,
     task_type: str = "db_update",
-    producer: Optional[aio_pika.Connection] = None,
+    producer_instance: Optional[RabbitMQProducer] = None,
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
     return_result: bool = False,
-    logger: Optional[logging.Logger] = None
+    logger_param: Optional[logging.Logger] = None
 ) -> Any:
-    """Enqueue a database update task to RabbitMQ or execute SELECT queries directly."""
-    logger = logger or logging.getLogger(__name__)
+    logger = logger_param or module_logger
     correlation_id = correlation_id or str(uuid.uuid4())
-    
+
     try:
-        # Convert sql to string if it's a TextClause
         if isinstance(sql, TextClause):
             sql = str(sql)
-            logger.debug(f"[{correlation_id}] Converted TextClause to string: {sql[:100]}...")
 
-        # Ensure params are JSON-serializable
-        serializable_params = {}
-        for key, value in params.items():
-            if isinstance(value, tuple):
-                serializable_params[key] = list(value)  # Convert tuples to lists
-            else:
-                serializable_params[key] = value
-        params = serializable_params
+        serializable_params = {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in params.items()
+        }
 
-        # Handle SELECT queries directly if return_result is True
         if return_result and sql.strip().upper().startswith("SELECT"):
             logger.debug(f"[{correlation_id}] Executing SELECT query directly for FileID {file_id}")
             async with async_engine.connect() as conn:
-                result = await conn.execute(text(sql), params)
-                rows = [dict(row) for row in result.mappings()]
-                result.close()
+                db_result = await conn.execute(text(sql), serializable_params) # Use serializable_params
+                rows = [dict(row) for row in db_result.mappings()] # Use .mappings() for dicts
+                # result.close() # Not needed with async with async_engine.connect() and execute
                 logger.info(f"[{correlation_id}] Retrieved {len(rows)} rows for FileID {file_id}")
                 return rows
 
-        # Initialize producer if not provided
-        if not producer or not producer.is_connected:
-            from rabbitmq_producer import RabbitMQProducer
-            producer = await RabbitMQProducer.get_producer(logger=logger)
-            logger.debug(f"[{correlation_id}] Initialized new RabbitMQ producer for FileID {file_id}")
+        # Get a producer instance if not provided or if the provided one is not connected
+        current_producer = producer_instance
+        if current_producer is None or not current_producer.is_connected:
+            logger.info(f"[{correlation_id}] Producer not provided or not connected. Getting/re-getting instance.")
+            # Pass logger to get_producer if your RabbitMQProducer.get_producer supports it
+            # and you want its logs to use this specific logger instance.
+            # For simplicity, assuming get_producer uses its own internal logger.
+            current_producer = await RabbitMQProducer.get_producer()
+        
+        # Verify connection again after attempting to get/create
+        if not current_producer or not current_producer.is_connected:
+            logger.error(f"[{correlation_id}] Failed to get a connected RabbitMQ producer for FileID {file_id}.")
+            raise RuntimeError("Failed to establish/use RabbitMQ connection.")
 
-        # Construct task dictionary
         task = {
             "file_id": file_id,
             "sql": sql,
-            "params": params,
+            "params": serializable_params, # Use serializable_params
             "task_type": task_type,
             "correlation_id": correlation_id,
             "return_result": return_result,
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-        # Determine queue name
-        queue_name = response_queue or "db_update_queue"
-        channel = await producer.connection.channel()
+        queue_to_publish_to = response_queue or current_producer.queue_name # Use producer's default or response_queue
 
-        # Handle response queues (temporary, non-durable)
-        if queue_name.startswith("select_response_"):
-            try:
-                await channel.get_queue(queue_name)
-                logger.debug(f"[{correlation_id}] Using existing response queue: {queue_name}")
-            except aiormq.exceptions.ChannelNotFoundEntity:
-                await channel.declare_queue(
-                    queue_name,
-                    durable=False,
-                    exclusive=False,
-                    auto_delete=True,
-                    arguments={"x-expires": 600000}  # 10-minute expiration
-                )
-                logger.debug(f"[{correlation_id}] Declared new response queue: {queue_name}")
-            except aiormq.exceptions.ChannelPreconditionFailed:
-                logger.warning(f"[{correlation_id}] Queue {queue_name} has incompatible settings, generating new name")
-                queue_name = f"{queue_name}_{uuid.uuid4().hex[:8]}"
-                await channel.declare_queue(
-                    queue_name,
-                    durable=False,
-                    exclusive=False,
-                    auto_delete=True,
-                    arguments={"x-expires": 600000}
-                )
-                logger.debug(f"[{correlation_id}] Declared new response queue: {queue_name}")
-        else:
-            # Main queue (durable)
-            await channel.declare_queue(
-                queue_name,
-                durable=True,
-                exclusive=False,
-                auto_delete=False
-            )
-            logger.debug(f"[{correlation_id}] Declared main queue: {queue_name}")
-
-        # Publish task
-        message_body = json.dumps(task)
-        await channel.default_exchange.publish(
-            aio_pika.Message(
-                body=message_body.encode(),
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                content_type="application/json",
-                correlation_id=correlation_id
-            ),
-            routing_key=queue_name
+        await current_producer.publish_message(
+            message=task,
+            routing_key=queue_to_publish_to,
+            correlation_id=correlation_id
         )
-        logger.info(f"[{correlation_id}] Enqueued task to {queue_name} for FileID {file_id}: {message_body[:200]}")
-        
-        # Return queue name or simulated rows affected
-        return queue_name if not return_result else 1
+        logger.info(f"[{correlation_id}] Successfully enqueued task via producer.publish_message to {queue_to_publish_to} for FileID {file_id}: {json.dumps(task)[:200]}")
+
+        return queue_to_publish_to if not return_result else 1 # Indicate 1 "row affected" for non-SELECT
+
     except Exception as e:
-        logger.error(f"[{correlation_id}] Error enqueuing task to {queue_name} for FileID {file_id}: {e}", exc_info=True)
+        # The queue_name variable might not be defined if error occurs before it's set
+        # So, log generically or ensure it's defined.
+        q_name_for_log = response_queue or (producer_instance.queue_name if producer_instance else "db_update_queue")
+        logger.error(f"[{correlation_id}] Error enqueuing task to {q_name_for_log} for FileID {file_id}: {e}", exc_info=True)
         raise
