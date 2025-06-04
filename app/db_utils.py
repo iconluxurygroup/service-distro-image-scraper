@@ -711,28 +711,9 @@ async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logge
         return None
     
 import aio_pika
-import json
-import uuid
-import logging
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import aiormq.exceptions
-from typing import Any, Optional
-from sqlalchemy.sql.expression import TextClause
-
-logger = logging.getLogger(__name__)
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((
-        aio_pika.exceptions.AMQPError,
-        aio_pika.exceptions.ChannelClosed,
-        aiormq.exceptions.ChannelAccessRefused,
-        aiormq.exceptions.ChannelPreconditionFailed,
-        SQLAlchemyError,
-        RuntimeError,
-    )),
-)
+from sqlalchemy.sql import text, TextClause # Make sure to import TextClause and text
+from sqlalchemy.exc import SQLAlchemyError # Make sure to import SQLAlchemyError
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
@@ -746,7 +727,7 @@ logger = logging.getLogger(__name__)
         asyncio.TimeoutError, # For timeouts during RMQ operations
     )),
 )
-async def enqueue_db_update_option_a( # Renamed for clarity
+async def enqueue_db_update(
     file_id: str,
     sql: Any,
     params: dict,
@@ -757,7 +738,7 @@ async def enqueue_db_update_option_a( # Renamed for clarity
     return_result: bool = False,
     logger_param: Optional[logging.Logger] = None
 ) -> Any:
-    logger = logger_param or module_logger
+    logger = logger_param or default_logger
     correlation_id = correlation_id or str(uuid.uuid4())
 
     try:
