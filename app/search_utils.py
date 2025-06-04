@@ -234,19 +234,23 @@ async def update_sort_order(
         processed = await asyncio.gather(*tasks, return_exceptions=True)
 
         for result in processed:
-            if isinstance(result, Exception):
-                logger.error(f"Unexpected error in batch processing: {result}", exc_info=True)
+            if isinstance(result, asyncio.CancelledError):
+                logger.warning(f"A task was cancelled during batch processing: {result}")
+                failure_count += 1 # Or handle as appropriate for cancelled tasks
+                # Potentially log which EntryID was being processed if you can associate it
+                continue
+            elif isinstance(result, Exception): # Handle other exceptions
+                logger.error(f"Unexpected error in batch processing for an entry: {result}", exc_info=True)
                 failure_count += 1
                 continue
+
+            # If it's not an exception, it should be the dictionary
             results.append(result)
-            if result["Success"]:
+            if result.get("Success"): # Use .get() for safety, though it should be a dict here
                 success_count += 1
             else:
                 failure_count += 1
-            if not result["Success"]:
-                logger.warning(f"No results for EntryID {result['EntryID']}: {result.get('Error', 'Unknown error')}")
-
-        logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
+                logger.warning(f"No results for EntryID {result.get('EntryID', 'Unknown EntryID')}: {result.get('Error', 'Unknown error')}")
 
         # Verify sort order distribution
         async with async_engine.connect() as conn:
