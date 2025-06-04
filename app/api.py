@@ -1083,7 +1083,7 @@ STATUS_WAREHOUSE_CHECK_NO_MATCH = 1
 STATUS_WAREHOUSE_RESULT_POPULATED = 2 # This endpoint will set this status
 STATUS_PENDING_GOOGLE_SEARCH = 3
 STATUS_GOOGLE_SEARCH_COMPLETE = 4
-
+producer = None
 @router.post("/populate-results-from-warehouse/{file_id}", tags=["Processing", "Warehouse"])
 async def api_populate_results_from_warehouse(
     request: Request,
