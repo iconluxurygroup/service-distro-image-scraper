@@ -708,7 +708,10 @@ async def update_initial_sort_order(file_id: str, logger: Optional[logging.Logge
     except Exception as e:
         logger.error(f"Unexpected error for FileID {file_id}: {e}", exc_info=True)
         return None
-    
+def datetime_converter(o: Any) -> str:
+    if isinstance(o, datetime.datetime) or isinstance(o, datetime.date):
+        return o.isoformat()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")    
 import aio_pika
 import aiormq.exceptions
 from sqlalchemy.sql import text # Make sure to import TextClause and text
@@ -752,11 +755,15 @@ async def enqueue_db_update(
 
         if return_result and sql.strip().upper().startswith("SELECT"):
             logger.debug(f"[{correlation_id}] Executing SELECT query directly for FileID {file_id}")
-            async with async_engine.connect() as conn:
-                db_result = await conn.execute(text(sql), serializable_params) # Use serializable_params
-                rows = [dict(row) for row in db_result.mappings()] # Use .mappings() for dicts
-                # result.close() # Not needed with async with async_engine.connect() and execute
+            async with async_engine.connect() as conn: # Assuming async_engine is defined
+                db_result = await conn.execute(text(sql), serializable_params)
+                rows = [dict(row) for row in db_result.mappings()]
                 logger.info(f"[{correlation_id}] Retrieved {len(rows)} rows for FileID {file_id}")
+                # Convert datetime objects in rows if they are to be returned and might be JSON serialized later
+                for row_data in rows:
+                    for key, value in row_data.items():
+                        if isinstance(value, datetime.datetime) or isinstance(value, datetime.date):
+                            row_data[key] = value.isoformat()
                 return rows
 
         # Get a producer instance if not provided or if the provided one is not connected
@@ -780,7 +787,7 @@ async def enqueue_db_update(
             "task_type": task_type,
             "correlation_id": correlation_id,
             "return_result": return_result,
-            "timestamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            "timestamp": datetime.datetime.now().isoformat()
         }
 
         queue_to_publish_to = response_queue or current_producer.queue_name # Use producer's default or response_queue
