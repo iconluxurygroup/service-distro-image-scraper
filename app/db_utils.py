@@ -780,7 +780,7 @@ async def enqueue_db_update(
             logger.error(f"[{correlation_id}] Failed to get a connected RabbitMQ producer for FileID {file_id}.")
             raise RuntimeError("Failed to establish/use RabbitMQ connection.")
 
-        task = {
+        task: Dict[str, Any] = {
             "file_id": file_id,
             "sql": sql,
             "params": serializable_params, # Use serializable_params
@@ -797,7 +797,10 @@ async def enqueue_db_update(
             routing_key=queue_to_publish_to,
             correlation_id=correlation_id
         )
-        logger.info(f"[{correlation_id}] Successfully enqueued task via producer.publish_message to {queue_to_publish_to} for FileID {file_id}: {json.dumps(task)[:200]}")
+        logger.info(
+            f"[{correlation_id}] Successfully enqueued task via producer.publish_message to {queue_to_publish_to} "
+            f"for FileID {file_id}: {json.dumps(task, default=datetime_converter)[:200]}"
+        )
 
         return queue_to_publish_to if not return_result else 1 # Indicate 1 "row affected" for non-SELECT
 
