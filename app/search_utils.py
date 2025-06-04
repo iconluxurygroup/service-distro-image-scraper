@@ -369,20 +369,6 @@ async def update_sort_order(
 
     return all_processed_results
 
-    # Catch specific exceptions if needed, otherwise Tenacity handles retries for specified exceptions
-    # except SQLAlchemyError as e_sql: ...
-    # except aio_pika.exceptions.AMQPError as e_amqp: ...
-
-    finally:
-        # IMPORTANT: The producer_singleton (and its underlying connection) is NOT closed here.
-        # It is a shared singleton and should be managed at the application lifecycle level
-        # (e.g., closed on application shutdown).
-        if producer_singleton:
-             logger.info(
-                f"Finished batch SortOrder update for FileID {file_id}. "
-                "Shared RabbitMQ producer connection remains open for application use."
-            )
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
