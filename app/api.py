@@ -944,13 +944,19 @@ async def process_restart_batch(
                 entry_id = entry[0]
                 if isinstance(result, Exception):
                     logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
+                    if isinstance(result, asyncio.CancelledError):
+                        logger.warning(f"Task for EntryID {entry_id} was cancelled")
                     failed_entries += 1
                     continue
-                entry_id_result, success = result
-                if success:
-                    successful_entries += 1
-                    last_entry_id_processed = entry_id
-                else:
+                try:
+                    entry_id_result, success = result
+                    if success:
+                        successful_entries += 1
+                        last_entry_id_processed = entry_id
+                    else:
+                        failed_entries += 1
+                except ValueError as e:
+                    logger.error(f"Failed to unpack result for EntryID {entry_id}: {e}, Result: {result}", exc_info=True)
                     failed_entries += 1
 
             async with async_engine.connect() as conn:
