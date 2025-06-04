@@ -800,7 +800,6 @@ async def process_restart_batch(
                                         sort_results = await update_search_sort_order(
                                             file_id=str(file_id_db),
                                             entry_id=str(entry_id), 
-                                            producer_instance=producer,  
                                             brand=brand,      
                                             model=model,      
                                             color=color,       
