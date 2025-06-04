@@ -140,7 +140,6 @@ async def update_search_sort_order(
                     file_id=file_id,
                     sql=update_query,
                     params=params,
-                    background_tasks=background_tasks,
                     task_type="update_sort_order",
                     producer=producer,
                     correlation_id=correlation_id,
