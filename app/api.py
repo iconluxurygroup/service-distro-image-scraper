@@ -1098,7 +1098,7 @@ async def api_populate_results_from_warehouse(
     and inserts a new entry into utb_ImageScraperResult with SourceType='Warehouse'.
     It also updates the status of the processed record in utb_ImageScraperRecords.
     """
-    job_specific_id = f"warehouse_results_for_{file_id}_{uuid.uuid4().hex[:8]}"
+    job_specific_id = file_id
     logger, log_filename = setup_job_logger(job_id=job_specific_id, console_output=True)
 
     logger.info(f"[{job_specific_id}] API: Starting population of '{IMAGE_SCRAPER_RESULT_TABLE_NAME}' from '{WAREHOUSE_IMAGES_TABLE_NAME}' for original FileID: {file_id}. Limit: {limit}")
@@ -1109,7 +1109,7 @@ async def api_populate_results_from_warehouse(
     tasks_enqueued_for_scraper_status_update = 0
     errors_in_loop = 0
 
-    current_producer_instance = global_producer
+    current_producer_instance = producer
 
     try:
         if not current_producer_instance or not current_producer_instance.is_connected:
