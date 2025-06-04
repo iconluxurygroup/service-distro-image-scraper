@@ -1042,7 +1042,7 @@ async def api_populate_distro_pics(
     base_image_url = "https://cms.rtsplusdev.com/files/icon_warehouse_images"
     
     # Get the producer instance from app.state
-    current_producer_instance = request.app.state.rmq_producer
+    current_producer_instance  = await RabbitMQProducer.get_producer()
 
     try:
         if not current_producer_instance or not current_producer_instance.is_connected:
