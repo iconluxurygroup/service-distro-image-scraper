@@ -732,11 +732,11 @@ async def enqueue_db_update(
     sql: Any,
     params: dict,
     task_type: str = "db_update",
-    producer_instance: Optional[RabbitMQProducer] = None,
+    producer_instance: Optional[RabbitMQProducer] = None, # Expects producer_instance
     response_queue: Optional[str] = None,
     correlation_id: Optional[str] = None,
     return_result: bool = False,
-    logger_param: Optional[logging.Logger] = None
+    logger_param: Optional[logging.Logger] = None      # Expects logger_param
 ) -> Any:
     logger = logger_param or default_logger
     correlation_id = correlation_id or str(uuid.uuid4())
