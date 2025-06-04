@@ -697,12 +697,11 @@ async def process_restart_batch(
                         file_id=str(file_id_db),
                         sql=sql,
                         params=params,
-                        background_tasks=background_tasks,
                         task_type=task_type,
                         response_queue=response_queue,
                         correlation_id=correlation_id,
                         return_result=return_result,
-                        logger=logger
+                        logger_param=logger
                     )
                     return result
             except asyncio.TimeoutError as te:
@@ -1155,7 +1154,6 @@ async def api_clear_ai_json(
             file_id=file_id,
             sql=sql,
             params=params,
-            background_tasks=background_tasks,
             task_type="clear_ai_json",
             correlation_id=correlation_id,
             return_result=True
@@ -1177,7 +1175,6 @@ async def api_clear_ai_json(
             file_id=file_id,
             sql=verify_sql,
             params=verify_params,
-            background_tasks=background_tasks,
             task_type="verify_clear_ai_json",
             correlation_id=verify_correlation_id,
             return_result=True
@@ -1385,7 +1382,6 @@ async def enqueue_task(file_id: str, sql: str, background_tasks: BackgroundTasks
             params={},
             task_type="db_update",
             queue_name="db_update_queue",
-            background_tasks=background_tasks,
             logger=logger
         )
         return {"status": "Task enqueued"}
@@ -1759,7 +1755,6 @@ async def api_sort_by_relevance(
                 file_id=file_id,
                 sql=sql,
                 params=params,
-                background_tasks=background_tasks,
                 task_type="verify_sort_order",
                 correlation_id=correlation_id
             )
@@ -1835,11 +1830,10 @@ async def api_reset_step1(
             file_id=file_id,
             sql=reset_query,
             params={"file_id": int(file_id)},
-            background_tasks=background_tasks,
             task_type="reset_step1",
-            producer=producer,
+            producer_instance=producer,
             correlation_id=correlation_id,
-            logger=logger
+            logger_param=logger
         )
         logger.info(f"Enqueued Step1 reset for FileID: {file_id}, CorrelationID: {correlation_id}")
         log_public_url = await upload_file_to_space(
@@ -1981,7 +1975,6 @@ async def api_reset_step1_no_results(
                 file_id=file_id,
                 sql=sql,
                 params=params,
-                background_tasks=background_tasks,
                 task_type="reset_step1_no_results",
                 correlation_id=correlation_id,
                 return_result=True
@@ -2185,7 +2178,6 @@ async def api_validate_images(
                             file_id=file_id,
                             sql=sql,
                             params=params,
-                            background_tasks=background_tasks,
                             task_type="mark_invalid_image",
                             correlation_id=correlation_id,
                             response_queue="shared_response_queue"  # Use shared queue
@@ -2246,7 +2238,6 @@ async def api_validate_images(
                 file_id=file_id,
                 sql=sql,
                 params=params,
-                background_tasks=background_tasks,
                 task_type="verify_invalid_images",
                 correlation_id=correlation_id
             )
@@ -2365,7 +2356,6 @@ async def api_reset_step1_no_results(
                 file_id=file_id,
                 sql=sql,
                 params=params,
-                background_tasks=background_tasks,
                 task_type="reset_step1_no_results",
                 correlation_id=correlation_id,
                 return_result=True
