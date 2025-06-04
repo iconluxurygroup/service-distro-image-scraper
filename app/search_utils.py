@@ -20,7 +20,7 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-MAX_CONCURRENCY = 5
+MAX_CONCURRENCY = 1
 
 @retry(
     stop=stop_after_attempt(3),
