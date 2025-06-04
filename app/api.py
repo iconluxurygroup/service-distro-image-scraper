@@ -489,7 +489,7 @@ async def run_generate_download_file(file_id: str, logger: logging.Logger, log_f
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger) -> Optional[str]:
+async def upload_log_file(file_id: str, log_filename: str, logger: logging.Logger,   db_record_file_id_to_update: Optional[str] = None ) -> Optional[str]:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
