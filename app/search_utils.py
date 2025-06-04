@@ -124,7 +124,7 @@ async def update_search_sort_order(
         # logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
         # Enqueue updates using the provided producer_instance
-        # REMOVED: producer = await RabbitMQProducer.get_producer()
+        producer = await RabbitMQProducer.get_producer()
         # REMOVED: try/finally block for local producer.close()
 
         update_data = []
@@ -185,70 +185,66 @@ async def update_sort_order(
 ) -> List[Dict]:
     """
     Updates SortOrder for all entries in a FileID by applying update_search_sort_order.
-    Manages a single RabbitMQ producer for the entire batch operation.
+    Uses the singleton RabbitMQ producer. The producer's connection is NOT closed here
+    to allow robust mechanisms to function and to be managed at app lifecycle level.
     """
     logger = logger or default_logger
-    producer = None  # Initialize producer to None for the finally block
+    producer = None  # Initialize producer to None
+
     try:
         file_id_int = int(file_id)
         logger.info(f"Starting batch SortOrder update for FileID: {file_id_int}")
 
-        # Fetch entries
+        # Fetch entries (as before)
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT EntryID, ProductBrand, ProductModel, ProductColor, ProductCategory 
                 FROM utb_ImageScraperRecords 
                 WHERE FileID = :file_id
             """)
-            # logger.debug(f"Executing query: {query} with FileID: {file_id_int}")
             db_result = await conn.execute(query, {"file_id": file_id_int})
             entries = db_result.fetchall()
-            # db_result.close() # Not needed with fetchall() and context manager
 
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id_int}")
             return []
 
         # Get producer ONCE for the whole batch operation
-        producer = await RabbitMQProducer.get_producer()
+        # This producer instance's connection will remain open after this function completes.
+        producer = await RabbitMQProducer.get_producer() # Your existing RabbitMQProducer
 
-        all_processed_results = [] # Renamed to avoid confusion
+        all_processed_results = []
         success_count = 0
         failure_count = 0
-        semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENCY) # Your MAX_CONCURRENCY
 
-        async def process_entry(entry_data, shared_producer): # Accept shared_producer
+        async def process_entry(entry_data, shared_producer):
             async with semaphore:
                 entry_id_val, brand_val, model_val, color_val, category_val = entry_data
-                # logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id_val}, Brand: {brand_val}, Model: {model_val}")
                 try:
-                    # Pass the shared_producer to update_search_sort_order
-                    entry_results = await update_search_sort_order(
+                    entry_results = await update_search_sort_order( # Your existing function
                         file_id=str(file_id_int),
                         entry_id=str(entry_id_val),
-                        producer_instance=shared_producer, # Pass shared producer
+                        producer_instance=shared_producer, # Pass singleton producer
                         brand=brand_val,
                         model=model_val,
                         color=color_val,
                         category=category_val,
                         logger=logger,
                         background_tasks=background_tasks
-                        # brand_rules could be passed here if fetched once for the FileID
                     )
                     return {"EntryID": entry_id_val, "Success": bool(entry_results), "Results": entry_results}
-                except Exception as e: # Catch exceptions from update_search_sort_order call
+                except Exception as e:
                     logger.error(f"Error processing EntryID {entry_id_val} for FileID {file_id_int}: {e}", exc_info=True)
                     return {"EntryID": entry_id_val, "Success": False, "Error": str(e)}
 
-        tasks = [process_entry(entry, producer) for entry in entries] # Pass producer to tasks
+        tasks = [process_entry(entry, producer) for entry in entries]
         processed_gather_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for result_item in processed_gather_results:
-            if isinstance(result_item, BaseException): # Catches asyncio.CancelledError and other exceptions
+            if isinstance(result_item, BaseException):
                 logger.error(f"A task for FileID {file_id_int} resulted in an exception: {result_item}", exc_info=True)
                 failure_count += 1
-                # Potentially add a placeholder to all_processed_results if needed for full accounting
-                # all_processed_results.append({"EntryID": "UnknownDueToException", "Success": False, "Error": str(result_item)})
                 continue
             
             all_processed_results.append(result_item)
@@ -322,18 +318,23 @@ async def update_sort_order(
         raise
     except ValueError as ve:
         logger.error(f"Invalid file_id format: {file_id}, error: {ve}")
-        return []
+        return [] # Or re-raise based on desired behavior
     except Exception as e:
         logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        return []
+        return [] # Or re-raise based on desired behavior
     finally:
-        if producer:
-            try:
-                await producer.close()
-                logger.info(f"Closed shared RabbitMQ producer after processing FileID {file_id}")
-            except Exception as e_close:
-                logger.error(f"Error closing shared RabbitMQ producer for FileID {file_id}: {e_close}", exc_info=True)
-
+        # IMPORTANT CHANGE: Do NOT close the producer here.
+        # The producer is a singleton managing a robust connection.
+        # It should be closed at the application level during shutdown.
+        #
+        # if producer:
+        #     try:
+        #         await producer.close() # <<< THIS LINE IS REMOVED/COMMENTED
+        #         logger.info(f"Closed shared RabbitMQ producer after processing FileID {file_id}")
+        #     except Exception as e_close:
+        #         logger.error(f"Error closing shared RabbitMQ producer for FileID {file_id}: {e_close}", exc_info=True)
+        if producer: # We still log that we finished using it for this operation
+             logger.info(f"Finished using shared RabbitMQ producer for FileID {file_id}. Producer connection remains open for application use.")
 
 @retry(
     stop=stop_after_attempt(3),
