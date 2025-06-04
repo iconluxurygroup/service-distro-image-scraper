@@ -797,14 +797,15 @@ async def process_restart_batch(
 
                             if results_written:
                                 try:
-                                    async with asyncio.timeout(60):  # Increased from 30 to 60 seconds
+                                    async with asyncio.timeout(60):
                                         sort_results = await update_search_sort_order(
                                             file_id=str(file_id_db),
-                                            entry_id=str(entry_id),
-                                            brand=brand,
-                                            model=search_string,
-                                            color=color,
-                                            category=category,
+                                            entry_id=str(entry_id), 
+                                            producer_instance=producer,  
+                                            brand=brand,      
+                                            model=model,      
+                                            color=color,       
+                                            category=category,       
                                             logger=logger,
                                             brand_rules=brand_rules,
                                             background_tasks=background_tasks
