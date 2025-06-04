@@ -184,8 +184,8 @@ async def update_sort_order(
     """
     logger = logger or default_logger
     try:
-        file_id = int(file_id)
-        logger.info(f"Starting batch SortOrder update for FileID: {file_id}")
+        file_id_int = int(file_id) # Use a different variable name to avoid confusion if file_id (str) is needed later
+        logger.info(f"Starting batch SortOrder update for FileID: {file_id_int}")
 
         # Fetch entries
         async with async_engine.connect() as conn:
@@ -194,13 +194,13 @@ async def update_sort_order(
                 FROM utb_ImageScraperRecords 
                 WHERE FileID = :file_id
             """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id}")
-            result = await conn.execute(query, {"file_id": file_id})
+            logger.debug(f"Executing query: {query} with FileID: {file_id_int}")
+            result = await conn.execute(query, {"file_id": file_id_int})
             entries = result.fetchall()
             result.close()
 
         if not entries:
-            logger.warning(f"No entries found for FileID: {file_id}")
+            logger.warning(f"No entries found for FileID: {file_id_int}")
             return []
 
         results = []
@@ -214,7 +214,7 @@ async def update_sort_order(
                 logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
                 try:
                     entry_results = await update_search_sort_order(
-                        file_id=str(file_id),
+                        file_id=str(file_id_int), # Pass original file_id or converted, consistently
                         entry_id=str(entry_id),
                         brand=brand,
                         model=model,
@@ -225,51 +225,71 @@ async def update_sort_order(
                     )
                     return {"EntryID": entry_id, "Success": bool(entry_results), "Results": entry_results}
                 except Exception as e:
-                    logger.error(f"Error processing EntryID {entry_id}: {e}", exc_info=True)
+                    # This catches exceptions from update_search_sort_order if they are not BaseException but Exception
+                    logger.error(f"Error processing EntryID {entry_id} for FileID {file_id_int}: {e}", exc_info=True)
                     return {"EntryID": entry_id, "Success": False, "Error": str(e)}
 
         # Process entries in parallel
         tasks = [process_entry(entry) for entry in entries]
         processed = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for result in processed:
-            if isinstance(result, Exception):
-                logger.error(f"Unexpected error in batch processing: {result}", exc_info=True)
+        for result_item in processed: # Renamed result to result_item to avoid confusion with outer result variables
+            if isinstance(result_item, BaseException): # Changed from Exception to BaseException
+                # This will catch CancelledError and other BaseExceptions returned by gather
+                logger.error(f"A task for FileID {file_id_int} resulted in an exception: {result_item}", exc_info=True)
                 failure_count += 1
                 continue
-            results.append(result)
-            if result["Success"]:
+            
+            # At this point, result_item should be a dictionary from process_entry
+            results.append(result_item)
+            if result_item.get("Success"): # Use .get() for safety, though "Success" should always be present
                 success_count += 1
             else:
                 failure_count += 1
-            if not result["Success"]:
-                logger.warning(f"No results for EntryID {result['EntryID']}: {result.get('Error', 'Unknown error')}")
+                # Log specific error if present from process_entry's catch block
+                logger.warning(
+                    f"Processing failed for EntryID {result_item.get('EntryID', 'Unknown')} in FileID {file_id_int}: "
+                    f"{result_item.get('Error', 'Task returned Success=False without explicit error.')}"
+                )
 
-        logger.info(f"Completed batch SortOrder update for FileID {file_id}: {success_count} entries successful, {failure_count} failed")
+        logger.info(f"Completed batch SortOrder update for FileID {file_id_int}: {success_count} entries successful, {failure_count} failed")
 
         # Verify sort order distribution
         async with async_engine.connect() as conn:
             verification_query = text("""
                 SELECT 
                     SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS PositiveSortOrderEntries,
-                    SUM(CASE WHEN t.SortOrder = 0 THEN 1 ELSE 0 END) AS BrandMatchEntries,
-                    SUM(CASE WHEN t.SortOrder < 0 THEN 1 ELSE 0 END) AS NoMatchEntries,
+                    SUM(CASE WHEN t.SortOrder = 0 THEN 1 ELSE 0 END) AS BrandMatchEntries, /* This comment seems outdated based on current logic: -2 is no match */
+                    SUM(CASE WHEN t.SortOrder = -2 THEN 1 ELSE 0 END) AS NoMatchEntries, /* Priority 4 becomes -2 */
                     SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS NullSortOrderEntries,
-                    SUM(CASE WHEN t.SortOrder = -1 THEN 1 ELSE 0 END) AS UnexpectedSortOrderEntries
+                    SUM(CASE WHEN t.SortOrder < 0 AND t.SortOrder != -2 THEN 1 ELSE 0 END) AS UnexpectedNegativeSortOrderEntries /* e.g. -1 */
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                 WHERE r.FileID = :file_id
             """)
-            result = await conn.execute(verification_query, {"file_id": file_id})
-            verification = result.fetchone()
-            result.close()
+            # In the original code, SUM(CASE WHEN t.SortOrder = 0 THEN 1 ELSE 0 END) was BrandMatchEntries
+            # SUM(CASE WHEN t.SortOrder < 0 THEN 1 ELSE 0 END) was NoMatchEntries
+            # The logic `sort_order = -2 if res["priority"] == 4 else (index + 1)` means:
+            # Priority 1,2,3 (model+brand, model, brand) -> SortOrder > 0
+            # Priority 4 (no match) -> SortOrder = -2
+            # So, SortOrder = 0 should ideally not occur unless `index + 1` is 0, which is impossible.
+            # The verification query comments might need updating based on actual SortOrder values expected.
+            # For now, I've adjusted NoMatchEntries to check for -2 and UnexpectedNegativeSortOrderEntries for other negatives.
 
-            logger.info(f"Verification for FileID {file_id}: "
-                       f"{verification[0]} entries with model matches, "
-                       f"{verification[1]} entries with brand matches only, "
-                       f"{verification[2]} entries with no matches, "
-                       f"{verification[3]} entries with NULL SortOrder, "
-                       f"{verification[4]} entries with unexpected SortOrder")
+            verif_result = await conn.execute(verification_query, {"file_id": file_id_int})
+            verification_data = verif_result.fetchone()
+            verif_result.close()
+            
+            if verification_data:
+                logger.info(f"Verification for FileID {file_id_int}: "
+                           f"{verification_data[0] or 0} entries with positive SortOrder (matches), "
+                           f"{verification_data[1] or 0} entries with SortOrder=0 (unexpected or specific brand-only logic not reflected), "
+                           f"{verification_data[2] or 0} entries with SortOrder=-2 (no matches), "
+                           f"{verification_data[3] or 0} entries with NULL SortOrder, "
+                           f"{verification_data[4] or 0} entries with other negative/unexpected SortOrder")
+            else:
+                logger.warning(f"Could not fetch verification data for FileID {file_id_int}")
+
 
             # Log sample sort orders
             sample_query = text("""
@@ -278,21 +298,28 @@ async def update_sort_order(
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                 WHERE r.FileID = :file_id
                 ORDER BY t.EntryID
-            """)
-            result = await conn.execute(sample_query, {"file_id": file_id})
-            sort_orders = result.fetchall()
-            logger.debug(f"Sample SortOrder values for FileID {file_id}: {[(row[0], row[1], row[2]) for row in sort_orders]}")
+            """) # Note: TOP 10 is SQL Server specific. If using PostgreSQL, use LIMIT 10.
+               # Assuming the database is SQL Server due to `TOP 10`.
+            sample_res = await conn.execute(sample_query, {"file_id": file_id_int})
+            sort_orders = sample_res.fetchall()
+            sample_res.close()
+            logger.debug(f"Sample SortOrder values for FileID {file_id_int}: {[(row[0], row[1], row[2]) for row in sort_orders]}")
 
         return results
     except SQLAlchemyError as e:
         logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        raise
+        raise # Re-raise to be handled by retry or caller
     except ValueError as ve:
         logger.error(f"Invalid file_id format: {file_id}, error: {ve}")
-        return []
+        return [] # Or raise, depending on desired behavior for invalid input
     except Exception as e:
+        # This catches exceptions that occurred in update_sort_order itself,
+        # like the TypeError if the BaseException check was missing.
         logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        # Depending on policy, you might want to return [] or re-raise.
+        # The original code returned [], implying it's a "handled" failure at this level.
         return []
+
 
 @retry(
     stop=stop_after_attempt(3),
@@ -309,8 +336,8 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
     """
     logger = logger or default_logger
     try:
-        file_id = int(file_id)
-        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id}")
+        file_id_int = int(file_id)
+        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id_int}")
 
         async with async_engine.begin() as conn:
             # Count null SortOrder entries
@@ -324,10 +351,10 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                         WHERE FileID = :file_id
                     ) AND SortOrder IS NULL
                 """),
-                {"file_id": file_id}
+                {"file_id": file_id_int}
             )
             null_count = result.scalar()
-            logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id}")
+            logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id_int}")
 
             # Delete placeholder entries
             result = await conn.execute(
@@ -339,10 +366,10 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                         WHERE r.FileID = :file_id
                     ) AND ImageUrl LIKE 'placeholder://%'
                 """),
-                {"file_id": file_id}
+                {"file_id": file_id_int}
             )
             rows_deleted = result.rowcount
-            logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id}")
+            logger.info(f"Deleted {rows_deleted} placeholder entries for FileID {file_id_int}")
 
             # Update null SortOrder entries in batch
             result = await conn.execute(
@@ -355,12 +382,12 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                         WHERE r.FileID = :file_id
                     ) AND SortOrder IS NULL
                 """),
-                {"file_id": file_id}
+                {"file_id": file_id_int}
             )
             rows_updated = result.rowcount
-            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id}")
+            logger.info(f"Updated {rows_updated} NULL SortOrder entries to -2 for FileID {file_id_int}")
 
-        return {"file_id": file_id, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
+        return {"file_id": file_id_int, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
     except SQLAlchemyError as e:
         logger.error(f"Database error updating entries for FileID {file_id}: {e}", exc_info=True)
         raise
