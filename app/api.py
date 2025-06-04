@@ -1040,44 +1040,49 @@ WAREHOUSE_MODEL_SOURCE_COLUMN = "ModelSource"
 WAREHOUSE_CREATE_DATE_COLUMN = "CreateDate"
 WAREHOUSE_UPDATE_DATE_COLUMN = "UpdateDate"
 
-@router.post("/populate-distro-pics/{file_id}", tags=["Database"])
+@router.post("/populate-distro-pics/{file_id}", tags=["Database Operations"]) # Added more descriptive tag
 async def api_populate_distro_pics_final(
     request: Request,
-    file_id: str, # This is utb_ImageScraperRecords.FileID
+    file_id: str, # This is THE NUMERICAL utb_ImageScraperFiles.ID, used as utb_ImageScraperRecords.FileID
     limit: Optional[int] = Query(1000, description=f"Max records from {SCRAPER_TABLE_NAME} to process"),
 ):
+    """
+    Populates the DistroPics table based on matches between ImageScraperRecords and IconWarehouseImages.
+    - file_id: The numerical ID from utb_ImageScraperFiles, used to filter utb_ImageScraperRecords.
+    """
+    # job_specific_id is for logging, S3 paths, and unique run identification
     job_specific_id = f"populate_distro_final_{file_id}_{uuid.uuid4().hex[:8]}"
     logger, log_filename = setup_job_logger(job_id=job_specific_id, console_output=True)
 
-    logger.info(f"[{job_specific_id}] API: Starting DistroPics population. Source: {SCRAPER_TABLE_NAME}. Limit: {limit}. Context FileID: {file_id}")
+    logger.info(f"[{job_specific_id}] API: Starting DistroPics population. Source: {SCRAPER_TABLE_NAME}. Limit: {limit}. Context DB FileID: {file_id}")
 
     enqueued_tasks_count = 0
     error_count = 0
     processed_scraper_records = 0
     base_image_url = "https://cms.rtsplusdev.com/files/icon_warehouse_images" # Or from config
 
-    current_producer_instance = await RabbitMQProducer.get_producer()
+    current_producer_instance = await RabbitMQProducer.get_producer() # Ensure RabbitMQProducer is imported
 
     try:
         if not current_producer_instance or not current_producer_instance.is_connected:
             logger.error(f"[{job_specific_id}] API: RabbitMQ producer is not available or not connected.")
             if log_filename and os.path.exists(log_filename):
+                # Use the numerical file_id for db_record_file_id_to_update
                 await upload_log_file(
-                    file_id=job_specific_id, log_filename=log_filename,
-                    logger=logger, db_record_file_id_to_update=file_id # Original string file_id
+                    file_id=job_specific_id, # For S3 path
+                    log_filename=log_filename,
+                    logger=logger,
+                    db_record_file_id_to_update=file_id # Numerical ID for DB
                 )
             raise HTTPException(status_code=503, detail="RabbitMQ service unavailable.")
         logger.info(f"[{job_specific_id}] API: Using RabbitMQ. Connected: {current_producer_instance.is_connected}")
 
-        async with async_engine.connect() as conn:
-            # Step 1: Fetch records from SCRAPER_TABLE_NAME for the given FileID,
-            #         joining with WAREHOUSE_TABLE_NAME to find matches.
+        async with async_engine.connect() as conn: # Ensure async_engine is imported
             fetch_source_sql = text(f"""
                 SELECT TOP (:limit_param)
                     isr.{SCRAPER_PK_COLUMN} AS ScraperEntryID,
                     isr.{SCRAPER_PRODUCT_MODEL_COLUMN} AS ScraperProductModel,
                     isr.{SCRAPER_FILE_ID_COLUMN} AS ScraperFileID,
-                    -- isr.ExcelRowID, isr.ProductBrand, etc. if needed
                     iwi.{WAREHOUSE_PK_COLUMN} AS WarehouseDatawarehouseID,
                     iwi.{WAREHOUSE_MODEL_NUMBER_COLUMN} AS WarehouseModelNumber,
                     iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} AS WarehouseModelClean,
@@ -1088,15 +1093,14 @@ async def api_populate_distro_pics_final(
                 FROM {SCRAPER_TABLE_NAME} isr
                 INNER JOIN {WAREHOUSE_TABLE_NAME} iwi
                     ON isr.{SCRAPER_PRODUCT_MODEL_COLUMN} = iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN}
-                    -- Or: ON isr.ProductModel = iwi.ModelNumber if that's the match
-                    -- Or: ON LTRIM(RTRIM(isr.ProductModel)) = LTRIM(RTRIM(iwi.ModelClean)) for robust matching
-                WHERE isr.{SCRAPER_FILE_ID_COLUMN} = :file_id_param
+                WHERE isr.{SCRAPER_FILE_ID_COLUMN} = :file_id_param  -- file_id_param is the numerical ID
                   AND (isr.{SCRAPER_ENTRY_STATUS_COLUMN} = 0 OR isr.{SCRAPER_ENTRY_STATUS_COLUMN} IS NULL)
                   AND iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_MODEL_CLEAN_COLUMN} <> ''
                   AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_MODEL_FOLDER_COLUMN} <> ''
-                ORDER BY isr.{SCRAPER_PK_COLUMN}; -- Process in a consistent order
+                ORDER BY isr.{SCRAPER_PK_COLUMN};
             """)
             
+            # Pass the numerical file_id from the API path to the SQL query
             source_records_cursor = await conn.execute(
                 fetch_source_sql,
                 {"file_id_param": file_id, "limit_param": limit}
@@ -1104,29 +1108,33 @@ async def api_populate_distro_pics_final(
             source_records_to_process = source_records_cursor.fetchall()
             processed_scraper_records = len(source_records_to_process)
 
-
         if not source_records_to_process:
-            logger.info(f"[{job_specific_id}] API: No pending records found in {SCRAPER_TABLE_NAME} for FileID '{file_id}' that match an entry in {WAREHOUSE_TABLE_NAME}.")
+            logger.info(f"[{job_specific_id}] API: No pending records found in {SCRAPER_TABLE_NAME} for DB FileID '{file_id}' that match an entry in {WAREHOUSE_TABLE_NAME}.")
+            # Use numerical file_id for db_record_file_id_to_update
             log_public_url = await upload_log_file(
-                file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id
+                file_id=job_specific_id, # For S3 path
+                log_filename=log_filename,
+                logger=logger,
+                db_record_file_id_to_update=file_id # Numerical ID for DB
             )
             return {
                 "status": "success",
-                "message": f"No new/pending records for FileID '{file_id}' to process into DistroPics.",
+                "message": f"No new/pending records for DB FileID '{file_id}' to process into DistroPics.",
                 "tasks_enqueued": 0, "scraper_records_found_for_processing": 0, "processing_errors_in_loop": 0,
-                "log_url": log_public_url
+                "log_url": log_public_url,
+                "db_file_id": file_id
             }
 
-        logger.info(f"[{job_specific_id}] API: Found {len(source_records_to_process)} combined records from {SCRAPER_TABLE_NAME} (FileID '{file_id}') and {WAREHOUSE_TABLE_NAME} for DistroPics processing.")
+        logger.info(f"[{job_specific_id}] API: Found {len(source_records_to_process)} combined records from {SCRAPER_TABLE_NAME} (DB FileID '{file_id}') and {WAREHOUSE_TABLE_NAME} for DistroPics processing.")
 
         for record in source_records_to_process:
             correlation_task_id = str(uuid.uuid4())
             try:
                 scraper_entry_id = record.ScraperEntryID
-                product_model_from_scraper = record.ScraperProductModel # This is the key ProductModel
+                product_model_from_scraper = record.ScraperProductModel
                 warehouse_dw_id = record.WarehouseDatawarehouseID
                 warehouse_model_folder = record.WarehouseModelFolder
-                warehouse_model_clean = record.WarehouseModelClean # For constructing image URL
+                warehouse_model_clean = record.WarehouseModelClean
 
                 if not warehouse_model_clean or not warehouse_model_folder:
                     logger.warning(f"[{job_specific_id}][{correlation_task_id}] Skipping ScraperEntryID {scraper_entry_id} (ProductModel: {product_model_from_scraper}): Warehouse ModelClean or Folder missing for DW_ID {warehouse_dw_id}.")
@@ -1135,35 +1143,23 @@ async def api_populate_distro_pics_final(
 
                 distro_image_url = f"{base_image_url}/{warehouse_model_folder}/{warehouse_model_clean.replace('.png', '')}.png"
 
-                # --- Logic for Sort Order ---
-                # Task 1: Deprioritize other DistroPics entries for the SAME ProductModel
-                # This ensures that the new/updated entry for this ProductModel (linked via ScraperEntryID to DatawarehouseID)
-                # will become the primary one (SortOrder=1).
                 deprio_sql_str = text(f"""
                     UPDATE DistroPics
-                    SET SortOrder = SortOrder + 1000, -- Or any value > 1, e.g., 99
+                    SET SortOrder = SortOrder + 1000,
                         DistroUpdateTime = GETDATE()
                     WHERE ProductModel = :product_model 
-                      AND SortOrder = 1
-                      ; 
+                      AND SortOrder = 1; 
                 """)
                 await enqueue_db_update(
-                    file_id=job_specific_id,
+                    file_id=job_specific_id, # For logging context within enqueue_db_update
                     sql=deprio_sql_str.text,
-                    params={
-                        "product_model": product_model_from_scraper,
-                        # "scraper_id": scraper_entry_id, # if needed in WHERE
-                        # "dw_id": warehouse_dw_id,       # if needed in WHERE
-                        },
+                    params={"product_model": product_model_from_scraper},
                     task_type="distro_deprioritize_others",
                     producer_instance=current_producer_instance,
                     correlation_id=f"{correlation_task_id}_deprio", logger_param=logger,
                 )
                 enqueued_tasks_count += 1
                 
-                # Task 2: Upsert (MERGE) the current record into DistroPics and set its SortOrder to 1
-                # The MERGE tries to find an existing link between this specific ScraperEntryID and DatawarehouseID.
-                # If it exists, it updates it (especially SortOrder and UpdateTime). If not, it inserts.
                 merge_sql_str = text(f"""
                     MERGE DistroPics AS target
                     USING (
@@ -1171,20 +1167,19 @@ async def api_populate_distro_pics_final(
                             :scraper_id AS ScraperEntryID_fk,
                             :dw_id AS DatawarehouseID_fk,
                             :p_model AS ProductModel,
-                            1 AS SortOrder, -- Set SortOrder to 1 for this specific link
+                            1 AS SortOrder,
                             :wh_model_num AS WarehouseModelNumber,
                             :wh_model_clean AS WarehouseModelClean,
                             :wh_create_date AS WarehouseCreateDate,
-                            GETUTCDATE() AS CurrentTime, -- Use GETUTCDATE() for DB time consistency
+                            GETUTCDATE() AS CurrentTime,
                             :distro_img_url AS DistroImageURL,
                             :wh_model_source AS WarehouseModelSource,
                             :wh_model_folder AS WarehouseModelFolder
                     ) AS source
                     ON (target.ScraperEntryID_fk = source.ScraperEntryID_fk AND target.DatawarehouseID_fk = source.DatawarehouseID_fk)
-                    
                     WHEN MATCHED THEN
                         UPDATE SET
-                            target.ProductModel = source.ProductModel, -- Should typically be the same
+                            target.ProductModel = source.ProductModel,
                             target.SortOrder = source.SortOrder,
                             target.WarehouseModelNumber = source.WarehouseModelNumber,
                             target.WarehouseModelClean = source.WarehouseModelClean,
@@ -1206,22 +1201,15 @@ async def api_populate_distro_pics_final(
                             source.CurrentTime, source.CurrentTime
                         );
                 """)
-
                 merge_params = {
-                    "scraper_id": scraper_entry_id,
-                    "dw_id": warehouse_dw_id,
+                    "scraper_id": scraper_entry_id, "dw_id": warehouse_dw_id,
                     "p_model": product_model_from_scraper,
-                    "wh_model_num": record.WarehouseModelNumber,
-                    "wh_model_clean": record.WarehouseModelClean, # This is from iwi.ModelClean
-                    "wh_create_date": record.WarehouseCreateDate, # from iwi.CreateDate
-                    # "wh_update_date": record.WarehouseUpdateDate, # from iwi.UpdateDate, use for DistroUpdateTime if preferred
-                    "distro_img_url": distro_image_url,
-                    "wh_model_source": record.WarehouseModelSource,
-                    "wh_model_folder": warehouse_model_folder,
+                    "wh_model_num": record.WarehouseModelNumber, "wh_model_clean": record.WarehouseModelClean,
+                    "wh_create_date": record.WarehouseCreateDate, "distro_img_url": distro_image_url,
+                    "wh_model_source": record.WarehouseModelSource, "wh_model_folder": warehouse_model_folder,
                 }
-                
                 await enqueue_db_update(
-                    file_id=job_specific_id,
+                    file_id=job_specific_id, # For logging context
                     sql=merge_sql_str.text, 
                     params=merge_params,
                     task_type="distro_upsert_primary",
@@ -1230,15 +1218,14 @@ async def api_populate_distro_pics_final(
                 )
                 enqueued_tasks_count += 1
 
-                # Task 3: Update status in SCRAPER_TABLE_NAME (e.g., set EntryStatus = 1 for processed)
                 update_scraper_status_sql = text(f"""
                     UPDATE {SCRAPER_TABLE_NAME}
-                    SET {SCRAPER_ENTRY_STATUS_COLUMN} = 1, -- 1 for processed, adjust as needed
+                    SET {SCRAPER_ENTRY_STATUS_COLUMN} = 1,
                         CompleteTime = GETDATE()
                     WHERE {SCRAPER_PK_COLUMN} = :scraper_id;
                 """)
                 await enqueue_db_update(
-                    file_id=job_specific_id,
+                    file_id=job_specific_id, # For logging context
                     sql=update_scraper_status_sql.text,
                     params={"scraper_id": scraper_entry_id},
                     task_type="distro_update_scraper_status",
@@ -1246,9 +1233,7 @@ async def api_populate_distro_pics_final(
                     correlation_id=f"{correlation_task_id}_status", logger_param=logger,
                 )
                 enqueued_tasks_count += 1
-
                 logger.debug(f"[{job_specific_id}][{correlation_task_id}] Enqueued 3 tasks for ScraperEntryID {scraper_entry_id}, ProductModel {product_model_from_scraper}, DW_ID {warehouse_dw_id}.")
-
             except Exception as e_loop:
                 error_count += 1
                 scraper_id_log = getattr(record, 'ScraperEntryID', 'Unknown')
@@ -1256,34 +1241,48 @@ async def api_populate_distro_pics_final(
 
         logger.info(f"[{job_specific_id}] API: DistroPics population tasks enqueued. Scraper Records Processed: {processed_scraper_records}. Total Tasks Enqueued: {enqueued_tasks_count}, Loop Errors: {error_count}")
 
+        # Upload final log and update DB records using the numerical file_id
         final_log_url = await upload_log_file(
-            file_id=job_specific_id, log_filename=log_filename,
-            logger=logger, db_record_file_id_to_update=file_id # Original string file_id
+            file_id=job_specific_id, # For S3 path
+            log_filename=log_filename,
+            logger=logger,
+            db_record_file_id_to_update=file_id # Numerical ID for DB (utb_ImageScraperFiles.ID)
         )
+
+        # Update utb_ImageScraperFiles table using the numerical file_id
+        # These functions from db_utils.py expect the numerical ID that can be int()
+        if final_log_url: # Only update FileLocationURLComplete if log upload was successful
+             await update_file_location_complete(file_id, final_log_url, logger=logger)
+        await update_file_generate_complete(file_id, logger=logger)
+
+        logger.info(f"[{job_specific_id}] Successfully updated DB (FileLocationURLComplete, CreateFileCompleteTime) for DB FileID: {file_id}")
+
         return {
             "status": "success",
-            "message": f"DistroPics tasks for FileID '{file_id}' enqueued. Scraper Records Processed: {processed_scraper_records}. Total Tasks Enqueued: {enqueued_tasks_count}. Errors in Loop: {error_count}.",
+            "message": f"DistroPics tasks for DB FileID '{file_id}' (Job: {job_specific_id}) enqueued. Scraper Records Processed: {processed_scraper_records}. Total Tasks Enqueued: {enqueued_tasks_count}. Errors in Loop: {error_count}.",
             "tasks_enqueued": enqueued_tasks_count,
             "scraper_records_processed_count": processed_scraper_records,
             "processing_errors_in_loop": error_count,
-            "log_url": final_log_url
+            "log_url": final_log_url,
+            "db_file_id_processed": file_id # Clarify which ID was processed for DB records
         }
 
-    except HTTPException: # Re-raise HTTPExceptions so FastAPI handles them
+    except HTTPException:
         raise
     except Exception as e_critical:
         logger.error(f"[{job_specific_id}] API: Critical error: {e_critical}", exc_info=True)
         critical_log_url = None
         if log_filename and os.path.exists(log_filename):
+            # Use numerical file_id for db_record_file_id_to_update in case of critical error too
             critical_log_url = await upload_log_file(
-                file_id=job_specific_id, log_filename=log_filename,
-                logger=logger, db_record_file_id_to_update=file_id # Original string file_id
+                file_id=job_specific_id, # For S3 path
+                log_filename=log_filename,
+                logger=logger,
+                db_record_file_id_to_update=file_id # Numerical ID for DB
             )
-        # Consider what detail to expose in the HTTP response for security
-        raise HTTPException(status_code=500, detail=f"Critical error during DistroPics population. Log: {critical_log_url or 'Log upload failed or N/A'}")
+        raise HTTPException(status_code=500, detail=f"Critical error during DistroPics population for DB FileID '{file_id}'. Log: {critical_log_url or 'Log upload failed or N/A'}")
     finally:
-        logger.info(f"[{job_specific_id}] API: Endpoint finished processing for context FileID: {file_id}.")
-
+        logger.info(f"[{job_specific_id}] API: Endpoint finished processing for context DB FileID: {file_id}.")
 
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(
