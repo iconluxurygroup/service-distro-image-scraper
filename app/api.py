@@ -1083,22 +1083,15 @@ STATUS_WAREHOUSE_CHECK_NO_MATCH = 1
 STATUS_WAREHOUSE_RESULT_POPULATED = 2 # This endpoint will set this status
 STATUS_PENDING_GOOGLE_SEARCH = 3
 STATUS_GOOGLE_SEARCH_COMPLETE = 4
-producer = None
+
 @router.post("/populate-results-from-warehouse/{file_id}", tags=["Processing", "Warehouse"])
 async def api_populate_results_from_warehouse(
     request: Request,
-    file_id: str, # This is utb_ImageScraperFiles.ID (original file process ID)
+    file_id: str, 
     limit: Optional[int] = Query(1000, description=f"Max records from {SCRAPER_RECORDS_TABLE_NAME} to process for this FileID"),
     base_image_url: str = Query("https://cms.rtsplusdev.com/files/icon_warehouse_images", description="Base URL for constructing image paths from warehouse data, if applicable")
 ):
-    """
-    Processes records from utb_ImageScraperRecords for a given FileID.
-    For each record, it attempts to find a match in utb_IconWarehouseImages.
-    If a match is found, it constructs image data (URL, description, source)
-    and inserts a new entry into utb_ImageScraperResult with SourceType='Warehouse'.
-    It also updates the status of the processed record in utb_ImageScraperRecords.
-    """
-    job_specific_id = file_id
+    job_specific_id = f"warehouse_populate_{file_id}_{uuid.uuid4().hex[:8]}" # More unique job ID
     logger, log_filename = setup_job_logger(job_id=job_specific_id, console_output=True)
 
     logger.info(f"[{job_specific_id}] API: Starting population of '{IMAGE_SCRAPER_RESULT_TABLE_NAME}' from '{WAREHOUSE_IMAGES_TABLE_NAME}' for original FileID: {file_id}. Limit: {limit}")
@@ -1109,19 +1102,21 @@ async def api_populate_results_from_warehouse(
     tasks_enqueued_for_scraper_status_update = 0
     errors_in_loop = 0
 
-    current_producer_instance = producer
+    local_producer: Optional[RabbitMQProducer] = None
 
     try:
-        if not current_producer_instance or not current_producer_instance.is_connected:
-            logger.error(f"[{job_specific_id}] API: Global RabbitMQ producer is not available or not connected.")
-            await upload_log_file(file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id)
-            raise HTTPException(status_code=503, detail="RabbitMQ service unavailable.")
-        logger.info(f"[{job_specific_id}] API: Using global RabbitMQ producer. Connected: {current_producer_instance.is_connected}")
+        local_producer = await RabbitMQProducer.get_producer()
+        if not local_producer or not local_producer.is_connected:
+            logger.error(f"[{job_specific_id}] API: Failed to get a connected RabbitMQ producer for this task.")
+            # upload_log_file itself calls update_log_url_in_db, which needs a producer.
+            # If producer init fails here, that DB update might also fail unless update_log_url_in_db can get its own.
+            await upload_log_file(file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id) # Pass original file_id for DB record update
+            raise HTTPException(status_code=503, detail="RabbitMQ service unavailable (local producer init failed).")
+        logger.info(f"[{job_specific_id}] API: Obtained local RabbitMQ producer. Connected: {local_producer.is_connected}")
 
-        # Validate original FileID exists in utb_ImageScraperFiles
         async with async_engine.connect() as conn_validate:
             validate_file_sql = text(f"SELECT COUNT(*) FROM {IMAGE_SCRAPER_FILES_TABLE_NAME} WHERE {IMAGE_SCRAPER_FILES_PK_COLUMN} = :file_id_param")
-            val_result = await conn_validate.execute(validate_file_sql, {"file_id_param": file_id}) # file_id here is string, ensure DB column matches or cast
+            val_result = await conn_validate.execute(validate_file_sql, {"file_id_param": int(file_id)}) # Cast file_id to int for DB
             if val_result.scalar_one() == 0:
                 logger.error(f"[{job_specific_id}] Original FileID '{file_id}' does not exist in {IMAGE_SCRAPER_FILES_TABLE_NAME}.")
                 await upload_log_file(file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id)
@@ -1134,7 +1129,6 @@ async def api_populate_results_from_warehouse(
                     isr.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} AS ScraperProductModel,
                     isr.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} AS ScraperFileID_fk,
                     isr.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN} AS ScraperProductBrand,
-
                     iwi.{WAREHOUSE_IMAGES_PK_COLUMN} AS WarehousePK_ID,
                     iwi.{WAREHOUSE_IMAGES_MODEL_NUMBER_COLUMN} AS WarehouseModelNumber,
                     iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} AS WarehouseModelClean,
@@ -1149,10 +1143,9 @@ async def api_populate_results_from_warehouse(
                   AND iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} <> ''
                 ORDER BY isr.{SCRAPER_RECORDS_PK_COLUMN};
             """)
-
             scraper_records_cursor = await conn_fetch.execute(
                 fetch_scraper_records_sql,
-                {"file_id_param": file_id, "limit_param": limit}
+                {"file_id_param": int(file_id), "limit_param": limit} # Cast file_id to int
             )
             records_to_process = scraper_records_cursor.fetchall()
             scraper_records_queried = len(records_to_process)
@@ -1166,45 +1159,34 @@ async def api_populate_results_from_warehouse(
             return {
                 "status": "success",
                 "message": f"No new/pending records for FileID '{file_id}' found for warehouse-to-result processing.",
-                "scraper_records_queried": 0,
-                "warehouse_matches_found": 0,
-                "results_inserted_or_merged": 0,
-                "log_url": log_public_url
+                "scraper_records_queried": 0, "warehouse_matches_found": 0,
+                "results_inserted_or_merged": 0, "log_url": log_public_url
             }
 
         logger.info(f"[{job_specific_id}] API: Found {scraper_records_queried} records from {SCRAPER_RECORDS_TABLE_NAME} (original FileID '{file_id}') with warehouse matches to process into {IMAGE_SCRAPER_RESULT_TABLE_NAME}.")
 
         results_to_batch_insert = []
-
         for record in records_to_process:
             try:
                 scraper_entry_id = record.ScraperEntryID
-                
                 if not record.WarehouseModelClean or not record.WarehouseModelFolder:
                     logger.warning(f"[{job_specific_id}] Skipping ScraperEntryID {scraper_entry_id}: WarehouseModelClean or Folder missing for WarehousePK_ID {record.WarehousePK_ID}.")
                     errors_in_loop +=1
                     continue
                 
                 model_clean_for_url = record.WarehouseModelClean.replace('.png', '').replace('.jpg', '').replace('.jpeg', '')
-                image_url_from_warehouse = f"{base_image_url}/{record.WarehouseModelFolder}/{model_clean_for_url}.png" # Assumes PNG, adjust if needed
-                
+                image_url_from_warehouse = f"{base_image_url.rstrip('/')}/{record.WarehouseModelFolder.strip('/')}/{model_clean_for_url}.png"
                 image_desc = f"{record.ScraperProductBrand or 'Brand'} {record.WarehouseModelNumber or record.ScraperProductModel or 'Product'}"
                 image_source_domain = urlparse(base_image_url).netloc if base_image_url else "warehouse_internal"
                 image_actual_source = record.WarehouseModelSource or image_source_domain
 
                 results_to_batch_insert.append({
-                    # Map to keys expected by insert_search_results, or adapt insert_search_results
-                    # Assuming insert_search_results takes a dict similar to utb_ImageScraperResult structure
-                    "EntryID": scraper_entry_id, # This becomes IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN
-                    "ImageUrl": image_url_from_warehouse,
-                    "ImageDesc": image_desc,
-                    "ImageSource": image_actual_source,
-                    "ImageUrlThumbnail": image_url_from_warehouse, # Default to main image
-                    IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN: 0, # Default sort order
+                    "EntryID": scraper_entry_id,
+                    "ImageUrl": image_url_from_warehouse, "ImageDesc": image_desc,
+                    "ImageSource": image_actual_source, "ImageUrlThumbnail": image_url_from_warehouse,
+                    IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN: 0, 
                     IMAGE_SCRAPER_RESULT_SOURCE_TYPE_COLUMN: 'Warehouse',
-                    # CreateTime and UpdateTime are typically handled by insert_search_results or DB
                 })
-
             except Exception as e_loop:
                 errors_in_loop += 1
                 scraper_id_log = getattr(record, 'ScraperEntryID', 'Unknown')
@@ -1212,37 +1194,32 @@ async def api_populate_results_from_warehouse(
 
         if results_to_batch_insert:
             logger.info(f"[{job_specific_id}] Attempting to batch insert {len(results_to_batch_insert)} results into {IMAGE_SCRAPER_RESULT_TABLE_NAME}.")
-            
-            background_tasks_for_insert = BackgroundTasks() # If insert_search_results uses it
-            success_insert = await insert_search_results( # This function needs to handle these dicts
-                results=results_to_batch_insert, # List of dicts
-                logger=logger,
-                file_id=file_id, # Original FileID context for logging/grouping within insert_search_results
-                background_tasks=background_tasks_for_insert
+            background_tasks_for_insert = BackgroundTasks()
+            # insert_search_results is assumed to manage its own producer or use the one from enqueue_db_update's fallback
+            success_insert = await insert_search_results(
+                results=results_to_batch_insert, logger=logger,
+                file_id=file_id, background_tasks=background_tasks_for_insert
             )
 
-            if success_insert: # Assuming insert_search_results returns a boolean or count
-                inserted_results_count = len(results_to_batch_insert) # Or actual count if returned
+            if success_insert:
+                inserted_results_count = len(results_to_batch_insert)
                 logger.info(f"[{job_specific_id}] Successfully enqueued/processed batch insertion of {inserted_results_count} results from warehouse.")
-
                 entry_ids_processed = [res["EntryID"] for res in results_to_batch_insert]
                 if entry_ids_processed:
-                    update_scraper_status_sql_batch = text(f"""
+                    update_scraper_status_sql_batch_str = f"""
                         UPDATE {SCRAPER_RECORDS_TABLE_NAME}
                         SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED},
                             {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
                         WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :entry_ids_list;
-                    """)
-                    
+                    """
                     batch_update_params = {"entry_ids_list": tuple(entry_ids_processed)}
                     status_update_correlation_id = str(uuid.uuid4())
-
                     await enqueue_db_update(
-                        file_id=job_specific_id,
-                        sql=update_scraper_status_sql_batch.text,
+                        file_id=job_specific_id, # Use job_specific_id for this task's context
+                        sql=update_scraper_status_sql_batch_str,
                         params=batch_update_params,
                         task_type="batch_update_scraper_status_warehouse_complete",
-                        producer_instance=current_producer_instance,
+                        producer_instance=local_producer, # Use the locally acquired producer
                         correlation_id=status_update_correlation_id,
                         logger_param=logger
                     )
@@ -1253,31 +1230,32 @@ async def api_populate_results_from_warehouse(
         
         final_message = (
             f"Warehouse-to-Result processing for original FileID '{file_id}' initiated. "
-            f"Scraper Records Queried: {scraper_records_queried}, "
-            f"Warehouse Matches Found: {warehouse_matches_found}, "
-            f"Results Prepared for '{IMAGE_SCRAPER_RESULT_TABLE_NAME}': {len(results_to_batch_insert)} (actual insertion via insert_search_results), "
+            f"Scraper Records Queried: {scraper_records_queried}, Warehouse Matches Found: {warehouse_matches_found}, "
+            f"Results Prepared: {len(results_to_batch_insert)} (actual insertion via insert_search_results), "
             f"Scraper Status Update Tasks Enqueued: {tasks_enqueued_for_scraper_status_update}, "
             f"Errors in Loop: {errors_in_loop}."
         )
         logger.info(f"[{job_specific_id}] API: {final_message}")
-
         log_public_url = await upload_log_file(
             file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id
         )
         return {
-            "status": "success",
-            "message": final_message,
-            "job_specific_id": job_specific_id,
-            "original_file_id": file_id,
-            "scraper_records_queried": scraper_records_queried,
-            "warehouse_matches_found": warehouse_matches_found,
+            "status": "success", "message": final_message,
+            "job_specific_id": job_specific_id, "original_file_id": file_id,
+            "scraper_records_queried": scraper_records_queried, "warehouse_matches_found": warehouse_matches_found,
             "results_prepared_for_insertion": len(results_to_batch_insert),
             "scraper_status_updates_enqueued": tasks_enqueued_for_scraper_status_update,
-            "processing_errors_in_loop": errors_in_loop,
-            "log_url": log_public_url
+            "processing_errors_in_loop": errors_in_loop, "log_url": log_public_url
         }
 
     except HTTPException:
+        # Log file upload might be attempted again here, ensure it's idempotent or handled.
+        # If HTTPException is from producer init, this path might be problematic for log DB update.
+        # Consider not re-uploading if it was already attempted due to producer failure.
+        if local_producer is None or not local_producer.is_connected: # Check if producer was the issue
+             logger.warning(f"[{job_specific_id}] HTTPException raised, possibly due to producer issue. Log may not be updated in DB.")
+        else: # Producer was fine, other HTTPException
+             await upload_log_file(file_id=job_specific_id, log_filename=log_filename, logger=logger, db_record_file_id_to_update=file_id)
         raise
     except Exception as e_critical:
         logger.error(f"[{job_specific_id}] API: Critical error during warehouse-to-result processing for FileID '{file_id}': {e_critical}", exc_info=True)
@@ -1286,7 +1264,15 @@ async def api_populate_results_from_warehouse(
         )
         raise HTTPException(status_code=500, detail=f"Critical error during warehouse-to-result processing. Log: {critical_log_url or 'Log upload failed or N/A'}")
     finally:
+        if local_producer and local_producer.is_connected:
+            await local_producer.close()
+            logger.info(f"[{job_specific_id}] API: Closed local RabbitMQ producer.")
+        elif local_producer is None:
+            logger.info(f"[{job_specific_id}] API: Local RabbitMQ producer was not initialized.")
+        else: # Not connected
+             logger.info(f"[{job_specific_id}] API: Local RabbitMQ producer was not connected, no close needed or close failed.")
         logger.info(f"[{job_specific_id}] API: Endpoint finished processing for original FileID: {file_id}.")
+
 
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(
