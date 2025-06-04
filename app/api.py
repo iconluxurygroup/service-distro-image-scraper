@@ -1049,7 +1049,7 @@ async def api_populate_distro_pics(
             logger.error(f"[{job_specific_id}] API: RabbitMQ producer (from app.state) is not available or not connected. Cannot enqueue tasks.")
             if log_filename and os.path.exists(log_filename): # Check before using log_filename
                  await upload_log_file(
-                    log_file_identifier=job_specific_id, log_filename=log_filename, 
+                    file_id=job_specific_id, log_filename=log_filename, 
                     logger=logger, db_record_file_id_to_update=file_id # Use original file_id for DB association
                 )
             raise HTTPException(status_code=503, detail="RabbitMQ service unavailable. Task enqueue failed.")
@@ -1134,7 +1134,7 @@ async def api_populate_distro_pics(
         logger.info(f"[{job_specific_id}] API: DistroPics population attempt finished. Enqueued: {enqueued_tasks_count}, Skipped: {skipped_count}, Errors in loop: {error_count}")
         
         final_log_url = await upload_log_file(
-            log_file_identifier=job_specific_id, log_filename=log_filename, 
+            file_id=job_specific_id, log_filename=log_filename, 
             logger=logger, db_record_file_id_to_update=file_id
         )
         return {
@@ -1153,7 +1153,7 @@ async def api_populate_distro_pics(
         critical_log_url = None
         if log_filename and os.path.exists(log_filename): # Check before using log_filename
             critical_log_url = await upload_log_file(
-                log_file_identifier=job_specific_id, log_filename=log_filename, 
+                file_id=job_specific_id, log_filename=log_filename, 
                 logger=logger, db_record_file_id_to_update=file_id
             )
         raise HTTPException(status_code=500, detail=f"Critical error: {str(e_critical)}. Log: {critical_log_url or 'Error before log upload'}")
