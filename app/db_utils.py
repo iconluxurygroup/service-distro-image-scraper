@@ -805,8 +805,6 @@ async def enqueue_db_update(
         return queue_to_publish_to if not return_result else 1 # Indicate 1 "row affected" for non-SELECT
 
     except Exception as e:
-        # The queue_name variable might not be defined if error occurs before it's set
-        # So, log generically or ensure it's defined.
-        q_name_for_log = response_queue or (producer_instance.queue_name if producer_instance else "db_update_queue")
+        q_name_for_log = response_queue or (producer_instance.queue_name if producer_instance and hasattr(producer_instance, 'queue_name') else "db_update_queue")
         logger.error(f"[{correlation_id}] Error enqueuing task to {q_name_for_log} for FileID {file_id}: {e}", exc_info=True)
         raise
