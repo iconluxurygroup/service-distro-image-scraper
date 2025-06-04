@@ -73,33 +73,6 @@ def generate_unique_filename(original_filename, logger=None):
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(SQLAlchemyError),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying database update for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_file_location_complete_async(file_id: str, file_location: str, logger: Optional[logging.Logger] = None) -> None:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        async with async_engine.connect() as conn:
-            await conn.execute(
-                text("UPDATE utb_ImageScraperFiles SET FileLocationURLComplete = :url WHERE ID = :file_id"),
-                {"url": file_location, "file_id": file_id}
-            )
-            await conn.commit()
-            logger.info(f"Updated FileLocationURLComplete for FileID: {file_id} with URL: {file_location}")
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in update_file_location_complete_async: {e}", exc_info=True)
-        raise
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        raise
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(pyodbc.Error),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_file_generate_complete for FileID {retry_state.kwargs['file_id']} "
