@@ -1145,8 +1145,6 @@ async def api_populate_distro_pics_final(
                         DistroUpdateTime = GETUTCDATE()
                     WHERE ProductModel = :product_model 
                       AND SortOrder = 1
-                      -- Optional: AND ScraperEntryID_fk != :scraper_id -- if you only want to deprioritize *other* scraper entries
-                      -- Optional: AND DatawarehouseID_fk != :dw_id -- if you only want to deprioritize *other* warehouse links
                       ; 
                 """)
                 await enqueue_db_update(
