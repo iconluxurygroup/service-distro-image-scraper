@@ -143,7 +143,7 @@ async def update_search_sort_order(
                     task_type="update_sort_order",
                     producer_instance=producer,
                     correlation_id=correlation_id,
-                    logger=logger
+                    logger_param=logger
                 )
                 update_data.append({
                     "ResultID": res["ResultID"],
