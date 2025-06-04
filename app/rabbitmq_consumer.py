@@ -429,10 +429,6 @@ class RabbitMQConsumer:
                 result = await conn.execute(text(sql), update_params)
                 # await conn.commit() # .begin() handles commit
                 rowcount = result.rowcount if result.rowcount is not None else 0
-                logger.info(
-                    f"TaskType: update_sort_order, FileID: {file_id}, Executed SQL (snippet): {sql[:100].replace_all('\n',' ')}, "
-                    f"params: {update_params}, affected {rowcount} rows"
-                )
                 if rowcount == 0:
                     logger.warning(f"No rows updated for FileID: {file_id}, EntryID: {entry_id}, ResultID: {result_id}")
                     return {"success": False, "message": "No rows updated", "rowcount": 0}
