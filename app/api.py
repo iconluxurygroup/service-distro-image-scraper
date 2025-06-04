@@ -1075,7 +1075,7 @@ async def api_populate_distro_pics(
         if not source_records:
             logger.info(f"[{job_specific_id}] API: No new records in utb_IconWarehouseImages for DistroPics.")
             log_public_url = await upload_log_file(
-                log_file_identifier=job_specific_id, log_filename=log_filename, 
+                file_id=job_specific_id, log_filename=log_filename, 
                 logger=logger, db_record_file_id_to_update=file_id
             )
             return {
