@@ -942,21 +942,25 @@ async def process_restart_batch(
             )
             for entry, result in zip(batch_entries, results):
                 entry_id = entry[0]
-                if isinstance(result, Exception):
+                 # Corrected handling:
+                if isinstance(result, asyncio.CancelledError):
+                    # Log with exc_info=True to see where the CancelledError originated (e.g., a timeout)
+                    logger.warning(f"Task for EntryID {entry_id} was cancelled: {result}", exc_info=True)
+                    failed_entries += 1
+                    continue
+                elif isinstance(result, Exception): # Catches other exceptions derived from Exception
                     logger.error(f"Error processing EntryID {entry_id}: {result}", exc_info=True)
-                    if isinstance(result, asyncio.CancelledError):
-                        logger.warning(f"Task for EntryID {entry_id} was cancelled")
                     failed_entries += 1
                     continue
                 try:
-                    entry_id_result, success = result
+                    entry_id_result, success = result # This is line 952
                     if success:
                         successful_entries += 1
-                        last_entry_id_processed = entry_id
+                        last_entry_id_processed = entry_id_result # Using entry_id_result from the tuple is slightly more robust
                     else:
                         failed_entries += 1
-                except ValueError as e:
-                    logger.error(f"Failed to unpack result for EntryID {entry_id}: {e}, Result: {result}", exc_info=True)
+                except (TypeError, ValueError) as e: # Catch TypeError if result is not iterable, ValueError for wrong length
+                    logger.error(f"Failed to unpack result for EntryID {entry_id}: {e}. Result type: {type(result)}, Value: {result}", exc_info=True)
                     failed_entries += 1
 
             async with async_engine.connect() as conn:
