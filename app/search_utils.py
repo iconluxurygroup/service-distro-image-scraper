@@ -141,7 +141,7 @@ async def update_search_sort_order(
                     sql=update_query,
                     params=params,
                     task_type="update_sort_order",
-                    producer=producer,
+                    producer_instance=producer,
                     correlation_id=correlation_id,
                     logger=logger
                 )
