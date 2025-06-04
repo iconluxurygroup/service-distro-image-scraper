@@ -780,7 +780,7 @@ async def enqueue_db_update(
             "task_type": task_type,
             "correlation_id": correlation_id,
             "return_result": return_result,
-            "timestamp": datetime.datetime.now().isoformat()
+            "timestamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         }
 
         queue_to_publish_to = response_queue or current_producer.queue_name # Use producer's default or response_queue
