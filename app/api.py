@@ -1236,7 +1236,7 @@ async def api_populate_distro_pics_final(
                 update_scraper_status_sql = text(f"""
                     UPDATE {SCRAPER_TABLE_NAME}
                     SET {SCRAPER_ENTRY_STATUS_COLUMN} = 1, -- 1 for processed, adjust as needed
-                        CompleteTime = GETUTCDATE()
+                        CompleteTime = GETDATE()
                     WHERE {SCRAPER_PK_COLUMN} = :scraper_id;
                 """)
                 await enqueue_db_update(
