@@ -364,11 +364,10 @@ async def insert_search_results(
                     file_id=file_id,
                     sql=insert_query,
                     params=row,
-                    background_tasks=background_tasks,
                     task_type="insert",
-                    producer=producer,
+                    producer_instance=producer, 
                     correlation_id=cid,
-                    logger=logger
+                    logger_param=logger        
                 )
         logger.info(f"[{correlation_id}] Enqueued {len(data)} inserts with {len(insert_cids)} correlation IDs")
 
