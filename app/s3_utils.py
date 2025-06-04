@@ -69,33 +69,6 @@ def generate_unique_filename(original_filename, logger=None):
     new_filename = f"{code}_{timestamp}{ext}"
     logger.debug(f"Generated unique filename: {new_filename} from {original_filename}")
     return new_filename
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(pyodbc.Error),
-    before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_file_generate_complete for FileID {retry_state.kwargs['file_id']} "
-        f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
-    )
-)
-async def update_file_generate_complete(file_id: str, logger: Optional[logging.Logger] = None) -> None:
-    logger = logger or default_logger
-    try:
-        file_id = int(file_id)
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileCompleteTime = GETDATE() WHERE ID = ?", (file_id,))
-            conn.commit()
-            cursor.close()
-            logger.info(f"Marked file generation complete for FileID: {file_id}")
-    except pyodbc.Error as e:
-        logger.error(f"Database error in update_file_generate_complete: {e}", exc_info=True)
-        raise
-    except ValueError as e:
-        logger.error(f"Invalid file_id format: {e}")
-        raise
-
 async def upload_file_to_space(file_src, save_as, is_public=True, public=None, logger=None, file_id=None):
     if public is not None:
         is_public = public
