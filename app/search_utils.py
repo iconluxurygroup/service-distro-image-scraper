@@ -9,7 +9,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from fastapi import BackgroundTasks
 import psutil
 from database_config import async_engine
-from rabbitmq_producer import RabbitMQProducer
+from rabbitmq_producer import RabbitMQProducer # Assuming RabbitMQProducer class definition
 from db_utils import enqueue_db_update
 import uuid
 import aio_pika
@@ -25,15 +25,20 @@ MAX_CONCURRENCY = 10
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
+    # Consider if RuntimeError should be added if it can propagate from producer operations directly
+    # However, the current tracebacks are "Task exception was never retrieved", suggesting they
+    # might not be directly caught here. The main fix is lifecycle management.
     retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
-        f"Retrying update_search_sort_order for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
+        f"Retrying update_search_sort_order for FileID {retry_state.kwargs.get('file_id', 'unknown')}, "
+        f"EntryID {retry_state.kwargs.get('entry_id', 'unknown')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
     )
 )
 async def update_search_sort_order(
     file_id: str,
     entry_id: str,
+    producer_instance: RabbitMQProducer, # Accept a producer instance
     brand: Optional[str] = None,
     model: Optional[str] = None,
     color: Optional[str] = None,
@@ -44,13 +49,15 @@ async def update_search_sort_order(
 ) -> List[Dict]:
     """
     Updates SortOrder for search results based on brand and model matches.
+    Uses a provided RabbitMQ producer instance.
     """
     logger = logger or default_logger
     process = psutil.Process()
-    logger.info(f"Worker PID {process.pid}: Starting update_search_sort_order for FileID {file_id}, EntryID {entry_id}")
+    # Removed per-call PID logging for brevity, or adjust if still needed for specific debugging
+    # logger.info(f"Worker PID {process.pid}: Starting update_search_sort_order for FileID {file_id}, EntryID {entry_id}")
 
     try:
-        # Fetch results
+        # Fetch results (same as before)
         async with async_engine.connect() as conn:
             query = text("""
                 SELECT r.ResultID, r.ImageUrl, r.ImageDesc, r.ImageSource, r.ImageUrlThumbnail
@@ -61,21 +68,21 @@ async def update_search_sort_order(
             result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
             rows = result.fetchall()
             columns = result.keys()
-            result.close()
+            # result.close() # Not needed with fetchall() and context manager for connect
 
         if not rows:
             logger.warning(f"Worker PID {process.pid}: No results found for FileID {file_id}, EntryID {entry_id}")
             return []
 
         results = [dict(zip(columns, row)) for row in rows]
-        logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
+        # logger.info(f"Worker PID {process.pid}: Fetched {len(results)} rows for EntryID {entry_id}")
 
-        # Preprocess inputs
+        # Preprocess inputs (same as before)
         brand_clean = clean_string(brand).lower() if brand else ""
         model_clean = normalize_model(model) if model else ""
-        logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
+        # logger.debug(f"Worker PID {process.pid}: Cleaned brand: {brand_clean}, Cleaned model: {model_clean}")
 
-        # Generate aliases
+        # Generate aliases (same as before)
         brand_aliases = []
         if brand and brand_rules and isinstance(brand_rules, dict) and "brand_rules" in brand_rules:
             for rule in brand_rules.get("brand_rules", []):
@@ -88,21 +95,19 @@ async def update_search_sort_order(
         model_aliases = generate_aliases(model_clean) if model_clean else []
         if model_clean and not model_aliases:
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
-        logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
+        # logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
         if not brand_aliases and not model_aliases:
             logger.warning(f"Worker PID {process.pid}: No valid aliases generated for EntryID {entry_id}")
 
-        # Assign priorities
+        # Assign priorities (same as before)
         for res in results:
             image_desc = clean_string(res.get("ImageDesc", ""), preserve_url=False).lower()
             image_source = clean_string(res.get("ImageSource", ""), preserve_url=True).lower()
             image_url = clean_string(res.get("ImageUrl", ""), preserve_url=True).lower()
-            logger.debug(f"Worker PID {process.pid}: ImageDesc: {image_desc[:100]}, ImageSource: {image_source[:100]}, ImageUrl: {image_url[:100]}")
 
             model_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in model_aliases)
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
-            logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
             if model_matched and brand_matched:
                 res["priority"] = 1
@@ -112,57 +117,56 @@ async def update_search_sort_order(
                 res["priority"] = 3
             else:
                 res["priority"] = 4
-            logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
+            # logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
-        # Sort results
+        # Sort results (same as before)
         sorted_results = sorted(results, key=lambda x: x["priority"])
-        logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
+        # logger.debug(f"Worker PID {process.pid}: Sorted {len(sorted_results)} results for EntryID {entry_id}")
 
-        # Enqueue updates
-        producer = await RabbitMQProducer.get_producer()
-        try:
-            update_data = []
-            correlation_id = str(uuid.uuid4())
-            for index, res in enumerate(sorted_results):
-                sort_order = -2 if res["priority"] == 4 else (index + 1)
-                params = {
-                    "sort_order": sort_order,
-                    "entry_id": entry_id,
-                    "result_id": res["ResultID"]
-                }
-                update_query = """
-                    UPDATE utb_ImageScraperResult
-                    SET SortOrder = :sort_order
-                    WHERE EntryID = :entry_id AND ResultID = :result_id
-                """
-                await enqueue_db_update(
-                    file_id=file_id,
-                    sql=update_query,
-                    params=params,
-                    background_tasks=background_tasks,
-                    task_type="update_sort_order",
-                    producer=producer,
-                    correlation_id=correlation_id,
-                    logger=logger
-                )
-                update_data.append({
-                    "ResultID": res["ResultID"],
-                    "EntryID": entry_id,
-                    "SortOrder": sort_order
-                })
-                logger.debug(
-                    f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}"
-                )
+        # Enqueue updates using the provided producer_instance
+        # REMOVED: producer = await RabbitMQProducer.get_producer()
+        # REMOVED: try/finally block for local producer.close()
 
-            logger.info(
-                f"Worker PID {process.pid}: Enqueued SortOrder updates for {len(update_data)} rows for EntryID {entry_id}"
+        update_data = []
+        correlation_id = str(uuid.uuid4()) # Keep correlation_id per call if messages are related
+        for index, res in enumerate(sorted_results):
+            sort_order = -2 if res["priority"] == 4 else (index + 1)
+            params = {
+                "sort_order": sort_order,
+                "entry_id": entry_id,
+                "result_id": res["ResultID"]
+            }
+            update_query = """
+                UPDATE utb_ImageScraperResult
+                SET SortOrder = :sort_order
+                WHERE EntryID = :entry_id AND ResultID = :result_id
+            """
+            await enqueue_db_update(
+                file_id=file_id,
+                sql=update_query,
+                params=params,
+                background_tasks=background_tasks,
+                task_type="update_sort_order",
+                producer=producer_instance, # Use the passed-in producer
+                correlation_id=correlation_id,
+                logger=logger
             )
-            return update_data
-        finally:
-            await producer.close()
-            logger.info(f"Worker PID {process.pid}: Closed RabbitMQ producer for EntryID {entry_id}")
-    except Exception as e:
-        logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for EntryID {entry_id}: {e}", exc_info=True)
+            update_data.append({
+                "ResultID": res["ResultID"],
+                "EntryID": entry_id,
+                "SortOrder": sort_order
+            })
+            # logger.debug(
+            #     f"Worker PID {process.pid}: Enqueued UPDATE for ResultID {res['ResultID']} with SortOrder {sort_order}"
+            # )
+
+        logger.info(
+            f"Worker PID {process.pid}: Enqueued SortOrder updates for {len(update_data)} rows for FileID {file_id}, EntryID {entry_id}"
+        )
+        return update_data
+        # REMOVED: explicit producer.close() and associated logging here
+    except Exception as e: # Catching general Exception to ensure logging before re-raise
+        logger.error(f"Worker PID {process.pid}: Error in update_search_sort_order for FileID {file_id}, EntryID {entry_id}: {e}", exc_info=True)
         raise
 
 @retry(
@@ -181,10 +185,12 @@ async def update_sort_order(
 ) -> List[Dict]:
     """
     Updates SortOrder for all entries in a FileID by applying update_search_sort_order.
+    Manages a single RabbitMQ producer for the entire batch operation.
     """
     logger = logger or default_logger
+    producer = None  # Initialize producer to None for the finally block
     try:
-        file_id_int = int(file_id) # Use a different variable name to avoid confusion if file_id (str) is needed later
+        file_id_int = int(file_id)
         logger.info(f"Starting batch SortOrder update for FileID: {file_id_int}")
 
         # Fetch entries
@@ -194,131 +200,139 @@ async def update_sort_order(
                 FROM utb_ImageScraperRecords 
                 WHERE FileID = :file_id
             """)
-            logger.debug(f"Executing query: {query} with FileID: {file_id_int}")
-            result = await conn.execute(query, {"file_id": file_id_int})
-            entries = result.fetchall()
-            result.close()
+            # logger.debug(f"Executing query: {query} with FileID: {file_id_int}")
+            db_result = await conn.execute(query, {"file_id": file_id_int})
+            entries = db_result.fetchall()
+            # db_result.close() # Not needed with fetchall() and context manager
 
         if not entries:
             logger.warning(f"No entries found for FileID: {file_id_int}")
             return []
 
-        results = []
+        # Get producer ONCE for the whole batch operation
+        producer = await RabbitMQProducer.get_producer()
+
+        all_processed_results = [] # Renamed to avoid confusion
         success_count = 0
         failure_count = 0
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-        async def process_entry(entry):
+        async def process_entry(entry_data, shared_producer): # Accept shared_producer
             async with semaphore:
-                entry_id, brand, model, color, category = entry
-                logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id}, Brand: {brand}, Model: {model}")
+                entry_id_val, brand_val, model_val, color_val, category_val = entry_data
+                # logger.debug(f"Worker PID {psutil.Process().pid}: Processing EntryID {entry_id_val}, Brand: {brand_val}, Model: {model_val}")
                 try:
+                    # Pass the shared_producer to update_search_sort_order
                     entry_results = await update_search_sort_order(
-                        file_id=str(file_id_int), # Pass original file_id or converted, consistently
-                        entry_id=str(entry_id),
-                        brand=brand,
-                        model=model,
-                        color=color,
-                        category=category,
+                        file_id=str(file_id_int),
+                        entry_id=str(entry_id_val),
+                        producer_instance=shared_producer, # Pass shared producer
+                        brand=brand_val,
+                        model=model_val,
+                        color=color_val,
+                        category=category_val,
                         logger=logger,
                         background_tasks=background_tasks
+                        # brand_rules could be passed here if fetched once for the FileID
                     )
-                    return {"EntryID": entry_id, "Success": bool(entry_results), "Results": entry_results}
-                except Exception as e:
-                    # This catches exceptions from update_search_sort_order if they are not BaseException but Exception
-                    logger.error(f"Error processing EntryID {entry_id} for FileID {file_id_int}: {e}", exc_info=True)
-                    return {"EntryID": entry_id, "Success": False, "Error": str(e)}
+                    return {"EntryID": entry_id_val, "Success": bool(entry_results), "Results": entry_results}
+                except Exception as e: # Catch exceptions from update_search_sort_order call
+                    logger.error(f"Error processing EntryID {entry_id_val} for FileID {file_id_int}: {e}", exc_info=True)
+                    return {"EntryID": entry_id_val, "Success": False, "Error": str(e)}
 
-        # Process entries in parallel
-        tasks = [process_entry(entry) for entry in entries]
-        processed = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [process_entry(entry, producer) for entry in entries] # Pass producer to tasks
+        processed_gather_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for result_item in processed: # Renamed result to result_item to avoid confusion with outer result variables
-            if isinstance(result_item, BaseException): # Changed from Exception to BaseException
-                # This will catch CancelledError and other BaseExceptions returned by gather
+        for result_item in processed_gather_results:
+            if isinstance(result_item, BaseException): # Catches asyncio.CancelledError and other exceptions
                 logger.error(f"A task for FileID {file_id_int} resulted in an exception: {result_item}", exc_info=True)
                 failure_count += 1
+                # Potentially add a placeholder to all_processed_results if needed for full accounting
+                # all_processed_results.append({"EntryID": "UnknownDueToException", "Success": False, "Error": str(result_item)})
                 continue
             
-            # At this point, result_item should be a dictionary from process_entry
-            results.append(result_item)
-            if result_item.get("Success"): # Use .get() for safety, though "Success" should always be present
+            all_processed_results.append(result_item)
+            if result_item.get("Success"):
                 success_count += 1
             else:
                 failure_count += 1
-                # Log specific error if present from process_entry's catch block
                 logger.warning(
                     f"Processing failed for EntryID {result_item.get('EntryID', 'Unknown')} in FileID {file_id_int}: "
                     f"{result_item.get('Error', 'Task returned Success=False without explicit error.')}"
                 )
-
+        
         logger.info(f"Completed batch SortOrder update for FileID {file_id_int}: {success_count} entries successful, {failure_count} failed")
 
-        # Verify sort order distribution
+        # Verification (same as before, ensure file_id_int is used)
         async with async_engine.connect() as conn:
             verification_query = text("""
                 SELECT 
                     SUM(CASE WHEN t.SortOrder > 0 THEN 1 ELSE 0 END) AS PositiveSortOrderEntries,
-                    SUM(CASE WHEN t.SortOrder = 0 THEN 1 ELSE 0 END) AS BrandMatchEntries, /* This comment seems outdated based on current logic: -2 is no match */
-                    SUM(CASE WHEN t.SortOrder = -2 THEN 1 ELSE 0 END) AS NoMatchEntries, /* Priority 4 becomes -2 */
+                    SUM(CASE WHEN t.SortOrder = 0 THEN 1 ELSE 0 END) AS ZeroSortOrderEntries, 
+                    SUM(CASE WHEN t.SortOrder = -2 THEN 1 ELSE 0 END) AS NoMatchEntries, 
                     SUM(CASE WHEN t.SortOrder IS NULL THEN 1 ELSE 0 END) AS NullSortOrderEntries,
-                    SUM(CASE WHEN t.SortOrder < 0 AND t.SortOrder != -2 THEN 1 ELSE 0 END) AS UnexpectedNegativeSortOrderEntries /* e.g. -1 */
+                    SUM(CASE WHEN t.SortOrder < 0 AND t.SortOrder != -2 THEN 1 ELSE 0 END) AS OtherNegativeSortOrderEntries
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                 WHERE r.FileID = :file_id
             """)
-            # In the original code, SUM(CASE WHEN t.SortOrder = 0 THEN 1 ELSE 0 END) was BrandMatchEntries
-            # SUM(CASE WHEN t.SortOrder < 0 THEN 1 ELSE 0 END) was NoMatchEntries
-            # The logic `sort_order = -2 if res["priority"] == 4 else (index + 1)` means:
-            # Priority 1,2,3 (model+brand, model, brand) -> SortOrder > 0
-            # Priority 4 (no match) -> SortOrder = -2
-            # So, SortOrder = 0 should ideally not occur unless `index + 1` is 0, which is impossible.
-            # The verification query comments might need updating based on actual SortOrder values expected.
-            # For now, I've adjusted NoMatchEntries to check for -2 and UnexpectedNegativeSortOrderEntries for other negatives.
-
             verif_result = await conn.execute(verification_query, {"file_id": file_id_int})
             verification_data = verif_result.fetchone()
-            verif_result.close()
-            
+            # verif_result.close() # Not needed
+
             if verification_data:
                 logger.info(f"Verification for FileID {file_id_int}: "
-                           f"{verification_data[0] or 0} entries with positive SortOrder (matches), "
-                           f"{verification_data[1] or 0} entries with SortOrder=0 (unexpected or specific brand-only logic not reflected), "
-                           f"{verification_data[2] or 0} entries with SortOrder=-2 (no matches), "
-                           f"{verification_data[3] or 0} entries with NULL SortOrder, "
-                           f"{verification_data[4] or 0} entries with other negative/unexpected SortOrder")
+                           f"PositiveSortOrder: {verification_data[0] or 0}, ZeroSortOrder: {verification_data[1] or 0}, "
+                           f"NoMatch(SortOrder=-2): {verification_data[2] or 0}, NullSortOrder: {verification_data[3] or 0}, "
+                           f"OtherNegativeSortOrder: {verification_data[4] or 0}")
             else:
                 logger.warning(f"Could not fetch verification data for FileID {file_id_int}")
 
+            # Sample query (same as before)
+            # Note: TOP 10 is SQL Server specific. Use LIMIT 10 for PostgreSQL/MySQL.
+            sample_query_dialect = "SELECT TOP 10" if async_engine.dialect.name == "mssql" else "SELECT"
+            sample_query_limit = "ORDER BY t.EntryID LIMIT 10" if async_engine.dialect.name != "mssql" else "ORDER BY t.EntryID" # TOP already handles limit
 
-            # Log sample sort orders
-            sample_query = text("""
-                SELECT TOP 10 t.EntryID, t.SortOrder, LEFT(t.ImageUrl, 50) AS ImageUrl
+            sample_query = text(f"""
+                {sample_query_dialect} t.EntryID, t.SortOrder, LEFT(t.ImageUrl, 50) AS ImageUrl
                 FROM utb_ImageScraperResult t
                 INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
                 WHERE r.FileID = :file_id
-                ORDER BY t.EntryID
-            """) # Note: TOP 10 is SQL Server specific. If using PostgreSQL, use LIMIT 10.
-               # Assuming the database is SQL Server due to `TOP 10`.
+                {sample_query_limit} 
+            """) # For non-MSSQL, if TOP is not used, append LIMIT 10 after ORDER BY
+            if async_engine.dialect.name == "mssql" and "LIMIT" in sample_query_limit: # avoid double limit
+                 sample_query = text(f"""
+                    SELECT TOP 10 t.EntryID, t.SortOrder, LEFT(t.ImageUrl, 50) AS ImageUrl
+                    FROM utb_ImageScraperResult t
+                    INNER JOIN utb_ImageScraperRecords r ON t.EntryID = r.EntryID
+                    WHERE r.FileID = :file_id
+                    ORDER BY t.EntryID
+                """)
+
+
             sample_res = await conn.execute(sample_query, {"file_id": file_id_int})
             sort_orders = sample_res.fetchall()
-            sample_res.close()
-            logger.debug(f"Sample SortOrder values for FileID {file_id_int}: {[(row[0], row[1], row[2]) for row in sort_orders]}")
+            # sample_res.close() # Not needed
+            # logger.debug(f"Sample SortOrder values for FileID {file_id_int}: {[(row[0], row[1], row[2]) for row in sort_orders]}")
 
-        return results
+        return all_processed_results
+
     except SQLAlchemyError as e:
         logger.error(f"Database error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        raise # Re-raise to be handled by retry or caller
+        raise
     except ValueError as ve:
         logger.error(f"Invalid file_id format: {file_id}, error: {ve}")
-        return [] # Or raise, depending on desired behavior for invalid input
-    except Exception as e:
-        # This catches exceptions that occurred in update_sort_order itself,
-        # like the TypeError if the BaseException check was missing.
-        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
-        # Depending on policy, you might want to return [] or re-raise.
-        # The original code returned [], implying it's a "handled" failure at this level.
         return []
+    except Exception as e:
+        logger.error(f"Error in batch SortOrder update for FileID {file_id}: {e}", exc_info=True)
+        return []
+    finally:
+        if producer:
+            try:
+                await producer.close()
+                logger.info(f"Closed shared RabbitMQ producer after processing FileID {file_id}")
+            except Exception as e_close:
+                logger.error(f"Error closing shared RabbitMQ producer for FileID {file_id}: {e_close}", exc_info=True)
 
 
 @retry(
@@ -337,9 +351,9 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
     logger = logger or default_logger
     try:
         file_id_int = int(file_id)
-        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id_int}")
+        logger.info(f"Starting per-entry SortOrder update for FileID: {file_id_int} (no image entries)")
 
-        async with async_engine.begin() as conn:
+        async with async_engine.begin() as conn: # Use begin for transaction
             # Count null SortOrder entries
             result = await conn.execute(
                 text("""
@@ -353,8 +367,8 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
                 """),
                 {"file_id": file_id_int}
             )
-            null_count = result.scalar()
-            logger.debug(f"Worker PID {psutil.Process().pid}: {null_count} entries with NULL SortOrder for FileID {file_id_int}")
+            null_count = result.scalar_one_or_none() # Use scalar_one_or_none for safety
+            logger.debug(f"Worker PID {psutil.Process().pid}: {null_count or 0} entries with NULL SortOrder for FileID {file_id_int}")
 
             # Delete placeholder entries
             result = await conn.execute(
@@ -389,11 +403,11 @@ async def update_sort_no_image_entry(file_id: str, logger: Optional[logging.Logg
 
         return {"file_id": file_id_int, "rows_deleted": rows_deleted, "rows_updated": rows_updated}
     except SQLAlchemyError as e:
-        logger.error(f"Database error updating entries for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Database error updating no-image entries for FileID {file_id}: {e}", exc_info=True)
         raise
     except ValueError as ve:
-        logger.error(f"Invalid file_id format: {file_id}, error: {ve}")
+        logger.error(f"Invalid file_id format for no-image update: {file_id}, error: {ve}")
         return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0, "error": str(ve)}
     except Exception as e:
-        logger.error(f"Unexpected error updating entries for FileID {file_id}: {e}", exc_info=True)
+        logger.error(f"Unexpected error updating no-image entries for FileID {file_id}: {e}", exc_info=True)
         return {"file_id": file_id, "rows_deleted": 0, "rows_updated": 0, "error": str(e)}
