@@ -2205,13 +2205,23 @@ async def api_validate_images(
         validated_count = 0
         invalid_count = 0
         for res in validation_results:
-            if isinstance(res, Exception):
+            if isinstance(res, asyncio.CancelledError):
+                logger.warning(f"Image validation task cancelled: {res}", exc_info=True)
+                # Count cancelled tasks as invalid or handle as a separate category.
+                # Here, counting as invalid for simplicity.
+                invalid_count += 1
+                continue
+            elif isinstance(res, Exception):
                 logger.error(f"Error validating image: {res}", exc_info=True)
                 invalid_count += 1
                 continue
-            if res["valid"]:
-                validated_count += 1
-            else:
+            try:
+                if res["valid"]: # This line could raise TypeError if 'res' is not a dict
+                    validated_count += 1
+                else:
+                    invalid_count += 1
+            except (TypeError, KeyError) as e: # Catch if 'res' is not a dict or "valid" key is missing
+                logger.error(f"Unexpected result type or structure in image validation: {type(res)}, value: {res}. Error: {e}", exc_info=True)
                 invalid_count += 1
 
         logger.info(
