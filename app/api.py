@@ -802,7 +802,7 @@ async def process_restart_batch(
 
 # --- V6 Endpoints ---
 
-@router.post("/populate-results-from-warehouse/{file_id}", tags=["Processing", "Warehouse"])
+@router.post("/populate-results-from-warehouse/{file_id}", tags=["Database"])
 async def api_populate_results_from_warehouse(
     file_id: str,
     limit: Optional[int] = Query(1000, ge=1, le=10000, description=f"Max records from {SCRAPER_RECORDS_TABLE_NAME} to process."),
