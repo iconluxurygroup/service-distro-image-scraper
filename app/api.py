@@ -280,7 +280,7 @@ class SearchClient:
                                     f"PID {process_info.pid}: 'result' field missing or empty for term='{term}' in region {region_name}."
                                 )
                                 continue
-                            html_bytes = html_content_from_api.encode('utf-8') if isinstance(html_content_from_api, str) else str(html_content_from_api)
+                            html_bytes = html_content_from_api.encode('utf-8') if isinstance(html_content_from_api, str) else str(html_content_from_api).encode('utf-8')
                             # process_search_result expects (html_bytes, entry_id, logger)
                             formatted_results_df = process_search_result(html_bytes, entry_id, self.logger) # Corrected arguments
                             if not formatted_results_df.empty:

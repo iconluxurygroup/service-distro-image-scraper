@@ -121,10 +121,10 @@ def get_results_page_results(html_bytes, final_urls, final_descriptions, final_s
     logger.debug(f"Appended results from additional page. Total now: {len(final_urls)}")
     return final_urls, final_descriptions, final_sources, final_thumbs
 
-def process_search_result(image_html_bytes, results_html_bytes, entry_id: int, logger=None) -> pd.DataFrame:
+def process_search_result(image_html_bytes, entry_id: int, logger=None) -> pd.DataFrame:
     """Process search result HTML bytes and return a DataFrame with image data."""
     logger = logger or logging.getLogger(__name__)
-    
+    results_html_bytes = image_html_bytes
     final_urls, final_descriptions, final_sources, final_thumbs = get_original_images(image_html_bytes, logger)
     
     if results_html_bytes:
