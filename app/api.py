@@ -999,8 +999,8 @@ async def api_run_initial_sort(file_id: str, background_tasks: BackgroundTasks):
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
     return {"status_code": 200, "message": "Initial sort job completed.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
 
-@router.post("/run-no-image-sort/{file_id}", tags=["Sorting"])
-async def api_run_no_image_sort(file_id: str, background_tasks: Optional[BackgroundTasks] = None):
+@router.post("/run-no-image-sort/{file_id}", tags=["Sorting"], response_model=None)
+async def api_run_no_image_sort(file_id: str,  background_tasks: BackgroundTasks):
     job_run_id = f"no_image_sort_{file_id}_{uuid.uuid4().hex[:6]}"
     job_result = await run_job_with_logging(job_func=update_sort_no_image_entry, file_id_context=job_run_id, file_id=file_id, background_tasks=background_tasks)
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
