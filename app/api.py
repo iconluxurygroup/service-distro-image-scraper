@@ -802,7 +802,7 @@ async def process_restart_batch(
 
 # --- V6 Endpoints ---
 
-@router.post("/populate-results-from-warehouse/{file_id}", tags=["Processing", "Warehouse v6"])
+@router.post("/populate-results-from-warehouse/{file_id}", tags=["Processing", "Warehouse"])
 async def api_populate_results_from_warehouse(
     file_id: str,
     limit: Optional[int] = Query(1000, ge=1, le=10000, description=f"Max records from {SCRAPER_RECORDS_TABLE_NAME} to process."),
@@ -887,7 +887,7 @@ async def api_populate_results_from_warehouse(
         crit_err_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
         raise HTTPException(status_code=500, detail=f"Critical internal error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}")
 
-@router.post("/clear-ai-json/{file_id}", tags=["Database v6"])
+@router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query(None)):
     job_run_id = f"clear_ai_data_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
@@ -912,7 +912,7 @@ async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query
         crit_err_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
         raise HTTPException(status_code=500, detail=f"Internal server error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}")
 
-@router.post("/restart-job/{file_id}", tags=["Processing v6"])
+@router.post("/restart-job/{file_id}", tags=["Processing"])
 async def api_process_restart_job(
     file_id: str, entry_id: Optional[int] = Query(None),
     use_all_variations: bool = Query(False), num_workers_hint: int = Query(4, ge=1, le=cpu_count() * 2), # Max based on CPU
@@ -939,7 +939,7 @@ class TestableSearchResult(BaseModel):
 class TestInsertResultsRequest(BaseModel):
     results: List[TestableSearchResult]
 
-@router.post("/test-insert-results/{file_id}", tags=["Testing v6"])
+@router.post("/test-insert-results/{file_id}", tags=["Testing"])
 async def api_test_insert_search_results(file_id: str, payload: TestInsertResultsRequest, background_tasks: Optional[BackgroundTasks] = None):
     job_run_id = f"test_insert_results_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
@@ -969,7 +969,7 @@ async def api_test_insert_search_results(file_id: str, payload: TestInsertResult
         crit_err_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
         raise HTTPException(status_code=500, detail=f"Internal server error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}")
 
-@router.get("/get-send-to-email/{file_id}", tags=["Database v6"])
+@router.get("/get-send-to-email/{file_id}", tags=["Database"])
 async def api_get_send_to_email_address(file_id: str):
     job_run_id = f"get_email_{file_id}"
     logger, _ = setup_job_logger(job_id=job_run_id, console_output=False, log_level=logging.INFO) # Less verbose for GET
@@ -984,21 +984,21 @@ async def api_get_send_to_email_address(file_id: str):
     except ValueError: err_msg = f"Invalid FileID format: '{file_id}'."; logger.error(f"[{job_run_id}] {err_msg}"); raise HTTPException(status_code=400, detail=err_msg)
     except Exception as e_get_email: logger.error(f"[{job_run_id}] Error retrieving email for FileID '{file_id}': {e_get_email}", exc_info=True); raise HTTPException(status_code=500, detail=f"Internal error: {str(e_get_email)}")
 
-@router.post("/run-initial-sort/{file_id}", tags=["Sorting v6"])
+@router.post("/run-initial-sort/{file_id}", tags=["Sorting"])
 async def api_run_initial_sort(file_id: str, background_tasks: Optional[BackgroundTasks] = None):
     job_run_id = f"initial_sort_{file_id}_{uuid.uuid4().hex[:6]}"
     job_result = await run_job_with_logging(job_func=update_initial_sort_order, file_id_context=job_run_id, file_id=file_id, background_tasks=background_tasks)
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
     return {"status_code": 200, "message": "Initial sort job completed.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
 
-@router.post("/run-no-image-sort/{file_id}", tags=["Sorting v6"])
+@router.post("/run-no-image-sort/{file_id}", tags=["Sorting"])
 async def api_run_no_image_sort(file_id: str, background_tasks: Optional[BackgroundTasks] = None):
     job_run_id = f"no_image_sort_{file_id}_{uuid.uuid4().hex[:6]}"
     job_result = await run_job_with_logging(job_func=update_sort_no_image_entry, file_id_context=job_run_id, file_id=file_id, background_tasks=background_tasks)
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
     return {"status_code": 200, "message": "No-image sort job completed.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
 
-@router.post("/process-images-ai/{file_id}", tags=["AI Processing v6"])
+@router.post("/process-images-ai/{file_id}", tags=["AI Processing"])
 async def api_run_ai_image_processing(
     file_id: str, entry_ids: Optional[List[int]] = Query(None), step: int = Query(0),
     limit: int = Query(5000, ge=1), concurrency: int = Query(10, ge=1, le=50), # Added le for concurrency
@@ -1012,7 +1012,7 @@ async def api_run_ai_image_processing(
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
     return {"status_code": 200, "message": "AI image processing job completed.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
 
-@router.get("/get-images-for-excel/{file_id}", tags=["Data Export v6"])
+@router.get("/get-images-for-excel/{file_id}", tags=["Data Export"])
 async def api_get_images_for_excel_export(file_id: str):
     job_run_id = f"get_excel_images_{file_id}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=False, log_level=logging.INFO)
@@ -1028,7 +1028,7 @@ async def api_get_images_for_excel_export(file_id: str):
         log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}. Log: {log_s3_url}")
 
-@router.post("/mark-file-generation-complete/{file_id}", tags=["File Status v6"])
+@router.post("/mark-file-generation-complete/{file_id}", tags=["File Status"])
 async def api_mark_file_generation_complete(file_id: str):
     job_run_id = f"mark_gen_complete_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=False, log_level=logging.INFO)
@@ -1045,7 +1045,7 @@ async def api_mark_file_generation_complete(file_id: str):
 
 class FileLocationPayload(BaseModel): file_location_url: PydanticHttpUrl
 
-@router.post("/mark-file-location-complete/{file_id}", tags=["File Status v6"])
+@router.post("/mark-file-location-complete/{file_id}", tags=["File Status"])
 async def api_mark_file_location_complete(file_id: str, payload: FileLocationPayload):
     job_run_id = f"mark_loc_complete_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=False, log_level=logging.INFO)
@@ -1060,7 +1060,7 @@ async def api_mark_file_location_complete(file_id: str, payload: FileLocationPay
         log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}. Log: {log_s3_url}")
 
-@router.post("/sort-by-ai-relevance/{file_id}", tags=["Sorting v6"])
+@router.post("/sort-by-ai-relevance/{file_id}", tags=["Sorting"])
 async def api_sort_by_ai_relevance(
     file_id: str, entry_ids: Optional[List[int]] = Query(None),
     use_softmax_normalization: bool = Query(False)
@@ -1112,7 +1112,7 @@ async def api_sort_by_ai_relevance(
     except ValueError: err_msg=f"Invalid FileID: {file_id}"; logger.error(f"[{job_run_id}] {err_msg}"); await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=400, detail=err_msg)
     except Exception as e_main: logger.critical(f"[{job_run_id}] Critical error in AI relevance sort API: {e_main}", exc_info=True); crit_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=500, detail=f"Internal server error. Job Run ID: {job_run_id}. Log: {crit_log_url}")
 
-@router.post("/reset-step1-status/{file_id}", tags=["Database v6"])
+@router.post("/reset-step1-status/{file_id}", tags=["Database"])
 async def api_reset_step1_status_for_file(file_id: str):
     job_run_id = f"reset_step1_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
@@ -1129,7 +1129,7 @@ async def api_reset_step1_status_for_file(file_id: str):
     except ValueError: err_msg=f"Invalid FileID: {file_id}"; logger.error(f"[{job_run_id}] {err_msg}"); await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=400, detail=err_msg)
     except Exception as e_main: logger.critical(f"[{job_run_id}] Critical error resetting Step1: {e_main}", exc_info=True); crit_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=500, detail=f"Internal server error. Log: {crit_log_url}")
 
-@router.post("/reset-step1-for-no-results-entries/{file_id}", tags=["Database v6"])
+@router.post("/reset-step1-for-no-results-entries/{file_id}", tags=["Database"])
 async def api_reset_step1_for_no_result_entries(file_id: str, entry_ids_filter: Optional[List[int]] = Query(None)):
     job_run_id = f"reset_step1_no_res_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
@@ -1148,7 +1148,7 @@ async def api_reset_step1_for_no_result_entries(file_id: str, entry_ids_filter: 
     except ValueError: err_msg=f"Invalid FileID: {file_id}"; logger.error(f"[{job_run_id}] {err_msg}"); await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=400, detail=err_msg)
     except Exception as e_main: logger.critical(f"[{job_run_id}] Critical error resetting Step1 for no-result entries: {e_main}", exc_info=True); crit_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=500, detail=f"Internal server error. Log: {crit_log_url}")
 
-@router.post("/validate-result-images/{file_id}", tags=["Validation v6"])
+@router.post("/validate-result-images/{file_id}", tags=["Validation"])
 async def api_validate_scraper_result_images(
     file_id: str, entry_ids_filter: Optional[List[int]] = Query(None),
     concurrency_limit: int = Query(10, ge=1, le=50)
