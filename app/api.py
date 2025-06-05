@@ -1213,7 +1213,7 @@ async def api_populate_results_from_warehouse(
                     UPDATE {SCRAPER_RECORDS_TABLE_NAME}
                     SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED},
                         {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
-                    WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :entry_ids_list;
+                    WHERE {SCRAPER_RECORDS_PK_COLUMN} IN (:entry_ids_list);
                 """
                 # Ensure entry_ids_list is a list for the IN clause
                 batch_update_params = {"entry_ids_list": entry_ids_processed}
