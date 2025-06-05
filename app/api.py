@@ -402,7 +402,7 @@ async def orchestrate_entry_search(
 async def run_job_with_logging(
     job_func: Callable[..., Any],
     file_id_context: str,
-    **kwargs: Any
+    **kwargs: Any  # These are the arguments passed from the API endpoint call
 ) -> Dict[str, Any]:
     job_specific_logger, log_file_path = setup_job_logger(job_id=file_id_context, console_output=True)
     result_payload: Optional[Any] = None
@@ -418,24 +418,53 @@ async def run_job_with_logging(
         debug_info_dict["memory_usage_mb"]["before_job"] = mem_before
         job_specific_logger.debug(f"Memory before job '{job_function_name}': {mem_before:.2f} MB")
 
-        func_params = job_func.__code__.co_varnames
-        if 'logger' in func_params: kwargs['logger'] = job_specific_logger
-        if 'file_id' in func_params and 'file_id' not in kwargs: kwargs['file_id'] = file_id_context
-        if 'file_id_db_str' in func_params and 'file_id_db_str' not in kwargs : kwargs['file_id_db_str'] = file_id_context # Specific for process_restart_batch
-        if 'file_id_db' in func_params and 'file_id_db' not in kwargs: # for process_restart_batch original naming
-             try: kwargs['file_id_db'] = int(file_id_context)
-             except ValueError: kwargs['file_id_db'] = file_id_context # Pass as string if not int-like
+        # --- MODIFICATION START ---
+        # Get the names of arguments job_func explicitly accepts (excluding *args, **kwargs conventions)
+        func_explicit_args = set(job_func.__code__.co_varnames[:job_func.__code__.co_argcount])
+        
+        final_job_args = {}
 
+        # 1. Populate final_job_args with arguments job_func explicitly expects,
+        #    prioritizing specific handling by run_job_with_logging or values from incoming kwargs.
+        for arg_name in func_explicit_args:
+            if arg_name == 'logger':
+                final_job_args['logger'] = job_specific_logger
+            elif arg_name == 'file_id' and arg_name not in kwargs:
+                final_job_args['file_id'] = file_id_context
+            elif arg_name == 'file_id_db_str' and arg_name not in kwargs:
+                final_job_args['file_id_db_str'] = file_id_context
+            elif arg_name == 'file_id_db' and arg_name not in kwargs:
+                try:
+                    final_job_args['file_id_db'] = int(file_id_context)
+                except ValueError:
+                    final_job_args['file_id_db'] = file_id_context
+            elif arg_name in kwargs: # Argument is expected and was passed in kwargs
+                final_job_args[arg_name] = kwargs[arg_name]
+            # If an arg is in func_explicit_args but not in kwargs and not handled above,
+            # it implies job_func has a default for it, or it's a programming error in the call.
+            # Python's ** operator will handle this (missing arg error if no default).
+
+        # 2. If job_func accepts arbitrary keyword arguments (has **kwargs in its definition),
+        #    then pass through any remaining kwargs that weren't explicit parameters.
+        if job_func.__code__.co_flags & 0x08:  # CO_VARKEYWORDS flag indicates **kwargs
+            for k, v in kwargs.items():
+                if k not in final_job_args: # Add if not already included
+                    final_job_args[k] = v
+            # Ensure logger is passed even if only **kwargs is present and logger is not an explicit param
+            # (though typically logger would be explicit if needed).
+            if 'logger' not in func_explicit_args and 'logger' not in final_job_args :
+                 final_job_args['logger'] = job_specific_logger
+        # --- MODIFICATION END ---
 
         if asyncio.iscoroutinefunction(job_func):
-            result_payload = await job_func(**kwargs)
+            result_payload = await job_func(**final_job_args) # Use filtered args
         else:
-            result_payload = await asyncio.to_thread(job_func, **kwargs)
+            result_payload = await asyncio.to_thread(job_func, **final_job_args) # Use filtered args
         
         mem_after = round(current_process.memory_info().rss / (1024 * 1024), 2)
         debug_info_dict["memory_usage_mb"]["after_job"] = mem_after
         job_specific_logger.debug(f"Memory after job '{job_function_name}': {mem_after:.2f} MB")
-        if (mem_after - mem_before) > 500:
+        if (mem_after - mem_before) > 500: # Threshold in MB
             job_specific_logger.warning(f"Job '{job_function_name}' memory increase: {(mem_after - mem_before):.2f} MB.")
 
         job_specific_logger.info(f"Successfully completed job '{job_function_name}' for context FileID: {file_id_context}")
@@ -445,12 +474,17 @@ async def run_job_with_logging(
         job_specific_logger.error(f"Error in job '{job_function_name}' for FileID {file_id_context}: {str(e)}", exc_info=True)
         debug_info_dict["errors_encountered"].append({"error_message": str(e), "error_type": type(e).__name__, "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()})
         response_message = f"Job '{job_function_name}' for context FileID {file_id_context} failed: {str(e)}"
+        # Re-raise the original exception type if it's an HTTPException, or keep default 500
+        if isinstance(e, HTTPException):
+            http_status_code = e.status_code
+            # response_message is already set above to include the error from e
+        # else: http_status_code remains 500
     finally:
         uploaded_log_url = await upload_log_file(
             job_id_for_s3_path=file_id_context,
             local_log_file_path=log_file_path,
             logger_instance=job_specific_logger,
-            db_record_file_id_to_update=file_id_context # Assuming context ID is the DB FileID
+            db_record_file_id_to_update=file_id_context 
         )
         debug_info_dict["log_s3_url"] = uploaded_log_url
 
