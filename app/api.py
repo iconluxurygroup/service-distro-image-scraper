@@ -905,7 +905,7 @@ async def api_populate_results_from_warehouse(
                 num_results_enqueued = len(results_to_insert_payload)
                 logger.info(f"[{job_run_id}] Successfully enqueued {num_results_enqueued} warehouse results.")
                 if processed_entry_ids_for_status_update:
-                    unique_eids = list(set(processed_entry_ids_for_status_update))
+                    unique_eids_raw = list(set(processed_entry_ids_for_status_update))
                     status_update_sql = f"UPDATE {SCRAPER_RECORDS_TABLE_NAME} SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED}, {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE() WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :eids_list;"
                     await enqueue_db_update(file_id=job_run_id, sql=status_update_sql, params={"eids_list": unique_eids}, task_type="batch_update_scraper_status_warehouse_populated", correlation_id=str(uuid.uuid4()), logger_param=logger)
                     num_status_updates_enqueued = len(unique_eids)
