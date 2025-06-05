@@ -992,8 +992,8 @@ async def api_get_send_to_email_address(file_id: str):
     except ValueError: err_msg = f"Invalid FileID format: '{file_id}'."; logger.error(f"[{job_run_id}] {err_msg}"); raise HTTPException(status_code=400, detail=err_msg)
     except Exception as e_get_email: logger.error(f"[{job_run_id}] Error retrieving email for FileID '{file_id}': {e_get_email}", exc_info=True); raise HTTPException(status_code=500, detail=f"Internal error: {str(e_get_email)}")
 
-@router.post("/run-initial-sort/{file_id}", tags=["Sorting"])
-async def api_run_initial_sort(file_id: str, background_tasks: Optional[BackgroundTasks] = None):
+@router.post("/run-initial-sort/{file_id}", tags=["Sorting"], response_model=None)
+async def api_run_initial_sort(file_id: str, background_tasks: BackgroundTasks):
     job_run_id = f"initial_sort_{file_id}_{uuid.uuid4().hex[:6]}"
     job_result = await run_job_with_logging(job_func=update_initial_sort_order, file_id_context=job_run_id, file_id=file_id, background_tasks=background_tasks)
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
