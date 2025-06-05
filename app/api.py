@@ -145,49 +145,6 @@ async def lifespan(app_instance: FastAPI): # Renamed app to app_instance
         else:
             default_logger.info("Global RabbitMQ producer initialized and connected successfully.")
 
-        # Startup Test Insertion (optional, can be disabled for production)
-        RUN_STARTUP_TEST_INSERT = os.getenv("RUN_STARTUP_TEST_INSERT", "false").lower() == "true"
-        if RUN_STARTUP_TEST_INSERT:
-            default_logger.info("Running test insertion of search result on startup...")
-            test_file_id = f"startup_test_{uuid.uuid4().hex[:8]}"
-            test_logger, test_log_filename = setup_job_logger(job_id=test_file_id, console_output=False) # Usually don't want console output for this
-            try:
-                # Ensure a corresponding FileID exists or handle it gracefully
-                # For a true test, you might insert a temporary FileID into utb_ImageScraperFiles
-                # Here, we assume insert_search_results can handle file_id context without DB FK strictness for this test,
-                # or that the test_file_id is just for logging/grouping RabbitMQ tasks.
-
-                sample_result_data = [
-                    {
-                        "EntryID": 99999, # Use a distinct EntryID for tests
-                        "ImageUrl": "https://via.placeholder.com/150/0000FF/808080?Text=TestImage",
-                        "ImageDesc": "Automated startup test image description",
-                        "ImageSource": "https://placeholder.com",
-                        "ImageUrlThumbnail": "https://via.placeholder.com/50/0000FF/808080?Text=Thumb"
-                    }
-                ]
-                # `insert_search_results` uses `enqueue_db_update` which relies on `global_producer`
-                success_flag = await insert_search_results(
-                    results=sample_result_data,
-                    logger=test_logger,
-                    file_id=test_file_id, # Context for the task, not necessarily a DB FK
-                    background_tasks=BackgroundTasks() # Provide if signature requires
-                )
-                if success_flag: # This indicates successful enqueuing
-                    test_logger.info(f"Test search result enqueued successfully for EntryID 99999, Context FileID {test_file_id}.")
-                    # Verification would require checking RabbitMQ queue or waiting for consumer and checking DB.
-                    # For startup, enqueuing success is usually sufficient.
-                else:
-                    test_logger.error(f"Failed to enqueue test search result for EntryID 99999, Context FileID {test_file_id}.")
-            except Exception as e_startup_test:
-                test_logger.error(f"Error during startup test insertion: {e_startup_test}", exc_info=True)
-                # Do not exit app for a failed test, but log as critical if desired.
-            finally:
-                if os.path.exists(test_log_filename):
-                    await upload_log_file(test_file_id, test_log_filename, test_logger, db_record_file_id_to_update=None) # No DB update for this ephemeral test log
-        else:
-            default_logger.info("Skipping startup test insertion (RUN_STARTUP_TEST_INSERT is not true).")
-
 
         # Setup signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
