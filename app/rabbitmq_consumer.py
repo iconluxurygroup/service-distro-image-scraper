@@ -218,80 +218,121 @@ class RabbitMQConsumer:
             await self.close()
             await asyncio.sleep(5)
             await self.start_consuming()
-            
     async def execute_update(self, task, conn, logger):
-        file_id = task.get("file_id", "unknown")
-        task_type = task.get("task_type", "unknown")
-        sql = task.get("sql") # Get SQL early for logging
-        original_params = task.get("params", {}) # Get original params early
+            file_id = task.get("file_id", "unknown")
+            task_type = task.get("task_type", "unknown")
+            sql = task.get("sql")
+            original_params = task.get("params", {})
 
-        # Initialize adapted_params with a copy of original_params
-        adapted_params = original_params.copy() if isinstance(original_params, dict) else {}
+            # This will hold the parameters actually sent to the DB
+            adapted_params: Dict[str, Any]
 
-        try:
-            if not isinstance(original_params, dict):
-                logger.error(
-                    f"TaskType: {task_type}, FileID: {file_id}, Invalid params format: {original_params}, expected dict. SQL: {sql}"
-                )
-                # Raise ValueError to ensure this doesn't proceed with malformed params.
-                # This will be caught by the callback's general exception handler.
-                raise ValueError(f"Invalid params format: {original_params}, expected dict")
+            try:
+                if not isinstance(original_params, dict):
+                    logger.error(
+                        f"TaskType: {task_type}, FileID: {file_id}, Invalid params format: {original_params}, expected dict. SQL: {sql}"
+                    )
+                    raise ValueError(f"Invalid params format: {original_params}, expected dict")
 
-            # Specific adaptation for 'entry_ids_list' based on the observed error.
-            # This key is identified from the error log: "params: {'entry_ids_list': [134517]}"
-            param_key_to_adapt = 'entry_ids_list'
-            if param_key_to_adapt in adapted_params:
-                param_value = adapted_params[param_key_to_adapt]
-                if isinstance(param_value, list):
-                    if param_value:  # If the list is not empty
-                        # Check if elements are simple types (e.g., int, str) and need wrapping in tuples.
-                        # Example: [1, 2, 3] -> [(1,), (2,), (3,)]
-                        # If param_value[0] is already a list or tuple, e.g., [(1,), (2,)], assume it's correctly formatted.
-                        if not isinstance(param_value[0], (list, tuple)):
-                            logger.info( # Log as INFO for visibility during debugging this fix
-                                f"TaskType: {task_type}, FileID: {file_id}, "
-                                f"Adapting parameter '{param_key_to_adapt}' for TVP compatibility. "
-                                f"Original: {param_value}"
-                            )
-                            adapted_params[param_key_to_adapt] = [(item,) for item in param_value]
+                # Create a new dict for adapted_params to avoid modifying original_params if it's passed around.
+                adapted_params = {} 
+                _adaptation_done_on_any_key = False # For improved error logging context
+
+                for key, value in original_params.items():
+                    if isinstance(value, list) and value:  # If it's a non-empty list
+                        # Check if elements are simple types (e.g., int, str) and need wrapping in tuples for TVP.
+                        if not isinstance(value[0], (list, tuple)):
                             logger.info(
                                 f"TaskType: {task_type}, FileID: {file_id}, "
-                                f"Adapted '{param_key_to_adapt}': {adapted_params[param_key_to_adapt]}"
+                                f"Adapting parameter '{key}' for TVP compatibility. "
+                                f"Original list (first 3 items): {value[:3]}"
                             )
-                        # else:
-                        #   logger.debug(f"TaskType: {task_type}, FileID: {file_id}, Parameter '{param_key_to_adapt}' elements are already sequences, no adaptation needed.")
-                    # else:
-                        # logger.debug(f"TaskType: {task_type}, FileID: {file_id}, Parameter '{param_key_to_adapt}' is an empty list, no adaptation.")
-                        # SQLAlchemy typically handles empty lists for IN clauses (e.g., by generating a '1=0' condition).
-                        # If pyodbc/driver still attempts to use TVP for an empty list and causes an error,
-                        # this part might need further adjustment (e.g., skip query or modify SQL based on dialect behavior).
+                            adapted_params[key] = [(item,) for item in value]
+                            _adaptation_done_on_any_key = True
+                        else:
+                            # Value is a list of sequences (e.g., list of tuples), assume it's already TVP-formatted or complex.
+                            adapted_params[key] = value
+                            # logger.debug(f"TaskType: {task_type}, FileID: {file_id}, Parameter '{key}' elements are already sequences or complex, using as is.")
+                    else:
+                        # Not a list, or an empty list. Pass as is.
+                        # SQLAlchemy/pyodbc usually handles empty lists for IN clauses correctly (e.g., by generating 1=0).
+                        adapted_params[key] = value
+                
+                # Log parameters carefully to avoid overly verbose logs if params are huge.
+                # This creates a version of params for logging where long lists are truncated.
+                params_to_log = {
+                    k: (f"{str(v[:3])[:-1]}... (total {len(v)})]" if isinstance(v, list) and len(v) > 3 else v)
+                    for k, v in adapted_params.items()
+                }
+                logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}. SQL: {sql}. Final Params (sample): {params_to_log}")
+                
+                stmt = text(sql)
+                result = await conn.execute(stmt, adapted_params) 
+                
+                await conn.commit()
+                rowcount = result.rowcount if result is not None and hasattr(result, 'rowcount') and result.rowcount is not None else 0
+                logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
+                return {"rowcount": rowcount}
+            
+            except SQLAlchemyError as e:
+                # For logging, show original and what adapted_params became if adaptation was attempted.
+                adapted_params_display_for_error: str
+                original_params_display_for_error: str
 
-            logger.debug(f"Executing UPDATE/INSERT for FileID {file_id}: {sql}, adapted_params: {adapted_params}")
-            result = await conn.execute(text(sql), adapted_params) # Use adapted_params
-            await conn.commit()
-            # Ensure rowcount is an int, default to 0 if not available (though .rowcount should be there for UPDATEs)
-            rowcount = result.rowcount if result is not None and result.rowcount is not None else 0
-            logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
-            return {"rowcount": rowcount}
-        except SQLAlchemyError as e:
-            # Log with both original and potentially adapted params for better diagnostics
-            current_adapted_params = adapted_params if 'adapted_params' in locals() and adapted_params != original_params else "N/A (same as original or not adapted)"
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Database error executing UPDATE/INSERT. SQL: {sql}, Original Params: {original_params}, "
-                f"Adapted Params: {current_adapted_params}, Error: {str(e)}",
-                exc_info=True # Include full traceback for the SQLAlchemyError
-            )
-            raise # Re-raise to be handled by the callback's error handling (which includes nack/requeue)
-        except Exception as e: # Catch other unexpected errors during this execution phase
-            current_adapted_params = adapted_params if 'adapted_params' in locals() and adapted_params != original_params else "N/A (same as original or not adapted)"
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Unexpected error executing UPDATE/INSERT. SQL: {sql}, Original Params: {original_params}, "
-                f"Adapted Params: {current_adapted_params}, Error: {str(e)}",
-                exc_info=True
-            )
-            raise
+                if isinstance(original_params, dict):
+                    original_params_display_for_error = str({
+                        k: (f"{str(v[:3])[:-1]}... (total {len(v)})]" if isinstance(v, list) and len(v) > 3 else v)
+                        for k, v in original_params.items()
+                    })
+                else:
+                    original_params_display_for_error = str(original_params)
+
+                if 'adapted_params' in locals() and isinstance(adapted_params, dict): # Check if adapted_params was formed
+                    if _adaptation_done_on_any_key:
+                        adapted_params_display_for_error = str({
+                            k: (f"{str(v[:3])[:-1]}... (total {len(v)})]" if isinstance(v, list) and len(v) > 3 else v)
+                            for k, v in adapted_params.items()
+                        })
+                    else:
+                        adapted_params_display_for_error = "N/A (no adaptation criteria met, params effectively same as original)"
+                else: 
+                    adapted_params_display_for_error = "N/A (error before full adaptation or params not a dict)"
+                
+                logger.error(
+                    f"TaskType: {task_type}, FileID: {file_id}, "
+                    f"Database error executing UPDATE/INSERT. SQL: {sql}, Original Params (sample): {original_params_display_for_error}, "
+                    f"Adapted Params (sample): {adapted_params_display_for_error}, Error: {str(e)}",
+                    exc_info=True
+                )
+                raise
+            except Exception as e: # Catch other unexpected errors
+                adapted_params_display_for_error_generic: str
+                original_params_display_for_error_generic: str
+
+                if isinstance(original_params, dict):
+                    original_params_display_for_error_generic = str({
+                        k: (f"{str(v[:3])[:-1]}... (total {len(v)})]" if isinstance(v, list) and len(v) > 3 else v)
+                        for k, v in original_params.items()
+                    })
+                else:
+                    original_params_display_for_error_generic = str(original_params)
+
+                if 'adapted_params' in locals() and isinstance(adapted_params, dict):
+                    adapted_params_display_for_error_generic = str({
+                        k: (f"{str(v[:3])[:-1]}... (total {len(v)})]" if isinstance(v, list) and len(v) > 3 else v)
+                        for k, v in adapted_params.items() 
+                    })
+                else:
+                    adapted_params_display_for_error_generic = "N/A (params state unknown or error before full adaptation)"
+                
+                logger.error(
+                    f"TaskType: {task_type}, FileID: {file_id}, "
+                    f"Unexpected error executing UPDATE/INSERT. SQL: {sql}, Original Params (sample): {original_params_display_for_error_generic}, "
+                    f"Adapted Params (sample): {adapted_params_display_for_error_generic}, Error: {str(e)}",
+                    exc_info=True
+                )
+                raise        
+    
     async def execute_select(self, task, conn, logger):
         file_id = task.get("file_id")
         select_sql = task.get("sql")
