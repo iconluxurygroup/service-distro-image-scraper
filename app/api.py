@@ -943,8 +943,12 @@ class TestableSearchResult(BaseModel):
 class TestInsertResultsRequest(BaseModel):
     results: List[TestableSearchResult]
 
-@router.post("/test-insert-results/{file_id}", tags=["Testing"])
-async def api_test_insert_search_results(file_id: str, payload: TestInsertResultsRequest, background_tasks: Optional[BackgroundTasks] = None):
+@router.post("/test-insert-results/{file_id}", tags=["Testing"], response_model=None)
+async def api_test_insert_search_results(
+    file_id: str,
+    payload: TestInsertResultsRequest,
+    background_tasks: BackgroundTasks,
+):
     job_run_id = f"test_insert_results_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
     logger.info(f"[{job_run_id}] API Call: Test insert results for FileID '{file_id}'. Count: {len(payload.results)}")
