@@ -1008,9 +1008,10 @@ async def api_run_no_image_sort(file_id: str,  background_tasks: BackgroundTasks
 
 @router.post("/process-images-ai/{file_id}", tags=["AI"], response_model=None)
 async def api_run_ai_image_processing(
-    file_id: str, entry_ids: Optional[List[int]] = Query(None), step: int = Query(0),
+    file_id: str, 
+    background_tasks: BackgroundTasks,
+    entry_ids: Optional[List[int]] = Query(None), step: int = Query(0),
     limit: int = Query(5000, ge=1), concurrency: int = Query(10, ge=1, le=50), # Added le for concurrency
-    background_tasks: BackgroundTasks
 ):
     job_run_id = f"ai_processing_{file_id}_{uuid.uuid4().hex[:6]}"
     job_result = await run_job_with_logging(
