@@ -916,7 +916,7 @@ async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query
 async def api_process_restart_job(
     file_id: str, entry_id: Optional[int] = Query(None),
     use_all_variations: bool = Query(False), num_workers_hint: int = Query(4, ge=1, le=cpu_count() * 2), # Max based on CPU
-    background_tasks: Optional[BackgroundTasks] = None
+    background_tasks: BackgroundTasks
 ):
     job_run_id = f"restart_job_{file_id}_{entry_id or 'auto'}_{'allvars' if use_all_variations else 'stdvars'}_{num_workers_hint}w"
     job_result = await run_job_with_logging(
