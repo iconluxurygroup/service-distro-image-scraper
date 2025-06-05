@@ -1184,7 +1184,7 @@ async def api_populate_results_from_warehouse(
                     "EntryID": scraper_entry_id,
                     "ImageUrl": image_url_from_warehouse, "ImageDesc": image_desc,
                     "ImageSource": image_actual_source, "ImageUrlThumbnail": image_url_from_warehouse,
-                    IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN: 0, 
+                    IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN: 1,  # Changed from 0 to 1 as per request
                     IMAGE_SCRAPER_RESULT_SOURCE_TYPE_COLUMN: 'Warehouse',
                 })
             except Exception as e_loop:
