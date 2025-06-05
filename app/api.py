@@ -1205,26 +1205,33 @@ async def api_populate_results_from_warehouse(
                 inserted_results_count = len(results_to_batch_insert)
                 logger.info(f"[{job_specific_id}] Successfully enqueued/processed batch insertion of {inserted_results_count} results from warehouse.")
                 entry_ids_processed = [res["EntryID"] for res in results_to_batch_insert]
-                if entry_ids_processed:
-                    update_scraper_status_sql_batch_str = f"""
-                        UPDATE {SCRAPER_RECORDS_TABLE_NAME}
-                        SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED},
-                            {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
-                        WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :entry_ids_list;
-                    """
-                    batch_update_params = {"entry_ids_list": tuple(entry_ids_processed)}
-                    status_update_correlation_id = str(uuid.uuid4())
-                    await enqueue_db_update(
-                        file_id=job_specific_id, # Use job_specific_id for this task's context
-                        sql=update_scraper_status_sql_batch_str,
-                        params=batch_update_params,
-                        task_type="batch_update_scraper_status_warehouse_complete",
-                        producer_instance=local_producer, # Use the locally acquired producer
-                        correlation_id=status_update_correlation_id,
-                        logger_param=logger
-                    )
-                    tasks_enqueued_for_scraper_status_update = 1
-                    logger.info(f"[{job_specific_id}] Enqueued batch status update for {len(entry_ids_processed)} scraper records. CorrelationID: {status_update_correlation_id}")
+                            # Define entry_ids_processed based on the successfully inserted results
+            entry_ids_processed = [res["EntryID"] for res in results_to_batch_insert]
+
+            if entry_ids_processed:
+                update_scraper_status_sql_batch_str = f"""
+                    UPDATE {SCRAPER_RECORDS_TABLE_NAME}
+                    SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED},
+                        {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
+                    WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :entry_ids_list;
+                """
+                # Ensure entry_ids_list is a list for the IN clause
+                batch_update_params = {"entry_ids_list": entry_ids_processed}
+                
+                status_update_correlation_id = str(uuid.uuid4())
+                
+                logger.info(f"[{job_specific_id}] Enqueuing scraper status update for {len(entry_ids_processed)} EntryIDs. Correlation ID: {status_update_correlation_id}")
+
+                await enqueue_db_update(
+                    file_id=job_specific_id, # Use job_specific_id for this task's context
+                    sql=update_scraper_status_sql_batch_str,
+                    params=batch_update_params,
+                    task_type="batch_update_scraper_status_warehouse_complete",
+                    producer_instance=local_producer, # Use the locally acquired producer
+                    correlation_id=status_update_correlation_id,
+                    logger_param=logger # Assuming logger_param is the intended parameter name in enqueue_db_update
+                )
+                tasks_enqueued_for_scraper_status_update = 1 # If you need to track this
             else:
                 logger.error(f"[{job_specific_id}] Batch insertion of warehouse results into {IMAGE_SCRAPER_RESULT_TABLE_NAME} reported failure.")
         
