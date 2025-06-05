@@ -1120,7 +1120,14 @@ async def api_sort_by_ai_relevance(
         return {"status": "tasks_enqueued", "message": final_msg, "log_url": final_log_url}
     except ValueError: err_msg=f"Invalid FileID: {file_id}"; logger.error(f"[{job_run_id}] {err_msg}"); await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=400, detail=err_msg)
     except Exception as e_main: logger.critical(f"[{job_run_id}] Critical error in AI relevance sort API: {e_main}", exc_info=True); crit_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id); raise HTTPException(status_code=500, detail=f"Internal server error. Job Run ID: {job_run_id}. Log: {crit_log_url}")
-
+@router.get("/sort-by-search/{file_id}", tags=["Sorting"])
+async def api_match_and_search_sort(file_id: str):
+    logger, log_filename = setup_job_logger(job_id=file_id, console_output=True)
+    result = await run_job_with_logging(update_sort_order, file_id)
+    if result["status_code"] != 200:
+        log_public_url = await upload_log_file(file_id, log_filename, logger)
+        raise HTTPException(status_code=result["status_code"], detail=result["message"])
+    return result
 @router.post("/reset-step1-status/{file_id}", tags=["Database"])
 async def api_reset_step1_status_for_file(file_id: str):
     job_run_id = f"reset_step1_{file_id}_{uuid.uuid4().hex[:6]}"
