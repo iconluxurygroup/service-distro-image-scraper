@@ -905,12 +905,28 @@ async def api_populate_results_from_warehouse(
                 num_results_enqueued = len(results_to_insert_payload)
                 logger.info(f"[{job_run_id}] Successfully enqueued {num_results_enqueued} warehouse results.")
                 if processed_entry_ids_for_status_update:
+                    # This is your list of unique integer IDs, e.g., [134517, 134518]
                     unique_eids_raw = list(set(processed_entry_ids_for_status_update))
+
+                    eids_list_for_query = [(eid,) for eid in unique_eids_raw]
+
                     status_update_sql = f"UPDATE {SCRAPER_RECORDS_TABLE_NAME} SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED}, {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE() WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :eids_list;"
-                    await enqueue_db_update(file_id=job_run_id, sql=status_update_sql, params={"eids_list": unique_eids}, task_type="batch_update_scraper_status_warehouse_populated", correlation_id=str(uuid.uuid4()), logger_param=logger)
-                    num_status_updates_enqueued = len(unique_eids)
+                    
+                    await enqueue_db_update(
+                        file_id=job_run_id, 
+                        sql=status_update_sql, 
+                        params={"eids_list": eids_list_for_query},  # Use the transformed list
+                        task_type="batch_update_scraper_status_warehouse_populated", 
+                        correlation_id=str(uuid.uuid4()), 
+                        logger_param=logger
+                    )
+                    
+                    # The number of updates is based on the count of unique raw IDs
+                    num_status_updates_enqueued = len(unique_eids_raw) 
                     logger.info(f"[{job_run_id}] Enqueued status update for {num_status_updates_enqueued} scraper records.")
-            else: logger.error(f"[{job_run_id}] `insert_search_results` reported failure to enqueue warehouse results.")
+            else: 
+                logger.error(f"[{job_run_id}] `insert_search_results` reported failure to enqueue warehouse results.")
+
         final_message = (f"Warehouse-to-Result for FileID '{file_id}': Matched={num_scraper_records_matched}, Prepared={num_results_prepared}, EnqueuedInsertions={num_results_enqueued}, EnqueuedStatusUpdates={num_status_updates_enqueued}, PrepErrors={num_data_prep_errors}.")
         logger.info(f"[{job_run_id}] {final_message}")
         final_log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
