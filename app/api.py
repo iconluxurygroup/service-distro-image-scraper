@@ -912,7 +912,7 @@ async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query
         crit_err_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
         raise HTTPException(status_code=500, detail=f"Internal server error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}")
 
-@router.post("/restart-job/{file_id}", tags=["Processing"])
+@router.post("/restart-job/{file_id}", tags=["Processing"], response_model=None)
 async def api_process_restart_job(
     file_id: str, entry_id: Optional[int] = Query(None),
     use_all_variations: bool = Query(False), num_workers_hint: int = Query(4, ge=1, le=cpu_count() * 2), # Max based on CPU
