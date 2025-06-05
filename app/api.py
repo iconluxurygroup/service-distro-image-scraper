@@ -112,7 +112,7 @@ STATUS_PENDING_GOOGLE_SEARCH = 3 # Ready for Google Search (e.g., if warehouse h
 STATUS_GOOGLE_SEARCH_COMPLETE = 4 # Google search done and results populated
 # --- End Constants ---
 
-app = FastAPI(title="Super Scraper API", version=VERSION) # VERSION should be like "6.0.0"
+app = FastAPI(title="super_scraper", version=VERSION) # VERSION should be like "6.0.0"
 
 # Setup default logger for the application itself
 default_logger = logging.getLogger("super_scraper_api")
