@@ -93,16 +93,6 @@ async def batch_vision_reason(
 
         for entry_id in entry_ids_to_process:
             async with async_engine.connect() as conn:
-                result = await conn.execute(
-                    text("""
-                        SELECT ProductBrand, ProductModel, ProductColor, ProductCategory
-                        FROM utb_ImageScraperRecords
-                        WHERE FileID = :file_id AND EntryID = :entry_id
-                    """),
-                    {"file_id": file_id, "entry_id": entry_id}
-                )
-                row = result.fetchone()
-                result.close()
                 product_brand = product_model = product_color = product_category = ''
                 if row:
                     product_brand, product_model, product_color, product_category = row
