@@ -914,11 +914,11 @@ async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query
 
 @router.post("/restart-job/{file_id}", tags=["Processing"], response_model=None)
 async def api_process_restart_job(
-
-    file_id: str, 
+    file_id: str,
+    background_tasks: BackgroundTasks, 
     entry_id: Optional[int] = Query(None),
-    use_all_variations: bool = Query(False), num_workers_hint: int = Query(4, ge=1, le=cpu_count() * 2),
-    background_tasks: Optional[BackgroundTasks] = None,
+    use_all_variations: bool = Query(False),
+    num_workers_hint: int = Query(4, ge=1, le=cpu_count() * 2),
 ):
     
     job_run_id = f"restart_job_{file_id}_{entry_id or 'auto'}_{'allvars' if use_all_variations else 'stdvars'}_{num_workers_hint}w"
@@ -929,7 +929,8 @@ async def api_process_restart_job(
     )
     if job_result["status_code"] != 200:
         raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
-    return {"status_code": 200, "message": f"Job restart for FileID '{file_id}' initiated.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
+    return {"status_code": 200, "message": f"Job restart for FileID '{file_id}' initiated.", "details": job_result.get("data"), "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
+
 
 class TestableSearchResult(BaseModel):
     EntryID: int
