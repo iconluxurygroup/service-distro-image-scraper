@@ -1761,4 +1761,4 @@ async def api_test_insert_results(
         # logger.info(f"[{job_id_test_insert}] API TestInsert: Disposed database engine for FileID {file_id}")
 
 
-app.include_router(router, prefix="/api/v5")
+app.include_router(router, prefix="/api/v6")
