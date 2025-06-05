@@ -1006,11 +1006,11 @@ async def api_run_no_image_sort(file_id: str,  background_tasks: BackgroundTasks
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
     return {"status_code": 200, "message": "No-image sort job completed.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
 
-@router.post("/process-images-ai/{file_id}", tags=["AI Processing"])
+@router.post("/process-images-ai/{file_id}", tags=["AI"], response_model=None)
 async def api_run_ai_image_processing(
     file_id: str, entry_ids: Optional[List[int]] = Query(None), step: int = Query(0),
     limit: int = Query(5000, ge=1), concurrency: int = Query(10, ge=1, le=50), # Added le for concurrency
-    background_tasks: Optional[BackgroundTasks] = None
+    background_tasks: BackgroundTasks
 ):
     job_run_id = f"ai_processing_{file_id}_{uuid.uuid4().hex[:6]}"
     job_result = await run_job_with_logging(
