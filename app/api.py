@@ -1351,7 +1351,7 @@ async def api_clear_ai_json(
         raise HTTPException(status_code=500, detail=f"Internal server error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}")
 
 
-@router.post("/restart-job/{file_id}", tags=["Processing v6"])
+@router.post("/restart-job/{file_id}", tags=["Processing"])
 async def api_process_restart_job( # Renamed function slightly for clarity
     file_id: str, 
     entry_id: Optional[int] = Query(None, description="Optional EntryID to start processing from. If None, determined automatically."),
