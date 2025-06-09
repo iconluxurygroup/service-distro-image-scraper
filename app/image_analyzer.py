@@ -31,25 +31,19 @@ YOLO_MODEL = None
 FASHION_LABELS = []
 CATEGORY_MAPPING = {}
 IMAGE_HASH_THRESHOLD = 5 # Hamming distance; lower is more strict.
+CR_HASH_SIMILARITY_THRESHOLD = 0.75
 
 async def initialize_models_and_config():
     """Initializes models and loads configurations. Run once at startup."""
     global YOLO_MODEL, FASHION_LABELS, CATEGORY_MAPPING
-    if YOLO_MODEL: # Prevent re-initialization
-        return
+    if YOLO_MODEL: return
         
     default_logger.info("Initializing YOLOv8 model (yolov8s-seg.pt)...")
     try:
         YOLO_MODEL = YOLO("yolov8s-seg.pt")
-        
-        # >>> FIX 1: EXPLICITLY FUSE THE MODEL ONCE AT STARTUP
-        # This performs the Conv+BN fusion optimization immediately and prevents
-        # it from being re-attempted (and failing) on subsequent prediction calls.
         default_logger.info("Fusing YOLOv8 model for performance optimization...")
         YOLO_MODEL.model.fuse()
         default_logger.info("YOLOv8 model initialized and fused successfully.")
-        # <<< END OF FIX 1
-        
     except Exception as e:
         default_logger.error(f"Fatal: YOLO model initialization failed: {e}", exc_info=True)
         raise SystemExit("Could not initialize the primary vision model.") from e
@@ -70,9 +64,8 @@ if __name__ != "__main__":
 
 
 # --- Internal Helper Functions ---
-
 def _calculate_image_metrics(image_bytes: bytes) -> Dict[str, Any]:
-    """Calculates perceptual hash and sharpness for an image in a non-blocking thread."""
+    """Calculates crop-resistant hash and sharpness for an image."""
     try:
         img = Image.open(BytesIO(image_bytes))
         if 'A' in img.getbands() or 'a' in img.getbands():
@@ -80,31 +73,31 @@ def _calculate_image_metrics(image_bytes: bytes) -> Dict[str, Any]:
         else:
             img = img.convert('RGB')
 
-        phash = imagehash.phash(img)
+        # >>> CHANGE 2: Calculate crop_resistant_hash instead of phash
+        # These parameters are a good starting point. Higher segmentation_image_size
+        # can find smaller details but is slower.
+        cr_hash = imagehash.crop_resistant_hash(
+            img, min_segment_size=500, segmentation_image_size=1000
+        )
+
+        # Sharpness calculation remains the same
         gray_img = img.convert('L')
         laplacian_kernel = ImageFilter.Kernel((3, 3), [0, 1, 0, 1, -4, 1, 0, 1, 0], scale=1, offset=0)
         laplacian_filtered_img = gray_img.filter(laplacian_kernel)
         sharpness = np.array(laplacian_filtered_img).var()
         
-        return {"phash": phash, "sharpness": sharpness, "success": True}
+        return {"cr_hash": cr_hash, "sharpness": sharpness, "success": True}
     except Exception as e:
         default_logger.warning(f"Could not calculate image metrics: {e}", exc_info=True)
-        return {"phash": None, "sharpness": 0.0, "success": False}
-
+        return {"cr_hash": None, "sharpness": 0.0, "success": False}
 
 async def _preprocess_image(record: Dict, session: aiohttp.ClientSession, logger: logging.Logger) -> Dict:
     """Downloads, hashes, and calculates sharpness for a single image record."""
     result_id = record.get("ResultID")
     image_url = record.get("ImageUrl")
-    
     if not image_url:
         return {"record": record, "status": "missing_url"}
-
-    # >>> FIX 2: MAKE IMAGE DOWNLOAD MORE ROBUST
-    # The try/except block is widened to catch any Exception, including asyncio.TimeoutError.
-    # This prevents one slow or failing URL from crashing the entire batch.
     try:
-        # Increased timeout for more tolerance
         timeout = aiohttp.ClientTimeout(total=45)
         async with session.get(image_url, timeout=timeout) as response:
             response.raise_for_status()
@@ -112,7 +105,6 @@ async def _preprocess_image(record: Dict, session: aiohttp.ClientSession, logger
     except Exception as e:
         logger.warning(f"ResultID {result_id}: Failed to download image from {image_url}: {type(e).__name__} - {e}")
         return {"record": record, "status": "download_failed"}
-    # <<< END OF FIX 2
 
     metrics = await asyncio.to_thread(_calculate_image_metrics, image_data)
     if not metrics["success"]:
@@ -122,9 +114,34 @@ async def _preprocess_image(record: Dict, session: aiohttp.ClientSession, logger
         "record": record,
         "status": "success",
         "image_data": image_data,
-        "phash": metrics["phash"],
+        "cr_hash": metrics["cr_hash"], # Changed from "phash"
         "sharpness": metrics["sharpness"],
     }
+    
+def _are_cr_hashes_similar(hash1_str: str, hash2_str: str, threshold: float) -> bool:
+    """Compares two crop-resistant hashes stored as strings."""
+    if not hash1_str or not hash2_str:
+        return False
+    try:
+        # Recreate the multihash objects from their string representations
+        h1 = imagehash.hex_to_multihash(hash1_str)
+        h2 = imagehash.hex_to_multihash(hash2_str)
+
+        # .hash_diff returns (matches, total_segments_in_h1, total_segments_in_h2)
+        matches, seg1, seg2 = h1.hash_diff(h2)
+
+        # Don't compare empty hashes
+        if seg1 == 0 or seg2 == 0:
+            return False
+
+        # Calculate similarity as the ratio of matches to the number of segments in the SMALLER image.
+        # This correctly identifies if a small image is contained within a larger one.
+        similarity_score = matches / min(seg1, seg2)
+        
+        return similarity_score >= threshold
+    except Exception as e:
+        default_logger.error(f"Error comparing crop-resistant hashes: {e}")
+        return False
 
 def _run_yolo_analysis(image_bytes: bytes) -> Dict[str, Any]:
     """Processes an image with YOLOv8 to detect objects."""
@@ -207,13 +224,9 @@ async def _perform_full_ai_analysis(image_data: bytes, record: Dict, logger: log
 # --- PRIMARY PUBLIC FUNCTION ---
 
 async def process_batch_for_relevance(records: List[Dict], logger: logging.Logger) -> List[Tuple[str, bool, str]]:
-    """
-    Analyzes a batch of image records with intelligent deduplication and ranking.
-    Every record will have a result, ensuring nothing is overlooked.
-    """
     logger.info(f"Starting batch process for {len(records)} records.")
-    all_final_results = [] # Will hold dicts of {"output": tuple, "sort_score": tuple}
-
+    all_final_results = []
+    
     # --- Stage 1: Pre-process all images (Download, Hash, Sharpness) ---
     logger.info("Stage 1: Downloading and pre-processing all images...")
     async with aiohttp.ClientSession() as session:
@@ -224,7 +237,6 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
     failed_items = [item for item in processed_items if item["status"] != "success"]
     logger.info(f"Successfully pre-processed {len(successful_items)} images. {len(failed_items)} failed.")
 
-    # Immediately handle and store failures
     for item in failed_items:
         error_json = json.dumps({"error": f"Pre-processing failed: {item['status']}", "result_id": item['record']['ResultID']})
         all_final_results.append({"output": (error_json, False, "Error: Image could not be processed."), "sort_score": (-1.0, -1.0)})
@@ -232,29 +244,36 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
     if not successful_items:
         logger.warning("No images were successfully pre-processed. Aborting further analysis.")
         if all_final_results:
-            all_final_results.sort(key=lambda x: x["sort_score"], reverse=True)
-            return [res["output"] for res in all_final_results]
+            return [res["output"] for res in sorted(all_final_results, key=lambda x: x["sort_score"], reverse=True)]
         return []
 
     # --- Stage 2: Group images by hash similarity ---
-    logger.info("Stage 2: Grouping images by visual similarity...")
+    logger.info("Stage 2: Grouping images by visual similarity using crop-resistant hash...")
     groups = []
     processed_ids = set()
+    
+    # Convert hash objects to strings once for efficient comparison
+    for item in successful_items:
+        item['cr_hash_str'] = str(item['cr_hash'])
+
     for item in successful_items:
         item_id = item['record']['ResultID']
         if item_id in processed_ids: continue
         
         current_group = [item]
         processed_ids.add(item_id)
+        
+        # >>> CHANGE 4: Use the new comparison logic
         for other_item in successful_items:
             other_id = other_item['record']['ResultID']
             if other_id in processed_ids: continue
-            if (item['phash'] - other_item['phash']) <= IMAGE_HASH_THRESHOLD:
+            
+            # Use the dedicated comparison function
+            if _are_cr_hashes_similar(item['cr_hash_str'], other_item['cr_hash_str'], CR_HASH_SIMILARITY_THRESHOLD):
                 current_group.append(other_item)
                 processed_ids.add(other_id)
         groups.append(current_group)
     logger.info(f"Identified {len(groups)} unique image groups from {len(successful_items)} images.")
-
     # --- Stage 3 & 4: Select Representatives and Analyze Them ---
     logger.info("Stage 3 & 4: Analyzing sharpest representative from each group...")
     representatives = [max(group, key=lambda x: x['sharpness']) for group in groups]
