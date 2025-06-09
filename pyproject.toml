@@ -38,7 +38,7 @@ dependencies = [
     "aio-pika==9.5.5",
     "aiormq==6.8.1",
     "spacy==3.7.5",
-    "ImageHash==3.5",
+    "ImageHash==4.3.2",
 
     
 ]
