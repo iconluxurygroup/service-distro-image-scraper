@@ -14,8 +14,12 @@ from PIL import Image, ImageFilter, ImageFile
 from ultralytics import YOLO
 
 # --- Assumed Project Structure & Configs ---
-from config import GOOGLE_API_KEY
-from common import load_config
+# from config import GOOGLE_API_KEY
+# from common import load_config
+# Faking these for standalone execution
+GOOGLE_API_KEY="YOUR_API_KEY"
+async def load_config(name, fallback, logger, expect_list=False): return fallback
+# --- End Fakes ---
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -34,10 +38,21 @@ IMAGE_HASH_THRESHOLD = 5 # Hamming distance; lower is more strict.
 async def initialize_models_and_config():
     """Initializes models and loads configurations. Run once at startup."""
     global YOLO_MODEL, FASHION_LABELS, CATEGORY_MAPPING
+    if YOLO_MODEL: # Prevent re-initialization
+        return
+        
     default_logger.info("Initializing YOLOv8 model (yolov8s-seg.pt)...")
     try:
         YOLO_MODEL = YOLO("yolov8s-seg.pt")
-        default_logger.info("YOLOv8 model initialized successfully.")
+        
+        # >>> FIX 1: EXPLICITLY FUSE THE MODEL ONCE AT STARTUP
+        # This performs the Conv+BN fusion optimization immediately and prevents
+        # it from being re-attempted (and failing) on subsequent prediction calls.
+        default_logger.info("Fusing YOLOv8 model for performance optimization...")
+        YOLO_MODEL.model.fuse()
+        default_logger.info("YOLOv8 model initialized and fused successfully.")
+        # <<< END OF FIX 1
+        
     except Exception as e:
         default_logger.error(f"Fatal: YOLO model initialization failed: {e}", exc_info=True)
         raise SystemExit("Could not initialize the primary vision model.") from e
@@ -49,7 +64,12 @@ async def initialize_models_and_config():
 
 # Run initialization when module is imported in a server context
 if __name__ != "__main__":
-    asyncio.run(initialize_models_and_config())
+    try:
+        # This check ensures it runs only once per worker process.
+        if not YOLO_MODEL:
+            asyncio.run(initialize_models_and_config())
+    except Exception as e:
+        default_logger.error(f"Could not run async initialization in module scope: {e}")
 
 
 # --- Internal Helper Functions ---
@@ -58,30 +78,14 @@ def _calculate_image_metrics(image_bytes: bytes) -> Dict[str, Any]:
     """Calculates perceptual hash and sharpness for an image in a non-blocking thread."""
     try:
         img = Image.open(BytesIO(image_bytes))
-        
-        # Ensure image has an alpha channel for consistency, then convert to RGB before processing
-        # This handles palette images with transparency warnings.
         if 'A' in img.getbands() or 'a' in img.getbands():
             img = img.convert('RGBA').convert('RGB')
         else:
             img = img.convert('RGB')
 
-        # 1. Perceptual Hash for similarity grouping
         phash = imagehash.phash(img)
-
-        # 2. Sharpness (Laplacian variance) for selecting the best representative
         gray_img = img.convert('L')
-        
-        # --- FIX APPLIED HERE ---
-        # Instead of ImageFilter.LAPLACIAN, we define the kernel manually.
-        # This is the standard 3x3 Laplacian kernel and is compatible with all Pillow versions.
-        laplacian_kernel = ImageFilter.Kernel(
-            (3, 3), 
-            [0, 1, 0, 1, -4, 1, 0, 1, 0], 
-            scale=1, 
-            offset=0
-        )
-        # Apply the filter and calculate the variance
+        laplacian_kernel = ImageFilter.Kernel((3, 3), [0, 1, 0, 1, -4, 1, 0, 1, 0], scale=1, offset=0)
         laplacian_filtered_img = gray_img.filter(laplacian_kernel)
         sharpness = np.array(laplacian_filtered_img).var()
         
@@ -90,22 +94,28 @@ def _calculate_image_metrics(image_bytes: bytes) -> Dict[str, Any]:
         default_logger.warning(f"Could not calculate image metrics: {e}", exc_info=True)
         return {"phash": None, "sharpness": 0.0, "success": False}
 
+
 async def _preprocess_image(record: Dict, session: aiohttp.ClientSession, logger: logging.Logger) -> Dict:
     """Downloads, hashes, and calculates sharpness for a single image record."""
     result_id = record.get("ResultID")
     image_url = record.get("ImageUrl")
     
-    image_data = None
     if not image_url:
         return {"record": record, "status": "missing_url"}
 
+    # >>> FIX 2: MAKE IMAGE DOWNLOAD MORE ROBUST
+    # The try/except block is widened to catch any Exception, including asyncio.TimeoutError.
+    # This prevents one slow or failing URL from crashing the entire batch.
     try:
-        async with session.get(image_url, timeout=20) as response:
+        # Increased timeout for more tolerance
+        timeout = aiohttp.ClientTimeout(total=45)
+        async with session.get(image_url, timeout=timeout) as response:
             response.raise_for_status()
             image_data = await response.read()
-    except aiohttp.ClientError as e:
-        logger.warning(f"ResultID {result_id}: Failed to download image from {image_url}: {e}")
+    except Exception as e:
+        logger.warning(f"ResultID {result_id}: Failed to download image from {image_url}: {type(e).__name__} - {e}")
         return {"record": record, "status": "download_failed"}
+    # <<< END OF FIX 2
 
     metrics = await asyncio.to_thread(_calculate_image_metrics, image_data)
     if not metrics["success"]:
@@ -123,6 +133,7 @@ def _run_yolo_analysis(image_bytes: bytes) -> Dict[str, Any]:
     """Processes an image with YOLOv8 to detect objects."""
     if not YOLO_MODEL: raise RuntimeError("YOLO model not initialized.")
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    # The model is already fused, so this call is now safe in a multi-process environment.
     results = YOLO_MODEL(image, verbose=False)[0]
     
     detected_objects, person_detected = [], False
@@ -218,12 +229,15 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
 
     # Immediately handle and store failures
     for item in failed_items:
-        error_json = json.dumps({"error": f"Pre-processing failed: {item['status']}"})
+        error_json = json.dumps({"error": f"Pre-processing failed: {item['status']}", "result_id": item['record']['ResultID']})
         all_final_results.append({"output": (error_json, False, "Error: Image could not be processed."), "sort_score": (-1.0, -1.0)})
 
     if not successful_items:
         logger.warning("No images were successfully pre-processed. Aborting further analysis.")
-        return [res["output"] for res in all_final_results]
+        if all_final_results:
+            all_final_results.sort(key=lambda x: x["sort_score"], reverse=True)
+            return [res["output"] for res in all_final_results]
+        return []
 
     # --- Stage 2: Group images by hash similarity ---
     logger.info("Stage 2: Grouping images by visual similarity...")
@@ -269,7 +283,6 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
             final_json = analysis_core.copy()
             final_json["result_id"] = member_item['record']['ResultID'] # Ensure correct ID
             
-            # Enrich with group and hash info
             final_json["group_info"] = {
                 "phash": str(member_item['phash']),
                 "is_representative": member_item['record']['ResultID'] == rep_id,
@@ -291,4 +304,3 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
     all_final_results.sort(key=lambda x: x["sort_score"], reverse=True)
     
     return [res["output"] for res in all_final_results]
-
