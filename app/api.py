@@ -399,97 +399,71 @@ async def orchestrate_entry_search(
     logger.info(f"EntryID {entry_id}: Orchestration complete. Total {len(all_valid_results_collected)} valid results for Original='{original_search_term}'.")
     return all_valid_results_collected
 
+# In main.py
+
 async def run_job_with_logging(
     job_func: Callable[..., Any],
     file_id_context: str,
-    **kwargs: Any  # These are the arguments passed from the API endpoint call
+    **kwargs: Any
 ) -> Dict[str, Any]:
-    job_specific_logger, log_file_path = setup_job_logger(job_id=file_id_context, console_output=True)
-    result_payload: Optional[Any] = None
-    debug_info_dict = {"memory_usage_mb": {}, "log_file_server_path": log_file_path, "errors_encountered": []}
-    http_status_code = 500
-    response_message = "Job execution failed unexpectedly."
-    job_function_name = getattr(job_func, '__name__', 'unnamed_job_function')
+    """Wraps a job function with dedicated logging, error handling, and resource monitoring."""
+    job_logger, log_file_path = setup_job_logger(job_id=file_id_context, console_output=True)
+    job_name = getattr(job_func, '__name__', 'unnamed_job')
+    job_logger.info(f"Starting job '{job_name}' for context: {file_id_context}")
+    
+    start_time = time.monotonic()
+    process = psutil.Process()
+    mem_before = process.memory_info().rss / (1024**2)
+    job_logger.debug(f"Memory before job: {mem_before:.2f} MB")
+    
+    result_payload, http_status_code, response_message = None, 500, "Job failed unexpectedly."
+    debug_info = {"log_file_server_path": log_file_path, "errors": []}
 
     try:
-        job_specific_logger.info(f"Starting job '{job_function_name}' for context FileID: {file_id_context}")
-        current_process = psutil.Process()
-        mem_before = round(current_process.memory_info().rss / (1024 * 1024), 2)
-        debug_info_dict["memory_usage_mb"]["before_job"] = mem_before
-        job_specific_logger.debug(f"Memory before job '{job_function_name}': {mem_before:.2f} MB")
-
-        # --- MODIFICATION START ---
-        # Get the names of arguments job_func explicitly accepts (excluding *args, **kwargs conventions)
-        func_explicit_args = set(job_func.__code__.co_varnames[:job_func.__code__.co_argcount])
+        # Prepare arguments for the job function, simply injecting the logger.
+        # This is much more robust than the previous dynamic argument logic.
+        job_args = kwargs.copy()
+        job_args['logger'] = job_logger
         
-        final_job_args = {}
-
-        # 1. Populate final_job_args with arguments job_func explicitly expects,
-        #    prioritizing specific handling by run_job_with_logging or values from incoming kwargs.
-        for arg_name in func_explicit_args:
-            if arg_name == 'logger':
-                final_job_args['logger'] = job_specific_logger
-            elif arg_name == 'file_id' and arg_name not in kwargs:
-                final_job_args['file_id'] = file_id_context
-            elif arg_name == 'file_id_db_str' and arg_name not in kwargs:
-                final_job_args['file_id_db_str'] = file_id_context
-            elif arg_name == 'file_id_db' and arg_name not in kwargs:
-                try:
-                    final_job_args['file_id_db'] = int(file_id_context)
-                except ValueError:
-                    final_job_args['file_id_db'] = file_id_context
-            elif arg_name in kwargs: # Argument is expected and was passed in kwargs
-                final_job_args[arg_name] = kwargs[arg_name]
-            # If an arg is in func_explicit_args but not in kwargs and not handled above,
-            # it implies job_func has a default for it, or it's a programming error in the call.
-            # Python's ** operator will handle this (missing arg error if no default).
-
-        # 2. If job_func accepts arbitrary keyword arguments (has **kwargs in its definition),
-        #    then pass through any remaining kwargs that weren't explicit parameters.
-        if job_func.__code__.co_flags & 0x08:  # CO_VARKEYWORDS flag indicates **kwargs
-            for k, v in kwargs.items():
-                if k not in final_job_args: # Add if not already included
-                    final_job_args[k] = v
-            # Ensure logger is passed even if only **kwargs is present and logger is not an explicit param
-            # (though typically logger would be explicit if needed).
-            if 'logger' not in func_explicit_args and 'logger' not in final_job_args :
-                 final_job_args['logger'] = job_specific_logger
-        # --- MODIFICATION END ---
-
         if asyncio.iscoroutinefunction(job_func):
-            result_payload = await job_func(**final_job_args) # Use filtered args
+            result_payload = await job_func(**job_args)
         else:
-            result_payload = await asyncio.to_thread(job_func, **final_job_args) # Use filtered args
+            # For non-async functions, run in a thread pool.
+            result_payload = await asyncio.to_thread(lambda: job_func(**job_args))
         
-        mem_after = round(current_process.memory_info().rss / (1024 * 1024), 2)
-        debug_info_dict["memory_usage_mb"]["after_job"] = mem_after
-        job_specific_logger.debug(f"Memory after job '{job_function_name}': {mem_after:.2f} MB")
-        if (mem_after - mem_before) > 500: # Threshold in MB
-            job_specific_logger.warning(f"Job '{job_function_name}' memory increase: {(mem_after - mem_before):.2f} MB.")
-
-        job_specific_logger.info(f"Successfully completed job '{job_function_name}' for context FileID: {file_id_context}")
         http_status_code = 200
-        response_message = f"Job '{job_function_name}' for context FileID '{file_id_context}' completed successfully."
+        response_message = f"Job '{job_name}' completed successfully."
+        job_logger.info(response_message)
+
     except Exception as e:
-        job_specific_logger.error(f"Error in job '{job_function_name}' for FileID {file_id_context}: {str(e)}", exc_info=True)
-        debug_info_dict["errors_encountered"].append({"error_message": str(e), "error_type": type(e).__name__, "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()})
-        response_message = f"Job '{job_function_name}' for context FileID {file_id_context} failed: {str(e)}"
-        # Re-raise the original exception type if it's an HTTPException, or keep default 500
-        if isinstance(e, HTTPException):
-            http_status_code = e.status_code
-            # response_message is already set above to include the error from e
-        # else: http_status_code remains 500
+        error_type = type(e).__name__
+        error_message = str(e)
+        # Check for the specific TypeError and provide a more helpful message.
+        if isinstance(e, TypeError) and 'missing' in error_message:
+            job_logger.error(f"CRITICAL CODING ERROR in job '{job_name}': A required argument was not passed. Error: {error_message}", exc_info=True)
+            response_message = f"Job '{job_name}' failed due to a programming error: missing argument. Check server logs."
+        else:
+            job_logger.error(f"Error in job '{job_name}': {error_type} - {error_message}", exc_info=True)
+            response_message = f"Job '{job_name}' failed: {error_message}"
+        
+        debug_info["errors"].append({"type": error_type, "message": error_message})
+        http_status_code = getattr(e, 'status_code', 500) if isinstance(e, HTTPException) else 500
+    
     finally:
-        uploaded_log_url = await upload_log_file(
-            job_id_for_s3_path=file_id_context,
-            local_log_file_path=log_file_path,
-            logger_instance=job_specific_logger,
-            db_record_file_id_to_update=file_id_context 
-        )
-        debug_info_dict["log_s3_url"] = uploaded_log_url
-
-    return {"status_code": http_status_code, "message": response_message, "data": result_payload, "debug_info": debug_info_dict}
-
+        mem_after = process.memory_info().rss / (1024**2)
+        duration = time.monotonic() - start_time
+        job_logger.debug(f"Memory after job: {mem_after:.2f} MB (Change: {mem_after - mem_before:+.2f} MB)")
+        job_logger.info(f"Job '{job_name}' finished in {duration:.2f} seconds.")
+        
+        # Ensure log upload happens even on failure.
+        debug_info["log_s3_url"] = await upload_log_file(file_id_context, log_file_path, job_logger)
+        
+    return {
+        "status_code": http_status_code, 
+        "message": response_message, 
+        "data": result_payload, 
+        "debug_info": debug_info
+    }
 async def run_generate_download_file(
     file_id: str,
     parent_logger: logging.Logger,
@@ -1056,28 +1030,29 @@ async def api_run_no_image_sort(file_id: str,  background_tasks: BackgroundTasks
     if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
     return {"status_code": 200, "message": "No-image sort job completed.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
 
+# In main.py, inside the router section
+
 @router.post("/process-images-ai/{file_id}", tags=["AI"], response_model=None)
 async def api_run_ai_image_processing(
     file_id: str, 
     background_tasks: BackgroundTasks,
-    entry_ids: Optional[List[int]] = Query(None, description="Optional list of EntryIDs to process."),
-    limit: int = Query(10000, ge=1, description="Overall limit of images to process."),
-    concurrency: int = Query(10, ge=1, le=50, description="Number of concurrent AI analysis tasks."),
+    entry_ids: Optional[List[int]] = Query(None),
+    # The 'step' parameter is defined here
+    step: int = Query(0),
+    limit: int = Query(5000, ge=1),
+    concurrency: int = Query(10, ge=1, le=50),
 ):
-    """
-    Initiates a scalable, memory-efficient AI processing job for images associated with a FileID.
-    This process works in batches to handle very large datasets without crashing.
-    """
-    # Use a more descriptive job context ID for logging and tracking
+    """Initiates a scalable, memory-efficient AI processing job for images."""
     job_run_id = f"ai_process_{file_id}_{uuid.uuid4().hex[:6]}"
     
-    # Using run_job_with_logging to handle execution, logging, and error reporting
+    # Using our robust wrapper to handle the execution
     job_result = await run_job_with_logging(
         job_func=batch_vision_reason,
         file_id_context=job_run_id,
-        # Pass all necessary arguments for batch_vision_reason
+        # Pass all necessary arguments for batch_vision_reason as keyword arguments
         file_id=file_id,
         entry_ids=entry_ids,
+        step=step,  # <-- THIS IS THE FIX. The 'step' argument is now passed.
         limit=limit,
         concurrency=concurrency,
         background_tasks=background_tasks
