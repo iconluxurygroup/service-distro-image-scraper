@@ -1060,17 +1060,39 @@ async def api_run_no_image_sort(file_id: str,  background_tasks: BackgroundTasks
 async def api_run_ai_image_processing(
     file_id: str, 
     background_tasks: BackgroundTasks,
-    entry_ids: Optional[List[int]] = Query(None), step: int = Query(0),
-    limit: int = Query(5000, ge=1), concurrency: int = Query(10, ge=1, le=50), # Added le for concurrency
+    entry_ids: Optional[List[int]] = Query(None, description="Optional list of EntryIDs to process."),
+    limit: int = Query(10000, ge=1, description="Overall limit of images to process."),
+    concurrency: int = Query(10, ge=1, le=50, description="Number of concurrent AI analysis tasks."),
 ):
-    job_run_id = f"ai_processing_{file_id}_{uuid.uuid4().hex[:6]}"
+    """
+    Initiates a scalable, memory-efficient AI processing job for images associated with a FileID.
+    This process works in batches to handle very large datasets without crashing.
+    """
+    # Use a more descriptive job context ID for logging and tracking
+    job_run_id = f"ai_process_{file_id}_{uuid.uuid4().hex[:6]}"
+    
+    # Using run_job_with_logging to handle execution, logging, and error reporting
     job_result = await run_job_with_logging(
-        job_func=batch_vision_reason, file_id_context=job_run_id,
-        file_id=file_id, entry_ids=entry_ids, step=step, limit=limit, concurrency=concurrency, background_tasks=background_tasks
+        job_func=batch_vision_reason,
+        file_id_context=job_run_id,
+        # Pass all necessary arguments for batch_vision_reason
+        file_id=file_id,
+        entry_ids=entry_ids,
+        limit=limit,
+        concurrency=concurrency,
+        background_tasks=background_tasks
     )
-    if job_result["status_code"] != 200: raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
-    return {"status_code": 200, "message": "AI image processing job completed.", "details": job_result["data"], "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")}
 
+    if job_result["status_code"] != 200:
+        raise HTTPException(status_code=job_result["status_code"], detail=job_result["message"])
+
+    return {
+        "status_code": 200,
+        "message": f"AI image processing job for FileID '{file_id}' has completed.",
+        "details": job_result.get("data"),
+        "log_url": job_result.get("debug_info", {}).get("log_s3_url", "N/A")
+    }
+    
 @router.get("/get-images-for-excel/{file_id}", tags=["Data Export"])
 async def api_get_images_for_excel_export(file_id: str):
     job_run_id = f"get_excel_images_{file_id}"
