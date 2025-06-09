@@ -290,20 +290,18 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
         rep_id = representative['record']['ResultID']
         analysis_core = rep_analysis_map.get(rep_id, {"success": False, "error": "Representative analysis failed."})
 
-        sort_score = (-1.0, -1.0)
-        if analysis_core.get("success"):
-            scores = analysis_core.get("scores", {})
-            sort_score = (scores.get("relevance", 0.0), scores.get("shot_quality", 0.0))
+        sort_score = (0.0, 0.0)
 
         for member_item in group:
             final_json = analysis_core.copy()
-            final_json["result_id"] = member_item['record']['ResultID'] # Ensure correct ID
+            final_json["result_id"] = member_item['record']['ResultID']
             
+            # >>> CHANGE 5: Update the group_info with the new hash type
             final_json["group_info"] = {
-                "phash": str(member_item['phash']),
+                "hash_type": "crop_resistant_hash",
+                "hash_value": member_item['cr_hash_str'], # Store the string representation
                 "is_representative": member_item['record']['ResultID'] == rep_id,
                 "analysis_source_id": rep_id,
-                "hamming_distance_from_source": int(member_item['phash'] - representative['phash']),
             }
 
             is_fashion = False
