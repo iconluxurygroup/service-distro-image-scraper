@@ -14,12 +14,9 @@ from PIL import Image, ImageFilter, ImageFile
 from ultralytics import YOLO
 
 # --- Assumed Project Structure & Configs ---
-# from config import GOOGLE_API_KEY
-# from common import load_config
-# Faking these for standalone execution
-GOOGLE_API_KEY="YOUR_API_KEY"
-async def load_config(name, fallback, logger, expect_list=False): return fallback
-# --- End Fakes ---
+from config import GOOGLE_API_KEY
+from common import load_config
+
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
