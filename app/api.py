@@ -1037,22 +1037,22 @@ async def api_run_ai_image_processing(
     file_id: str, 
     background_tasks: BackgroundTasks,
     entry_ids: Optional[List[int]] = Query(None),
-    # The 'step' parameter is defined here
-    step: int = Query(0),
+    step: int = Query(0), # Kept for compatibility, not used by new batch_vision_reason
     limit: int = Query(5000, ge=1),
     concurrency: int = Query(10, ge=1, le=50),
 ):
-    """Initiates a scalable, memory-efficient AI processing job for images."""
+    """Initiates a scalable, batch-oriented AI processing job for images."""
     job_run_id = f"ai_process_{file_id}_{uuid.uuid4().hex[:6]}"
     
-    # Using our robust wrapper to handle the execution
+    # This is a generic job runner you have defined, which is a good pattern.
+    # It will call the updated `batch_vision_reason` from `ai_utils.py`.
     job_result = await run_job_with_logging(
         job_func=batch_vision_reason,
         file_id_context=job_run_id,
-        # Pass all necessary arguments for batch_vision_reason as keyword arguments
+        # Pass all necessary arguments for the new batch_vision_reason
         file_id=file_id,
         entry_ids=entry_ids,
-        step=step,  # <-- THIS IS THE FIX. The 'step' argument is now passed.
+        step=step,
         limit=limit,
         concurrency=concurrency,
         background_tasks=background_tasks
