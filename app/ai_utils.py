@@ -1,3 +1,5 @@
+# file: ai_utils.py
+
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
@@ -9,11 +11,10 @@ from sqlalchemy.sql import text
 # --- Project-Specific Imports ---
 from database_config import async_engine
 from db_utils import enqueue_db_update
-from logging_config import setup_job_logger
 from search_utils import update_search_sort_order
 
 # This is the new, consolidated analyzer module from the previous step.
-# Make sure you have created image_analyzer.py and deleted the old image_reason.py.
+# It contains the `analyze_single_image_record` function.
 from image_analyzer import analyze_single_image_record
 
 
@@ -189,15 +190,20 @@ async def batch_vision_reason(
     # --- Post-Processing: Update Sort Order for affected entries ---
     if processed_entry_ids:
         logger.info(f"[{job_id}] AI processing complete. Now updating sort order for {len(processed_entry_ids)} affected entries.")
-        sort_tasks = [
-            update_search_sort_order(
-                file_id=str(file_id_int),
-                entry_id=str(entry_id_to_sort),
-                logger=logger
-            ) for entry_id_to_sort in processed_entry_ids
-        ]
-        await asyncio.gather(*sort_tasks)
-        logger.info(f"[{job_id}] Finished updating sort orders.")
+        try:
+            # We can run these in parallel. update_search_sort_order should be safe for this.
+            sort_tasks = [
+                update_search_sort_order(
+                    file_id=str(file_id_int),
+                    entry_id=str(entry_id_to_sort),
+                    logger=logger
+                ) for entry_id_to_sort in processed_entry_ids
+            ]
+            await asyncio.gather(*sort_tasks)
+            logger.info(f"[{job_id}] Finished enqueuing/running sort order updates.")
+        except Exception as e_sort:
+            logger.error(f"[{job_id}] An error occurred during the post-processing sort step: {e_sort}", exc_info=True)
+
 
     final_message = f"Batch AI processing job finished for FileID {file_id}."
     logger.info(f"[{job_id}] {final_message} Final counts - Success: {total_processed_successfully}, Failed: {total_failed}")
