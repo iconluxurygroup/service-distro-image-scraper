@@ -58,15 +58,36 @@ def _calculate_image_metrics(image_bytes: bytes) -> Dict[str, Any]:
     """Calculates perceptual hash and sharpness for an image in a non-blocking thread."""
     try:
         img = Image.open(BytesIO(image_bytes))
+        
+        # Ensure image has an alpha channel for consistency, then convert to RGB before processing
+        # This handles palette images with transparency warnings.
+        if 'A' in img.getbands() or 'a' in img.getbands():
+            img = img.convert('RGBA').convert('RGB')
+        else:
+            img = img.convert('RGB')
+
         # 1. Perceptual Hash for similarity grouping
         phash = imagehash.phash(img)
+
         # 2. Sharpness (Laplacian variance) for selecting the best representative
         gray_img = img.convert('L')
-        laplacian = np.array(gray_img.filter(ImageFilter.LAPLACIAN))
-        sharpness = laplacian.var()
+        
+        # --- FIX APPLIED HERE ---
+        # Instead of ImageFilter.LAPLACIAN, we define the kernel manually.
+        # This is the standard 3x3 Laplacian kernel and is compatible with all Pillow versions.
+        laplacian_kernel = ImageFilter.Kernel(
+            (3, 3), 
+            [0, 1, 0, 1, -4, 1, 0, 1, 0], 
+            scale=1, 
+            offset=0
+        )
+        # Apply the filter and calculate the variance
+        laplacian_filtered_img = gray_img.filter(laplacian_kernel)
+        sharpness = np.array(laplacian_filtered_img).var()
+        
         return {"phash": phash, "sharpness": sharpness, "success": True}
     except Exception as e:
-        default_logger.warning(f"Could not calculate image metrics: {e}")
+        default_logger.warning(f"Could not calculate image metrics: {e}", exc_info=True)
         return {"phash": None, "sharpness": 0.0, "success": False}
 
 async def _preprocess_image(record: Dict, session: aiohttp.ClientSession, logger: logging.Logger) -> Dict:
