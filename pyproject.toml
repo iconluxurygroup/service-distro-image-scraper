@@ -37,6 +37,7 @@ dependencies = [
     "lxml==5.4.0",
     "aio-pika==9.5.5",
     "aiormq==6.8.1",
+    "spacy==3.7.5",
 
     
 ]

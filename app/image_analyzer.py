@@ -7,13 +7,15 @@ from typing import Dict, List, Tuple
 
 import aiohttp
 import google.generativeai as genai
+import spacy
+import torch
 from PIL import Image, ImageFile
-from ultralytics import YOLO
+from torchvision import models, transforms
 
-from config import GOOGLE_API_KEY # Assumes you have this in your config
-from common import load_config # Assumes you have this helper in common.py
+from config import GOOGLE_API_KEY
+from common import load_config
 
-# Allows PIL to load truncated images, which are common on the web
+# Allows PIL to load truncated or malformed images, a common issue with web images.
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # --- Default Logger ---
@@ -22,98 +24,107 @@ if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# --- Global Models and Configurations (Initialized once) ---
-YOLO_CLS_MODEL = None
-YOLO_SEG_MODEL = None
-CATEGORY_MAPPING = {}
-NON_FASHION_LABELS = []
+# --- Global Models and Configurations (Initialized ONCE at startup) ---
+RESNET_MODEL = None
+NLP_MODEL = None
+IMAGENET_LABELS = {}
 FASHION_LABELS = []
 
 async def initialize_models_and_config():
     """
-    Initializes AI models and loads necessary configurations asynchronously.
-    This function is called once when the module is first imported.
+    Initializes all necessary AI models and configurations. This is a critical
+    step for performance, ensuring models are not reloaded on every API call.
     """
-    global YOLO_CLS_MODEL, YOLO_SEG_MODEL, CATEGORY_MAPPING, NON_FASHION_LABELS, FASHION_LABELS
+    global RESNET_MODEL, NLP_MODEL, IMAGENET_LABELS, FASHION_LABELS
     
-    # --- Initialize YOLO Models ---
+    # 1. Initialize ResNet-50 Model Pre-trained on ImageNet
     try:
-        # Using a smaller, faster model is often sufficient and better for production.
-        default_logger.info("Initializing YOLO models (yolov8s-cls.pt, yolov8s-seg.pt)...")
-        YOLO_CLS_MODEL = YOLO("yolov8s-cls.pt")
-        YOLO_SEG_MODEL = YOLO("yolov8s-seg.pt")
-        default_logger.info("YOLO models initialized successfully.")
+        default_logger.info("Initializing pre-trained ResNet-50 model...")
+        weights = models.ResNet50_Weights.IMAGENET1K_V2
+        RESNET_MODEL = models.resnet50(weights=weights)
+        RESNET_MODEL.eval()  # Set model to evaluation mode for inference
+        # Load the class labels that ImageNet was trained on
+        IMAGENET_LABELS = {i: label.replace("_", " ") for i, label in enumerate(weights.meta["categories"])}
+        default_logger.info("ResNet-50 model initialized successfully.")
     except Exception as e:
-        default_logger.error(
-            f"Fatal: YOLO model initialization failed: {e}. "
-            "Computer vision steps will be skipped. Ensure model files are accessible.",
-            exc_info=True
-        )
+        default_logger.error(f"Fatal: ResNet-50 initialization failed: {e}", exc_info=True)
 
-    # --- Load Configuration from remote/local files ---
-    # Define fallbacks in case remote loading fails.
-    FALLBACK_CATEGORY_MAPPING = {"t-shirt/top": "t-shirt", "trouser": "pants", "pullover": "sweater"}
-    FALLBACK_NON_FASHION_LABELS = ["car", "dog", "chair", "table", "person"]
-    FALLBACK_FASHION_LABELS = ["shirt", "pants", "dress", "shoe", "bag", "hat", "jacket", "coat"]
+    # 2. Initialize spaCy NLP Model for Semantic Similarity
+    try:
+        default_logger.info("Initializing spaCy NLP model (en_core_web_md)...")
+        NLP_MODEL = spacy.load("en_core_web_md")
+        default_logger.info("spaCy NLP model initialized successfully.")
+    except OSError:
+        default_logger.error("spaCy model 'en_core_web_md' not found. Please run: python -m spacy download en_core_web_md")
+    except Exception as e:
+        default_logger.error(f"Fatal: spaCy initialization failed: {e}. Semantic analysis will be skipped.", exc_info=True)
 
-    CATEGORY_MAPPING = await load_config("category_mapping", FALLBACK_CATEGORY_MAPPING, default_logger)
-    NON_FASHION_LABELS = await load_config("non_fashion_labels", FALLBACK_NON_FASHION_LABELS, default_logger, expect_list=True)
+    # 3. Load Application-Specific Fashion Labels
+    FALLBACK_FASHION_LABELS = ["shirt", "pants", "dress", "shoe", "bag", "hat", "jacket", "coat", "sneaker", "boot"]
     FASHION_LABELS = await load_config("fashion_labels", FALLBACK_FASHION_LABELS, default_logger, expect_list=True)
 
-
-# Initialize everything when the module is loaded.
+# Run the initialization when the module is first imported.
 asyncio.run(initialize_models_and_config())
 
 
-async def _download_image(url: str, session: aiohttp.ClientSession, logger: logging.Logger) -> bytes:
+# --- Internal Helper Functions ---
+
+async def _download_image(url: str, session: aiohttp.ClientSession) -> bytes:
     """Downloads image data from a URL."""
-    async with session.get(url, timeout=15) as response:
+    async with session.get(url, timeout=20) as response:
         response.raise_for_status()
         return await response.read()
 
-async def _run_yolo_detection(image_bytes: bytes, logger: logging.Logger) -> Tuple[str, List[float]]:
-    """Runs YOLO classification and segmentation on image bytes."""
-    if not YOLO_CLS_MODEL or not YOLO_SEG_MODEL:
-        return "Computer vision models not available.", []
+def _run_resnet_classification(image_bytes: bytes) -> List[Tuple[str, float]]:
+    """Processes an image with ResNet-50 and returns its top predictions."""
+    if not RESNET_MODEL:
+        raise RuntimeError("ResNet-50 model is not available for classification.")
+    
+    # --- THIS IS THE CORRECTED, COMPLETE IMPLEMENTATION ---
+    # Define the same transformations ImageNet was trained with
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    image_tensor = preprocess(image).unsqueeze(0)  # Add batch dimension
 
-    try:
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    with torch.no_grad():
+        outputs = RESNET_MODEL(image_tensor)
+        probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+
+    # Get the top 5 predictions
+    top5_prob, top5_catid = torch.topk(probabilities, 5)
+    
+    results = []
+    for i in range(top5_prob.size(0)):
+        label = IMAGENET_LABELS[top5_catid[i].item()]
+        confidence = top5_prob[i].item()
+        results.append((label, confidence))
+    return results
+    # --- END OF CORRECTION ---
+
+def _get_semantic_similarity(text1: str, text2: str) -> float:
+    """Calculates semantic similarity between two texts using spaCy."""
+    if not NLP_MODEL or not text1 or not text2:
+        return 0.0
+    
+    # Process text for better comparison (e.g., 't-shirt' -> 't shirt')
+    doc1 = NLP_MODEL(text1.lower().replace("-", " "))
+    doc2 = NLP_MODEL(text2.lower().replace("-", " "))
+    
+    # Ensure vectors are available for comparison
+    if not doc1.has_vector or not doc2.has_vector or doc1.vector_norm == 0 or doc2.vector_norm == 0:
+        return 0.0
         
-        # Run synchronous, CPU-bound YOLO models in a separate thread to not block the event loop.
-        cls_results, seg_results = await asyncio.to_thread(
-            lambda: (YOLO_CLS_MODEL(image, verbose=False), YOLO_SEG_MODEL(image, verbose=False))
-        )
-
-        # Process Classification Result
-        cls_probs = cls_results[0].probs
-        cls_label = cls_results[0].names[cls_probs.top1]
-        cls_conf = float(cls_probs.top1conf)
-        cls_label_processed = CATEGORY_MAPPING.get(cls_label, cls_label) if cls_conf > 0.3 and cls_label not in NON_FASHION_LABELS else "unknown"
-
-        # Process Segmentation Result
-        detected_objects, person_confidences = [], []
-        if seg_results and seg_results[0].masks:
-            for box in seg_results[0].boxes:
-                label = seg_results[0].names[int(box.cls[0])]
-                score = float(box.conf[0])
-                if score < 0.3: continue
-                
-                if label == "person":
-                    person_confidences.append(score)
-                elif label not in NON_FASHION_LABELS:
-                    processed_label = CATEGORY_MAPPING.get(label, label)
-                    detected_objects.append(f"{processed_label} ({score:.2f})")
-        
-        description = f"Primary object: {cls_label_processed}. Other items: {', '.join(detected_objects) if detected_objects else 'None'}."
-        return description, person_confidences
-
-    except Exception as e:
-        logger.error(f"Error during YOLO processing: {e}", exc_info=True)
-        return "CV processing error.", []
+    return doc1.similarity(doc2)
 
 
 async def _call_gemini_api(image_base64: str, prompt: str, logger: logging.Logger) -> Dict:
-    """Calls the Google Gemini API with built-in retries and error handling."""
+    """Calls the Google Gemini API with robust error handling and retries."""
     if not GOOGLE_API_KEY:
         return {"success": False, "features": {"error": "Google API Key not configured."}}
 
@@ -127,8 +138,7 @@ async def _call_gemini_api(image_base64: str, prompt: str, logger: logging.Logge
                 [image_part, prompt],
                 generation_config={"response_mime_type": "application/json"}
             )
-            # Clean the response which might be wrapped in markdown
-            cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+            cleaned_text = response.text.strip().lstrip("```json").rstrip("```").strip()
             return {"success": True, "features": json.loads(cleaned_text)}
         except Exception as e:
             logger.warning(f"Gemini API call attempt {attempt + 1} failed: {e}")
@@ -140,19 +150,8 @@ async def _call_gemini_api(image_base64: str, prompt: str, logger: logging.Logge
 # --- PRIMARY PUBLIC FUNCTION ---
 async def analyze_single_image_record(record: Dict, logger: logging.Logger) -> Tuple[str, bool, str]:
     """
-    Analyzes a single image record from the database. This is the main entry point.
-
-    Orchestrates downloading, computer vision (YOLO), and generative AI (Gemini)
-    to produce a comprehensive analysis encapsulated in a JSON object.
-
-    Args:
-        record: A dictionary representing a single row from `utb_ImageScraperResult`
-                joined with `utb_ImageScraperRecords`.
-        logger: The logger instance for the job.
-
-    Returns:
-        A tuple containing (ai_json_string, is_fashion_boolean, ai_caption_string).
-        On failure, returns a JSON with an error and a descriptive failure caption.
+    Analyzes a single image record using an advanced multi-modal AI pipeline.
+    This is the main entry point to be called by the batch processor.
     """
     result_id = record.get("ResultID")
     image_url = record.get("ImageUrl")
@@ -165,67 +164,66 @@ async def analyze_single_image_record(record: Dict, logger: logging.Logger) -> T
         return failure_response
 
     try:
-        # Step 1: Download the image
+        # Step 1: Download Image
         async with aiohttp.ClientSession() as session:
-            image_data = await _download_image(image_url, session, logger)
-        
+            image_data = await _download_image(image_url, session)
         image_base64 = base64.b64encode(image_data).decode("utf-8")
 
-        # Step 2: Run local Computer Vision (YOLO)
-        cv_description, person_confidences = await _run_yolo_detection(image_data, logger)
+        # Step 2: Computer Vision - ResNet-50 Classification
+        # Run in a separate thread to avoid blocking the async event loop
+        detected_objects = await asyncio.to_thread(_run_resnet_classification, image_data)
+        top_detection = detected_objects[0] if detected_objects else ("unknown", 0.0)
+        
+        # Step 3: Semantic Analysis
+        product_details = {key: record.get(key, "N/A") for key in ["ProductBrand", "ProductCategory", "ProductModel"]}
+        expected_category = product_details["ProductCategory"]
+        category_similarity_score = _get_semantic_similarity(top_detection[0], expected_category)
 
-        # Step 3: Prepare context and prompt for Generative AI (Gemini)
-        product_details = {
-            "brand": record.get("ProductBrand", "N/A"),
-            "category": record.get("ProductCategory", "N/A"),
-            "model": record.get("ProductModel", "N/A"),
-            "color": record.get("ProductColor", "N/A"),
-        }
-
+        # Step 4: Prepare a rich, structured prompt for the Gemini Reasoning Engine
         gemini_prompt = f"""
-        Analyze the provided image based on the following context and return a single, valid JSON object.
-        Context:
-        - Expected Product: Category='{product_details['category']}', Brand='{product_details['brand']}', Model='{product_details['model']}'.
-        - My initial computer vision scan found: "{cv_description}".
+        You are an expert fashion product analyst. Synthesize the following structured data into a final analysis.
+        
+        **CONTEXT:**
+        - **Expected Product:** Category='{expected_category}', Brand='{product_details['ProductBrand']}'.
+        - **Image Analysis (ResNet-50):** My vision model detected the primary object as a '{top_detection[0]}' with {top_detection[1]:.2%} confidence. Other detections: {detected_objects[1:]}.
+        - **Semantic Analysis (NLP Concept):** The detected term '{top_detection[0]}' has a semantic similarity score of {category_similarity_score:.2f} with the expected category '{expected_category}'. A score > 0.65 is a good match.
 
-        Task: Based on all available information, provide your analysis in the following JSON format ONLY:
+        **YOUR TASK:**
+        Return a single, valid JSON object with the following structure. Do NOT include markdown or any other text.
         {{
-          "description": "A crisp, one-sentence marketing description of the product shown.",
-          "extracted_category": "Your best guess for the item's specific category (e.g., 'leather jacket', 'running shoes').",
-          "relevance_score": "A float from 0.0 to 1.0 on how well the image matches the 'Expected Product' context.",
-          "product_shot_quality_score": "A float from 0.0 to 1.0 evaluating if this is a good product photo (high score for clean, solid backgrounds; low score for lifestyle shots or images with people).",
-          "reasoning": "A brief justification for your scores."
+          "description": "A compelling, one-sentence marketing description for the item shown.",
+          "extracted_category": "Your final, most specific category for the item (e.g., 'quilted leather jacket', 'high-top canvas sneakers').",
+          "relevance_score": "A final relevance score (float 0.0-1.0) based on ALL context, especially the semantic score.",
+          "product_shot_quality_score": "A score (float 0.0-1.0) for the image quality. High scores for clean, studio shots on plain backgrounds. Low scores for blurry, dark, or busy lifestyle photos.",
+          "reasoning": "A brief justification for your scores, referencing the provided context."
         }}
         """
 
-        # Step 4: Call Generative AI (Gemini)
+        # Step 5: Call Gemini for the final reasoning step
         gemini_result = await _call_gemini_api(image_base64, gemini_prompt, logger)
 
         if not gemini_result["success"]:
-            # If Gemini fails, we still have the CV results.
-            failure_reason = gemini_result["features"].get("error", "Gemini analysis failed.")
-            ai_json = json.dumps({"error": failure_reason, "cv_description": cv_description, "scores": {}})
+            failure_reason = gemini_result["features"].get("error", "Gemini reasoning failed.")
+            ai_json = json.dumps({"error": failure_reason, "resnet_detection": top_detection[0], "scores": {}})
             return (ai_json, False, f"Error: {failure_reason}")
 
         features = gemini_result["features"]
-
-        # Step 5: Consolidate results and calculate final scores
-        is_fashion = features.get("extracted_category", "unknown").lower() in FASHION_LABELS
+        
+        # Step 6: Consolidate results into the final AiJson payload
+        is_fashion = any(label in features.get("extracted_category", "").lower() for label in FASHION_LABELS)
 
         final_scores = {
             "relevance": round(float(features.get("relevance_score", 0.0)), 2),
             "sentiment": round(float(features.get("product_shot_quality_score", 0.0)), 2),
-            "category_match": 1.0 if is_fashion else 0.1,
+            "category_match": round(category_similarity_score, 2),
         }
 
-        # Step 6: Assemble the final AiJson payload
         final_ai_json = {
             "scores": final_scores,
             "category": features.get("extracted_category", "unknown"),
             "description": features.get("description", "No description available."),
             "reasoning": features.get("reasoning", "No reasoning available."),
-            "cv_detection": cv_description,
-            "person_detected": bool(person_confidences),
+            "cv_detection_summary": f"ResNet-50 Top Match: {top_detection[0]} ({top_detection[1]:.2%})",
             "result_id": result_id,
         }
 
