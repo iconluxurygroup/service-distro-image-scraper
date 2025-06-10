@@ -42,6 +42,11 @@ def load_config_constants(config_url: str, fallback_db_password: Optional[str] =
                 'api_key': config_data.get('dataproxy_settings', {}).get('api_key'),
                 'api_url': config_data.get('dataproxy_settings', {}).get('api_url')
             },
+            'roamingproxy_settings': {
+                'api_key': config_data.get('roamingproxy_settings', {}).get('api_key'),
+                'api_url': config_data.get('roamingproxy_settings', {}).get('api_url')
+            },
+            'proxy_strategy': config_data.get('proxy_strategy', 'round_robin'),
             'google_api_settings': {
                 'api_key': config_data.get('google_api_settings', {}).get('api_key')
             },
