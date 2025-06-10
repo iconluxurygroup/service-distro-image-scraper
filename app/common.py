@@ -141,134 +141,85 @@ async def preprocess_sku(
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     logger = logger or logging.getLogger(__name__)
     brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
-    brand = None
-    model = search_string
-    color = None
-
+    
     if not search_string or not isinstance(search_string, str):
         logger.warning(f"Invalid search string: {search_string}")
-        return search_string, None, search_string, None
+        return search_string, known_brand, search_string, None
 
     search_string_clean = clean_string(search_string).lower()
+    
+    # --- Function to safely process a rule ---
+    def process_rule(rule, current_sku):
+        sku_format = rule.get("sku_format", {})
+        expected_length = rule.get("expected_length", {})
+        
+        base_lengths = expected_length.get("base", [])
+        base_length = int(base_lengths[0]) if base_lengths else 0
+        
+        with_color_lengths = expected_length.get("with_color", [])
+        with_color_length = int(with_color_lengths[0]) if with_color_lengths else 0
 
-    # Normalize known_brand
+        color_ext_lengths = sku_format.get("color_extension", [])
+        color_extension_length = int(color_ext_lengths[0]) if color_ext_lengths else 0
+        
+        color_separator = sku_format.get("color_separator")
+
+        # Try splitting on color_separator if it exists
+        if color_separator and color_separator in current_sku:
+            parts = current_sku.rsplit(color_separator, 1)
+            if len(parts) > 1:
+                base_part, color_part = parts[0].strip(), parts[1].strip()
+                # Check if lengths are plausible
+                if (base_length > 0 and abs(len(base_part) - base_length) <= 2) and \
+                   (color_extension_length > 0 and len(color_part) <= color_extension_length + 2):
+                    return rule.get("full_name"), base_part, color_part
+
+        # Try splitting based on expected lengths if lengths are defined
+        if with_color_length > 0 and len(current_sku) == with_color_length:
+            base_part = current_sku[:-color_extension_length]
+            color_part = current_sku[-color_extension_length:]
+            return rule.get("full_name"), base_part, color_part
+
+        # Check if it matches the base length
+        if base_length > 0 and abs(len(current_sku) - base_length) <= 2:
+            return rule.get("full_name"), current_sku, None
+            
+        return None, None, None
+
+    # --- Main logic ---
+    # 1. If a known_brand is provided, check its rule first.
     if known_brand:
         known_brand_clean = clean_string(known_brand).lower()
         for rule in brand_rules_data.get("brand_rules", []):
             if not rule.get("is_active", False):
                 continue
-            full_name = rule.get("full_name", "")
-            full_name_clean = clean_string(full_name).lower()
-            # Check full_name and aliases
-            aliases = [clean_string(name).lower() for name in rule.get("names", [])]
-            if known_brand_clean == full_name_clean or known_brand_clean in aliases:
-                brand = full_name
-                sku_format = rule.get("sku_format", {})
-                color_separator = sku_format.get("color_separator", "")
-                expected_length = rule.get("expected_length", {})
-                base_length = expected_length.get("base", [0])[0]
-                with_color_length = expected_length.get("with_color", [base_length])[0]
-                color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
-
-                # Try splitting on color_separator
-                if color_separator and color_separator in search_string_clean:
-                    parts = search_string_clean.rsplit(color_separator, 1)
-                    if len(parts) > 1:
-                        base_part = parts[0].strip()
-                        color_part = parts[1].strip()
-                        if (abs(len(base_part) - base_length) <= 2 and
-                            len(color_part) <= color_extension_length + 2):
-                            model = base_part
-                            color = color_part
-                            logger.debug(
-                                f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
-                                f"model '{model}', color '{color}' using separator '{color_separator}'"
-                            )
-                            return search_string, brand, model, color
-                # Assume last color_extension_length chars are color
-                if len(search_string_clean) == with_color_length:
-                    base_part = search_string_clean[:-color_extension_length]
-                    color_part = search_string_clean[-color_extension_length:]
-                    model = base_part
-                    color = color_part
-                    logger.debug(
-                        f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
-                        f"model '{model}', color '{color}' (no separator, assumed color)"
-                    )
+            
+            rule_name_clean = clean_string(rule.get("full_name", "")).lower()
+            aliases_clean = [clean_string(name).lower() for name in rule.get("names", [])]
+            
+            if known_brand_clean == rule_name_clean or known_brand_clean in aliases_clean:
+                brand, model, color = process_rule(rule, search_string_clean)
+                if brand: # Rule successfully parsed the SKU
+                    logger.debug(f"Preprocessed SKU '{search_string}' with known brand '{brand}', model '{model}', color '{color}'")
                     return search_string, brand, model, color
-                # Match base length
-                if abs(len(search_string_clean) - base_length) <= 2:
-                    model = search_string_clean
-                    logger.debug(
-                        f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
-                        f"model '{model}' (no color)"
-                    )
-                    return search_string, brand, model, None
-                # Return known brand even if SKU doesn't match
-                logger.debug(
-                    f"Preprocessed SKU '{search_string}' with known brand '{brand}', "
-                    f"model '{model}', color '{color}' (forced brand match)"
-                )
-                return search_string, brand, model, color
-        logger.warning(f"Known brand '{known_brand}' not found in active brand rules")
-        return search_string, known_brand, model, color
+                # If rule didn't parse it, still return the known brand with the original SKU as model
+                logger.debug(f"Forced brand match for '{known_brand}'. SKU did not match rule structure.")
+                return search_string, rule.get("full_name"), search_string_clean, None
 
-    # Fallback: Try to match brand rules
+        logger.warning(f"Known brand '{known_brand}' not found in active brand rules. Treating as unmatched.")
+
+    # 2. If no known brand or it wasn't found, iterate all rules.
     for rule in brand_rules_data.get("brand_rules", []):
         if not rule.get("is_active", False):
             continue
-        full_name = rule.get("full_name", "")
-        sku_format = rule.get("sku_format", {})
-        color_separator = sku_format.get("color_separator", "")
-        expected_length = rule.get("expected_length", {})
-        base_length = expected_length.get("base", [0])[0]
-        with_color_length = expected_length.get("with_color", [base_length])[0]
-        color_extension_length = int(sku_format.get("color_extension", ["0"])[0])
+        brand, model, color = process_rule(rule, search_string_clean)
+        if brand:
+            logger.debug(f"Preprocessed SKU '{search_string}' to brand '{brand}', model '{model}', color '{color}'")
+            return search_string, brand, model, color
 
-        if not (base_length - 2 <= len(search_string_clean) <= with_color_length + 2):
-            continue
-
-        if color_separator and color_separator in search_string_clean:
-            parts = search_string_clean.rsplit(color_separator, 1)
-            if len(parts) > 1:
-                base_part = parts[0].strip()
-                color_part = parts[1].strip()
-                if (abs(len(base_part) - base_length) <= 2 and
-                    len(color_part) <= color_extension_length + 2):
-                    brand = full_name
-                    model = base_part
-                    color = color_part
-                    logger.debug(
-                        f"Preprocessed SKU '{search_string}' to brand '{brand}', "
-                        f"model '{model}', color '{color}' using separator '{color_separator}'"
-                    )
-                    break
-        elif len(search_string_clean) == with_color_length:
-            base_part = search_string_clean[:-color_extension_length]
-            color_part = search_string_clean[-color_extension_length:]
-            if len(base_part) == base_length:
-                brand = full_name
-                model = base_part
-                color = color_part
-                logger.debug(
-                    f"Preprocessed SKU '{search_string}' to brand '{brand}', "
-                    f"model '{model}', color '{color}' (no separator, assumed color)"
-                )
-                break
-        elif abs(len(search_string_clean) - base_length) <= 2:
-            brand = full_name
-            model = search_string_clean
-            logger.debug(
-                f"Preprocessed SKU '{search_string}' to brand '{brand}', "
-                f"model '{model}' (no color)"
-            )
-            break
-
-    if not brand:
-        logger.warning(f"No brand matched for SKU '{search_string}'")
-        brand = known_brand
-
-    return search_string, brand, model, color
+    # 3. Fallback: No brand matched
+    logger.warning(f"No brand matched for SKU '{search_string}'")
+    return search_string, known_brand, search_string_clean, None
 
 
 
@@ -370,7 +321,6 @@ def normalize_model(model: Any) -> str:
 import logging
 import re
 from typing import Dict, List, Optional
-
 async def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
@@ -388,11 +338,12 @@ async def generate_search_variations(
         "no_color": [],
         "model_alias": []
     }
-    all_variations = set()  # Track unique variations
+    all_variations = set()
 
     if not search_string or not isinstance(search_string, str):
         logger.warning("Empty or invalid search string provided")
         return variations
+
     raw_search_string = search_string
     search_string = clean_string(search_string).lower()
     brand = clean_string(brand).lower() if brand else None
@@ -401,10 +352,9 @@ async def generate_search_variations(
     brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
     logger.debug(f"Input: search_string='{search_string}', brand='{brand}', model='{model}', color='{color}'")
 
-    # Add default variation
     variations["default"].append(raw_search_string)
     all_variations.add(search_string)
-    logger.debug(f"Added default variation: '{search_string}'")
+    logger.debug(f"Added default variation: '{raw_search_string}'")
 
     matched_rule = None
     if brand:
@@ -415,16 +365,26 @@ async def generate_search_variations(
 
     delimiters = [' ', '-', '_']
     if matched_rule:
-        sku_format = matched_rule["sku_format"]
-        article_length = int(sku_format["base"]["article"][0])
-        model_length = int(sku_format["base"]["model"][0])
-        color_length = int(sku_format["color_extension"][0])
-        color_separator = sku_format["color_separator"]
+        # --- Start of SAFE dictionary access ---
+        sku_format = matched_rule.get("sku_format", {})
+        base_format = sku_format.get("base", {})
+        article_lengths = base_format.get("article", ["8"])
+        model_lengths = base_format.get("model", ["7"])
+        color_lengths = sku_format.get("color_extension", ["0"])
+        
+        article_length = int(article_lengths[0]) if article_lengths else 8
+        model_length = int(model_lengths[0]) if model_lengths else 7
+        color_length = int(color_lengths[0]) if color_lengths else 0
+        
+        expected_lengths = matched_rule.get("expected_length", {})
+        with_color_lengths = expected_lengths.get("with_color", [])
+        # --- End of SAFE dictionary access ---
+        
         base = model if model else search_string
         color_part = color if color else ""
 
-        # Handle missing separator
-        if not color_part and len(search_string) == matched_rule["expected_length"]["with_color"][0]:
+        # Handle missing separator based on expected length
+        if not color_part and with_color_lengths and len(search_string) == with_color_lengths[0]:
             base = search_string[:-color_length]
             color_part = search_string[-color_length:]
             logger.debug(f"Assumed color: '{color_part}', base: '{base}'")
@@ -436,7 +396,7 @@ async def generate_search_variations(
             all_variations.add(no_color_var)
         logger.debug(f"Added no_color variation: '{no_color_var}'")
 
-        # Delimiter Variations: Replace color separator
+        # Delimiter Variations
         if color_part:
             for delim in delimiters:
                 delim_var = f"{base}{delim}{color_part}"
@@ -445,43 +405,37 @@ async def generate_search_variations(
                     all_variations.add(delim_var)
             logger.debug(f"Generated delimiter variations: {variations['delimiter_variations']}")
 
-        # Brand Alias: Full name only
-        brand_alias_var = f"{matched_rule['full_name'].lower()} {search_string}"
-        if not brand_alias_var:
-            brand_alias_var = brand
+        # Brand Alias
+        brand_alias_var = f"{matched_rule.get('full_name', brand).lower()} {search_string}"
         if brand_alias_var not in all_variations:
             variations["brand_alias"].append(brand_alias_var)
             all_variations.add(brand_alias_var)
         logger.debug(f"Added brand_alias: '{brand_alias_var}'")
 
-        # Model Alias: Delimiters between article, model, and color
+        # Model Alias
         article = base[:article_length]
         model_part = base[article_length:article_length + model_length]
         for delim1 in delimiters:
-            for delim2 in delimiters:
-                if color_part:
-                    model_alias_var = f"{article}{delim1}{model_part}{delim2}{color_part}"
-                    if model_alias_var not in all_variations:
-                        variations["model_alias"].append(model_alias_var)
-                        all_variations.add(model_alias_var)
-                else:
-                    model_alias_var = f"{article}{delim1}{model_part}"
-                    if model_alias_var not in all_variations:
-                        variations["model_alias"].append(model_alias_var)
-                        all_variations.add(model_alias_var)
+            base_alias = f"{article}{delim1}{model_part}"
+            if base_alias not in all_variations:
+                variations["model_alias"].append(base_alias)
+                all_variations.add(base_alias)
+            if color_part:
+                for delim2 in delimiters:
+                    full_alias = f"{base_alias}{delim2}{color_part}"
+                    if full_alias not in all_variations:
+                        variations["model_alias"].append(full_alias)
+                        all_variations.add(full_alias)
         logger.debug(f"Generated model_alias variations: {variations['model_alias']}")
 
     else:
-        # Fallback: Only default variation
         logger.warning(f"No brand matched for SKU: {search_string}. Using fallback (default only).")
-        # Default already added
-        logger.debug(f"Fallback: Only default variation '{search_string}'")
 
-    # Remove empty categories
-    variations = {k: v for k, v in variations.items() if v}
+    variations = {k: [item.upper() for item in v] for k, v in variations.items() if v}
     total_variations = sum(len(v) for v in variations.values())
-    logger.info(f"Generated total of {total_variations} unique variations for search string '{search_string}': {variations}")
+    logger.info(f"Generated total of {total_variations} unique variations for search string '{raw_search_string}': {variations}")
     return variations
+
 async def create_predefined_aliases(logger: Optional[logging.Logger] = None) -> Dict[str, List[str]]:
     logger = logger or default_logger
     # Load brand_rules using load_config
