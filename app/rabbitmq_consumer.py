@@ -13,10 +13,12 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import psutil
 from typing import Optional, Dict, Any,Union,Tuple
 import aiormq.exceptions
+        # ... (other parts of RabbitMQConsumer class) ...
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+    # In rabbitmq_consumer.py
 
+    # Add this import at the top of your file
+from sqlalchemy import text, bindparam
 import aio_pika
 import json
 import logging
@@ -218,14 +220,7 @@ class RabbitMQConsumer:
             await self.close()
             await asyncio.sleep(5)
             await self.start_consuming()
-        # ... (other parts of RabbitMQConsumer class) ...
 
-    # In rabbitmq_consumer.py
-
-    # Add this import at the top of your file
-    from sqlalchemy import text, bindparam
-
-    # ... inside your RabbitMQConsumer class ...
 
     async def execute_update(self, task: dict, conn, logger: logging.Logger):
         """
