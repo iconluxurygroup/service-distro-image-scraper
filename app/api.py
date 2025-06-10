@@ -38,7 +38,7 @@ from tenacity import (RetryError, before_sleep_log, retry,
 from ai_utils import batch_vision_reason
 from common import (fetch_brand_rules, generate_search_variations,
                     preprocess_sku)
-from config import (BRAND_RULES_URL, DATAPROXY_API_KEY, RABBITMQ_URL,
+from config import (BRAND_RULES_URL, DATAPROXY_API_KEY, RABBITMQ_URL,ROAMINGPROXY_API_URL, ROAMINGPROXY_API_KEY,
                     SEARCH_PROXY_API_URL) # VERSION removed, will define locally
 from database_config import async_engine
 from db_utils import (enqueue_db_update, fetch_last_valid_entry,
@@ -217,7 +217,7 @@ class SearchClient:
         self.proxy_strategy = proxy_strategy
         self.proxies = {
             ProxyType.DATAPROXY: {
-                "endpoint": DATAPROXY_API_URL,
+                "endpoint": SEARCH_PROXY_API_URL,
                 "api_key": DATAPROXY_API_KEY,
                 "headers": {
                     "accept": "application/json",
@@ -439,7 +439,8 @@ async def orchestrate_entry_search(
 
     all_valid_results_collected: List[Dict] = []
     variation_type_priority = ["default", "brand_alias", "model_alias", "delimiter_variations", "color_variations", "no_color", "category_specific"]
-    search_client = SearchClient(endpoint=search_api_endpoint, logger=logger)
+    # CORRECTED LINE: Removed the 'endpoint' argument
+    search_client = SearchClient(logger=logger)
     try:
         for variation_type in variation_type_priority:
             terms_for_type = search_variations_map.get(variation_type, [])
