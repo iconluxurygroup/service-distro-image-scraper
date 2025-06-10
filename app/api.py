@@ -969,20 +969,28 @@ async def api_populate_results_from_warehouse(
                     # This is your list of unique integer IDs, e.g., [134517, 134518]
                     unique_eids_raw = list(set(processed_entry_ids_for_status_update))
 
-                    eids_list_for_query = [(eid,) for eid in unique_eids_raw]
-
-                    status_update_sql = f"UPDATE {SCRAPER_RECORDS_TABLE_NAME} SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED}, {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE() WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :eids_list;"
+                    # --- FIX ---
+                    # 1. REMOVE the incorrect transformation to a list of tuples.
+                    #    We will use `unique_eids_raw` directly.
+                    
+                    # 2. ADD parentheses around the named parameter in the SQL string.
+                    status_update_sql = (
+                        f"UPDATE {SCRAPER_RECORDS_TABLE_NAME} "
+                        f"SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED}, "
+                        f"{SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE() "
+                        f"WHERE {SCRAPER_RECORDS_PK_COLUMN} IN (:eids_list);"  # <-- Note the parentheses
+                    )
                     
                     await enqueue_db_update(
                         file_id=job_run_id, 
                         sql=status_update_sql, 
-                        params={"eids_list": eids_list_for_query},  # Use the transformed list
+                        # 3. PASS THE FLAT LIST directly.
+                        params={"eids_list": unique_eids_raw},
                         task_type="batch_update_scraper_status_warehouse_populated", 
                         correlation_id=str(uuid.uuid4()), 
                         logger_param=logger
                     )
                     
-                    # The number of updates is based on the count of unique raw IDs
                     num_status_updates_enqueued = len(unique_eids_raw) 
                     logger.info(f"[{job_run_id}] Enqueued status update for {num_status_updates_enqueued} scraper records.")
             else: 
