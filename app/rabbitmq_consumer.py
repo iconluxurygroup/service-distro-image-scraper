@@ -220,13 +220,18 @@ class RabbitMQConsumer:
             await self.start_consuming()
         # ... (other parts of RabbitMQConsumer class) ...
 
-    # In your RabbitMQConsumer class
+    # In rabbitmq_consumer.py
+
+    # Add this import at the top of your file
+    from sqlalchemy import text, bindparam
+
+    # ... inside your RabbitMQConsumer class ...
 
     async def execute_update(self, task: dict, conn, logger: logging.Logger):
         """
         Executes a SQL UPDATE/INSERT statement from a task.
-        Relies on SQLAlchemy to correctly handle parameter binding, including expanding
-        lists for "IN" clauses.
+        This version explicitly marks list-based parameters for "IN" clause expansion,
+        ensuring SQLAlchemy generates the correct SQL for the pyodbc driver.
         """
         file_id = task.get("file_id", "unknown")
         task_type = task.get("task_type", "unknown")
@@ -235,48 +240,50 @@ class RabbitMQConsumer:
 
         # --- Basic Validation ---
         if not sql_from_task or not isinstance(params_from_task, dict):
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Invalid task format. "
-                "Missing 'sql' or 'params' is not a dictionary."
-            )
+            logger.error(f"TaskType: {task_type}, FileID: {file_id}, Invalid task format.")
             raise ValueError("Invalid task format: Missing 'sql' or 'params' is not a dictionary.")
 
         try:
-            # --- Execution (The SQLAlchemy Way) ---
-            # 1. Create a TextClause object from the SQL string.
+            # --- THE FIX: Explicitly mark parameters for expansion ---
+
+            # 1. Start with the base text() object.
             stmt = text(sql_from_task)
 
-            # 2. Log what we are about to do, for clarity.
+            # 2. Find any parameters that are lists and mark them for expansion.
+            #    This makes the code robust for any list-based parameter, not just 'eids_list'.
+            list_params = {key for key, value in params_from_task.items() if isinstance(value, list)}
+            
+            if list_params:
+                logger.debug(f"TaskType: {task_type}, FileID: {file_id}, Found list parameters to expand: {list_params}")
+                # Create a dictionary of bindparam objects for the keys that need expansion
+                binds = {key: bindparam(key, expanding=True) for key in list_params}
+                stmt = stmt.bindparams(**binds)
+
+            # 3. Log what we are about to do for clarity.
             params_to_log = {
-                k: (f"{str(v)[:100]}... (total {len(v)})" if isinstance(v, list) and len(str(v)) > 100 else v)
+                k: (f"{str(v)[:100]}...({len(v)})" if isinstance(v, list) and len(str(v)) > 100 else v)
                 for k, v in params_from_task.items()
             }
             logger.debug(
                 f"TaskType: {task_type}, FileID: {file_id}, "
-                f"Executing SQL: {sql_from_task}. "
+                f"Executing SQL: {stmt}. "
                 f"Params: {params_to_log}"
             )
 
-            # 3. Execute directly. SQLAlchemy will expand the 'eids_list' parameter correctly.
+            # 4. Execute. SQLAlchemy will now do the right thing.
             result = await conn.execute(stmt, params_from_task)
-
-            # 4. NOTE: You do NOT need conn.commit() here.
-            # Your callback uses `async with async_engine.begin() as conn:`, which
-            # creates a transaction that automatically commits on success or rolls back on error.
-
+            
             rowcount = result.rowcount if hasattr(result, 'rowcount') else 0
             logger.info(f"TaskType: {task_type}, FileID: {file_id}: DB operation successful, {rowcount} rows affected.")
             
             return {"rowcount": rowcount}
 
         except SQLAlchemyError as e:
-            # The calling function will catch and log this. Re-raise it.
             logger.error(
                 f"TaskType: {task_type}, FileID: {file_id}, Database error on SQL: {sql_from_task}. Error: {e}",
                 exc_info=True
             )
             raise
-
     # ... (rest of RabbitMQConsumer class and main script) ...
     
     async def execute_select(self, task, conn, logger):
