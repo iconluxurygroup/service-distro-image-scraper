@@ -133,35 +133,44 @@ async def load_config(
     url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
     config = await config_cache.load_config(file_key, url, config_name, expect_list, retries, backoff_factor, logger)
     return config if config else fallback
-async def preprocess_sku(
+aasync def preprocess_sku(
     search_string: str,
     known_brand: Optional[str] = None,
     brand_rules: Optional[Dict] = None,
     logger: Optional[logging.Logger] = None
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    """
+    Preprocesses a search string to identify brand, model, and color based on brand rules.
+
+    - If a `known_brand` is provided, it exclusively attempts to process the SKU against that brand's rules.
+    - If the SKU format matches the rule, it's parsed into model/color.
+    - If the format does not match, the brand is "forced," and the original SKU is used as the model.
+    - If the `known_brand` is not in the rules, it is still returned, preventing incorrect matching with other brands.
+    - If no `known_brand` is provided, it iterates through all rules to find a potential match.
+    """
     logger = logger or logging.getLogger(__name__)
     brand_rules_data = brand_rules or await fetch_brand_rules(logger=logger)
-    
+
     if not search_string or not isinstance(search_string, str):
         logger.warning(f"Invalid search string: {search_string}")
         return search_string, known_brand, search_string, None
 
     search_string_clean = clean_string(search_string).lower()
-    
-    # --- Function to safely process a rule ---
+
+    # --- Internal function to safely process a rule ---
     def process_rule(rule, current_sku):
         sku_format = rule.get("sku_format", {})
         expected_length = rule.get("expected_length", {})
-        
+
         base_lengths = expected_length.get("base", [])
         base_length = int(base_lengths[0]) if base_lengths else 0
-        
+
         with_color_lengths = expected_length.get("with_color", [])
         with_color_length = int(with_color_lengths[0]) if with_color_lengths else 0
 
         color_ext_lengths = sku_format.get("color_extension", [])
         color_extension_length = int(color_ext_lengths[0]) if color_ext_lengths else 0
-        
+
         color_separator = sku_format.get("color_separator")
 
         # Try splitting on color_separator if it exists
@@ -170,12 +179,12 @@ async def preprocess_sku(
             if len(parts) > 1:
                 base_part, color_part = parts[0].strip(), parts[1].strip()
                 # Check if lengths are plausible
-                if (base_length > 0 and abs(len(base_part) - base_length) <= 2) and \
-                   (color_extension_length > 0 and len(color_part) <= color_extension_length + 2):
+                if (base_length == 0 or abs(len(base_part) - base_length) <= 2) and \
+                   (color_extension_length == 0 or len(color_part) <= color_extension_length + 2):
                     return rule.get("full_name"), base_part, color_part
 
         # Try splitting based on expected lengths if lengths are defined
-        if with_color_length > 0 and len(current_sku) == with_color_length:
+        if with_color_length > 0 and color_extension_length > 0 and len(current_sku) >= with_color_length:
             base_part = current_sku[:-color_extension_length]
             color_part = current_sku[-color_extension_length:]
             return rule.get("full_name"), base_part, color_part
@@ -183,32 +192,38 @@ async def preprocess_sku(
         # Check if it matches the base length
         if base_length > 0 and abs(len(current_sku) - base_length) <= 2:
             return rule.get("full_name"), current_sku, None
-            
+
         return None, None, None
 
     # --- Main logic ---
-    # 1. If a known_brand is provided, check its rule first.
+
+    # 1. If a known_brand is provided, handle it exclusively and then exit.
     if known_brand:
         known_brand_clean = clean_string(known_brand).lower()
         for rule in brand_rules_data.get("brand_rules", []):
             if not rule.get("is_active", False):
                 continue
-            
+
             rule_name_clean = clean_string(rule.get("full_name", "")).lower()
             aliases_clean = [clean_string(name).lower() for name in rule.get("names", [])]
-            
+
             if known_brand_clean == rule_name_clean or known_brand_clean in aliases_clean:
+                # Found the rule for the known brand.
                 brand, model, color = process_rule(rule, search_string_clean)
                 if brand: # Rule successfully parsed the SKU
                     logger.debug(f"Preprocessed SKU '{search_string}' with known brand '{brand}', model '{model}', color '{color}'")
                     return search_string, brand, model, color
-                # If rule didn't parse it, still return the known brand with the original SKU as model
+
+                # Rule did not parse SKU, but we matched the brand. Force it and return.
                 logger.debug(f"Forced brand match for '{known_brand}'. SKU did not match rule structure.")
                 return search_string, rule.get("full_name"), search_string_clean, None
 
+        # If we finished the loop, the known_brand was provided but NOT found in the rules.
+        # Log it, and return the original brand, preventing fall-through.
         logger.warning(f"Known brand '{known_brand}' not found in active brand rules. Treating as unmatched.")
+        return search_string, known_brand, search_string_clean, None
 
-    # 2. If no known brand or it wasn't found, iterate all rules.
+    # 2. This part is ONLY executed if known_brand was NOT provided.
     for rule in brand_rules_data.get("brand_rules", []):
         if not rule.get("is_active", False):
             continue
@@ -217,10 +232,9 @@ async def preprocess_sku(
             logger.debug(f"Preprocessed SKU '{search_string}' to brand '{brand}', model '{model}', color '{color}'")
             return search_string, brand, model, color
 
-    # 3. Fallback: No brand matched
+    # 3. Fallback: No brand was provided, and no rule matched.
     logger.warning(f"No brand matched for SKU '{search_string}'")
-    return search_string, known_brand, search_string_clean, None
-
+    return search_string, None, search_string_clean, None
 
 
 def clean_string(s: str, preserve_url: bool = False) -> str:
