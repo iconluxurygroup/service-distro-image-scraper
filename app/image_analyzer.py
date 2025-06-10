@@ -30,8 +30,8 @@ if not default_logger.handlers:
 YOLO_MODEL = None
 FASHION_LABELS = []
 CATEGORY_MAPPING = {}
-IMAGE_HASH_THRESHOLD = 5 # Hamming distance; lower is more strict.
-CR_HASH_SIMILARITY_THRESHOLD = 0.75
+# >>> CHANGE 1: Switched from a simple Hamming distance to a similarity ratio for crop-resistant hashes.
+CR_HASH_SIMILARITY_THRESHOLD = 0.75 # Similarity score (0-1); higher is more strict.
 
 async def initialize_models_and_config():
     """Initializes models and loads configurations. Run once at startup."""
@@ -73,7 +73,7 @@ def _calculate_image_metrics(image_bytes: bytes) -> Dict[str, Any]:
         else:
             img = img.convert('RGB')
 
-        # >>> CHANGE 2: Calculate crop_resistant_hash instead of phash
+        # >>> CHANGE 2: Calculate crop_resistant_hash instead of phash.
         # These parameters are a good starting point. Higher segmentation_image_size
         # can find smaller details but is slower.
         cr_hash = imagehash.crop_resistant_hash(
@@ -114,10 +114,11 @@ async def _preprocess_image(record: Dict, session: aiohttp.ClientSession, logger
         "record": record,
         "status": "success",
         "image_data": image_data,
-        "cr_hash": metrics["cr_hash"], # Changed from "phash"
+        "cr_hash": metrics["cr_hash"], # Changed from "phash" to "cr_hash"
         "sharpness": metrics["sharpness"],
     }
-    
+
+# >>> CHANGE 3: New helper function to compare crop-resistant hashes.
 def _are_cr_hashes_similar(hash1_str: str, hash2_str: str, threshold: float) -> bool:
     """Compares two crop-resistant hashes stored as strings."""
     if not hash1_str or not hash2_str:
@@ -263,7 +264,7 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
         current_group = [item]
         processed_ids.add(item_id)
         
-        # >>> CHANGE 4: Use the new comparison logic
+        # >>> CHANGE 4: Use the new comparison logic for crop-resistant hashes.
         for other_item in successful_items:
             other_id = other_item['record']['ResultID']
             if other_id in processed_ids: continue
@@ -290,13 +291,19 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
         rep_id = representative['record']['ResultID']
         analysis_core = rep_analysis_map.get(rep_id, {"success": False, "error": "Representative analysis failed."})
 
-        sort_score = (0.0, 0.0)
+        # >>> CHANGE 5: (BUG FIX) Calculate sort score based on representative's analysis.
+        # This ensures all items in a group are ranked together based on relevance and quality.
+        if analysis_core.get("success"):
+            scores = analysis_core.get("scores", {})
+            sort_score = (scores.get("relevance", 0.0), scores.get("shot_quality", 0.0))
+        else:
+            sort_score = (-1.0, -1.0) # Ensure failed groups are ranked last.
 
         for member_item in group:
             final_json = analysis_core.copy()
             final_json["result_id"] = member_item['record']['ResultID']
             
-            # >>> CHANGE 5: Update the group_info with the new hash type
+            # >>> CHANGE 6: Update the group_info with the new hash type.
             final_json["group_info"] = {
                 "hash_type": "crop_resistant_hash",
                 "hash_value": member_item['cr_hash_str'], # Store the string representation
@@ -311,6 +318,7 @@ async def process_batch_for_relevance(records: List[Dict], logger: logging.Logge
 
             caption = final_json.get("description", "AI-generated description.") if final_json.get("success") else "Error: Analysis failed."
             output_tuple = (json.dumps(final_json), is_fashion, caption)
+            # Assign the group's sort score to each member.
             all_final_results.append({"output": output_tuple, "sort_score": sort_score})
 
     # --- Stage 7: Rank All Results and Return ---
