@@ -133,7 +133,7 @@ async def load_config(
     url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
     config = await config_cache.load_config(file_key, url, config_name, expect_list, retries, backoff_factor, logger)
     return config if config else fallback
-aasync def preprocess_sku(
+async def preprocess_sku(
     search_string: str,
     known_brand: Optional[str] = None,
     brand_rules: Optional[Dict] = None,
