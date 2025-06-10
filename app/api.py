@@ -439,7 +439,6 @@ async def orchestrate_entry_search(
 
     all_valid_results_collected: List[Dict] = []
     variation_type_priority = ["default", "brand_alias", "model_alias", "delimiter_variations", "color_variations", "no_color", "category_specific"]
-    # CORRECTED LINE: Removed the 'endpoint' argument
     search_client = SearchClient(logger=logger)
     try:
         for variation_type in variation_type_priority:
