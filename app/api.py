@@ -203,24 +203,46 @@ async def lifespan(app_instance: FastAPI):
 
 app.lifespan = lifespan
 
+from enum import Enum
+import random
+
+class ProxyType(Enum):
+    DATAPROXY = "dataproxy"
+    ROAMINGPROXY = "roamingproxy"
+
 class SearchClient:
-    def __init__(self, endpoint: str, logger: logging.Logger, max_concurrency: int = 10):
-        self.endpoint = endpoint
+    def __init__(self, logger: logging.Logger, max_concurrency: int = 10, proxy_strategy: str = "round_robin"):
         self.logger = logger
         self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.api_key = DATAPROXY_API_KEY
+        self.proxy_strategy = proxy_strategy
+        self.proxies = {
+            ProxyType.DATAPROXY: {
+                "endpoint": DATAPROXY_API_URL,
+                "api_key": DATAPROXY_API_KEY,
+                "headers": {
+                    "accept": "application/json",
+                    "x-api-key": DATAPROXY_API_KEY,
+                    "Content-Type": "application/json"
+                }
+            },
+            ProxyType.ROAMINGPROXY: {
+                "endpoint": ROAMINGPROXY_API_URL,
+                "api_key": ROAMINGPROXY_API_KEY,
+                "headers": {
+                    "accept": "application/json",
+                    "x-api-key": ROAMINGPROXY_API_KEY,
+                    "Content-Type": "application/json"
+                }
+            }
+        }
         self._aiohttp_session: Optional[aiohttp.ClientSession] = None
         self.regions = ['northamerica-northeast', 'us-east', 'southamerica', 'us-central', 'us-west', 'europe', 'australia', 'asia', 'middle-east']
-        self.request_headers = {
-            "accept": "application/json",
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json"
-        }
+        self._request_counter = 0  # For round-robin strategy
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._aiohttp_session is None or self._aiohttp_session.closed:
             self.logger.debug("Creating new aiohttp.ClientSession for SearchClient.")
-            self._aiohttp_session = aiohttp.ClientSession(headers=self.request_headers)
+            self._aiohttp_session = aiohttp.ClientSession()
         return self._aiohttp_session
 
     async def close(self):
@@ -228,6 +250,18 @@ class SearchClient:
             self.logger.debug("Closing SearchClient's aiohttp.ClientSession.")
             await self._aiohttp_session.close()
             self._aiohttp_session = None
+
+    def _select_proxy(self) -> tuple[ProxyType, dict]:
+        """Selects a proxy based on the configured strategy."""
+        if self.proxy_strategy == "round_robin":
+            proxy_type = ProxyType.DATAPROXY if self._request_counter % 2 == 0 else ProxyType.ROAMINGPROXY
+            self._request_counter += 1
+            return proxy_type, self.proxies[proxy_type]
+        elif self.proxy_strategy == "primary_fallback":
+            return ProxyType.DATAPROXY, self.proxies[ProxyType.DATAPROXY]  # Default to DataProxy
+        else:
+            self.logger.warning(f"Unknown proxy strategy: {self.proxy_strategy}. Defaulting to DataProxy.")
+            return ProxyType.DATAPROXY, self.proxies[ProxyType.DATAPROXY]
 
     @retry(
         stop=stop_after_attempt(3),
@@ -240,28 +274,78 @@ class SearchClient:
             process_info = psutil.Process()
             search_url_google = f"https://www.google.com/search?q={urllib.parse.quote(term)}&tbm=isch"
             current_session = await self._get_session()
+            results = []
 
             for region_idx, region_name in enumerate(self.regions):
-                current_fetch_endpoint = f"{self.endpoint}?region={region_name}"
+                # Select proxy for this request
+                proxy_type, proxy_config = self._select_proxy()
+                current_fetch_endpoint = f"{proxy_config['endpoint']}?region={region_name}"
                 self.logger.info(
                     f"PID {process_info.pid}: Attempting search for term='{term}' (EntryID {entry_id}, Brand='{brand}') "
-                    f"via {current_fetch_endpoint} (Region {region_idx+1}/{len(self.regions)}: {region_name})"
+                    f"via {proxy_type.value} at {current_fetch_endpoint} (Region {region_idx+1}/{len(self.regions)}: {region_name})"
                 )
+
                 try:
                     async with asyncio.timeout(45):
-                        async with current_session.post(current_fetch_endpoint, json={"url": search_url_google}) as response:
+                        async with current_session.post(
+                            current_fetch_endpoint,
+                            json={"url": search_url_google},
+                            headers=proxy_config["headers"]
+                        ) as response:
                             response_text_content = await response.text()
                             response_preview = response_text_content[:250] if response_text_content else "[EMPTY RESPONSE BODY]"
                             self.logger.debug(
-                                f"PID {process_info.pid}: Response from {current_fetch_endpoint} for term='{term}': "
+                                f"PID {process_info.pid}: Response from {proxy_type.value} at {current_fetch_endpoint} for term='{term}': "
                                 f"Status={response.status}, Preview='{response_preview}'"
                             )
                             if response.status in (429, 503):
                                 self.logger.warning(
-                                    f"PID {process_info.pid}: Service temporarily unavailable (Status {response.status}) for '{term}' in region {region_name}. "
-                                ) # Removed content preview from warning for brevity
+                                    f"PID {process_info.pid}: Service temporarily unavailable (Status {response.status}) for '{term}' in region {region_name} via {proxy_type.value}."
+                                )
                                 if region_idx == len(self.regions) - 1:
-                                    raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status, message="Service unavailable after all regions", headers=response.headers)
+                                    # Try the other proxy as a fallback
+                                    fallback_proxy_type = ProxyType.ROAMINGPROXY if proxy_type == ProxyType.DATAPROXY else ProxyType.DATAPROXY
+                                    fallback_endpoint = f"{self.proxies[fallback_proxy_type]['endpoint']}?region={region_name}"
+                                    self.logger.info(
+                                        f"PID {process_info.pid}: Falling back to {fallback_proxy_type.value} at {fallback_endpoint} for term='{term}'."
+                                    )
+                                    async with current_session.post(
+                                        fallback_endpoint,
+                                        json={"url": search_url_google},
+                                        headers=self.proxies[fallback_proxy_type]["headers"]
+                                    ) as fallback_response:
+                                        response_text_content = await fallback_response.text()
+                                        response_preview = response_text_content[:250] if response_text_content else "[EMPTY RESPONSE BODY]"
+                                        self.logger.debug(
+                                            f"PID {process_info.pid}: Fallback response from {fallback_proxy_type.value} at {fallback_endpoint}: "
+                                            f"Status={fallback_response.status}, Preview='{response_preview}'"
+                                        )
+                                        fallback_response.raise_for_status()
+                                        api_json_response = await fallback_response.json()
+                                        html_content_from_api = api_json_response.get("result")
+                                        if not html_content_from_api:
+                                            self.logger.warning(
+                                                f"PID {process_info.pid}: 'result' field missing or empty for term='{term}' in region {region_name} via {fallback_proxy_type.value}."
+                                            )
+                                            continue
+                                        html_bytes = html_content_from_api.encode('utf-8') if isinstance(html_content_from_api, str) else str(html_content_from_api).encode('utf-8')
+                                        formatted_results_df = process_search_result(html_bytes, entry_id, self.logger)
+                                        if not formatted_results_df.empty:
+                                            results = [
+                                                {
+                                                    "EntryID": entry_id,
+                                                    "ImageUrl": str(row_data.get("ImageUrl", "placeholder://no-image-url-in-df")),
+                                                    "ImageDesc": str(row_data.get("ImageDesc", "N/A")),
+                                                    "ImageSource": str(row_data.get("ImageSource", "placeholder://no-source-in-df")),
+                                                    "ImageUrlThumbnail": str(row_data.get("ImageUrlThumbnail", row_data.get("ImageUrl", "placeholder://no-thumbnail-in-df")))
+                                                }
+                                                for _, row_data in formatted_results_df.iterrows()
+                                            ]
+                                            self.logger.info(
+                                                f"PID {process_info.pid}: Successfully found {len(results)} results for term='{term}' "
+                                                f"in region {region_name} via {fallback_proxy_type.value}."
+                                            )
+                                            return results
                                 await asyncio.sleep(1 + region_idx * 0.5)
                                 continue
                             response.raise_for_status()
@@ -269,24 +353,24 @@ class SearchClient:
                                 api_json_response = await response.json()
                             except json.JSONDecodeError as json_e:
                                 self.logger.error(
-                                    f"PID {process_info.pid}: JSONDecodeError for term='{term}' in region {region_name}. "
+                                    f"PID {process_info.pid}: JSONDecodeError for term='{term}' in region {region_name} via {proxy_type.value}. "
                                     f"Status: {response.status}, Body Preview: {response_preview}. Error: {json_e}", exc_info=True
                                 )
-                                if region_idx == len(self.regions) - 1: raise
+                                if region_idx == len(self.regions) - 1:
+                                    raise
                                 continue
                             html_content_from_api = api_json_response.get("result")
                             if not html_content_from_api:
                                 self.logger.warning(
-                                    f"PID {process_info.pid}: 'result' field missing or empty for term='{term}' in region {region_name}."
+                                    f"PID {process_info.pid}: 'result' field missing or empty for term='{term}' in region {region_name} via {proxy_type.value}."
                                 )
                                 continue
                             html_bytes = html_content_from_api.encode('utf-8') if isinstance(html_content_from_api, str) else str(html_content_from_api).encode('utf-8')
-                            # process_search_result expects (html_bytes, entry_id, logger)
-                            formatted_results_df = process_search_result(html_bytes, entry_id, self.logger) # Corrected arguments
+                            formatted_results_df = process_search_result(html_bytes, entry_id, self.logger)
                             if not formatted_results_df.empty:
                                 self.logger.info(
                                     f"PID {process_info.pid}: Successfully found {len(formatted_results_df)} results for term='{term}' "
-                                    f"in region {region_name}."
+                                    f"in region {region_name} via {proxy_type.value}."
                                 )
                                 return [
                                     {
@@ -299,21 +383,23 @@ class SearchClient:
                                     for _, row_data in formatted_results_df.iterrows()
                                 ]
                             else:
-                                self.logger.warning(f"PID {process_info.pid}: `process_search_result` returned empty for term='{term}' in region {region_name}.")
+                                self.logger.warning(f"PID {process_info.pid}: `process_search_result` returned empty for term='{term}' in region {region_name} via {proxy_type.value}.")
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"PID {process_info.pid}: Request timeout for term='{term}' in region {region_name}.")
-                    if region_idx == len(self.regions) - 1: raise
+                    self.logger.warning(f"PID {process_info.pid}: Request timeout for term='{term}' in region {region_name} via {proxy_type.value}.")
+                    if region_idx == len(self.regions) - 1:
+                        raise
                 except aiohttp.ClientError as client_e:
-                    self.logger.warning(f"PID {process_info.pid}: ClientError for term='{term}' in region {region_name}: {client_e}", exc_info=True)
-                    if region_idx == len(self.regions) - 1: raise
+                    self.logger.warning(f"PID {process_info.pid}: ClientError for term='{term}' in region {region_name} via {proxy_type.value}: {client_e}", exc_info=True)
+                    if region_idx == len(self.regions) - 1:
+                        raise
                 except Exception as e_region:
-                    self.logger.error(f"PID {process_info.pid}: Unexpected error processing term='{term}' in region {region_name}: {e_region}", exc_info=True)
-                    if region_idx == len(self.regions) - 1: raise # Reraise to be caught by tenacity or caller
+                    self.logger.error(f"PID {process_info.pid}: Unexpected error processing term='{term}' in region {region_name} via {proxy_type.value}: {e_region}", exc_info=True)
+                    if region_idx == len(self.regions) - 1:
+                        raise
             self.logger.error(
-                f"PID {process_info.pid}: All regions failed for term='{term}' (EntryID {entry_id})."
+                f"PID {process_info.pid}: All regions failed for term='{term}' (EntryID {entry_id}) via {proxy_type.value}."
             )
             return []
-
 def _create_placeholder_result(entry_id: int, type_suffix: str, description: str) -> Dict:
     return {
         "EntryID": entry_id,
@@ -610,6 +696,7 @@ async def process_restart_batch(
     MAX_CONCURRENT_ENTRY_PROCESSING = max(num_workers, 5)
     MAX_ENTRY_ATTEMPTS = 3
     configured_search_endpoint = SEARCH_PROXY_API_URL
+  
     logger.debug(f"Batch Config for FileID {file_id_for_db}: BatchSize={BATCH_SIZE_PER_GATHER}, MaxConcurrentEntries={MAX_CONCURRENT_ENTRY_PROCESSING}, MaxEntryAttempts={MAX_ENTRY_ATTEMPTS}.")
 
     try:
