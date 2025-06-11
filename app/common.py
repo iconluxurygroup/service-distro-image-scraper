@@ -440,7 +440,19 @@ async def generate_search_variations(
         logger.debug(f"Generated model_alias variations: {variations['model_alias']}")
 
     else:
-        logger.warning(f"No brand matched for SKU: {search_string}. Using fallback (default only).")
+        # Fallback if no specific rule is matched.
+        # Check if a brand was provided but just didn't have a rule.
+        if brand:
+            logger.warning(f"No active rule found for brand '{brand}'. Generating a fallback brand+SKU variation.")
+            # Create a "brand + sku" variation as a fallback
+            brand_alias_var = f"{brand.lower()} {raw_search_string.lower()}"
+            if brand_alias_var not in all_variations:
+                variations["brand_alias"].append(brand_alias_var)
+                all_variations.add(brand_alias_var.lower())
+                logger.debug(f"Added fallback brand_alias: '{brand_alias_var}'")
+        else:
+            # This is the case where no brand was identified at all.
+            logger.warning(f"No brand matched for SKU: {search_string}. Using fallback (default only).")
 
     variations = {k: [item.upper() for item in v] for k, v in variations.items() if v}
     total_variations = sum(len(v) for v in variations.values())
