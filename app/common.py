@@ -12,6 +12,8 @@ from fuzzywuzzy import fuzz
 from functools import lru_cache
 from config import BASE_CONFIG_URL
 import urllib.parse
+from datetime import datetime, timedelta
+
 default_logger = logging.getLogger(__name__)
 if not default_logger.handlers:
     default_logger.setLevel(logging.INFO)
@@ -93,7 +95,8 @@ class ConfigCache:
     async def load_config(self, file_key: str, url: str, config_name: str, expect_list: bool = False, max_attempts: int = 3, timeout: float = 10, logger=None):
         logger = logger or default_logger
         cache_key = (file_key, url)
-        if cache_key in self.cache and self.last_updated.get(cache_key) and (datetime.now() - self.last_updated[cache_key]).total_seconds() < self.ttl:
+        now = datetime.now()
+        if cache_key in self.cache and self.last_updated.get(cache_key) and (now - self.last_updated[cache_key]).total_seconds() < self.ttl:
             logger.debug(f"Returning cached {config_name} from {url}")
             return self.cache[cache_key]
 
@@ -106,7 +109,7 @@ class ConfigCache:
                         if expect_list and not isinstance(config, list):
                             raise ValueError(f"{config_name} must be a list")
                         self.cache[cache_key] = config
-                        self.last_updated[cache_key] = datetime.now()
+                        self.last_updated[cache_key] = now
                         logger.info(f"Loaded {config_name} from {url} on attempt {attempt}")
                         return config
             except (aiohttp.ClientError, ValueError) as e:
@@ -131,8 +134,66 @@ async def load_config(
 ) -> Any:
     logger = logger or default_logger
     url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
-    config = await config_cache.load_config(file_key, url, config_name, expect_list, retries, backoff_factor, logger)
+    # Note: timeout is derived from backoff_factor here, not passed directly
+    timeout = backoff_factor * retries
+    config = await config_cache.load_config(file_key, url, config_name, expect_list, retries, timeout, logger)
     return config if config else fallback
+
+def clean_string(s: str, preserve_url: bool = False) -> str:
+    if not isinstance(s, str):
+        return ''
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+    s = s.replace('\\u0026', '&')
+    if preserve_url:
+        s = re.sub(r'\s+', ' ', s.strip().lower())
+    else:
+        s = re.sub(r'[^a-z0-9\s&]', '', s.strip().lower())
+        s = re.sub(r'\s+', ' ', s)
+    return s
+
+class BrandRulesCache:
+    def __init__(self, ttl_seconds=300):
+        self.ttl = ttl_seconds
+        self.cache = None
+        self.last_updated = None
+
+    async def fetch_brand_rules(self, url: str, max_attempts: int = 3, timeout: float = 10, logger=None):
+        logger = logger or default_logger
+        now = datetime.now()
+        if self.cache and self.last_updated and (now - self.last_updated).total_seconds() < self.ttl:
+            logger.debug(f"Returning cached brand rules from {url}")
+            return self.cache
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=timeout) as response:
+                        response.raise_for_status()
+                        self.cache = await response.json()
+                        self.last_updated = now
+                        logger.info(f"Successfully fetched and cached brand rules from {url} on attempt {attempt}")
+                        return self.cache
+            except (aiohttp.ClientError, ValueError) as e:
+                logger.warning(f"Attempt {attempt}/{max_attempts} failed to fetch brand rules: {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
+                    return {"brand_rules": []}
+        return {"brand_rules": []}
+
+brand_rules_cache = BrandRulesCache()
+
+async def fetch_brand_rules(
+    file_key: str = "brand_rules",
+    max_attempts: int = 3,
+    timeout: int = 10,
+    logger: Optional[logging.Logger] = None
+) -> Dict[str, Any]:
+    logger = logger or default_logger
+    url = f"{BASE_CONFIG_URL}{CONFIG_FILES.get(file_key, 'brand_rules.json')}"
+    return await brand_rules_cache.fetch_brand_rules(url, max_attempts, timeout, logger)
+
 async def preprocess_sku(
     search_string: str,
     known_brand: Optional[str] = None,
@@ -218,9 +279,9 @@ async def preprocess_sku(
                 logger.debug(f"Forced brand match for '{known_brand}'. SKU did not match rule structure.")
                 return search_string, rule.get("full_name"), search_string_clean, None
 
-        # If we finished the loop, the known_brand was provided but NOT found in the rules.
-        # Log it, and return the original brand, preventing fall-through.
-        logger.warning(f"Known brand '{known_brand}' not found in active brand rules. Treating as unmatched.")
+        # If the loop finished, the known_brand was provided but NOT found in the rules.
+        # Log it, and return the original brand to prevent fall-through.
+        logger.warning(f"Known brand '{known_brand}' not found in active brand rules. Treating as unmatched and returning original brand.")
         return search_string, known_brand, search_string_clean, None
 
     # 2. This part is ONLY executed if known_brand was NOT provided.
@@ -235,19 +296,6 @@ async def preprocess_sku(
     # 3. Fallback: No brand was provided, and no rule matched.
     logger.warning(f"No brand matched for SKU '{search_string}'")
     return search_string, None, search_string_clean, None
-
-
-def clean_string(s: str, preserve_url: bool = False) -> str:
-    if not isinstance(s, str):
-        return ''
-    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
-    s = s.replace('\\u0026', '&')
-    if preserve_url:
-        s = re.sub(r'\s+', ' ', s.strip().lower())
-    else:
-        s = re.sub(r'[^a-z0-9\s&]', '', s.strip().lower())
-        s = re.sub(r'\s+', ' ', s)
-    return s
 
 def generate_aliases(model: Any, article_length: int = 8, model_length: int = 7, color: Optional[str] = None) -> List[str]:
     logger = logging.getLogger(__name__)
@@ -282,59 +330,6 @@ def generate_aliases(model: Any, article_length: int = 8, model_length: int = 7,
     logger.debug(f"Generated aliases for model '{model}' with article_length={article_length}, color='{color}': {aliases}")
     return [a for a in aliases if a and len(a) >= 4]
 
-from datetime import datetime, timedelta
-import aiohttp
-
-class BrandRulesCache:
-    def __init__(self, ttl_seconds=300):
-        self.ttl = ttl_seconds
-        self.cache = None
-        self.last_updated = None
-
-    async def fetch_brand_rules(self, url: str, max_attempts: int = 3, timeout: float = 10, logger=None):
-        logger = logger or default_logger
-        if self.cache and self.last_updated and (datetime.now() - self.last_updated).total_seconds() < self.ttl:
-            logger.debug(f"Returning cached brand rules from {url}")
-            return self.cache
-        
-        for attempt in range(1, max_attempts + 1):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=timeout) as response:
-                        response.raise_for_status()
-                        self.cache = await response.json()
-                        self.last_updated = datetime.now()
-                        logger.info(f"Successfully fetched and cached brand rules from {url} on attempt {attempt}")
-                        return self.cache
-            except (aiohttp.ClientError, ValueError) as e:
-                logger.warning(f"Attempt {attempt}/{max_attempts} failed to fetch brand rules: {e}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    logger.error(f"Failed to fetch brand rules after {max_attempts} attempts")
-                    return {"brand_rules": []}
-        return {"brand_rules": []}
-
-brand_rules_cache = BrandRulesCache()
-
-async def fetch_brand_rules(
-    file_key: str = "brand_rules",
-    max_attempts: int = 3,
-    timeout: int = 10,
-    logger: Optional[logging.Logger] = None
-) -> Dict[str, Any]:
-    logger = logger or default_logger
-    url = f"{BASE_CONFIG_URL}{CONFIG_FILES.get(file_key, 'brand_rules.json')}"
-    return await brand_rules_cache.fetch_brand_rules(url, max_attempts, timeout, logger)
-
-def normalize_model(model: Any) -> str:
-    if not isinstance(model, str):
-        return str(model).strip().lower()
-    return model.strip().lower()
-
-import logging
-import re
-from typing import Dict, List, Optional
 async def generate_search_variations(
     search_string: str,
     brand: Optional[str] = None,
@@ -398,7 +393,7 @@ async def generate_search_variations(
         color_part = color if color else ""
 
         # Handle missing separator based on expected length
-        if not color_part and with_color_lengths and len(search_string) == with_color_lengths[0]:
+        if not color_part and with_color_lengths and len(search_string) == int(with_color_lengths[0]):
             base = search_string[:-color_length]
             color_part = search_string[-color_length:]
             logger.debug(f"Assumed color: '{color_part}', base: '{base}'")
@@ -470,6 +465,7 @@ async def create_predefined_aliases(logger: Optional[logging.Logger] = None) -> 
     
     logger.debug(f"Created predefined_aliases: {predefined_aliases}")
     return predefined_aliases
+
 async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[str]]) -> List[str]:
     brand_clean = clean_string(brand).lower()
     if not brand_clean:
