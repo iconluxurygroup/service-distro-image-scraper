@@ -26,6 +26,7 @@ CONFIG_FILES = {
     "non_fashion_labels": "non_fashion_labels.json",
     "brand_rules": "brand_rules.json"
 }
+
 def validate_thumbnail_url(url: Optional[str], logger: Optional[logging.Logger] = None) -> bool:
     """
     Validates a thumbnail URL by checking for HTTP/HTTPS scheme and absence of placeholder values.
@@ -65,6 +66,7 @@ def clean_url_string(value: Optional[str], is_url: bool = True, logger: Optional
             logger.debug(f"Invalid URL format: {cleaned[:100]}, error: {e}")
             return ""
     return cleaned
+
 async def create_temp_dirs(file_id: int, logger: Optional[logging.Logger] = None) -> Tuple[str, str]:
     logger = logger or default_logger
     temp_images_dir = f"temp_images_{file_id}"
@@ -134,7 +136,6 @@ async def load_config(
 ) -> Any:
     logger = logger or default_logger
     url = f"{BASE_CONFIG_URL}{CONFIG_FILES[file_key]}"
-    # Note: timeout is derived from backoff_factor here, not passed directly
     timeout = backoff_factor * retries
     config = await config_cache.load_config(file_key, url, config_name, expect_list, retries, timeout, logger)
     return config if config else fallback
@@ -193,6 +194,14 @@ async def fetch_brand_rules(
     logger = logger or default_logger
     url = f"{BASE_CONFIG_URL}{CONFIG_FILES.get(file_key, 'brand_rules.json')}"
     return await brand_rules_cache.fetch_brand_rules(url, max_attempts, timeout, logger)
+
+def normalize_model(model: Any) -> str:
+    """
+    Normalizes a model identifier to a consistent string format.
+    """
+    if not isinstance(model, str):
+        return str(model).strip().lower()
+    return model.strip().lower()
 
 async def preprocess_sku(
     search_string: str,
@@ -374,7 +383,6 @@ async def generate_search_variations(
 
     delimiters = [' ', '-', '_']
     if matched_rule:
-        # --- Start of SAFE dictionary access ---
         sku_format = matched_rule.get("sku_format", {})
         base_format = sku_format.get("base", {})
         article_lengths = base_format.get("article", ["8"])
@@ -387,25 +395,21 @@ async def generate_search_variations(
         
         expected_lengths = matched_rule.get("expected_length", {})
         with_color_lengths = expected_lengths.get("with_color", [])
-        # --- End of SAFE dictionary access ---
         
         base = model if model else search_string
         color_part = color if color else ""
 
-        # Handle missing separator based on expected length
         if not color_part and with_color_lengths and len(search_string) == int(with_color_lengths[0]):
             base = search_string[:-color_length]
             color_part = search_string[-color_length:]
             logger.debug(f"Assumed color: '{color_part}', base: '{base}'")
 
-        # No Color: Base only
         no_color_var = base[:article_length + model_length]
         if no_color_var not in all_variations:
             variations["no_color"].append(no_color_var)
             all_variations.add(no_color_var)
         logger.debug(f"Added no_color variation: '{no_color_var}'")
 
-        # Delimiter Variations
         if color_part:
             for delim in delimiters:
                 delim_var = f"{base}{delim}{color_part}"
@@ -414,14 +418,12 @@ async def generate_search_variations(
                     all_variations.add(delim_var)
             logger.debug(f"Generated delimiter variations: {variations['delimiter_variations']}")
 
-        # Brand Alias
         brand_alias_var = f"{matched_rule.get('full_name', brand).lower()} {search_string}"
         if brand_alias_var not in all_variations:
             variations["brand_alias"].append(brand_alias_var)
             all_variations.add(brand_alias_var)
         logger.debug(f"Added brand_alias: '{brand_alias_var}'")
 
-        # Model Alias
         article = base[:article_length]
         model_part = base[article_length:article_length + model_length]
         for delim1 in delimiters:
@@ -447,7 +449,6 @@ async def generate_search_variations(
 
 async def create_predefined_aliases(logger: Optional[logging.Logger] = None) -> Dict[str, List[str]]:
     logger = logger or default_logger
-    # Load brand_rules using load_config
     brand_rules = await load_config(
         file_key="brand_rules",
         fallback={"brand_rules": []},
@@ -475,7 +476,7 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
     for key, alias_list in predefined_aliases.items():
         key_clean = clean_string(key).lower()
         if key_clean == brand_clean:
-            aliases.append(key)  # Add full name with original case
+            aliases.append(key)
             aliases.extend(clean_string(alias) for alias in alias_list if clean_string(alias).lower() != key_clean)
             break
 
@@ -485,7 +486,7 @@ async def generate_brand_aliases(brand: str, predefined_aliases: Dict[str, List[
         alias_lower = alias.lower()
         if len(alias_lower) >= 2 and alias_lower not in seen:
             seen.add(alias_lower)
-            filtered_aliases.append(alias)  # Preserve original case
+            filtered_aliases.append(alias)
 
     return filtered_aliases
 
@@ -597,8 +598,8 @@ async def filter_model_results(
         brand_names = []
         domain_hierarchy = []
         for rule in brand_rules.get("brand_rules", []):
-            if rule["is_active"]:
-                brand_names.extend(rule["names"])
+            if rule.get("is_active"):
+                brand_names.extend(rule.get("names", []))
                 domain_hierarchy.extend(rule.get("domain_hierarchy", []))
         brand_pattern = '|'.join(re.escape(name.lower()) for name in brand_names)
         domain_pattern = '|'.join(re.escape(domain.lower()) for domain in domain_hierarchy)
