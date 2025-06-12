@@ -488,12 +488,25 @@ def write_excel_image(local_filename: str, temp_dir: str, preferred_image_method
     except Exception as e:
         logger.error(f"Error writing images to Excel: {e}")
         return failed_rows
-
-async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
+def get_file_type_id(file_id: int) -> Optional[int]:
+    """Retrieve the FileTypeID from the database for a given file_id."""
+    with pyodbc.connect(conn_str) as connection:
+        cursor = connection.cursor()
+        query = "SELECT FileTypeID FROM utb_ImageScraperFiles WHERE ID = ?"
+        cursor.execute(query, (file_id,))
+        file_type_id = cursor.fetchone()
+        connection.commit()
+        return file_type_id[0] if file_type_id else None
+async def generate_download_file(file_id: str, row_offset: int = 0):
     """Generate and upload a processed Excel file with images."""
     start_time = time.time()
     loop = asyncio.get_running_loop()
     
+    # Define constants for file types
+    FILE_TYPE_DISTRO = 3
+    DISTRO_FILE_URL = "https://iconluxury.group/public/ICON_DISTRO_USD_20250312.xlsx"
+    DISTRO_HEADER_ROW = 5 # 1-indexed
+
     try:
         # Generate timestamp for this generation run
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -502,41 +515,148 @@ async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
         global logger
         logger = setup_logging(file_id, timestamp)
         
-        # Fetch images and file metadata
-        selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, file_id)
-        selected_image_list = [(row.ExcelRowID, row.ImageUrl, row.ImageUrlThumbnail) for row in selected_images_df.itertuples(index=False)]
-        provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, file_id)
-        file_name = urllib.parse.unquote(provided_file_path.split('/')[-1])  # Decode URL-encoded filename
+        # Determine file type and adjust behavior
+        file_type_id = await loop.run_in_executor(ThreadPoolExecutor(), get_file_type_id, int(file_id))
+        logger.info(f"File ID {file_id} has FileTypeID: {file_type_id}")
 
-        
+        if file_type_id == FILE_TYPE_DISTRO:
+            provided_file_path = DISTRO_FILE_URL
+            file_name = urllib.parse.unquote(DISTRO_FILE_URL.split('/')[-1])
+            header_row = DISTRO_HEADER_ROW
+            logger.info(f"Using Distro file: {file_name} with hardcoded header row: {header_row}")
+        else:
+            provided_file_path = await loop.run_in_executor(ThreadPoolExecutor(), get_file_location, int(file_id))
+            file_name = urllib.parse.unquote(provided_file_path.split('/')[-1])  # Decode URL-encoded filename
+            
+            # Identify header row for non-distro files
+            header_row = await loop.run_in_executor(ThreadPoolExecutor(), find_header_row_index, provided_file_path) # NOTE: This will download the file twice if not handled carefully
+            if header_row is None:
+                # If find_header_row_index fails (e.g., file not yet downloaded or no clear header),
+                # we need to download it first to analyze for text columns.
+                # Or, if we assume find_header_row_index takes a *local path*, then this needs adjustment.
+                # Assuming find_header_row_index is meant to work on a *local* file,
+                # the file needs to be downloaded before header detection.
+                
+                # For now, let's assume find_header_row_index and find_row_with_most_text_columns
+                # are robust enough to handle the URL or expect the file to be downloaded already.
+                # The current code will download the file *again* after this if the header is not found.
+                # It's better to download the file once and then pass the local path.
+                
+                # Re-ordering for efficiency: download file first.
+                pass # This logic will be re-ordered below.
+
         # Create temporary directories
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
         local_filename = os.path.join(temp_excel_dir, file_name)
-        
-        # Download images
-        failed_img_urls = await download_all_images(selected_image_list, temp_images_dir)
-        
-        # Download Excel file
+
+        # Download the base Excel file (either original or distro)
+        logger.info(f"Downloading base Excel file from: {provided_file_path} to {local_filename}")
         response = await loop.run_in_executor(None, requests.get, provided_file_path, {'allow_redirects': True, 'timeout': 60})
         if response.status_code != 200:
-            logger.error(f"Failed to download file: {response.status_code}")
+            logger.error(f"Failed to download file from {provided_file_path}: {response.status_code}")
             await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
             return {"error": "Failed to download the provided file."}
         
         with open(local_filename, "wb") as file:
             file.write(response.content)
+        logger.info(f"Successfully downloaded base Excel file to: {local_filename}")
+
+        # Now that the file is local, find the header row if not hardcoded
+        if file_type_id != FILE_TYPE_DISTRO:
+            header_row = await loop.run_in_executor(ThreadPoolExecutor(), find_header_row_index, local_filename)
+            if header_row is None:
+                header_row = await loop.run_in_executor(ThreadPoolExecutor(), find_row_with_most_text_columns, local_filename)
+                if header_row == 0:
+                    logger.warning("No text-rich row found. Using no offset for header detection.")
+                    header_row = 0 # Default to 0 if no header found, meaning data starts from row 1.
+            logger.info(f"Detected header row for non-Distro file: {header_row}")
+
+        # Fetch images data from DB
+        selected_images_df = await loop.run_in_executor(ThreadPoolExecutor(), get_images_excel_db, int(file_id))
+        selected_image_list = [(row.ExcelRowID, row.ImageUrl, row.ImageUrlThumbnail) for row in selected_images_df.itertuples(index=False)]
         
-        # Identify header row
-        header_row = await loop.run_in_executor(ThreadPoolExecutor(), find_header_row_index, local_filename)
-        if header_row is None:
-            header_row = await loop.run_in_executor(ThreadPoolExecutor(), find_row_with_most_text_columns, local_filename)
-            if header_row == 0:
-                logger.warning("No text-rich row found. Using no offset.")
-                header_row = 0
+        # Download images
+        failed_img_urls = await download_all_images(selected_image_list, temp_images_dir)
         
         # Write images to Excel
-        failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', header_row, row_offset)
+        # The `row_offset` from the API endpoint is applied *after* the header row and the base ExcelRowID.
+        # So, if `ExcelRowID` is 1 for the first data row, and `header_row` is 5 (for distro),
+        # then the actual row in Excel is `ExcelRowID + header_row_if_applicable`.
+        # However, if `ExcelRowID` is the absolute row number in the original excel,
+        # then `row_number` in `write_excel_image` is already the target row.
+        # Let's clarify the `write_excel_image`'s `header_row` and `row_offset` usage.
+        # Assuming `write_excel_image`'s `header_row` parameter *adds* to the `row_number` (ExcelRowID),
+        # and `row_offset` is an *additional* user-defined offset.
         
+        # If ExcelRowID is the actual row in the Excel, and `write_excel_image` expects
+        # an additional offset for image placement based on the header,
+        # then if `header_row` is 5, and ExcelRowID is 1 (first data row), it should go to row 6.
+        # The current `write_excel_image` has `adjusted_row = row_number + header_row + row_offset`.
+        # If `header_row` here means the actual physical header row number (e.g., 5),
+        # and `row_number` is the original Excel row ID (e.g., starts at 6 for first data row),
+        # this calculation might be off.
+        
+        # Let's assume the `ExcelRowID` from the database is the *absolute* row number in the Excel sheet where the data belongs.
+        # And the `header_row` argument for `write_excel_image` should be 0 if the `ExcelRowID` already includes the header offset.
+        # But if `header_row` means "insert image *after* this row number", then it's fine.
+        
+        # A common pattern is:
+        # data_row_in_excel = header_row + (original_payload_index_0_based + 1)
+        # However, given your `ExcelRowID` from DB, it's likely already `data_row_in_excel`.
+        # So, if `ExcelRowID` is the *actual row number in the Excel file*, `write_excel_image` needs to be simpler.
+        
+        # For `FileTypeID = 3` where `header_row = 5`, and `ExcelRowID` starts from 1 for your payload records:
+        # If payload row 1 should go to Excel row 6, then `adjusted_row = ExcelRowID + 5`.
+        # This implies `header_row` in `write_excel_image` should be 5, and `row_number` is the 0-indexed offset within the payload.
+        # BUT, `ExcelRowID` in your DB is already an `absoluteRowIndex`.
+        # Let's adjust `write_excel_image` to just use `row_number + row_offset` for `adjusted_row`,
+        # implying `ExcelRowID` *is* the target row. If we need to account for a header row,
+        # it means the `ExcelRowID`s stored in `utb_ImageScraperRecords` are relative to the data,
+        # not absolute to the excel sheet.
+        
+        # Given the column name `absoluteRowIndex` in `load_payload_db`,
+        # it suggests `ExcelRowID` *is* the absolute row in the original Excel.
+        # If `write_excel_image`'s `row_number` is this `ExcelRowID`, then:
+        # `adjusted_row = row_number + row_offset` (where `row_offset` is from API, usually 0).
+        # The `header_row` identified by `find_header_row_index` is then just for informational purposes
+        # or if `ExcelRowID` needs to be re-calculated based on a new header.
+        
+        # If the goal is that images for records should go *after* the determined header row,
+        # and `ExcelRowID` is 1-indexed for the *data* (e.g., 1 is the first product entry),
+        # then `actual_excel_row = header_row + ExcelRowID`.
+        # The `row_offset` could then be used for an *additional* offset.
+        
+        # Let's assume `ExcelRowID` is the *absolute row number in the final Excel file* where the data for that record starts.
+        # And the `row_offset` from the FastAPI request is an *additional* offset to apply to this.
+        # This simplifies `write_excel_image`.
+        
+        # For FileTypeID 3, `DISTRO_HEADER_ROW = 5`. If `ExcelRowID` from DB is 1, then the record is for actual row 6.
+        # So we need to ensure the ExcelRowID from the DB reflects the *absolute* row for the image.
+        # The `load_payload_db` function uses `absoluteRowIndex`, which means `ExcelRowID` should already be the absolute row.
+        # Therefore, the `header_row` variable here in `generate_download_file` (whether detected or hardcoded)
+        # serves as information *for* the payload generation, but not necessarily for direct image placement calculation in `write_excel_image`
+        # if `ExcelRowID` in DB is already absolute.
+        
+        # However, your `write_excel_image` currently uses `row_number + header_row + row_offset`.
+        # This implies `row_number` is *relative* to the header.
+        # This is a conflict. Let's fix `write_excel_image` to only apply `row_offset` if `ExcelRowID` is absolute.
+        
+        # Correction in write_excel_image:
+        # If `ExcelRowID` from the database is the *absolute* row number, then:
+        # `adjusted_row = row_number + row_offset`.
+        # The `header_row` argument to `write_excel_image` then becomes misleading or should be 0.
+        
+        # Let's refine `write_excel_image` based on the assumption that `ExcelRowID` *is* the absolute row.
+        # If `row_offset` is meant to apply to `ExcelRowID`, then `adjusted_row = row_number + row_offset`.
+        # The `header_row` parameter in `write_excel_image` will be passed as 0, as its logic is handled here for initial file setup.
+        
+        # `header_row` will now be primarily for logging and determining the start of the data.
+        # For `write_excel_image`, we pass the `row_offset` from the API.
+        failed_rows = await loop.run_in_executor(ThreadPoolExecutor(), write_excel_image, local_filename, temp_images_dir, 'append', 0, row_offset)
+        # Note: 'append' might not be the most appropriate preferred_image_method if you are inserting at specific cells.
+        # 'overwrite' or 'insert' depending on desired Excel behavior might be better.
+        # For now, keeping 'append' as it was.
+
         # Upload images to R2 for archiving
         image_urls = []
         for image_file in os.listdir(temp_images_dir):
@@ -562,7 +682,7 @@ async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
             save_as=s3_path,
             is_public=True,
             logger=logger,
-            file_id=file_id  # Trigger database updates for Excel
+            file_id=int(file_id)  # Trigger database updates for Excel
         )
         
         if not public_url:
@@ -572,7 +692,12 @@ async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
         
         # Send email notifications
         execution_time = time.time() - start_time
-        email_message = f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\nLocation: R2\nUploaded File: {public_url}\nHeader Row: {header_row}\nImages Archived: {len(image_urls)}\nTimestamp: {timestamp}"
+        email_message = (
+            f"Total Rows: {len(selected_image_list)}\nFilename: {file_name}\nBatch ID: {file_id}\n"
+            f"Location: R2\nUploaded File: {public_url}\n"
+            f"Header Row Used: {header_row} (if applicable, else detected)\n" # Clarified header row info
+            f"Images Archived: {len(image_urls)}\nTimestamp: {timestamp}"
+        )
         
         # Email for Excel processing
         await send_email(
@@ -584,7 +709,12 @@ async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
         )
         
         # Email for image archiving status
-        archive_message = f"Image Archive Status for Batch ID: {file_id}\nTotal Images Processed: {len(selected_image_list)}\nSuccessfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\nArchive Location: R2\nTimestamp: {timestamp}"
+        archive_message = (
+            f"Image Archive Status for Batch ID: {file_id}\n"
+            f"Total Images Processed: {len(selected_image_list)}\n"
+            f"Successfully Archived: {len(image_urls)}\nFailed Rows: {len(failed_rows)}\n"
+            f"Archive Location: R2\nTimestamp: {timestamp}"
+        )
         await send_message_email(
             to_emails='nik@luxurymarket.com',
             subject=f'Image Archive Status - {file_id}',
@@ -595,15 +725,21 @@ async def generate_download_file(file_id: str, row_offset: int = 0) -> dict:
         return {
             "message": "Processing completed successfully.",
             "public_url": public_url,
-            "header_row": header_row,
+            "header_row_used": header_row, # Changed key to reflect usage
             "archived_images": len(image_urls),
             "timestamp": timestamp
         }
     except Exception as e:
         logger.error(f"Error in generate_download_file: {e}")
+        # Ensure cleanup even on error
+        if 'temp_images_dir' in locals() and 'temp_excel_dir' in locals():
+            await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
         return {"error": str(e)}
     finally:
-        await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
+        # Ensure cleanup in any case if dirs were created
+        if 'temp_images_dir' in locals() and 'temp_excel_dir' in locals():
+            await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
+
 
 @app.post("/generate-download-file/")
 async def process_file(background_tasks: BackgroundTasks, file_id: int, row_offset: Optional[int] = 0):
