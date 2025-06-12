@@ -562,7 +562,7 @@ async def run_generate_download_file(
 
     try:
         # Ensure this URL is configurable and points to the correct service endpoint.
-        file_generation_endpoint = os.getenv("FILE_GENERATION_SERVICE_URL", f"https://icon7-8001.iconluxury.today/generate-download-file/?file_id={file_id}")
+        file_generation_endpoint = os.getenv("FILE_GENERATION_SERVICE_URL", f"https://icon7-8001.iconluxury.today/v2/generate-download-file/?file_id={file_id}")
         parent_logger.info(f"{log_prefix} Calling file generation service: {file_generation_endpoint}")
 
         async with httpx.AsyncClient(timeout=300.0) as client:
