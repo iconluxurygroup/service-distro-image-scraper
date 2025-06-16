@@ -24,6 +24,8 @@ import urllib.parse
 from pathlib import Path
 import numpy as np
 from collections import Counter
+import re
+import random
 
 # --- Production Imports ---
 # These are assumed to be in your project structure
@@ -42,58 +44,44 @@ VALID_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image
 MIN_IMAGE_SIZE = 1000  # Minimum content length in bytes
 MAX_IMAGE_VERIFY_SIZE = 3000 # For verification before processing
 MAX_IMAGE_DIMENSION = 130   # For resizing
-import requests
-import random
 
 def get_user_agents(logger_instance: logging.Logger) -> List[str]:
     """
     Fetches a list of user agents from the DataProxy API.
     Returns a default list if the API call fails.
     """
-    # A reliable default User-Agent in case the API fails
     default_ua = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"]
-    
     try:
         api_url = "https://api.thedataproxy.com/v2/user-agents/?skip=0&limit=100"
         logger_instance.info(f"Fetching user agents from {api_url}")
-        
         response = requests.get(api_url, timeout=15)
-        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
-        
+        response.raise_for_status()
         data = response.json()
         user_agents = [ua.get("user_agent") for ua in data.get("data", []) if ua.get("user_agent")]
-        
         if not user_agents:
             logger_instance.warning("User-Agent API returned no agents. Using default.")
             return default_ua
-            
         logger_instance.info(f"Successfully fetched {len(user_agents)} user agents.")
         return user_agents
-        
     except requests.exceptions.RequestException as e:
         logger_instance.error(f"Failed to fetch user agents from API: {e}. Using default.")
         return default_ua
+
 # --- General Utility Functions ---
 def setup_logging(file_id: str, timestamp: str) -> logging.Logger:
     """Configure logging to save logs to a file for a specific job run."""
     log_dir = os.path.join('jobs', file_id, timestamp, 'logs')
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     log_file = os.path.join(log_dir, f'job_{file_id}_{timestamp}.log')
-    
     logger_instance = logging.getLogger(f"job_{file_id}_{timestamp}")
     logger_instance.setLevel(logging.INFO)
-    
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(formatter)
-    
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    
     logger_instance.handlers = [file_handler, console_handler]
     logger_instance.propagate = False
-    
     logger_instance.info(f"Logging initialized for FileID: {file_id}, Timestamp: {timestamp}")
     return logger_instance
 
@@ -102,11 +90,9 @@ async def create_temp_dirs(unique_id: str) -> Tuple[str, str]:
     base_dir = Path.cwd() / 'temp_files'
     temp_images_dir = base_dir / 'images' / unique_id
     temp_excel_dir = base_dir / 'excel' / unique_id
-    
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, temp_images_dir.mkdir, True, True)
-    await loop.run_in_executor(None, temp_excel_dir.mkdir, True, True)
-    
+    await loop.run_in_executor(None, temp_images_dir.mkdir, exist_ok=True, parents=True)
+    await loop.run_in_executor(None, temp_excel_dir.mkdir, exist_ok=True, parents=True)
     return str(temp_images_dir), str(temp_excel_dir)
 
 async def cleanup_temp_dirs(directories: List[str]):
@@ -136,30 +122,32 @@ def get_file_location(file_id: int, logger_instance: logging.Logger) -> str:
         if not result:
             raise FileNotFoundError(f"No file location found in DB for FileID {file_id}")
         return result[0]
-    
+
 def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.DataFrame:
-    """Retrieve detailed image and product data for Excel processing."""
-    # This initial UPDATE uses pyodbc directly and correctly passes a tuple.
+    """
+    Retrieve detailed image and product data for Excel processing.
+    Fetches ALL image results for each product, ordered by SortOrder to allow for fallbacks.
+    """
     with pyodbc.connect(conn_str) as connection:
         cursor = connection.cursor()
         cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?", (file_id,))
         connection.commit()
     
-    # 1. SQL QUERY: Using the '?' placeholder required by pyodbc.
+    # MODIFIED QUERY: Selects r.SortOrder and removes the "SortOrder = 1" filter.
+    # Orders by ExcelRowID and then SortOrder to prepare for grouping.
     query = """
         SELECT
-            s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail,
+            s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail, r.SortOrder,
             s.ProductBrand AS Brand, s.ProductModel AS Style,
             s.ProductColor AS Color, s.ProductCategory AS Category
         FROM utb_ImageScraperFiles f
         INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
         INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
-        WHERE f.ID = ? AND r.SortOrder = 1
-        ORDER BY s.ExcelRowID
+        WHERE f.ID = ?
+        ORDER BY s.ExcelRowID, r.SortOrder
     """
     
-    # 2. PANDAS CALL: Pass params as a list containing a TUPLE.
-    # The trailing comma in (file_id,) is critical to create a tuple.
+    logger_instance.info(f"Executing query to fetch all image results for FileID: {file_id}")
     return pd.read_sql_query(query, engine, params=[(file_id,)])
 
 def update_file_location_complete(file_id: int, file_location: str, logger_instance: logging.Logger):
@@ -184,116 +172,82 @@ async def validate_image_response(response, url: str, logger_instance: logging.L
         return False, None
     return True, await response.read()
 
-import re
-
 async def image_download(semaphore, item: Dict, save_path: str, session, logger_instance: logging.Logger, user_agents: List[str]):
     """
-    Downloads an image with robust path and filename sanitization.
+    Attempts to download an image for a given item by iterating through its available image URLs.
+    It tries the main URL, then the thumbnail URL for each sort order until one is successful.
     """
-    
-    def sanitize_filename_part(part: str) -> str:
-        """Removes illegal characters and handles empty or problematic parts."""
-        if not part:
-            return ""
-        # Remove characters that are invalid for file/directory names
-        # and replace multiple spaces/underscores with a single underscore.
-        s = re.sub(r'[\s/\\:*?"<>|]+', '_', str(part))
-        # Remove leading/trailing underscores or hyphens
-        s = s.strip('_-')
-        return s
-
-    try:
-        # --- PATH AND FILENAME SANITIZATION ---
-        row_id = str(item.get('ExcelRowID', ''))
-        style = sanitize_filename_part(item.get('Style', 'style'))
-        color = sanitize_filename_part(item.get('Color', ''))
-
-        # Create a clean list of filename components
-        name_parts = [row_id, style, color]
-        # Join the parts to create a clean, reliable filename
-        image_name = f"{item['ExcelRowID']}_{item.get('Style', 'style').replace(' ', '_')}" # Placeholder for your sanitized name
-
-        async def attempt_download(download_url: str, is_thumb: bool) -> bool:
-            if not download_url: return False
-            try:
-                # *** KEY CHANGE: ROTATE USER-AGENT FOR EACH ATTEMPT ***
-                headers = {
-                    "User-Agent": random.choice(user_agents)
-                }
-                
-                # Pass the dynamically generated header to the request
-                async with session.get(download_url, headers=headers) as response:
-                    is_valid, data = await validate_image_response(response, download_url, logger_instance)
-                    if not is_valid: return False
-                    
-                    final_path = os.path.join(save_path, f"{image_name}.png")
-                    with PILImage.open(BytesIO(data)) as img:
-                        img.save(final_path, 'PNG')
-                    return True
-            except Exception as e:
-                logger_instance.error(f"Download failed for {'thumbnail' if is_thumb else 'image'} {download_url}: {e}")
-                return False
-
-        async with semaphore:
-            url, thumbnail = item.get('ImageUrl'), item.get('ImageUrlThumbnail')
-            if await attempt_download(url, False) or await attempt_download(thumbnail, True):
-                return True
-            logger_instance.error(f"All download attempts failed for Row {item['ExcelRowID']}")
-            return False
-
-    except Exception as e:
-        logger_instance.error(f"Error generating filename for item {item.get('ExcelRowID', 'Unknown')}: {e}")
-        return False
-
-
-    async def attempt_download(download_url: str, is_thumb: bool) -> bool:
-        if not download_url: return False
-        try:
-            async with session.get(download_url) as response:
-                is_valid, data = await validate_image_response(response, download_url, logger_instance)
-                if not is_valid: return False
-
-                # Use the sanitized image_name and os.path.join to ensure correct path construction
-                final_path = os.path.join(save_path, f"{image_name}.png")
-
-                # Ensure the directory exists before saving the file
-                # Although create_temp_dirs creates the base, this is an extra safeguard.
-                os.makedirs(os.path.dirname(final_path), exist_ok=True)
-
-                with PILImage.open(BytesIO(data)) as img:
-                    img.save(final_path, 'PNG')
-                return True
-        except Exception as e:
-            logger_instance.error(f"Download failed for {'thumbnail' if is_thumb else 'image'} {download_url}: {e}")
-            return False
-
-    url, thumbnail = item.get('ImageUrl'), item.get('ImageUrlThumbnail')
     async with semaphore:
-        if await attempt_download(url, False) or await attempt_download(thumbnail, True):
-            return True
-        logger_instance.error(f"All download attempts failed for Row {item['ExcelRowID']}")
+        row_id = item['ExcelRowID']
+
+        def sanitize_filename_part(part: str) -> str:
+            if not part: return ""
+            s = re.sub(r'[\s/\\:*?"<>|]+', '_', str(part))
+            return s.strip('_-')
+
+        try:
+            # Sanitize filename components once
+            style = sanitize_filename_part(item.get('Style', 'style'))
+            color = sanitize_filename_part(item.get('Color', ''))
+            name_parts = [str(row_id), style, color]
+            image_name = "_".join(filter(None, name_parts))
+
+        except Exception as e:
+            logger_instance.error(f"Error generating filename for item {row_id}: {e}")
+            return False
+
+        # Loop through all available image options for this item
+        for i, (url, thumb_url, sort_order) in enumerate(item['image_options']):
+            
+            async def attempt_download(download_url: str, is_thumb: bool) -> bool:
+                if not download_url: return False
+                try:
+                    headers = {"User-Agent": random.choice(user_agents)}
+                    async with session.get(download_url, headers=headers) as response:
+                        is_valid, data = await validate_image_response(response, download_url, logger_instance)
+                        if not is_valid: return False
+                        
+                        final_path = os.path.join(save_path, f"{image_name}.png")
+                        with PILImage.open(BytesIO(data)) as img:
+                            img.save(final_path, 'PNG')
+                        logger_instance.info(f"SUCCESS (SortOrder {sort_order}) for Row {row_id} from {'thumbnail' if is_thumb else 'main'} URL.")
+                        return True
+                except Exception as e:
+                    logger_instance.warning(f"Attempt {i+1} failed for Row {row_id} ({'thumb' if is_thumb else 'main'}): {e}")
+                    return False
+
+            # Try main URL, if it works, we are done with this item and can return
+            if await attempt_download(url, is_thumb=False):
+                return True
+            # If main fails, try thumbnail URL
+            if await attempt_download(thumb_url, is_thumb=True):
+                return True
+        
+        # If the loop completes, all attempts have failed for this item
+        logger_instance.error(f"All download attempts FAILED for Row {row_id}. No more images to try.")
         return False
 
 async def download_all_images(data: List[Dict], save_path: str, logger_instance: logging.Logger, user_agents: List[str]):
-    """Download all images concurrently, passing the user_agent list to each task."""
-    domains = [tldextract.extract(item['ImageUrl']).top_domain_under_public_suffix 
-               for item in data if item.get('ImageUrl')]
-    pool_size = min(500, max(10, len(Counter(domains)) * 2))
+    """Download all images concurrently, trying fallbacks for each item."""
+    domains = []
+    for item in data:
+        if item.get('image_options'):
+            first_url = item['image_options'][0][0]
+            if first_url:
+                domains.append(tldextract.extract(first_url).top_domain_under_public_suffix)
     
+    pool_size = min(500, max(10, len(Counter(domains)) * 2))
     timeout_config = ClientTimeout(total=60)
     retry_options = ExponentialRetry(attempts=3, start_timeout=3)
     
-    # We remove the static 'headers' argument here, as it will be set dynamically for each request.
     async with RetryClient(raise_for_status=False, retry_options=retry_options, timeout=timeout_config) as session:
         semaphore = asyncio.Semaphore(pool_size)
-        # Pass the user_agents list down to each individual download task
         tasks = [image_download(semaphore, item, save_path, session, logger_instance, user_agents) for item in data]
         results = await asyncio.gather(*tasks)
         
         failed_count = len([res for res in results if not res])
         if failed_count > 0:
-            logger_instance.warning(f"{failed_count} images failed to download.")
-
+            logger_instance.warning(f"{failed_count} product rows failed to download any image.")
 
 # --- Image & Excel Processing Functions ---
 def resize_image(image_path: str, logger_instance: logging.Logger) -> bool:
@@ -305,12 +259,11 @@ def resize_image(image_path: str, logger_instance: logging.Logger) -> bool:
         elif img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Replace non-white background
         pixels = np.array(img)
         border_pixels = np.concatenate([pixels[0, :], pixels[-1, :], pixels[:, 0], pixels[:, -1]])
         colors, counts = np.unique(border_pixels, axis=0, return_counts=True)
         most_common = colors[counts.argmax()]
-        if np.sum(most_common) < 700: # Is the background dark?
+        if np.sum(most_common) < 700:
             mask = np.all(np.abs(pixels - most_common) <= 15, axis=2)
             pixels[mask] = [255, 255, 255]
             img = PILImage.fromarray(pixels)
@@ -353,7 +306,7 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     wb.save(local_filename)
 
 def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row_offset: int, logger_instance: logging.Logger):
-    try:    
+    try:
         wb = load_workbook(local_filename); ws = wb.active
         image_map = {int(f.split('_')[0]): f for f in os.listdir(temp_dir) if '_' in f and f.split('_')[0].isdigit()}
 
@@ -361,14 +314,12 @@ def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row
             image_path = os.path.join(temp_dir, image_file)
             if verify_and_process_image(image_path, logger_instance):
                 img = Image(image_path)
-                # Generic files use absolute ExcelRowID. Header_row is informational. API offset is applied.
                 adjusted_row = row_id + header_row + row_offset
                 img.anchor = f"A{adjusted_row}"; ws.add_image(img)
         wb.save(local_filename)
     except Exception as e:
         logger_instance.error(f"Error writing to generic Excel file: {e}", exc_info=True)
         raise
-
 
 def find_header_row_index(excel_file: str, logger_instance: logging.Logger) -> Optional[int]:
     try:
@@ -393,20 +344,34 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
     file_id_int = int(file_id)
 
     try:
-        # 1. FETCH THE LIST OF USER AGENTS AT THE START
         user_agents = get_user_agents(logger_instance)
-
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
-        logger_instance.info("Fetching data and downloading images...")
         
+        logger_instance.info("Fetching all image data from database...")
         images_df = get_images_excel_db(file_id_int, logger_instance)
         if images_df.empty:
             logger_instance.warning(f"No image data found for FileID {file_id}. The job will not proceed.")
             return
+
+        # --- NEW: Group data by ExcelRowID to handle multiple images per product ---
+        logger_instance.info("Grouping data by product to prepare for download attempts...")
+        grouped_data = []
+        for _, group in images_df.groupby('ExcelRowID'):
+            first_row = group.iloc[0]
+            # Create a list of tuples: (ImageUrl, ImageUrlThumbnail, SortOrder)
+            image_options = list(zip(group['ImageUrl'], group['ImageUrlThumbnail'], group['SortOrder']))
+            
+            grouped_data.append({
+                'ExcelRowID': int(first_row['ExcelRowID']),
+                'Brand': first_row['Brand'],
+                'Style': first_row['Style'],
+                'Color': first_row['Color'],
+                'Category': first_row['Category'],
+                'image_options': image_options # This list is ordered by SortOrder
+            })
         
-        # 2. PASS THE LIST TO THE IMAGE DOWNLOADER
-        await download_all_images(images_df.to_dict('records'), temp_images_dir, logger_instance, user_agents)
-        
+        logger_instance.info(f"Data prepared for {len(grouped_data)} unique products. Starting image downloads.")
+        await download_all_images(grouped_data, temp_images_dir, logger_instance, user_agents)
         
         file_type_id = get_file_type_id(file_id_int, logger_instance)
         FILE_TYPE_DISTRO = 3
@@ -416,12 +381,13 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
             template_url = "https://iconluxury.group/public/ICON_DISTRO_USD_20250312.xlsx"
             file_name = os.path.basename(urllib.parse.unquote(template_url))
             local_filename = os.path.join(temp_excel_dir, file_name)
-            header_row = 5 # Data starts after this many rows
+            header_row = 5
 
             res = requests.get(template_url, timeout=60); res.raise_for_status()
             with open(local_filename, "wb") as f: f.write(res.content)
             
-            write_excel_distro(local_filename, temp_images_dir, images_df.to_dict('records'), header_row, logger_instance)
+            # Pass the grouped data which contains one entry per product
+            write_excel_distro(local_filename, temp_images_dir, grouped_data, header_row, logger_instance)
         else:
             logger_instance.info("Starting GENERIC file generation.")
             file_url = get_file_location(file_id_int, logger_instance)
@@ -431,11 +397,9 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
             res = requests.get(file_url, timeout=60); res.raise_for_status()
             with open(local_filename, "wb") as f: f.write(res.content)
             
-            # This header is informational; row_offset from API is the key adjuster
             header_row = find_header_row_index(local_filename, logger_instance) or 0
             write_excel_generic(local_filename, temp_images_dir, header_row, row_offset, logger_instance)
 
-        # Upload final file and send notifications
         processed_file_name = f"{Path(file_name).stem}_processed_{timestamp}.xlsx"
         public_url = await upload_file_to_space(local_filename, save_as=f"processed_files/{processed_file_name}", file_id=file_id_int, is_public=True)
         update_file_location_complete(file_id_int, public_url, logger_instance)
@@ -446,7 +410,8 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
     except Exception as e:
         logger_instance.error(f"FATAL ERROR for FileID {file_id}: {e}", exc_info=True)
     finally:
-        if temp_images_dir: await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
+        if temp_images_dir and temp_excel_dir:
+            await cleanup_temp_dirs([temp_images_dir, temp_excel_dir])
 
 # --- FastAPI Endpoints ---
 @app.post("/generate-download-file/")
