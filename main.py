@@ -272,7 +272,7 @@ def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row
         wb.save(local_filename)
     except Exception as e:
         logger_instance.error(f"Error writing to generic Excel file: {e}", exc_info=True)
-    raise
+        raise
 
 
 def find_header_row_index(excel_file: str, logger_instance: logging.Logger) -> Optional[int]:
