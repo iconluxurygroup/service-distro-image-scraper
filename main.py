@@ -154,9 +154,49 @@ async def validate_image_response(response, url: str, logger_instance: logging.L
         return False, None
     return True, await response.read()
 
+import re
+
 async def image_download(semaphore, item: Dict, save_path: str, session, logger_instance: logging.Logger) -> bool:
-    url, thumbnail = item.get('ImageUrl'), item.get('ImageUrlThumbnail')
-    image_name = f"{item['ExcelRowID']}_{item.get('Style', 'style').replace(' ', '_')}"
+    """
+    Downloads an image with robust path and filename sanitization.
+    """
+    
+    def sanitize_filename_part(part: str) -> str:
+        """Removes illegal characters and handles empty or problematic parts."""
+        if not part:
+            return ""
+        # Remove characters that are invalid for file/directory names
+        # and replace multiple spaces/underscores with a single underscore.
+        s = re.sub(r'[\s/\\:*?"<>|]+', '_', str(part))
+        # Remove leading/trailing underscores or hyphens
+        s = s.strip('_-')
+        return s
+
+    try:
+        # --- PATH AND FILENAME SANITIZATION ---
+        row_id = str(item.get('ExcelRowID', ''))
+        style = sanitize_filename_part(item.get('Style', 'style'))
+        color = sanitize_filename_part(item.get('Color', ''))
+
+        # Create a clean list of filename components
+        name_parts = [row_id, style, color]
+        
+        # Filter out any empty parts that resulted from sanitization
+        # This prevents double underscores or leading/trailing underscores.
+        image_name_parts = [part for part in name_parts if part]
+
+        # Join the parts to create a clean, reliable filename
+        image_name = "_".join(image_name_parts)
+
+        if not image_name:
+            logger_instance.error(f"Could not generate a valid image name for Row {row_id}. Data: {item}")
+            return False
+        # --- END SANITIZATION ---
+
+    except Exception as e:
+        logger_instance.error(f"Error generating filename for item {item.get('ExcelRowID', 'Unknown')}: {e}")
+        return False
+
 
     async def attempt_download(download_url: str, is_thumb: bool) -> bool:
         if not download_url: return False
@@ -164,8 +204,14 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
             async with session.get(download_url) as response:
                 is_valid, data = await validate_image_response(response, download_url, logger_instance)
                 if not is_valid: return False
-                
+
+                # Use the sanitized image_name and os.path.join to ensure correct path construction
                 final_path = os.path.join(save_path, f"{image_name}.png")
+
+                # Ensure the directory exists before saving the file
+                # Although create_temp_dirs creates the base, this is an extra safeguard.
+                os.makedirs(os.path.dirname(final_path), exist_ok=True)
+
                 with PILImage.open(BytesIO(data)) as img:
                     img.save(final_path, 'PNG')
                 return True
@@ -173,6 +219,7 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
             logger_instance.error(f"Download failed for {'thumbnail' if is_thumb else 'image'} {download_url}: {e}")
             return False
 
+    url, thumbnail = item.get('ImageUrl'), item.get('ImageUrlThumbnail')
     async with semaphore:
         if await attempt_download(url, False) or await attempt_download(thumbnail, True):
             return True
