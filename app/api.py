@@ -486,6 +486,8 @@ async def orchestrate_entry_search(
     return all_valid_results_collected
 
 
+# In api.py
+
 async def run_job_with_logging(
     job_func: Callable[..., Any],
     file_id_context: str,
@@ -502,18 +504,22 @@ async def run_job_with_logging(
     job_logger.debug(f"Memory before job: {mem_before:.2f} MB")
     
     result_payload, http_status_code, response_message = None, 500, "Job failed unexpectedly."
-    debug_info = {"log_file_server_path": log_file_path, "errors": []}
+    # Initialize debug_info with more context from the start
+    debug_info = {
+        "job_name": job_name,
+        "job_context": file_id_context,
+        "start_time_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "log_file_server_path": log_file_path,
+        "errors": []
+    }
 
     try:
         # Prepare arguments for the job function.
         job_args = kwargs.copy()
         job_args['logger'] = job_logger
         
-        # --- FIX IS HERE ---
-        # Add the file_id from the context to the arguments for the job function.
-        job_args['file_id'] = file_id_context
-        # -------------------
-
+        # The line causing the original TypeError has been correctly removed.
+        
         if asyncio.iscoroutinefunction(job_func):
             result_payload = await job_func(**job_args)
         else:
@@ -524,19 +530,30 @@ async def run_job_with_logging(
         response_message = f"Job '{job_name}' completed successfully."
         job_logger.info(response_message)
 
+    except HTTPException as http_err:
+        # If the job itself raises an HTTPException, honor it.
+        error_type = "HTTPException"
+        error_message = str(http_err.detail)
+        http_status_code = http_err.status_code
+        job_logger.warning(f"Job '{job_name}' raised HTTPException (Status: {http_status_code}): {error_message}", exc_info=True)
+        debug_info["errors"].append({"type": error_type, "message": error_message, "traceback": traceback.format_exc()})
+        # Re-raise it to be handled by FastAPI's top-level error handler
+        raise
+
     except Exception as e:
         error_type = type(e).__name__
         error_message = str(e)
-        # Check for the specific TypeError and provide a more helpful message.
-        if isinstance(e, TypeError) and 'missing' in error_message:
-            job_logger.error(f"CRITICAL CODING ERROR in job '{job_name}': A required argument was not passed. Error: {error_message}", exc_info=True)
-            response_message = f"Job '{job_name}' failed due to a programming error: missing argument. Check server logs."
-        else:
-            job_logger.error(f"Error in job '{job_name}': {error_type} - {error_message}", exc_info=True)
-            response_message = f"Job '{job_name}' failed: {error_message}"
+        http_status_code = 500 # Internal Server Error for unhandled exceptions
         
-        debug_info["errors"].append({"type": error_type, "message": error_message})
-        http_status_code = getattr(e, 'status_code', 500) if isinstance(e, HTTPException) else 500
+        # Check for argument-related TypeErrors to provide a more helpful message.
+        if isinstance(e, TypeError) and ('unexpected keyword argument' in error_message or 'missing' in error_message):
+            response_message = f"Job '{job_name}' failed due to a programming error (argument mismatch). See logs for details."
+            job_logger.critical(f"CRITICAL CODING ERROR in job '{job_name}': {response_message} Error: {error_message}", exc_info=True)
+        else:
+            response_message = f"Job '{job_name}' failed with an internal error. See logs for details."
+            job_logger.error(f"Error in job '{job_name}': {error_type} - {error_message}", exc_info=True)
+        
+        debug_info["errors"].append({"type": error_type, "message": error_message, "traceback": traceback.format_exc()})
     
     finally:
         mem_after = process.memory_info().rss / (1024**2)
@@ -544,16 +561,24 @@ async def run_job_with_logging(
         job_logger.debug(f"Memory after job: {mem_after:.2f} MB (Change: {mem_after - mem_before:+.2f} MB)")
         job_logger.info(f"Job '{job_name}' finished in {duration:.2f} seconds.")
         
-        # Ensure log upload happens even on failure.
-        debug_info["log_s3_url"] = await upload_log_file(file_id_context, log_file_path, job_logger)
-        
+        try:
+            # The database FileID to associate the log with.
+            db_file_id = kwargs.get('file_id_db_str') or kwargs.get('file_id')
+            debug_info["log_s3_url"] = await upload_log_file(file_id_context, log_file_path, job_logger, db_record_file_id_to_update=db_file_id)
+        except Exception as log_e:
+            job_logger.error(f"CRITICAL: Failed to upload log file {log_file_path}. Error: {log_e}", exc_info=True)
+            debug_info["log_s3_url"] = "Log upload failed."
+            
+    # For failed jobs, raise an HTTPException with the collected details
+    if http_status_code != 200:
+        raise HTTPException(status_code=http_status_code, detail={"message": response_message, "debug_info": debug_info})
+
     return {
         "status_code": http_status_code, 
         "message": response_message, 
         "data": result_payload, 
         "debug_info": debug_info
     }
-
 async def run_generate_download_file(
     file_id: str,
     parent_logger: logging.Logger,
