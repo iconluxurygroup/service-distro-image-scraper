@@ -26,6 +26,7 @@ import numpy as np
 from collections import Counter
 import re
 import random
+from functools import partial
 
 # --- Production Imports ---
 # These are assumed to be in your project structure
@@ -70,18 +71,27 @@ def get_user_agents(logger_instance: logging.Logger) -> List[str]:
 # --- General Utility Functions ---
 def setup_logging(file_id: str, timestamp: str) -> logging.Logger:
     """Configure logging to save logs to a file for a specific job run."""
-    log_dir = os.path.join('jobs', file_id, timestamp, 'logs')
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    log_file = os.path.join(log_dir, f'job_{file_id}_{timestamp}.log')
+    log_dir = Path('jobs') / file_id / timestamp / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f'job_{file_id}_{timestamp}.log'
+    
     logger_instance = logging.getLogger(f"job_{file_id}_{timestamp}")
     logger_instance.setLevel(logging.INFO)
+    
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger_instance.handlers = [file_handler, console_handler]
-    logger_instance.propagate = False
+    
+    # Avoid adding handlers if they already exist
+    if not logger_instance.handlers:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        
+        logger_instance.addHandler(file_handler)
+        logger_instance.addHandler(console_handler)
+        logger_instance.propagate = False
+    
     logger_instance.info(f"Logging initialized for FileID: {file_id}, Timestamp: {timestamp}")
     return logger_instance
 
@@ -90,16 +100,19 @@ async def create_temp_dirs(unique_id: str) -> Tuple[str, str]:
     base_dir = Path.cwd() / 'temp_files'
     temp_images_dir = base_dir / 'images' / unique_id
     temp_excel_dir = base_dir / 'excel' / unique_id
+    
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, temp_images_dir.mkdir, exist_ok=True, parents=True)
-    await loop.run_in_executor(None, temp_excel_dir.mkdir, exist_ok=True, parents=True)
+    # CORRECTED: Use lambda or functools.partial to pass arguments to the executor.
+    await loop.run_in_executor(None, partial(os.makedirs, temp_images_dir, exist_ok=True))
+    await loop.run_in_executor(None, partial(os.makedirs, temp_excel_dir, exist_ok=True))
+    
     return str(temp_images_dir), str(temp_excel_dir)
 
 async def cleanup_temp_dirs(directories: List[str]):
     """Remove temporary directories."""
     loop = asyncio.get_running_loop()
     for dir_path in directories:
-        await loop.run_in_executor(None, lambda dp=dir_path: shutil.rmtree(dp, ignore_errors=True))
+        await loop.run_in_executor(None, partial(shutil.rmtree, dir_path, ignore_errors=True))
 
 # --- Database Functions ---
 def get_file_type_id(file_id: int, logger_instance: logging.Logger) -> Optional[int]:
@@ -133,8 +146,7 @@ def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.Dat
         cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?", (file_id,))
         connection.commit()
     
-    # MODIFIED QUERY: Selects r.SortOrder and removes the "SortOrder = 1" filter.
-    # Orders by ExcelRowID and then SortOrder to prepare for grouping.
+    # ROBUST QUERY: Gets all images and metadata, correctly ordered for fallback processing.
     query = """
         SELECT
             s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail, r.SortOrder,
@@ -176,27 +188,14 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
     """
     Attempts to download an image for a given item by iterating through its available image URLs.
     It tries the main URL, then the thumbnail URL for each sort order until one is successful.
+    Saves the image as {ExcelRowID}.png.
     """
     async with semaphore:
         row_id = item['ExcelRowID']
+        # The filename is simply the row ID, as requested.
+        image_name = str(row_id)
 
-        def sanitize_filename_part(part: str) -> str:
-            if not part: return ""
-            s = re.sub(r'[\s/\\:*?"<>|]+', '_', str(part))
-            return s.strip('_-')
-
-        try:
-            # Sanitize filename components once
-            style = sanitize_filename_part(item.get('Style', 'style'))
-            color = sanitize_filename_part(item.get('Color', ''))
-            name_parts = [str(row_id), style, color]
-            image_name = "_".join(filter(None, name_parts))
-
-        except Exception as e:
-            logger_instance.error(f"Error generating filename for item {row_id}: {e}")
-            return False
-
-        # Loop through all available image options for this item
+        # Loop through all available image options for this item, which are pre-sorted by SortOrder.
         for i, (url, thumb_url, sort_order) in enumerate(item['image_options']):
             
             async def attempt_download(download_url: str, is_thumb: bool) -> bool:
@@ -207,23 +206,24 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
                         is_valid, data = await validate_image_response(response, download_url, logger_instance)
                         if not is_valid: return False
                         
+                        # Save the file as {row_id}.png
                         final_path = os.path.join(save_path, f"{image_name}.png")
                         with PILImage.open(BytesIO(data)) as img:
                             img.save(final_path, 'PNG')
                         logger_instance.info(f"SUCCESS (SortOrder {sort_order}) for Row {row_id} from {'thumbnail' if is_thumb else 'main'} URL.")
                         return True
                 except Exception as e:
-                    logger_instance.warning(f"Attempt {i+1} failed for Row {row_id} ({'thumb' if is_thumb else 'main'}): {e}")
+                    logger_instance.warning(f"Download attempt {i+1} failed for Row {row_id} ({'thumb' if is_thumb else 'main'}): {e}")
                     return False
 
-            # Try main URL, if it works, we are done with this item and can return
+            # Try main URL. If it works, we are done with this item and can return True.
             if await attempt_download(url, is_thumb=False):
                 return True
-            # If main fails, try thumbnail URL
+            # If main fails, try the thumbnail URL as a fallback for this SortOrder.
             if await attempt_download(thumb_url, is_thumb=True):
                 return True
         
-        # If the loop completes, all attempts have failed for this item
+        # If the outer loop completes, all download attempts for all sort orders have failed for this item.
         logger_instance.error(f"All download attempts FAILED for Row {row_id}. No more images to try.")
         return False
 
@@ -289,14 +289,18 @@ def verify_and_process_image(image_path: str, logger_instance: logging.Logger) -
 
 def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict], header_row: int, logger_instance: logging.Logger):
     wb = load_workbook(local_filename); ws = wb.active
-    image_map = {int(f.split('_')[0]): f for f in os.listdir(temp_dir) if '_' in f and f.split('_')[0].isdigit()}
+    # Images are now named like "5.png", "10.png", etc.
+    image_map = {int(Path(f).stem): f for f in os.listdir(temp_dir) if Path(f).stem.isdigit()}
 
     for item in image_data:
         row_id, row_num = item['ExcelRowID'], item['ExcelRowID'] + header_row
+        # Check if an image was successfully downloaded for this row_id
         if row_id in image_map:
             image_path = os.path.join(temp_dir, image_map[row_id])
             if verify_and_process_image(image_path, logger_instance):
                 img = Image(image_path); img.anchor = f"A{row_num}"; ws.add_image(img)
+        
+        # Write metadata regardless of image success
         ws[f"B{row_num}"] = item.get('Brand', ''); ws[f"D{row_num}"] = item.get('Style', '')
         ws[f"E{row_num}"] = item.get('Color', ''); ws[f"H{row_num}"] = item.get('Category', '')
 
@@ -308,7 +312,7 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
 def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row_offset: int, logger_instance: logging.Logger):
     try:
         wb = load_workbook(local_filename); ws = wb.active
-        image_map = {int(f.split('_')[0]): f for f in os.listdir(temp_dir) if '_' in f and f.split('_')[0].isdigit()}
+        image_map = {int(Path(f).stem): f for f in os.listdir(temp_dir) if Path(f).stem.isdigit()}
 
         for row_id, image_file in image_map.items():
             image_path = os.path.join(temp_dir, image_file)
@@ -340,7 +344,7 @@ def find_header_row_index(excel_file: str, logger_instance: logging.Logger) -> O
 async def generate_download_file(file_id: str, row_offset: int = 0):
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     logger_instance = setup_logging(file_id, timestamp)
-    temp_images_dir, temp_excel_dir = None, None
+    temp_images_dir, temp_excel_dir = "", ""
     file_id_int = int(file_id)
 
     try:
@@ -353,7 +357,7 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
             logger_instance.warning(f"No image data found for FileID {file_id}. The job will not proceed.")
             return
 
-        # --- NEW: Group data by ExcelRowID to handle multiple images per product ---
+        # --- Group data by ExcelRowID to handle multiple images per product ---
         logger_instance.info("Grouping data by product to prepare for download attempts...")
         grouped_data = []
         for _, group in images_df.groupby('ExcelRowID'):
@@ -386,7 +390,6 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
             res = requests.get(template_url, timeout=60); res.raise_for_status()
             with open(local_filename, "wb") as f: f.write(res.content)
             
-            # Pass the grouped data which contains one entry per product
             write_excel_distro(local_filename, temp_images_dir, grouped_data, header_row, logger_instance)
         else:
             logger_instance.info("Starting GENERIC file generation.")
