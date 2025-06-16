@@ -102,7 +102,6 @@ async def create_temp_dirs(unique_id: str) -> Tuple[str, str]:
     temp_excel_dir = base_dir / 'excel' / unique_id
     
     loop = asyncio.get_running_loop()
-    # CORRECTED: Use lambda or functools.partial to pass arguments to the executor.
     await loop.run_in_executor(None, partial(os.makedirs, temp_images_dir, exist_ok=True))
     await loop.run_in_executor(None, partial(os.makedirs, temp_excel_dir, exist_ok=True))
     
@@ -139,14 +138,14 @@ def get_file_location(file_id: int, logger_instance: logging.Logger) -> str:
 def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.DataFrame:
     """
     Retrieve detailed image and product data for Excel processing.
-    Fetches ALL image results for each product, ordered by SortOrder to allow for fallbacks.
+    Fetches only positive SortOrder images to allow for fallbacks.
     """
     with pyodbc.connect(conn_str) as connection:
         cursor = connection.cursor()
         cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?", (file_id,))
         connection.commit()
     
-    # ROBUST QUERY: Gets all images and metadata, correctly ordered for fallback processing.
+    # MODIFIED QUERY: Added "AND r.SortOrder > 0" to fetch only positive results.
     query = """
         SELECT
             s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail, r.SortOrder,
@@ -155,11 +154,11 @@ def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.Dat
         FROM utb_ImageScraperFiles f
         INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
         INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
-        WHERE f.ID = ?
+        WHERE f.ID = ? AND r.SortOrder > 0
         ORDER BY s.ExcelRowID, r.SortOrder
     """
     
-    logger_instance.info(f"Executing query to fetch all image results for FileID: {file_id}")
+    logger_instance.info(f"Executing query to fetch all positive image results for FileID: {file_id}")
     return pd.read_sql_query(query, engine, params=[(file_id,)])
 
 def update_file_location_complete(file_id: int, file_location: str, logger_instance: logging.Logger):
@@ -192,10 +191,8 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
     """
     async with semaphore:
         row_id = item['ExcelRowID']
-        # The filename is simply the row ID, as requested.
         image_name = str(row_id)
 
-        # Loop through all available image options for this item, which are pre-sorted by SortOrder.
         for i, (url, thumb_url, sort_order) in enumerate(item['image_options']):
             
             async def attempt_download(download_url: str, is_thumb: bool) -> bool:
@@ -206,7 +203,6 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
                         is_valid, data = await validate_image_response(response, download_url, logger_instance)
                         if not is_valid: return False
                         
-                        # Save the file as {row_id}.png
                         final_path = os.path.join(save_path, f"{image_name}.png")
                         with PILImage.open(BytesIO(data)) as img:
                             img.save(final_path, 'PNG')
@@ -216,14 +212,11 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
                     logger_instance.warning(f"Download attempt {i+1} failed for Row {row_id} ({'thumb' if is_thumb else 'main'}): {e}")
                     return False
 
-            # Try main URL. If it works, we are done with this item and can return True.
             if await attempt_download(url, is_thumb=False):
                 return True
-            # If main fails, try the thumbnail URL as a fallback for this SortOrder.
             if await attempt_download(thumb_url, is_thumb=True):
                 return True
         
-        # If the outer loop completes, all download attempts for all sort orders have failed for this item.
         logger_instance.error(f"All download attempts FAILED for Row {row_id}. No more images to try.")
         return False
 
@@ -289,18 +282,15 @@ def verify_and_process_image(image_path: str, logger_instance: logging.Logger) -
 
 def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict], header_row: int, logger_instance: logging.Logger):
     wb = load_workbook(local_filename); ws = wb.active
-    # Images are now named like "5.png", "10.png", etc.
     image_map = {int(Path(f).stem): f for f in os.listdir(temp_dir) if Path(f).stem.isdigit()}
 
     for item in image_data:
         row_id, row_num = item['ExcelRowID'], item['ExcelRowID'] + header_row
-        # Check if an image was successfully downloaded for this row_id
         if row_id in image_map:
             image_path = os.path.join(temp_dir, image_map[row_id])
             if verify_and_process_image(image_path, logger_instance):
                 img = Image(image_path); img.anchor = f"A{row_num}"; ws.add_image(img)
         
-        # Write metadata regardless of image success
         ws[f"B{row_num}"] = item.get('Brand', ''); ws[f"D{row_num}"] = item.get('Style', '')
         ws[f"E{row_num}"] = item.get('Color', ''); ws[f"H{row_num}"] = item.get('Category', '')
 
@@ -354,15 +344,13 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
         logger_instance.info("Fetching all image data from database...")
         images_df = get_images_excel_db(file_id_int, logger_instance)
         if images_df.empty:
-            logger_instance.warning(f"No image data found for FileID {file_id}. The job will not proceed.")
+            logger_instance.warning(f"No positive SortOrder image data found for FileID {file_id}. The job will not proceed.")
             return
 
-        # --- Group data by ExcelRowID to handle multiple images per product ---
         logger_instance.info("Grouping data by product to prepare for download attempts...")
         grouped_data = []
         for _, group in images_df.groupby('ExcelRowID'):
             first_row = group.iloc[0]
-            # Create a list of tuples: (ImageUrl, ImageUrlThumbnail, SortOrder)
             image_options = list(zip(group['ImageUrl'], group['ImageUrlThumbnail'], group['SortOrder']))
             
             grouped_data.append({
@@ -371,7 +359,7 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
                 'Style': first_row['Style'],
                 'Color': first_row['Color'],
                 'Category': first_row['Category'],
-                'image_options': image_options # This list is ordered by SortOrder
+                'image_options': image_options
             })
         
         logger_instance.info(f"Data prepared for {len(grouped_data)} unique products. Starting image downloads.")
