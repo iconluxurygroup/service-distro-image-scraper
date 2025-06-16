@@ -258,17 +258,22 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     wb.save(local_filename)
 
 def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row_offset: int, logger_instance: logging.Logger):
-    wb = load_workbook(local_filename); ws = wb.active
-    image_map = {int(f.split('_')[0]): f for f in os.listdir(temp_dir) if '_' in f and f.split('_')[0].isdigit()}
+    try:    
+        wb = load_workbook(local_filename); ws = wb.active
+        image_map = {int(f.split('_')[0]): f for f in os.listdir(temp_dir) if '_' in f and f.split('_')[0].isdigit()}
 
-    for row_id, image_file in image_map.items():
-        image_path = os.path.join(temp_dir, image_file)
-        if verify_and_process_image(image_path, logger_instance):
-            img = Image(image_path)
-            # Generic files use absolute ExcelRowID. Header_row is informational. API offset is applied.
-            adjusted_row = row_id + row_offset
-            img.anchor = f"A{adjusted_row}"; ws.add_image(img)
-    wb.save(local_filename)
+        for row_id, image_file in image_map.items():
+            image_path = os.path.join(temp_dir, image_file)
+            if verify_and_process_image(image_path, logger_instance):
+                img = Image(image_path)
+                # Generic files use absolute ExcelRowID. Header_row is informational. API offset is applied.
+                adjusted_row = row_id + header_row + row_offset
+                img.anchor = f"A{adjusted_row}"; ws.add_image(img)
+        wb.save(local_filename)
+    except Exception as e:
+        logger_instance.error(f"Error writing to generic Excel file: {e}", exc_info=True)
+    raise
+
 
 def find_header_row_index(excel_file: str, logger_instance: logging.Logger) -> Optional[int]:
     try:
