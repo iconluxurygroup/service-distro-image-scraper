@@ -485,7 +485,6 @@ async def orchestrate_entry_search(
     logger.info(f"EntryID {entry_id}: Orchestration complete. Total {len(all_valid_results_collected)} valid results for Original='{original_search_term}'.")
     return all_valid_results_collected
 
-# In main.py
 
 async def run_job_with_logging(
     job_func: Callable[..., Any],
@@ -506,11 +505,15 @@ async def run_job_with_logging(
     debug_info = {"log_file_server_path": log_file_path, "errors": []}
 
     try:
-        # Prepare arguments for the job function, simply injecting the logger.
-        # This is much more robust than the previous dynamic argument logic.
+        # Prepare arguments for the job function.
         job_args = kwargs.copy()
         job_args['logger'] = job_logger
         
+        # --- FIX IS HERE ---
+        # Add the file_id from the context to the arguments for the job function.
+        job_args['file_id'] = file_id_context
+        # -------------------
+
         if asyncio.iscoroutinefunction(job_func):
             result_payload = await job_func(**job_args)
         else:
@@ -550,6 +553,7 @@ async def run_job_with_logging(
         "data": result_payload, 
         "debug_info": debug_info
     }
+
 async def run_generate_download_file(
     file_id: str,
     parent_logger: logging.Logger,
