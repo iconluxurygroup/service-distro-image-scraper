@@ -43,7 +43,7 @@ app = FastAPI()
 MAX_THREADS = int(os.environ.get('MAX_THREADS', 10))
 VALID_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp', 'image/avif', 'image/tiff', 'image/x-icon']
 MIN_IMAGE_SIZE = 1000  # Minimum content length in bytes
-MAX_IMAGE_VERIFY_SIZE = 3000 # For verification before processing
+MAX_IMAGE_VERIFY_SIZE = 1000 # For verification before processing
 MAX_IMAGE_DIMENSION = 130   # For resizing
 
 def get_user_agents(logger_instance: logging.Logger) -> List[str]:
@@ -184,14 +184,10 @@ async def validate_image_response(response, url: str, logger_instance: logging.L
     return True, await response.read()
 
 async def image_download(semaphore, item: Dict, save_path: str, session, logger_instance: logging.Logger, user_agents: List[str]):
-    """
-    Attempts to download an image for a given item by iterating through its available image URLs.
-    It tries the main URL, then the thumbnail URL for each sort order until one is successful.
-    Saves the image as {ExcelRowID}.png.
-    """
     async with semaphore:
         row_id = item['ExcelRowID']
         image_name = str(row_id)
+        loop = asyncio.get_running_loop() # Get loop here or pass it in
 
         for i, (url, thumb_url, sort_order) in enumerate(item['image_options']):
             
@@ -204,8 +200,15 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
                         if not is_valid: return False
                         
                         final_path = os.path.join(save_path, f"{image_name}.png")
-                        with PILImage.open(BytesIO(data)) as img:
-                            img.save(final_path, 'PNG')
+
+                        # --- MODIFIED PART ---
+                        def save_image_sync():
+                            with PILImage.open(BytesIO(data)) as img:
+                                img.save(final_path, 'PNG')
+                        
+                        await loop.run_in_executor(None, save_image_sync)
+                        # --- END MODIFIED PART ---
+                                
                         logger_instance.info(f"SUCCESS (SortOrder {sort_order}) for Row {row_id} from {'thumbnail' if is_thumb else 'main'} URL.")
                         return True
                 except Exception as e:
