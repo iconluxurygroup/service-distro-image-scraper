@@ -109,13 +109,13 @@ def get_file_location(file_id: int, logger_instance: logging.Logger) -> str:
     
 def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.DataFrame:
     """Retrieve detailed image and product data for Excel processing."""
-    # This block remains the same
+    # This initial UPDATE uses pyodbc directly and correctly passes a tuple.
     with pyodbc.connect(conn_str) as connection:
         cursor = connection.cursor()
         cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?", (file_id,))
         connection.commit()
     
-    # 1. SQL QUERY: Reverted to using the '?' positional placeholder for pyodbc.
+    # 1. SQL QUERY: Using the '?' placeholder required by pyodbc.
     query = """
         SELECT
             s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail,
@@ -128,9 +128,9 @@ def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.Dat
         ORDER BY s.ExcelRowID
     """
     
-    # 2. PANDAS CALL: Pass the parameters as a simple list.
-    # Pandas is smart enough to handle this correctly with the '?' placeholder.
-    return pd.read_sql_query(query, engine, params=[file_id])
+    # 2. PANDAS CALL: Pass params as a list containing a TUPLE.
+    # The trailing comma in (file_id,) is critical to create a tuple.
+    return pd.read_sql_query(query, engine, params=[(file_id,)])
 
 def update_file_location_complete(file_id: int, file_location: str, logger_instance: logging.Logger):
     """Update the completed file location URL in the database."""
