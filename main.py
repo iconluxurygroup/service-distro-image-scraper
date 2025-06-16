@@ -106,15 +106,17 @@ def get_file_location(file_id: int, logger_instance: logging.Logger) -> str:
         if not result:
             raise FileNotFoundError(f"No file location found in DB for FileID {file_id}")
         return result[0]
-
+    
 def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.DataFrame:
     """Retrieve detailed image and product data for Excel processing."""
+    # This block remains the same
     with pyodbc.connect(conn_str) as connection:
         cursor = connection.cursor()
         cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?", (file_id,))
         connection.commit()
     
-    query = f"""
+    # 1. UPDATED aSQL QUERY: Changed '?' to the named parameter ':file_id'
+    query = """
         SELECT
             s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail,
             s.ProductBrand AS Brand, s.ProductModel AS Style,
@@ -122,10 +124,12 @@ def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.Dat
         FROM utb_ImageScraperFiles f
         INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
         INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
-        WHERE f.ID = ? AND r.SortOrder = 1
+        WHERE f.ID = :file_id AND r.SortOrder = 1
         ORDER BY s.ExcelRowID
     """
-    return pd.read_sql_query(query, engine, params=[file_id])
+    
+    # 2. UPDATED PANDAS CALL: Changed 'params' to a dictionary
+    return pd.read_sql_query(query, engine, params={'file_id': file_id})
 
 def update_file_location_complete(file_id: int, file_location: str, logger_instance: logging.Logger):
     """Update the completed file location URL in the database."""
