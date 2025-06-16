@@ -180,13 +180,22 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
         return False
 
 async def download_all_images(data: List[Dict], save_path: str, logger_instance: logging.Logger):
-    domains = [tldextract.extract(item['ImageUrl']).registered_domain for item in data if item.get('ImageUrl')]
+    """Download all images concurrently."""
+    # 1. FIX: Updated deprecated '.registered_domain'
+    domains = [tldextract.extract(item['ImageUrl']).top_domain_under_public_suffix 
+               for item in data if item.get('ImageUrl')]
+               
     pool_size = min(500, max(10, len(Counter(domains)) * 2))
     
-    async with RetryClient(raise_for_status=False, retry_options=ExponentialRetry(attempts=3), client_timeout=ClientTimeout(total=60)) as session:
+    timeout_config = ClientTimeout(total=60)
+    retry_options = ExponentialRetry(attempts=3, start_timeout=3)
+    
+    # 2. FIX: Changed 'client_timeout' to the correct 'timeout' parameter
+    async with RetryClient(raise_for_status=False, retry_options=retry_options, timeout=timeout_config) as session:
         semaphore = asyncio.Semaphore(pool_size)
         tasks = [image_download(semaphore, item, save_path, session, logger_instance) for item in data]
         results = await asyncio.gather(*tasks)
+        
         failed_count = len([res for res in results if not res])
         if failed_count > 0:
             logger_instance.warning(f"{failed_count} images failed to download.")
@@ -286,8 +295,11 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
     try:
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
         logger_instance.info("Fetching data and downloading images...")
+        # NEW CODE
         images_df = get_images_excel_db(file_id_int, logger_instance)
-        if images_df.empty: raise ValueError("No image data found in database.")
+        if images_df.empty:
+            logger_instance.warning(f"No image data found for FileID {file_id}. The job will not proceed.")
+            return # Exit the function gracefully
         
         await download_all_images(images_df.to_dict('records'), temp_images_dir, logger_instance)
         
