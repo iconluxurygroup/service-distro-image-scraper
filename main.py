@@ -42,7 +42,37 @@ VALID_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image
 MIN_IMAGE_SIZE = 1000  # Minimum content length in bytes
 MAX_IMAGE_VERIFY_SIZE = 3000 # For verification before processing
 MAX_IMAGE_DIMENSION = 130   # For resizing
+import requests
+import random
 
+def get_user_agents(logger_instance: logging.Logger) -> List[str]:
+    """
+    Fetches a list of user agents from the DataProxy API.
+    Returns a default list if the API call fails.
+    """
+    # A reliable default User-Agent in case the API fails
+    default_ua = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"]
+    
+    try:
+        api_url = "https://api.thedataproxy.com/v2/user-agents/?skip=0&limit=100"
+        logger_instance.info(f"Fetching user agents from {api_url}")
+        
+        response = requests.get(api_url, timeout=15)
+        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
+        
+        data = response.json()
+        user_agents = [ua.get("user_agent") for ua in data.get("data", []) if ua.get("user_agent")]
+        
+        if not user_agents:
+            logger_instance.warning("User-Agent API returned no agents. Using default.")
+            return default_ua
+            
+        logger_instance.info(f"Successfully fetched {len(user_agents)} user agents.")
+        return user_agents
+        
+    except requests.exceptions.RequestException as e:
+        logger_instance.error(f"Failed to fetch user agents from API: {e}. Using default.")
+        return default_ua
 # --- General Utility Functions ---
 def setup_logging(file_id: str, timestamp: str) -> logging.Logger:
     """Configure logging to save logs to a file for a specific job run."""
@@ -156,7 +186,7 @@ async def validate_image_response(response, url: str, logger_instance: logging.L
 
 import re
 
-async def image_download(semaphore, item: Dict, save_path: str, session, logger_instance: logging.Logger) -> bool:
+async def image_download(semaphore, item: Dict, save_path: str, session, logger_instance: logging.Logger, user_agents: List[str]):
     """
     Downloads an image with robust path and filename sanitization.
     """
@@ -180,18 +210,36 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
 
         # Create a clean list of filename components
         name_parts = [row_id, style, color]
-        
-        # Filter out any empty parts that resulted from sanitization
-        # This prevents double underscores or leading/trailing underscores.
-        image_name_parts = [part for part in name_parts if part]
-
         # Join the parts to create a clean, reliable filename
-        image_name = "_".join(image_name_parts)
+        image_name = f"{item['ExcelRowID']}_{item.get('Style', 'style').replace(' ', '_')}" # Placeholder for your sanitized name
 
-        if not image_name:
-            logger_instance.error(f"Could not generate a valid image name for Row {row_id}. Data: {item}")
+        async def attempt_download(download_url: str, is_thumb: bool) -> bool:
+            if not download_url: return False
+            try:
+                # *** KEY CHANGE: ROTATE USER-AGENT FOR EACH ATTEMPT ***
+                headers = {
+                    "User-Agent": random.choice(user_agents)
+                }
+                
+                # Pass the dynamically generated header to the request
+                async with session.get(download_url, headers=headers) as response:
+                    is_valid, data = await validate_image_response(response, download_url, logger_instance)
+                    if not is_valid: return False
+                    
+                    final_path = os.path.join(save_path, f"{image_name}.png")
+                    with PILImage.open(BytesIO(data)) as img:
+                        img.save(final_path, 'PNG')
+                    return True
+            except Exception as e:
+                logger_instance.error(f"Download failed for {'thumbnail' if is_thumb else 'image'} {download_url}: {e}")
+                return False
+
+        async with semaphore:
+            url, thumbnail = item.get('ImageUrl'), item.get('ImageUrlThumbnail')
+            if await attempt_download(url, False) or await attempt_download(thumbnail, True):
+                return True
+            logger_instance.error(f"All download attempts failed for Row {item['ExcelRowID']}")
             return False
-        # --- END SANITIZATION ---
 
     except Exception as e:
         logger_instance.error(f"Error generating filename for item {item.get('ExcelRowID', 'Unknown')}: {e}")
@@ -226,26 +274,26 @@ async def image_download(semaphore, item: Dict, save_path: str, session, logger_
         logger_instance.error(f"All download attempts failed for Row {item['ExcelRowID']}")
         return False
 
-async def download_all_images(data: List[Dict], save_path: str, logger_instance: logging.Logger):
-    """Download all images concurrently."""
-    # 1. FIX: Updated deprecated '.registered_domain'
+async def download_all_images(data: List[Dict], save_path: str, logger_instance: logging.Logger, user_agents: List[str]):
+    """Download all images concurrently, passing the user_agent list to each task."""
     domains = [tldextract.extract(item['ImageUrl']).top_domain_under_public_suffix 
                for item in data if item.get('ImageUrl')]
-               
     pool_size = min(500, max(10, len(Counter(domains)) * 2))
     
     timeout_config = ClientTimeout(total=60)
     retry_options = ExponentialRetry(attempts=3, start_timeout=3)
     
-    # 2. FIX: Changed 'client_timeout' to the correct 'timeout' parameter
+    # We remove the static 'headers' argument here, as it will be set dynamically for each request.
     async with RetryClient(raise_for_status=False, retry_options=retry_options, timeout=timeout_config) as session:
         semaphore = asyncio.Semaphore(pool_size)
-        tasks = [image_download(semaphore, item, save_path, session, logger_instance) for item in data]
+        # Pass the user_agents list down to each individual download task
+        tasks = [image_download(semaphore, item, save_path, session, logger_instance, user_agents) for item in data]
         results = await asyncio.gather(*tasks)
         
         failed_count = len([res for res in results if not res])
         if failed_count > 0:
             logger_instance.warning(f"{failed_count} images failed to download.")
+
 
 # --- Image & Excel Processing Functions ---
 def resize_image(image_path: str, logger_instance: logging.Logger) -> bool:
@@ -345,15 +393,20 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
     file_id_int = int(file_id)
 
     try:
+        # 1. FETCH THE LIST OF USER AGENTS AT THE START
+        user_agents = get_user_agents(logger_instance)
+
         temp_images_dir, temp_excel_dir = await create_temp_dirs(file_id)
         logger_instance.info("Fetching data and downloading images...")
-        # NEW CODE
+        
         images_df = get_images_excel_db(file_id_int, logger_instance)
         if images_df.empty:
             logger_instance.warning(f"No image data found for FileID {file_id}. The job will not proceed.")
-            return # Exit the function gracefully
+            return
         
-        await download_all_images(images_df.to_dict('records'), temp_images_dir, logger_instance)
+        # 2. PASS THE LIST TO THE IMAGE DOWNLOADER
+        await download_all_images(images_df.to_dict('records'), temp_images_dir, logger_instance, user_agents)
+        
         
         file_type_id = get_file_type_id(file_id_int, logger_instance)
         FILE_TYPE_DISTRO = 3
