@@ -288,8 +288,14 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     ws = wb.active
     image_map = {int(Path(f).stem): f for f in os.listdir(temp_dir) if Path(f).stem.isdigit()}
 
-    # Set a default row height for consistency (adjust as needed)
-    DEFAULT_ROW_HEIGHT = 106  # Pixels, adjust based on typical image height
+    # Get default row height from the template
+    # Try the first data row (header_row + 1) or fall back to Excel default
+    DEFAULT_ROW_HEIGHT_POINTS = ws.row_dimensions.get(header_row + 1, {}).height
+    if DEFAULT_ROW_HEIGHT_POINTS is None:
+        DEFAULT_ROW_HEIGHT_POINTS = 12.75  # Excel default height in points (Calibri 11pt)
+        logger_instance.info(f"No row height set in template for row {header_row + 1}, using default {DEFAULT_ROW_HEIGHT_POINTS} points")
+    else:
+        logger_instance.info(f"Using template row height: {DEFAULT_ROW_HEIGHT_POINTS} points from row {header_row + 1}")
 
     # Process all rows in image_data
     for item in image_data:
@@ -297,7 +303,7 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
         row_num = row_id + header_row
         
         # Set row height explicitly for consistency
-        ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT
+        ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
 
         # Write image if available
         if row_id in image_map:
@@ -306,10 +312,11 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
                 img = Image(image_path)
                 img.anchor = f"A{row_num}"
                 ws.add_image(img)
-                # Adjust row height based on image if needed
-                img_height = img.height if hasattr(img, 'height') else DEFAULT_ROW_HEIGHT
-                ws.row_dimensions[row_num].height = max(DEFAULT_ROW_HEIGHT, img_height / 1.33)  # Convert pixels to points (approx)
-                logger_instance.info(f"Added image for Row {row_id} at Excel row {row_num}")
+                # Adjust row height based on image if needed (convert image height from pixels to points)
+                img_height_pixels = img.height if hasattr(img, 'height') else 0
+                img_height_points = img_height_pixels * 72 / 96  # Assuming 96 DPI
+                ws.row_dimensions[row_num].height = max(DEFAULT_ROW_HEIGHT_POINTS, img_height_points)
+                logger_instance.info(f"Added image for Row {row_id} at Excel row {row_num}, height set to {ws.row_dimensions[row_num].height} points")
             else:
                 logger_instance.warning(f"Image processing failed for Row {row_id}, writing row without image")
         else:
@@ -329,7 +336,7 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
         # Fill any skipped rows with empty metadata
         for row_num in range(min_data_row, max_data_row + 1):
             if not ws[f"B{row_num}"].value:  # Check if row is empty
-                ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT
+                ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
                 ws[f"B{row_num}"] = ''
                 ws[f"D{row_num}"] = ''
                 ws[f"E{row_num}"] = ''
