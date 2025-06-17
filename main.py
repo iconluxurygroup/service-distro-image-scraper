@@ -288,10 +288,17 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     ws = wb.active
     image_map = {int(Path(f).stem): f for f in os.listdir(temp_dir) if Path(f).stem.isdigit()}
 
+    # Set a default row height for consistency (adjust as needed)
+    DEFAULT_ROW_HEIGHT = 106  # Pixels, adjust based on typical image height
+
+    # Process all rows in image_data
     for item in image_data:
         row_id = item['ExcelRowID']
         row_num = row_id + header_row
         
+        # Set row height explicitly for consistency
+        ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT
+
         # Write image if available
         if row_id in image_map:
             image_path = os.path.join(temp_dir, image_map[row_id])
@@ -299,23 +306,41 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
                 img = Image(image_path)
                 img.anchor = f"A{row_num}"
                 ws.add_image(img)
+                # Adjust row height based on image if needed
+                img_height = img.height if hasattr(img, 'height') else DEFAULT_ROW_HEIGHT
+                ws.row_dimensions[row_num].height = max(DEFAULT_ROW_HEIGHT, img_height / 1.33)  # Convert pixels to points (approx)
+                logger_instance.info(f"Added image for Row {row_id} at Excel row {row_num}")
             else:
-                logger_instance.warning(f"Image processing failed for Row {row_id}, writing row without image.")
+                logger_instance.warning(f"Image processing failed for Row {row_id}, writing row without image")
         else:
-            logger_instance.info(f"No image found for Row {row_id}, writing row without image.")
-        
+            logger_instance.info(f"No image found for Row {row_id}, writing row without image")
+
         # Write metadata regardless of image presence
         ws[f"B{row_num}"] = item.get('Brand', '')
         ws[f"D{row_num}"] = item.get('Style', '')
         ws[f"E{row_num}"] = item.get('Color', '')
         ws[f"H{row_num}"] = item.get('Category', '')
 
-    # Clean up excess rows
+    # Ensure all rows up to max_data_row are processed to avoid gaps
     if image_data:
         max_data_row = max(item['ExcelRowID'] for item in image_data) + header_row
+        min_data_row = min(item['ExcelRowID'] for item in image_data) + header_row
+        
+        # Fill any skipped rows with empty metadata
+        for row_num in range(min_data_row, max_data_row + 1):
+            if not ws[f"B{row_num}"].value:  # Check if row is empty
+                ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT
+                ws[f"B{row_num}"] = ''
+                ws[f"D{row_num}"] = ''
+                ws[f"E{row_num}"] = ''
+                ws[f"H{row_num}"] = ''
+                logger_instance.info(f"Filled empty row {row_num} to prevent gaps")
+
+        # Remove rows after the last data row
         if ws.max_row > max_data_row:
+            logger_instance.info(f"Deleting {ws.max_row - max_data_row} rows after row {max_data_row}")
             ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
-    
+
     wb.save(local_filename)
     logger_instance.info(f"Excel file saved: {local_filename}")
 
