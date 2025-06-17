@@ -284,23 +284,40 @@ def verify_and_process_image(image_path: str, logger_instance: logging.Logger) -
         logger_instance.error(f"Image verification failed for {image_path}", exc_info=True); return False
 
 def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict], header_row: int, logger_instance: logging.Logger):
-    wb = load_workbook(local_filename); ws = wb.active
+    wb = load_workbook(local_filename)
+    ws = wb.active
     image_map = {int(Path(f).stem): f for f in os.listdir(temp_dir) if Path(f).stem.isdigit()}
 
     for item in image_data:
-        row_id, row_num = item['ExcelRowID'], item['ExcelRowID'] + header_row
+        row_id = item['ExcelRowID']
+        row_num = row_id + header_row
+        
+        # Write image if available
         if row_id in image_map:
             image_path = os.path.join(temp_dir, image_map[row_id])
             if verify_and_process_image(image_path, logger_instance):
-                img = Image(image_path); img.anchor = f"A{row_num}"; ws.add_image(img)
+                img = Image(image_path)
+                img.anchor = f"A{row_num}"
+                ws.add_image(img)
+            else:
+                logger_instance.warning(f"Image processing failed for Row {row_id}, writing row without image.")
+        else:
+            logger_instance.info(f"No image found for Row {row_id}, writing row without image.")
         
-        ws[f"B{row_num}"] = item.get('Brand', ''); ws[f"D{row_num}"] = item.get('Style', '')
-        ws[f"E{row_num}"] = item.get('Color', ''); ws[f"H{row_num}"] = item.get('Category', '')
+        # Write metadata regardless of image presence
+        ws[f"B{row_num}"] = item.get('Brand', '')
+        ws[f"D{row_num}"] = item.get('Style', '')
+        ws[f"E{row_num}"] = item.get('Color', '')
+        ws[f"H{row_num}"] = item.get('Category', '')
 
+    # Clean up excess rows
     if image_data:
         max_data_row = max(item['ExcelRowID'] for item in image_data) + header_row
-        if ws.max_row > max_data_row: ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
+        if ws.max_row > max_data_row:
+            ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
+    
     wb.save(local_filename)
+    logger_instance.info(f"Excel file saved: {local_filename}")
 
 def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row_offset: int, logger_instance: logging.Logger):
     try:
