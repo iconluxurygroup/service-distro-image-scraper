@@ -388,7 +388,6 @@ def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row
                 img.anchor = f"A{adjusted_row}"; ws.add_image(img)
         logger_instance.info("Setting worksheet view to A1.")
         ws.sheet_view.topLeftCell = 'A1'
-        ws.active_cell = 'A1'
         wb.save(local_filename)
     except Exception as e:
         logger_instance.error(f"Error writing to generic Excel file: {e}", exc_info=True)
