@@ -138,14 +138,14 @@ def get_file_location(file_id: int, logger_instance: logging.Logger) -> str:
 def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.DataFrame:
     """
     Retrieve detailed image and product data for Excel processing.
-    Fetches only positive SortOrder images to allow for fallbacks.
+    Includes all rows, even those without image results, using LEFT JOIN.
     """
     with pyodbc.connect(conn_str) as connection:
         cursor = connection.cursor()
         cursor.execute("UPDATE utb_ImageScraperFiles SET CreateFileStartTime = GETDATE() WHERE ID = ?", (file_id,))
         connection.commit()
     
-    # MODIFIED QUERY: Added "AND r.SortOrder > 0" to fetch only positive results.
+    # MODIFIED QUERY: Use LEFT JOIN to include all records, even those without images
     query = """
         SELECT
             s.ExcelRowID, r.ImageUrl, r.ImageUrlThumbnail, r.SortOrder,
@@ -153,12 +153,12 @@ def get_images_excel_db(file_id: int, logger_instance: logging.Logger) -> pd.Dat
             s.ProductColor AS Color, s.ProductCategory AS Category
         FROM utb_ImageScraperFiles f
         INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
-        INNER JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID 
-        WHERE f.ID = ? AND r.SortOrder > 0
+        LEFT JOIN utb_ImageScraperResult r ON r.EntryID = s.EntryID AND r.SortOrder > 0
+        WHERE f.ID = ?
         ORDER BY s.ExcelRowID, r.SortOrder
     """
     
-    logger_instance.info(f"Executing query to fetch all positive image results for FileID: {file_id}")
+    logger_instance.info(f"Executing query to fetch all records for FileID: {file_id}")
     return pd.read_sql_query(query, engine, params=[(file_id,)])
 
 def update_file_location_complete(file_id: int, file_location: str, logger_instance: logging.Logger):
@@ -291,7 +291,7 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     # Get default row height from the template
     DEFAULT_ROW_HEIGHT_POINTS = ws.row_dimensions.get(header_row + 1, {}).height
     if DEFAULT_ROW_HEIGHT_POINTS is None:
-        DEFAULT_ROW_HEIGHT_POINTS = 12.75  # Excel default height in points (Calibri 11pt)
+        DEFAULT_ROW_HEIGHT_POINTS = 12.75  # Excel default height in points
         logger_instance.info(f"No row height set in template for row {header_row + 1}, using default {DEFAULT_ROW_HEIGHT_POINTS} points")
     else:
         logger_instance.info(f"Using template row height: {DEFAULT_ROW_HEIGHT_POINTS} points from row {header_row + 1}")
@@ -299,67 +299,56 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     # Create a mapping of ExcelRowID to metadata for quick lookup
     row_data_map = {item['ExcelRowID']: item for item in image_data}
 
-    # Process all rows in image_data
-    for item in image_data:
-        row_id = item['ExcelRowID']
+    # Determine the range of ExcelRowIDs to process
+    if image_data:
+        min_row_id = min(item['ExcelRowID'] for item in image_data)
+        max_row_id = max(item['ExcelRowID'] for item in image_data)
+    else:
+        min_row_id, max_row_id = 1, 1  # Fallback to avoid empty range
+        logger_instance.warning("No data in image_data, setting default row range")
+
+    # Process all rows in the expected range to avoid gaps
+    for row_id in range(min_row_id, max_row_id + 1):
         row_num = row_id + header_row
-        
-        # Set row height explicitly for consistency
         ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
 
-        # Write image if available
-        if row_id in image_map:
-            image_path = os.path.join(temp_dir, image_map[row_id])
-            if verify_and_process_image(image_path, logger_instance):
-                img = Image(image_path)
-                img.anchor = f"A{row_num}"
-                ws.add_image(img)
-                # Adjust row height based on image if needed (convert image height from pixels to points)
-                img_height_pixels = img.height if hasattr(img, 'height') else 0
-                img_height_points = img_height_pixels * 72 / 96  # Assuming 96 DPI
-                ws.row_dimensions[row_num].height = max(DEFAULT_ROW_HEIGHT_POINTS, img_height_points)
-                logger_instance.info(f"Added image for Row {row_id} at Excel row {row_num}, height set to {ws.row_dimensions[row_num].height} points")
+        if row_id in row_data_map:
+            item = row_data_map[row_id]
+            # Write image if available
+            if row_id in image_map:
+                image_path = os.path.join(temp_dir, image_map[row_id])
+                if verify_and_process_image(image_path, logger_instance):
+                    img = Image(image_path)
+                    img.anchor = f"A{row_num}"
+                    ws.add_image(img)
+                    # Adjust row height based on image if needed
+                    img_height_pixels = img.height if hasattr(img, 'height') else 0
+                    img_height_points = img_height_pixels * 72 / 96  # Assuming 96 DPI
+                    ws.row_dimensions[row_num].height = max(DEFAULT_ROW_HEIGHT_POINTS, img_height_points)
+                    logger_instance.info(f"Added image for Row {row_id} at Excel row {row_num}, height set to {ws.row_dimensions[row_num].height} points")
+                else:
+                    logger_instance.warning(f"Image processing failed for Row {row_id}, writing metadata only")
             else:
-                logger_instance.warning(f"Image processing failed for Row {row_id}, writing row without image")
+                logger_instance.info(f"No image found for Row {row_id}, writing metadata only")
+
+            # Write metadata
+            ws[f"B{row_num}"] = item.get('Brand', '')
+            ws[f"D{row_num}"] = item.get('Style', '')
+            ws[f"E{row_num}"] = item.get('Color', '')
+            ws[f"H{row_num}"] = item.get('Category', '')
+            logger_instance.info(f"Wrote metadata for Row {row_id} at Excel row {row_num}")
         else:
-            logger_instance.info(f"No image found for Row {row_id}, writing row without image")
+            # Fill missing rows with empty metadata
+            ws[f"B{row_num}"] = ''
+            ws[f"D{row_num}"] = ''
+            ws[f"E{row_num}"] = ''
+            ws[f"H{row_num}"] = ''
+            logger_instance.info(f"Filled missing row {row_num} (ExcelRowID {row_id}) with empty metadata")
 
-        # Write metadata regardless of image presence
-        ws[f"B{row_num}"] = item.get('Brand', '')
-        ws[f"D{row_num}"] = item.get('Style', '')
-        ws[f"E{row_num}"] = item.get('Color', '')
-        ws[f"H{row_num}"] = item.get('Category', '')
-
-    # Ensure all rows up to max_data_row are processed to avoid gaps
-    if image_data:
-        max_data_row = max(item['ExcelRowID'] for item in image_data) + header_row
-        min_data_row = min(item['ExcelRowID'] for item in image_data) + header_row
-        
-        # Fill any skipped rows with corresponding metadata or empty values
-        for row_num in range(min_data_row, max_data_row + 1):
-            row_id = row_num - header_row
-            if row_id not in row_data_map:
-                # Fill truly missing rows (not in image_data) with empty metadata
-                ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
-                ws[f"B{row_num}"] = ''
-                ws[f"D{row_num}"] = ''
-                ws[f"E{row_num}"] = ''
-                ws[f"H{row_num}"] = ''
-                logger_instance.info(f"Filled missing row {row_num} (ExcelRowID {row_id}) with empty metadata")
-            elif not ws[f"B{row_num}"].value:  # Check if row was skipped in main loop
-                # Fill row with metadata from image_data if it was not written
-                item = row_data_map[row_id]
-                ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
-                ws[f"B{row_num}"] = item.get('Brand', '')
-                ws[f"D{row_num}"] = item.get('Style', '')
-                ws[f"E{row_num}"] = item.get('Color', '')
-                ws[f"H{row_num}"] = item.get('Category', '')
-                logger_instance.info(f"Filled skipped row {row_num} (ExcelRowID {row_id}) with metadata")
-
-        # Remove rows after the last data row
-        if ws.max_row > max_data_row:
-            logger_instance.info(f"Deleting {ws.max_row - max_data_row} rows after row {max_data_row}")
-            ws.delete_rows(max_data_row + 1, ws.max_row - max_data_row)
+    # Remove rows after the last data row
+    if ws.max_row > max_row_id + header_row:
+        logger_instance.info(f"Deleting {ws.max_row - (max_row_id + header_row)} rows after row {max_row_id + header_row}")
+        ws.delete_rows(max_row_id + header_row + 1, ws.max_row - (max_row_id + header_row))
 
     wb.save(local_filename)
     logger_instance.info(f"Excel file saved: {local_filename}")
