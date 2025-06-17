@@ -372,7 +372,6 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
             ws.delete_rows(max_row_id + header_row + 1, ws.max_row - (max_row_id + header_row))
         logger_instance.info("Setting worksheet view to A1.")
         ws.sheet_view.topLeftCell = 'A1'
-        ws.active_cell = 'A1'
         wb.save(local_filename)
         logger_instance.info(f"Excel file saved: {local_filename}")
 
