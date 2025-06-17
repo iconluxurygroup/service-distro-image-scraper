@@ -273,7 +273,14 @@ def resize_image(image_path: str, logger_instance: logging.Logger) -> bool:
     except Exception as e:
         logger_instance.error(f"Error resizing image {image_path}: {e}", exc_info=True)
         return False
-
+def get_last_non_empty_row(ws, column: str, header_row: int, logger_instance: logging.Logger) -> int:
+    """Find the last non-empty row in the specified column, starting after header_row."""
+    last_row = header_row
+    for row in ws[f"{column}{header_row + 1}:{column}{ws.max_row}"]:
+        if row[0].value is not None and str(row[0].value).strip():
+            last_row = max(last_row, row[0].row)
+    logger_instance.info(f"Last non-empty row in column {column}: {last_row}")
+    return last_row
 def verify_and_process_image(image_path: str, logger_instance: logging.Logger) -> bool:
     try:
         with PILImage.open(image_path) as img: img.verify()
@@ -299,13 +306,28 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     # Create a mapping of ExcelRowID to metadata for quick lookup
     row_data_map = {item['ExcelRowID']: item for item in image_data}
 
+    # NEW: Call get_last_non_empty_row to find the last non-empty row in column B
+    last_non_empty_row = get_last_non_empty_row(ws, column='B', header_row=header_row, logger_instance=logger_instance)
+
     # Determine the range of ExcelRowIDs to process
     if image_data:
         min_row_id = min(item['ExcelRowID'] for item in image_data)
         max_row_id = max(item['ExcelRowID'] for item in image_data)
+        # Adjust max_row_id to account for the last non-empty row in the template
+        max_row_id = max(max_row_id, last_non_empty_row - header_row)
+        logger_instance.info(f"Row range: ExcelRowID {min_row_id} to {max_row_id}, adjusted for template last row {last_non_empty_row}")
     else:
-        min_row_id, max_row_id = 1, 1  # Fallback to avoid empty range
-        logger_instance.warning("No data in image_data, setting default row range")
+        min_row_id = 1
+        max_row_id = last_non_empty_row - header_row if last_non_empty_row > header_row else 1
+        logger_instance.warning(f"No data in image_data, setting range based on template last row {last_non_empty_row}")
+
+    # Ensure enough rows exist in the worksheet
+    max_needed_row = max_row_id + header_row
+    if ws.max_row < max_needed_row:
+        logger_instance.info(f"Appending {max_needed_row - ws.max_row} rows to worksheet")
+        for row_num in range(ws.max_row + 1, max_needed_row + 1):
+            ws.append([''] * ws.max_column)  # Append empty row to match column count
+            ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
 
     # Process all rows in the expected range to avoid gaps
     for row_id in range(min_row_id, max_row_id + 1):
@@ -338,20 +360,19 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
             ws[f"H{row_num}"] = item.get('Category', '')
             logger_instance.info(f"Wrote metadata for Row {row_id} at Excel row {row_num}")
         else:
-            # Fill missing rows with empty metadata
+            # Fill missing row with empty metadata
             ws[f"B{row_num}"] = ''
             ws[f"D{row_num}"] = ''
             ws[f"E{row_num}"] = ''
             ws[f"H{row_num}"] = ''
             logger_instance.info(f"Filled missing row {row_num} (ExcelRowID {row_id}) with empty metadata")
+        # Remove rows after the last data row
+        if ws.max_row > max_row_id + header_row:
+            logger_instance.info(f"Deleting {ws.max_row - (max_row_id + header_row)} rows after row {max_row_id + header_row}")
+            ws.delete_rows(max_row_id + header_row + 1, ws.max_row - (max_row_id + header_row))
 
-    # Remove rows after the last data row
-    if ws.max_row > max_row_id + header_row:
-        logger_instance.info(f"Deleting {ws.max_row - (max_row_id + header_row)} rows after row {max_row_id + header_row}")
-        ws.delete_rows(max_row_id + header_row + 1, ws.max_row - (max_row_id + header_row))
-
-    wb.save(local_filename)
-    logger_instance.info(f"Excel file saved: {local_filename}")
+        wb.save(local_filename)
+        logger_instance.info(f"Excel file saved: {local_filename}")
 
 def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row_offset: int, logger_instance: logging.Logger):
     try:
