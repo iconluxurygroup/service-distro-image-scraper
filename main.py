@@ -390,7 +390,7 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
 
         if file_type_id == FILE_TYPE_DISTRO:
             logger_instance.info("Starting DISTRO file generation.")
-            template_url = "https://iconluxury.group/public/ICON_DISTRO_USD_20250312.xlsx"
+            template_url = "https://iconluxury.group/public/ICON_DISTRO_USD_20250617.xlsx"
             file_name = os.path.basename(urllib.parse.unquote(template_url))
             local_filename = os.path.join(temp_excel_dir, file_name)
             header_row = 5
