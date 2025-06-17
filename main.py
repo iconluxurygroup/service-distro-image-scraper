@@ -397,15 +397,31 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
         
         logger_instance.info("Fetching all image data from database...")
         images_df = get_images_excel_db(file_id_int, logger_instance)
+        
+        # NEW: Fetch all records if images_df is empty to ensure metadata is processed
         if images_df.empty:
-            logger_instance.warning(f"No positive SortOrder image data found for FileID {file_id}. The job will not proceed.")
-            return
+            logger_instance.warning(f"No image data found for FileID {file_id}. Fetching all records for metadata.")
+            query = """
+                SELECT
+                    s.ExcelRowID,
+                    s.ProductBrand AS Brand, s.ProductModel AS Style,
+                    s.ProductColor AS Color, s.ProductCategory AS Category
+                FROM utb_ImageScraperFiles f
+                INNER JOIN utb_ImageScraperRecords s ON s.FileID = f.ID 
+                WHERE f.ID = ?
+                ORDER BY s.ExcelRowID
+            """
+            images_df = pd.read_sql_query(query, engine, params=[(file_id,)])
+            if images_df.empty:
+                logger_instance.error(f"No records found for FileID {file_id}. The job cannot proceed.")
+                return
 
         logger_instance.info("Grouping data by product to prepare for download attempts...")
         grouped_data = []
         for _, group in images_df.groupby('ExcelRowID'):
             first_row = group.iloc[0]
-            image_options = list(zip(group['ImageUrl'], group['ImageUrlThumbnail'], group['SortOrder']))
+            # Include image options only if they exist
+            image_options = list(zip(group['ImageUrl'], group['ImageUrlThumbnail'], group['SortOrder'])) if 'ImageUrl' in group.columns else []
             
             grouped_data.append({
                 'ExcelRowID': int(first_row['ExcelRowID']),
@@ -417,7 +433,10 @@ async def generate_download_file(file_id: str, row_offset: int = 0):
             })
         
         logger_instance.info(f"Data prepared for {len(grouped_data)} unique products. Starting image downloads.")
-        await download_all_images(grouped_data, temp_images_dir, logger_instance, user_agents)
+        if any(item['image_options'] for item in grouped_data):
+            await download_all_images(grouped_data, temp_images_dir, logger_instance, user_agents)
+        else:
+            logger_instance.info("No images to download, proceeding with metadata only.")
         
         file_type_id = get_file_type_id(file_id_int, logger_instance)
         FILE_TYPE_DISTRO = 3
