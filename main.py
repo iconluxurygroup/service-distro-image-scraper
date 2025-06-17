@@ -370,7 +370,9 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
         if ws.max_row > max_row_id + header_row:
             logger_instance.info(f"Deleting {ws.max_row - (max_row_id + header_row)} rows after row {max_row_id + header_row}")
             ws.delete_rows(max_row_id + header_row + 1, ws.max_row - (max_row_id + header_row))
-
+        logger_instance.info("Setting worksheet view to A1.")
+        ws.sheet_view.topLeftCell = 'A1'
+        ws.active_cell = 'A1'
         wb.save(local_filename)
         logger_instance.info(f"Excel file saved: {local_filename}")
 
@@ -385,6 +387,9 @@ def write_excel_generic(local_filename: str, temp_dir: str, header_row: int, row
                 img = Image(image_path)
                 adjusted_row = row_id + header_row + row_offset
                 img.anchor = f"A{adjusted_row}"; ws.add_image(img)
+        logger_instance.info("Setting worksheet view to A1.")
+        ws.sheet_view.topLeftCell = 'A1'
+        ws.active_cell = 'A1'
         wb.save(local_filename)
     except Exception as e:
         logger_instance.error(f"Error writing to generic Excel file: {e}", exc_info=True)
