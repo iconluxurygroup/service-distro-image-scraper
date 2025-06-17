@@ -289,13 +289,15 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
     image_map = {int(Path(f).stem): f for f in os.listdir(temp_dir) if Path(f).stem.isdigit()}
 
     # Get default row height from the template
-    # Try the first data row (header_row + 1) or fall back to Excel default
     DEFAULT_ROW_HEIGHT_POINTS = ws.row_dimensions.get(header_row + 1, {}).height
     if DEFAULT_ROW_HEIGHT_POINTS is None:
         DEFAULT_ROW_HEIGHT_POINTS = 12.75  # Excel default height in points (Calibri 11pt)
         logger_instance.info(f"No row height set in template for row {header_row + 1}, using default {DEFAULT_ROW_HEIGHT_POINTS} points")
     else:
         logger_instance.info(f"Using template row height: {DEFAULT_ROW_HEIGHT_POINTS} points from row {header_row + 1}")
+
+    # Create a mapping of ExcelRowID to metadata for quick lookup
+    row_data_map = {item['ExcelRowID']: item for item in image_data}
 
     # Process all rows in image_data
     for item in image_data:
@@ -333,15 +335,26 @@ def write_excel_distro(local_filename: str, temp_dir: str, image_data: List[Dict
         max_data_row = max(item['ExcelRowID'] for item in image_data) + header_row
         min_data_row = min(item['ExcelRowID'] for item in image_data) + header_row
         
-        # Fill any skipped rows with empty metadata
+        # Fill any skipped rows with corresponding metadata or empty values
         for row_num in range(min_data_row, max_data_row + 1):
-            if not ws[f"B{row_num}"].value:  # Check if row is empty
+            row_id = row_num - header_row
+            if row_id not in row_data_map:
+                # Fill truly missing rows (not in image_data) with empty metadata
                 ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
                 ws[f"B{row_num}"] = ''
                 ws[f"D{row_num}"] = ''
                 ws[f"E{row_num}"] = ''
                 ws[f"H{row_num}"] = ''
-                logger_instance.info(f"Filled empty row {row_num} to prevent gaps")
+                logger_instance.info(f"Filled missing row {row_num} (ExcelRowID {row_id}) with empty metadata")
+            elif not ws[f"B{row_num}"].value:  # Check if row was skipped in main loop
+                # Fill row with metadata from image_data if it was not written
+                item = row_data_map[row_id]
+                ws.row_dimensions[row_num].height = DEFAULT_ROW_HEIGHT_POINTS
+                ws[f"B{row_num}"] = item.get('Brand', '')
+                ws[f"D{row_num}"] = item.get('Style', '')
+                ws[f"E{row_num}"] = item.get('Color', '')
+                ws[f"H{row_num}"] = item.get('Category', '')
+                logger_instance.info(f"Filled skipped row {row_num} (ExcelRowID {row_id}) with metadata")
 
         # Remove rows after the last data row
         if ws.max_row > max_data_row:
