@@ -116,6 +116,7 @@ async def send_message_email(to_emails, subject, message, logger=None):
         msg = MIMEMultipart()
         msg['From'] = f'{SENDER_NAME} <{SENDER_EMAIL}>'
         msg['To'] = ', '.join(valid_emails)
+        msg['Subject'] = subject
         
         # Set CC recipient
         cc_recipient = 'nik@iconluxurygroup.com' if 'nik@luxurymarket.com' not in valid_emails else 'nik@luxurymarket.com'
