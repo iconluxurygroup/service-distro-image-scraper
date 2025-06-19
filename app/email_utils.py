@@ -68,7 +68,7 @@ async def send_email(to_emails, subject, download_url, job_id, logger=None):
         </html>
         """
         msg.attach(MIMEText(html_content, 'html'))
-
+        msg['Subject'] = subject
         # Connect and send email
         smtp_client = aiosmtplib.SMTP(
             hostname=SMTP_SERVER,
