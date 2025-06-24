@@ -1086,8 +1086,7 @@ async def api_populate_results_from_warehouse(
                                 # Update status to indicate no match
                                 status_update_sql = text(f"""
                                     UPDATE {SCRAPER_RECORDS_TABLE_NAME}
-                                    SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status,
-                                        {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
+                                    SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status
                                     WHERE {SCRAPER_RECORDS_PK_COLUMN} = :eid
                                 """)
                                 await enqueue_db_update(
@@ -1181,8 +1180,7 @@ async def api_populate_results_from_warehouse(
             unique_eids = list(set(processed_entry_ids))
             status_update_sql = text(f"""
                 UPDATE {SCRAPER_RECORDS_TABLE_NAME}
-                SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status,
-                    {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
+                SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status
                 WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :eids
             """)
             await enqueue_db_update(
@@ -1251,6 +1249,7 @@ async def api_populate_results_from_warehouse(
             status_code=500,
             detail=f"Critical internal error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}"
         )
+        
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query(None)):
     job_run_id = f"clear_ai_data_{file_id}_{uuid.uuid4().hex[:6]}"
