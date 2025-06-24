@@ -925,7 +925,6 @@ async def process_restart_batch(
     }
 
 # --- V6 Endpoints ---
-
 @router.post("/populate-results-from-warehouse/{file_id}", tags=["Database"])
 async def api_populate_results_from_warehouse(
     file_id: str,
@@ -935,106 +934,263 @@ async def api_populate_results_from_warehouse(
     job_run_id = f"warehouse_populate_{file_id}_{uuid.uuid4().hex[:6]}"
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
     logger.info(f"[{job_run_id}] API Call: Populate results from warehouse for FileID '{file_id}'. Limit: {limit}.")
-    num_scraper_records_matched, num_results_prepared, num_results_enqueued, num_status_updates_enqueued, num_data_prep_errors = 0, 0, 0, 0, 0
+
+    # Initialize counters
+    num_entries_fetched = 0
+    num_warehouse_matches = 0
+    num_results_enqueued = 0
+    num_status_updates_enqueued = 0
+    num_processing_errors = 0
+
     try:
+        # Validate FileID
         file_id_int = int(file_id)
         async with async_engine.connect() as conn:
-            file_exists_q = await conn.execute(text(f"SELECT 1 FROM {IMAGE_SCRAPER_FILES_TABLE_NAME} WHERE {IMAGE_SCRAPER_FILES_PK_COLUMN} = :fid"), {"fid": file_id_int})
+            file_exists_q = await conn.execute(
+                text(f"SELECT 1 FROM {IMAGE_SCRAPER_FILES_TABLE_NAME} WHERE {IMAGE_SCRAPER_FILES_PK_COLUMN} = :fid"),
+                {"fid": file_id_int}
+            )
             if not file_exists_q.scalar_one_or_none():
                 logger.error(f"[{job_run_id}] FileID '{file_id_int}' not found in {IMAGE_SCRAPER_FILES_TABLE_NAME}.")
                 await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
                 raise HTTPException(status_code=404, detail=f"FileID {file_id_int} not found.")
-        async with async_engine.connect() as conn: # New connection for fetch
-            fetch_sql = text(f"""
-                SELECT TOP (:limit_val)
-                    isr.{SCRAPER_RECORDS_PK_COLUMN} AS ScraperEntryID, isr.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} AS ScraperProductModel,
-                    isr.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN} AS ScraperProductBrand, iwi.{WAREHOUSE_IMAGES_MODEL_NUMBER_COLUMN} AS WarehouseModelNumber,
-                    iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} AS WarehouseModelClean, iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} AS WarehouseModelFolder,
-                    iwi.{WAREHOUSE_IMAGES_MODEL_SOURCE_COLUMN} AS WarehouseModelSource
-                FROM {SCRAPER_RECORDS_TABLE_NAME} isr JOIN {WAREHOUSE_IMAGES_TABLE_NAME} iwi ON isr.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} = iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN}
-                WHERE isr.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} = :fid AND (isr.{SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_PENDING_WAREHOUSE_CHECK} OR isr.{SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} IS NULL)
-                  AND iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} <> ''
-                  AND iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} IS NOT NULL AND iwi.{WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN} <> ''
-                ORDER BY isr.{SCRAPER_RECORDS_PK_COLUMN};
-            """)
-            matched_records_cursor = await conn.execute(fetch_sql, {"fid": file_id_int, "limit_val": limit})
-            records_for_processing = matched_records_cursor.mappings().fetchall()
-            num_scraper_records_matched = len(records_for_processing)
-        if not records_for_processing:
-            msg = f"No records pending warehouse check for FileID '{file_id_int}' matching criteria."
-            logger.info(f"[{job_run_id}] {msg}")
+
+        # Batch configuration (aligned with process_restart_batch)
+        BATCH_SIZE_PER_GATHER = 20
+        MAX_CONCURRENT_ENTRY_PROCESSING = 5
+        MAX_ENTRY_ATTEMPTS = 3
+
+        # Fetch entries to process
+        logger.info(f"[{job_run_id}] Fetching up to {limit} entries for FileID '{file_id_int}'.")
+        try:
+            async with async_engine.connect() as conn:
+                fetch_sql = text(f"""
+                    SELECT TOP (:limit_val)
+                        r.{SCRAPER_RECORDS_PK_COLUMN} AS EntryID,
+                        r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} AS ProductModel,
+                        r.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN} AS ProductBrand
+                    FROM {SCRAPER_RECORDS_TABLE_NAME} r
+                    WHERE r.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} = :fid
+                      AND (r.{SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_PENDING_WAREHOUSE_CHECK} OR r.{SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} IS NULL)
+                      AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} IS NOT NULL
+                      AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} <> ''
+                    ORDER BY r.{SCRAPER_RECORDS_PK_COLUMN};
+                """)
+                db_res_entries = await conn.execute(fetch_sql, {"fid": file_id_int, "limit_val": limit})
+                entries_to_process_list = [
+                    {
+                        "EntryID": row["EntryID"],
+                        "ProductModel": row["ProductModel"],
+                        "ProductBrand": row["ProductBrand"]
+                    }
+                    for row in db_res_entries.mappings()
+                ]
+                num_entries_fetched = len(entries_to_process_list)
+                logger.info(f"[{job_run_id}] Fetched {num_entries_fetched} entries for processing.")
+        except SQLAlchemyError as db_exc_fetch:
+            error_msg = f"[{job_run_id}] Database error fetching entries for FileID '{file_id_int}': {db_exc_fetch}"
+            logger.error(error_msg, exc_info=True)
+            await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
+            raise HTTPException(status_code=500, detail=error_msg)
+
+        if not entries_to_process_list:
+            msg = f"[{job_run_id}] No entries pending warehouse check for FileID '{file_id_int}'."
+            logger.info(msg)
             log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
-            return {"status": "no_action_required", "message": msg, "log_url": log_s3_url}
-        logger.info(f"[{job_run_id}] Found {num_scraper_records_matched} scraper records with warehouse matches.")
-        results_to_insert_payload: List[Dict] = []
-        processed_entry_ids_for_status_update: List[int] = []
-        for rec_map in records_for_processing:
+            return {
+                "status": "no_action_required",
+                "message": msg,
+                "log_url": log_s3_url,
+                "counts": {
+                    "fetched": 0,
+                    "matched": 0,
+                    "enqueued_results": 0,
+                    "enqueued_status_updates": 0,
+                    "errors": 0
+                }
+            }
+
+        # Divide entries into batches
+        batched_entry_groups = [
+            entries_to_process_list[i:i + BATCH_SIZE_PER_GATHER]
+            for i in range(0, len(entries_to_process_list), BATCH_SIZE_PER_GATHER)
+        ]
+        logger.info(f"[{job_run_id}] Divided {num_entries_fetched} entries into {len(batched_entry_groups)} batches.")
+
+        # Define the search_warehouse_for_entry function (adapted from Jupyter)
+        async def search_warehouse_for_entry(entry: dict) -> dict:
+            if not entry or not entry.get("ProductModel"):
+                logger.warning(f"[{job_run_id}] No valid entry or ProductModel for EntryID {entry.get('EntryID', 'UNKNOWN')}")
+                return {}
+            query = text(f"""
+                SELECT {WAREHOUSE_IMAGES_MODEL_NUMBER_COLUMN}, {WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN}, {WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN}
+                FROM {WAREHOUSE_IMAGES_TABLE_NAME}
+                WHERE {WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} = :product_model
+            """)
             try:
-                scraper_eid = rec_map['ScraperEntryID']
-                model_clean, model_folder = rec_map.get('WarehouseModelClean'), rec_map.get('WarehouseModelFolder')
-                if not model_clean or not model_folder:
-                    logger.warning(f"[{job_run_id}] Skipping ScraperEntryID {scraper_eid}: WarehouseModelClean/Folder missing."); num_data_prep_errors += 1; continue
-                model_url_part = model_clean
-                for ext in ['.png', '.jpg', '.jpeg', '.webp']:
-                    if model_url_part.lower().endswith(ext): model_url_part = model_url_part[:-len(ext)]; break
-                img_url = f"{base_image_url.rstrip('/')}/{model_folder.strip('/')}/{model_url_part}.png"
-                desc = f"{rec_map.get('ScraperProductBrand') or 'Brand'} {rec_map.get('WarehouseModelNumber') or rec_map.get('ScraperProductModel') or 'Product'}"
-                source_domain = urlparse(base_image_url).netloc or "warehouse.internal"
-                actual_source = rec_map.get('WarehouseModelSource') or source_domain
-                results_to_insert_payload.append({
-                    IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN: scraper_eid, IMAGE_SCRAPER_RESULT_IMAGE_URL_COLUMN: img_url,
-                    IMAGE_SCRAPER_RESULT_IMAGE_DESC_COLUMN: desc, IMAGE_SCRAPER_RESULT_IMAGE_SOURCE_COLUMN: actual_source,
-                    IMAGE_SCRAPER_RESULT_IMAGE_URL_THUMBNAIL_COLUMN: img_url, IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN: 1,
-                    IMAGE_SCRAPER_RESULT_SOURCE_TYPE_COLUMN: 'Warehouse'})
-                processed_entry_ids_for_status_update.append(scraper_eid); num_results_prepared += 1
-            except Exception as e_prep: logger.error(f"[{job_run_id}] Error preparing data for ScraperEntryID {rec_map.get('ScraperEntryID', 'UNKNOWN')}: {e_prep}", exc_info=True); num_data_prep_errors += 1
-        if results_to_insert_payload:
-            logger.info(f"[{job_run_id}] Enqueuing insertion of {len(results_to_insert_payload)} results from warehouse.")
-            insertion_enqueued = await insert_search_results(results=results_to_insert_payload, logger=logger, file_id=file_id)
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(query, {"product_model": entry["ProductModel"]})
+                    row = result.fetchone()
+                    if row:
+                        match = {
+                            "ModelNumber": row[0],
+                            "ModelClean": row[1],
+                            "ModelFolder": row[2]
+                        }
+                        logger.info(f"[{job_run_id}] Warehouse match for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}': {match}")
+                        return match
+                    logger.info(f"[{job_run_id}] No warehouse match for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}'")
+                    return {}
+            except Exception as e:
+                logger.error(f"[{job_run_id}] Error searching warehouse for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}': {e}")
+                return {}
+
+        # Process entries in batches
+        entry_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ENTRY_PROCESSING)
+        results_to_insert = []
+        processed_entry_ids = []
+
+        async def process_single_entry(entry: dict) -> tuple[int, bool]:
+            async with entry_processing_semaphore:
+                for attempt in range(1, MAX_ENTRY_ATTEMPTS + 1):
+                    logger.info(f"[{job_run_id}] Processing EntryID {entry['EntryID']}: Attempt {attempt}/{MAX_ENTRY_ATTEMPTS}")
+                    try:
+                        warehouse_match = await search_warehouse_for_entry(entry)
+                        if not warehouse_match:
+                            logger.info(f"[{job_run_id}] EntryID {entry['EntryID']}: No warehouse match on attempt {attempt}.")
+                            if attempt == MAX_ENTRY_ATTEMPTS:
+                                return entry["EntryID"], False
+                            await asyncio.sleep(attempt * 1.5)
+                            continue
+
+                        # Prepare result for insertion
+                        model_clean = warehouse_match["ModelClean"]
+                        model_folder = warehouse_match["ModelFolder"]
+                        model_url_part = model_clean
+                        for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                            if model_url_part.lower().endswith(ext):
+                                model_url_part = model_url_part[:-len(ext)]
+                                break
+                        img_url = f"{base_image_url.rstrip('/')}/{model_folder.strip('/')}/{model_url_part}.png"
+                        desc = f"{entry.get('ProductBrand', 'Brand')} {warehouse_match.get('ModelNumber', entry.get('ProductModel', 'Product'))}"
+                        source_domain = urlparse(base_image_url).netloc or "warehouse.internal"
+
+                        result_payload = {
+                            IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN: entry["EntryID"],
+                            IMAGE_SCRAPER_RESULT_IMAGE_URL_COLUMN: img_url,
+                            IMAGE_SCRAPER_RESULT_IMAGE_DESC_COLUMN: desc,
+                            IMAGE_SCRAPER_RESULT_IMAGE_SOURCE_COLUMN: source_domain,
+                            IMAGE_SCRAPER_RESULT_IMAGE_URL_THUMBNAIL_COLUMN: img_url,
+                            IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN: 1,
+                            IMAGE_SCRAPER_RESULT_SOURCE_TYPE_COLUMN: "Warehouse"
+                        }
+
+                        results_to_insert.append(result_payload)
+                        processed_entry_ids.append(entry["EntryID"])
+                        return entry["EntryID"], True
+
+                    except Exception as e:
+                        logger.error(f"[{job_run_id}] EntryID {entry['EntryID']}: Error on attempt {attempt}: {e}", exc_info=True)
+                        if attempt == MAX_ENTRY_ATTEMPTS:
+                            return entry["EntryID"], False
+                        await asyncio.sleep(attempt * 2)
+                return entry["EntryID"], False
+
+        # Process batches
+        for batch_idx, entry_group in enumerate(batched_entry_groups, 1):
+            logger.info(f"[{job_run_id}] Processing batch {batch_idx}/{len(batched_entry_groups)} with {len(entry_group)} entries.")
+            batch_start_time = time.monotonic()
+            outcomes = await asyncio.gather(
+                *[process_single_entry(entry) for entry in entry_group],
+                return_exceptions=True
+            )
+            for entry, outcome in zip(entry_group, outcomes):
+                entry_id = entry["EntryID"]
+                if isinstance(outcome, Exception):
+                    logger.error(f"[{job_run_id}] EntryID {entry_id}: Failed with unhandled exception: {outcome}", exc_info=outcome)
+                    num_processing_errors += 1
+                elif isinstance(outcome, tuple) and len(outcome) == 2:
+                    _, success = outcome
+                    if success:
+                        num_warehouse_matches += 1
+                    else:
+                        num_processing_errors += 1
+                else:
+                    logger.error(f"[{job_run_id}] EntryID {entry_id}: Unexpected outcome: {outcome}")
+                    num_processing_errors += 1
+            batch_duration = time.monotonic() - batch_start_time
+            logger.info(f"[{job_run_id}] Batch {batch_idx} completed in {batch_duration:.2f}s. Matches: {num_warehouse_matches}, Errors: {num_processing_errors}")
+
+        # Enqueue results
+        if results_to_insert:
+            logger.info(f"[{job_run_id}] Enqueuing {len(results_to_insert)} results for insertion.")
+            insertion_enqueued = await insert_search_results(
+                results=results_to_insert,
+                logger=logger,
+                file_id=file_id
+            )
             if insertion_enqueued:
-                num_results_enqueued = len(results_to_insert_payload)
-                logger.info(f"[{job_run_id}] Successfully enqueued {num_results_enqueued} warehouse results.")
-                if processed_entry_ids_for_status_update:
-                    # This is your list of unique integer IDs, e.g., [134517, 134518]
-                    unique_eids_raw = list(set(processed_entry_ids_for_status_update))
+                num_results_enqueued = len(results_to_insert)
+                logger.info(f"[{job_run_id}] Successfully enqueued {num_results_enqueued} results.")
+            else:
+                logger.error(f"[{job_run_id}] Failed to enqueue results.")
+                num_processing_errors += len(results_to_insert)
 
-                    # --- FIX ---
-                    # 1. REMOVE the incorrect transformation to a list of tuples.
-                    #    We will use `unique_eids_raw` directly.
-                    
-                    # 2. ADD parentheses around the named parameter in the SQL string.
-                    status_update_sql = (
-                        f"UPDATE {SCRAPER_RECORDS_TABLE_NAME} "
-                        f"SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_WAREHOUSE_RESULT_POPULATED}, "
-                        f"{SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE() "
-                        f"WHERE {SCRAPER_RECORDS_PK_COLUMN} IN (:eids_list);"  # <-- Note the parentheses
-                    )
-                    
-                    await enqueue_db_update(
-                        file_id=job_run_id, 
-                        sql=status_update_sql, 
-                        # 3. PASS THE FLAT LIST directly.
-                        params={"eids_list": unique_eids_raw},
-                        task_type="batch_update_scraper_status_warehouse_populated", 
-                        correlation_id=str(uuid.uuid4()), 
-                        logger_param=logger
-                    )
-                    
-                    num_status_updates_enqueued = len(unique_eids_raw) 
-                    logger.info(f"[{job_run_id}] Enqueued status update for {num_status_updates_enqueued} scraper records.")
-            else: 
-                logger.error(f"[{job_run_id}] `insert_search_results` reported failure to enqueue warehouse results.")
+        # Enqueue status updates
+        if processed_entry_ids:
+            unique_eids = list(set(processed_entry_ids))
+            status_update_sql = text(f"""
+                UPDATE {SCRAPER_RECORDS_TABLE_NAME}
+                SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status,
+                    {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
+                WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :eids
+            """)
+            await enqueue_db_update(
+                file_id=job_run_id,
+                sql=status_update_sql,
+                params={"status": STATUS_WAREHOUSE_RESULT_POPULATED, "eids": unique_eids},
+                task_type="batch_update_scraper_status_warehouse_populated",
+                correlation_id=str(uuid.uuid4()),
+                logger_param=logger
+            )
+            num_status_updates_enqueued = len(unique_eids)
+            logger.info(f"[{job_run_id}] Enqueued status update for {num_status_updates_enqueued} entries.")
 
-        final_message = (f"Warehouse-to-Result for FileID '{file_id}': Matched={num_scraper_records_matched}, Prepared={num_results_prepared}, EnqueuedInsertions={num_results_enqueued}, EnqueuedStatusUpdates={num_status_updates_enqueued}, PrepErrors={num_data_prep_errors}.")
+        # Final logging and response
+        final_message = (
+            f"Warehouse population for FileID '{file_id}': "
+            f"Fetched={num_entries_fetched}, Matched={num_warehouse_matches}, "
+            f"EnqueuedResults={num_results_enqueued}, EnqueuedStatusUpdates={num_status_updates_enqueued}, "
+            f"Errors={num_processing_errors}"
+        )
         logger.info(f"[{job_run_id}] {final_message}")
         final_log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
-        return {"status": "processing_enqueued" if num_results_enqueued > 0 else "no_new_insertions", "message": final_message, "job_run_id": job_run_id, "original_file_id": file_id, "counts": {"matched": num_scraper_records_matched, "prepared": num_results_prepared, "enqueued_insert": num_results_enqueued, "enqueued_status_updates": num_status_updates_enqueued, "prep_errors": num_data_prep_errors}, "log_url": final_log_s3_url}
-    except HTTPException as http_exc: logger.warning(f"[{job_run_id}] HTTPException: {http_exc.detail}"); raise http_exc
-    except Exception as e_main:
-        logger.critical(f"[{job_run_id}] Critical error in warehouse population API for FileID '{file_id}': {e_main}", exc_info=True)
-        crit_err_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
-        raise HTTPException(status_code=500, detail=f"Critical internal error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}")
 
+        return {
+            "status": "processing_enqueued" if num_results_enqueued > 0 else "no_new_insertions",
+            "message": final_message,
+            "job_run_id": job_run_id,
+            "original_file_id": file_id,
+            "counts": {
+                "fetched": num_entries_fetched,
+                "matched": num_warehouse_matches,
+                "enqueued_results": num_results_enqueued,
+                "enqueued_status_updates": num_status_updates_enqueued,
+                "errors": num_processing_errors
+            },
+            "log_url": final_log_s3_url
+        }
+
+    except HTTPException as http_exc:
+        logger.warning(f"[{job_run_id}] HTTPException: {http_exc.detail}")
+        raise http_exc
+    except Exception as e:
+        logger.critical(f"[{job_run_id}] Critical error in warehouse population API for FileID '{file_id}': {e}", exc_info=True)
+        crit_err_log_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Critical internal error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}"
+        )
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query(None)):
     job_run_id = f"clear_ai_data_{file_id}_{uuid.uuid4().hex[:6]}"
