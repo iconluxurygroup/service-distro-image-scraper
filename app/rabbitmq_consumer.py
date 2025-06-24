@@ -256,14 +256,15 @@ class RabbitMQConsumer:
                 if f"IN {placeholder}" in sql_from_task:
                     question_marks = ", ".join(["?"] * len(list_values))
                     final_sql = sql_from_task.replace(f"IN {placeholder}", f"IN ({question_marks})")
-                    # Combine status and list values into a tuple for positional binding
-                    final_params = (
-                        tuple([params_from_task.get("status")] + list_values)
-                        if "status" in params_from_task
-                        else tuple(list_values)
+                    # Use dictionary for named parameters, mapping list values to individual keys
+                    final_params = {k: v for k, v in params_from_task.items() if k != list_param_key}
+                    final_params.update({f"param_{i}": v for i, v in enumerate(list_values)})
+                    # Update SQL to use named placeholders for list values
+                    final_sql = sql_from_task.replace(
+                        f"IN {placeholder}", f"IN ({', '.join(f':param_{i}' for i in range(len(list_values)))})"
                     )
                     logger.debug(
-                        f"TaskType: {task_type}, FileID: {file_id}, Expanded IN clause. Final SQL: {final_sql}, Final Params (sample): {str(final_params)[:100]}..."
+                        f"TaskType: {task_type}, FileID: {file_id}, Expanded IN clause. Final SQL: {final_sql}, Final Params (sample): {str({k: v for k, v in list(final_params.items())[:5]}) + ('...' if len(final_params) > 5 else '')}..."
                     )
                 else:
                     logger.warning(
@@ -276,11 +277,7 @@ class RabbitMQConsumer:
                 final_params = params_from_task
 
             # Log before execution
-            params_to_log = (
-                str(tuple(str(v)[:100] for v in final_params[:5]) + (("...",) if len(final_params) > 5 else ()))
-                if isinstance(final_params, (list, tuple))
-                else str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in final_params.items()})
-            )
+            params_to_log = str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in final_params.items()})
             logger.debug(
                 f"TaskType: {task_type}, FileID: {file_id}, Executing DB. Final SQL: {final_sql}, Final Params (sample): {params_to_log}"
             )
@@ -294,11 +291,7 @@ class RabbitMQConsumer:
             return {"rowcount": rowcount}
 
         except SQLAlchemyError as e:
-            params_at_error = (
-                str(tuple(str(v)[:100] for v in final_params[:3]) + (("...",) if len(final_params) > 3 else ()))
-                if 'final_params' in locals() and isinstance(final_params, (list, tuple))
-                else str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in params_from_task.items()})
-            )
+            params_at_error = str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in (final_params.items() if 'final_params' in locals() else params_from_task.items())})
             logger.error(
                 f"TaskType: {task_type}, FileID: {file_id}, Database error. Final SQL: {final_sql if 'final_sql' in locals() else sql_from_task}, "
                 f"Params used (sample): {params_at_error}, Error: {str(e)}",
