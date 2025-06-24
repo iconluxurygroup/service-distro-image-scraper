@@ -221,91 +221,98 @@ class RabbitMQConsumer:
         # ... (other parts of RabbitMQConsumer class) ...
 
     async def execute_update(self, task, conn, logger):
-    file_id = task.get("file_id", "unknown")
-    task_type = task.get("task_type", "unknown")
-    sql_from_task: str = task["sql"]
-    params_from_task: Dict[str, Any] = task.get("params", {})
+        file_id = task.get("file_id", "unknown")
+        task_type = task.get("task_type", "unknown")
+        sql_from_task: str = task["sql"]
+        params_from_task: Dict[str, Any] = task.get("params", {})
 
-    try:
-        if not isinstance(params_from_task, dict):
-            logger.error(
-                f"TaskType: {task_type}, FileID: {file_id}, Invalid params format: {params_from_task}, expected dict. SQL: {sql_from_task}"
-            )
-            raise ValueError(f"Invalid params format: {params_from_task}, expected dict")
-
-        # Identify any list parameters for IN clause
-        list_param_key = None
-        list_values = None
-        for key, value in params_from_task.items():
-            if isinstance(value, (list, tuple)) and value:  # Non-empty list or tuple
-                list_param_key = key
-                # Flatten list if it contains tuples (e.g., [(120836,), (120837,), ...])
-                list_values = [item[0] if isinstance(item, (list, tuple)) else item for item in value]
-                break
-
-        if list_param_key and list_values:
-            # Ensure all items in the list are scalars (e.g., int, str)
-            if not all(isinstance(item, (int, str)) for item in list_values):
+        try:
+            if not isinstance(params_from_task, dict):
                 logger.error(
-                    f"TaskType: {task_type}, FileID: {file_id}, Parameter '{list_param_key}' contains non-scalar items: {list_values[:5]}..."
+                    f"TaskType: {task_type}, FileID: {file_id}, Invalid params format: {params_from_task}, expected dict. SQL: {sql_from_task}"
                 )
-                raise ValueError(f"Parameter '{list_param_key}' contains non-scalar items")
+                raise ValueError(f"Invalid params format: {params_from_task}, expected dict")
 
-            # Replace IN :param with IN (?, ?, ...)
-            placeholder = f":{list_param_key}"
-            if f"IN {placeholder}" in sql_from_task:
-                question_marks = ", ".join(["?"] * len(list_values))
-                final_sql = sql_from_task.replace(f"IN {placeholder}", f"IN ({question_marks})")
-                # Use dictionary for named parameters, mapping list values to individual keys
-                final_params = {k: v for k, v in params_from_task.items() if k != list_param_key}
-                final_params.update({f"param_{i}": v for i, v in enumerate(list_values)})
-                # Update SQL to use named placeholders for list values
-                final_sql = sql_from_task.replace(
-                    f"IN {placeholder}", f"IN ({', '.join(f':param_{i}' for i in range(len(list_values)))})"
-                )
-                logger.debug(
-                    f"TaskType: {task_type}, FileID: {file_id}, Expanded IN clause. Final SQL: {final_sql}, Final Params (sample): {str({k: v for k, v in list(final_params.items())[:5]}) + ('...' if len(final_params) > 5 else '')}..."
-                )
+            # Identify any list parameters for IN clause
+            list_param_key = None
+            list_values = None
+            for key, value in params_from_task.items():
+                if isinstance(value, (list, tuple)) and value:  # Non-empty list or tuple
+                    list_param_key = key
+                    # Flatten list if it contains tuples (e.g., [(120836,), (120837,), ...])
+                    list_values = [item[0] if isinstance(item, (list, tuple)) else item for item in value]
+                    break
+
+            if list_param_key and list_values:
+                # Ensure all items in the list are scalars (e.g., int, str)
+                if not all(isinstance(item, (int, str)) for item in list_values):
+                    logger.error(
+                        f"TaskType: {task_type}, FileID: {file_id}, Parameter '{list_param_key}' contains non-scalar items: {list_values[:5]}..."
+                    )
+                    raise ValueError(f"Parameter '{list_param_key}' contains non-scalar items")
+
+                # Replace IN :param with IN (?, ?, ...)
+                placeholder = f":{list_param_key}"
+                if f"IN {placeholder}" in sql_from_task:
+                    question_marks = ", ".join(["?"] * len(list_values))
+                    final_sql = sql_from_task.replace(f"IN {placeholder}", f"IN ({question_marks})")
+                    # Combine status and list values into a tuple for positional binding
+                    final_params = (
+                        tuple([params_from_task.get("status")] + list_values)
+                        if "status" in params_from_task
+                        else tuple(list_values)
+                    )
+                    logger.debug(
+                        f"TaskType: {task_type}, FileID: {file_id}, Expanded IN clause. Final SQL: {final_sql}, Final Params (sample): {str(final_params)[:100]}..."
+                    )
+                else:
+                    logger.warning(
+                        f"TaskType: {task_type}, FileID: {file_id}, List parameter '{list_param_key}' found, but no 'IN :{list_param_key}' in SQL. Using named parameters."
+                    )
+                    final_sql = sql_from_task
+                    final_params = params_from_task
             else:
-                logger.warning(
-                    f"TaskType: {task_type}, FileID: {file_id}, List parameter '{list_param_key}' found, but no 'IN :{list_param_key}' in SQL. Using named parameters."
-                )
                 final_sql = sql_from_task
                 final_params = params_from_task
-        else:
-            final_sql = sql_from_task
-            final_params = params_from_task
 
-        # Log before execution
-        params_to_log = str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in final_params.items()})
-        logger.debug(
-            f"TaskType: {task_type}, FileID: {file_id}, Executing DB. Final SQL: {final_sql}, Final Params (sample): {params_to_log}"
-        )
+            # Log before execution
+            params_to_log = (
+                str(tuple(str(v)[:100] for v in final_params[:5]) + (("...",) if len(final_params) > 5 else ()))
+                if isinstance(final_params, (list, tuple))
+                else str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in final_params.items()})
+            )
+            logger.debug(
+                f"TaskType: {task_type}, FileID: {file_id}, Executing DB. Final SQL: {final_sql}, Final Params (sample): {params_to_log}"
+            )
 
-        stmt = text(final_sql)
-        result = await conn.execute(stmt, final_params)
-        await conn.commit()
+            stmt = text(final_sql)
+            result = await conn.execute(stmt, final_params)
+            await conn.commit()
 
-        rowcount = result.rowcount if result is not None and hasattr(result, 'rowcount') and result.rowcount is not None else 0
-        logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
-        return {"rowcount": rowcount}
+            rowcount = result.rowcount if result is not None and hasattr(result, 'rowcount') and result.rowcount is not None else 0
+            logger.info(f"Worker PID {psutil.Process().pid}: UPDATE/INSERT affected {rowcount} rows for FileID {file_id}")
+            return {"rowcount": rowcount}
 
-    except SQLAlchemyError as e:
-        params_at_error = str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in (final_params.items() if 'final_params' in locals() else params_from_task.items())})
-        logger.error(
-            f"TaskType: {task_type}, FileID: {file_id}, Database error. Final SQL: {final_sql if 'final_sql' in locals() else sql_from_task}, "
-            f"Params used (sample): {params_at_error}, Error: {str(e)}",
-            exc_info=True
-        )
-        raise
-    except Exception as e:
-        params_at_error = str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in params_from_task.items()})
-        logger.error(
-            f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing UPDATE/INSERT. Original SQL: {sql_from_task}, "
-            f"Params used (sample): {params_at_error}, Error: {str(e)}",
-            exc_info=True
-        )
-        raise
+        except SQLAlchemyError as e:
+            params_at_error = (
+                str(tuple(str(v)[:100] for v in final_params[:3]) + (("...",) if len(final_params) > 3 else ()))
+                if 'final_params' in locals() and isinstance(final_params, (list, tuple))
+                else str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in params_from_task.items()})
+            )
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, Database error. Final SQL: {final_sql if 'final_sql' in locals() else sql_from_task}, "
+                f"Params used (sample): {params_at_error}, Error: {str(e)}",
+                exc_info=True
+            )
+            raise
+        except Exception as e:
+            params_at_error = str({k: (f"{str(v[:3])}..." if isinstance(v, list) and len(v) > 3 else str(v)[:100]) for k, v in params_from_task.items()})
+            logger.error(
+                f"TaskType: {task_type}, FileID: {file_id}, Unexpected error executing UPDATE/INSERT. Original SQL: {sql_from_task}, "
+                f"Params used (sample): {params_at_error}, Error: {str(e)}",
+                exc_info=True
+            )
+            raise
 
     # ... (rest of RabbitMQConsumer class and main script) ...
     
