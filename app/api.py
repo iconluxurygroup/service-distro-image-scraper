@@ -815,26 +815,37 @@ async def process_restart_batch(
     entries_to_process_list: List[Tuple] = []
     try:
         async with async_engine.connect() as db_conn_fetch:
-            sql_fetch_entries = text(f"""
+            sql_fetch_entries = text("""
                 SELECT r.{SCRAPER_RECORDS_PK_COLUMN}, r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN}, 
-                       r.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN}, r.{SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN}, 
-                       r.{SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN}
+                    r.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN}, r.{SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN}, 
+                    r.{SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN}
                 FROM {SCRAPER_RECORDS_TABLE_NAME} r
                 WHERE r.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} = :fid
-                  AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} IS NOT NULL AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} <> ''
-                  AND EXISTS (
-                      SELECT 1 
-                      FROM {IMAGE_SCRAPER_RESULT_TABLE_NAME} res 
-                      WHERE res.{IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN} = r.{SCRAPER_RECORDS_PK_COLUMN}
-                        AND res.{IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN} IS NOT NULL
-                        AND res.{IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN} > 0
-                  )
+                AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} IS NOT NULL 
+                AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} <> ''
+                AND NOT EXISTS (
+                    SELECT 1 
+                    FROM {IMAGE_SCRAPER_RESULT_TABLE_NAME} res 
+                    WHERE res.{IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN} = r.{SCRAPER_RECORDS_PK_COLUMN}
+                        AND res.{IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN} = 1
+                )
                 ORDER BY r.{SCRAPER_RECORDS_PK_COLUMN};
-            """)
+            """.format(
+                SCRAPER_RECORDS_PK_COLUMN=SCRAPER_RECORDS_PK_COLUMN,
+                SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN=SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN,
+                SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN=SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN,
+                SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN=SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN,
+                SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN=SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN,
+                SCRAPER_RECORDS_TABLE_NAME=SCRAPER_RECORDS_TABLE_NAME,
+                SCRAPER_RECORDS_FILE_ID_FK_COLUMN=SCRAPER_RECORDS_FILE_ID_FK_COLUMN,
+                IMAGE_SCRAPER_RESULT_TABLE_NAME=IMAGE_SCRAPER_RESULT_TABLE_NAME,
+                IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN=IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN,
+                IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN=IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN
+            ))
             db_res_entries = await db_conn_fetch.execute(sql_fetch_entries, {"fid": file_id_for_db})
             entries_to_process_list = db_res_entries.fetchall()
             db_res_entries.close()
-        logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries with at least one result with SortOrder > 0.")
+        logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries without any SortOrder = 1 results.")
     except SQLAlchemyError as db_exc_fetch:
         error_msg = f"Database error fetching entries for FileID {file_id_for_db}: {db_exc_fetch}"
         logger.error(error_msg, exc_info=True)
