@@ -1178,25 +1178,6 @@ async def api_populate_results_from_warehouse(
                 logger.error(f"[{job_run_id}] Failed to enqueue results.")
                 counters["num_processing_errors"] += len(results_to_insert)
 
-        # Enqueue status updates for matched entries
-        if processed_entry_ids:
-            unique_eids = list(set(processed_entry_ids))  # Ensure unique IDs
-            status_update_sql = text(f"""
-                UPDATE {SCRAPER_RECORDS_TABLE_NAME}
-                SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status
-                WHERE {SCRAPER_RECORDS_PK_COLUMN} IN :eids
-            """)
-            await enqueue_db_update(
-                file_id=job_run_id,
-                sql=status_update_sql,
-                params={"status": STATUS_WAREHOUSE_RESULT_POPULATED, "eids": unique_eids},  # Flat list of integers
-                task_type="batch_update_scraper_status_warehouse_populated",
-                correlation_id=str(uuid.uuid4()),
-                logger_param=logger
-            )
-            counters["num_status_updates_enqueued"] += len(unique_eids)
-            logger.info(f"[{job_run_id}] Enqueued status update for {len(unique_eids)} matched entries.")
-
         # Final logging and response
         final_message = (
             f"Warehouse population for FileID '{file_id}': "
