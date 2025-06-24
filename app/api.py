@@ -1207,7 +1207,6 @@ async def api_populate_results_from_warehouse(
                 logger.error(f"[{job_run_id}] Failed to send email: {e_email}", exc_info=True)
 
         final_log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
-
         return {
             "status": "processing_enqueued" if counters["num_results_enqueued"] > 0 else "no_new_insertions",
             "message": final_message,
