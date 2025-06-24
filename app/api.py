@@ -688,7 +688,69 @@ async def upload_log_file(
     except Exception as e_final: # Should ideally be caught by RetryError if tenacity is configured for all Exception
         logger_instance.error(f"{log_prefix} Unexpected final error uploading log '{local_log_file_path}': {e_final}", exc_info=True)
         return None
+async def find_entries_missing_results(
+    file_id: str,
+    start_entry_id: Optional[int] = None,
+    logger: logging.Logger = default_logger
+) -> List[Dict]:
+    """
+    Find entries in utb_ImageScraperRecords that have no search results in utb_ImageScraperResult.
+    
+    Args:
+        file_id: The FileID to query.
+        start_entry_id: Optional starting EntryID (inclusive).
+        logger: Logger instance.
+    
+    Returns:
+        List of dictionaries containing EntryID, ProductModel, ProductBrand, ProductColor, ProductCategory
+        for entries with no results.
+    """
+    try:
+        file_id_int = int(file_id)
+    except ValueError:
+        logger.error(f"Invalid FileID format: '{file_id}'.")
+        raise ValueError(f"Invalid FileID: {file_id}")
 
+    actual_start_entry_id = start_entry_id or 0
+    entries_list = []
+    
+    try:
+        async with async_engine.connect() as db_conn:
+            sql_query = text(f"""
+                SELECT r.{SCRAPER_RECORDS_PK_COLUMN} AS EntryID, 
+                       r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} AS ProductModel, 
+                       r.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN} AS ProductBrand, 
+                       r.{SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN} AS ProductColor, 
+                       r.{SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN} AS ProductCategory
+                FROM {SCRAPER_RECORDS_TABLE_NAME} r
+                WHERE r.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} = :fid
+                  AND r.{SCRAPER_RECORDS_PK_COLUMN} >= :start_eid
+                  AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} IS NOT NULL 
+                  AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} <> ''
+                  AND NOT EXISTS (
+                      SELECT 1 
+                      FROM {IMAGE_SCRAPER_RESULT_TABLE_NAME} res 
+                      WHERE res.{IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN} = r.{SCRAPER_RECORDS_PK_COLUMN}
+                  )
+                ORDER BY r.{SCRAPER_RECORDS_PK_COLUMN};
+            """)
+            result = await db_conn.execute(sql_query, {"fid": file_id_int, "start_eid": actual_start_entry_id})
+            entries_list = [
+                {
+                    "EntryID": row["EntryID"],
+                    "ProductModel": row["ProductModel"],
+                    "ProductBrand": row["ProductBrand"],
+                    "ProductColor": row["ProductColor"],
+                    "ProductCategory": row["ProductCategory"]
+                }
+                for row in result.mappings()
+            ]
+            logger.info(f"FileID {file_id}: Found {len(entries_list)} entries with no results from EntryID {actual_start_entry_id}.")
+    except SQLAlchemyError as db_exc:
+        logger.error(f"Database error fetching entries for FileID {file_id}: {db_exc}", exc_info=True)
+        raise
+    return entries_list
+    
 async def process_restart_batch(
     file_id_db_str: str, # This is the string representation of the DB FileID
     entry_id: Optional[int] = None,
@@ -765,35 +827,17 @@ async def process_restart_batch(
     if "Scotch & Soda" not in brand_rules_data: brand_rules_data["Scotch & Soda"] = {"aliases": ["Scotch and Soda", "S&S"], "sku_pattern": r"^\d{6,8}[a-zA-Z0-9]*$"}
     logger.debug(f"FileID {file_id_for_db}: Using {len(brand_rules_data)} brand rules.")
 
-    entries_to_process_list: List[Tuple] = []
-    try:
-        async with async_engine.connect() as db_conn_fetch:
-            sql_fetch_entries = text(f"""
-                SELECT r.{SCRAPER_RECORDS_PK_COLUMN}, r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN}, 
-                       r.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN}, r.{SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN}, 
-                       r.{SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN}
-                FROM {SCRAPER_RECORDS_TABLE_NAME} r
-                WHERE r.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} = :fid
-                  AND r.{SCRAPER_RECORDS_PK_COLUMN} >= :start_eid
-                  AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} IS NOT NULL AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} <> ''
-                  AND (r.{SCRAPER_RECORDS_STEP1_COLUMN} IS NULL 
-                       OR NOT EXISTS (SELECT 1 FROM {IMAGE_SCRAPER_RESULT_TABLE_NAME} res 
-                                      WHERE res.{IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN} = r.{SCRAPER_RECORDS_PK_COLUMN} 
-                                        AND res.{IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN} IS NOT NULL 
-                                        AND res.{IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN} > 0))
-                ORDER BY r.{SCRAPER_RECORDS_PK_COLUMN};
-            """)
-            db_res_entries = await db_conn_fetch.execute(sql_fetch_entries, {"fid": file_id_for_db, "start_eid": actual_start_entry_id or 0})
-            entries_to_process_list = db_res_entries.fetchall()
-            db_res_entries.close()
-        logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries for processing (from actual_start_entry_id {actual_start_entry_id or 0}).")
-    except SQLAlchemyError as db_exc_fetch:
-        # ... (error handling)
-        error_msg = f"Database error fetching entries for FileID {file_id_for_db}: {db_exc_fetch}"
-        logger.error(error_msg, exc_info=True)
-        log_url = await upload_log_file(file_id_db_str, current_log_filename, logger, db_record_file_id_to_update=file_id_db_str)
-        return {"error": error_msg, "log_filename": current_log_filename, "log_public_url": log_url or "", "last_entry_id_processed": str(entry_id or "")}
-
+    entries_to_process_list = await find_entries_missing_results(
+    file_id=file_id_db_str,
+    start_entry_id=actual_start_entry_id,
+    logger=logger
+)
+    # Convert list of dicts to list of tuples for compatibility with existing code
+    entries_to_process_list = [
+        (entry["EntryID"], entry["ProductModel"], entry["ProductBrand"], entry["ProductColor"], entry["ProductCategory"])
+        for entry in entries_to_process_list
+    ]
+    logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries with no results (from actual_start_entry_id {actual_start_entry_id or 0}).")
 
     if not entries_to_process_list:
         # ... (no entries message)
