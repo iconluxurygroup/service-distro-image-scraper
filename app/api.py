@@ -934,12 +934,14 @@ async def api_populate_results_from_warehouse(
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
     logger.info(f"[{job_run_id}] API Call: Populate results from warehouse for FileID '{file_id}'. Limit: {limit}.")
 
-    # Initialize counters
-    num_entries_fetched = 0
-    num_warehouse_matches = 0
-    num_results_enqueued = 0
-    num_status_updates_enqueued = 0
-    num_processing_errors = 0
+    # Initialize counters using a dictionary for mutable updates
+    counters = {
+        "num_entries_fetched": 0,
+        "num_warehouse_matches": 0,
+        "num_results_enqueued": 0,
+        "num_status_updates_enqueued": 0,
+        "num_processing_errors": 0
+    }
 
     try:
         # Validate FileID
@@ -1037,8 +1039,8 @@ async def api_populate_results_from_warehouse(
                     }
                     for row in db_res_entries.mappings()
                 ]
-                num_entries_fetched = len(entries_to_process_list)
-                logger.info(f"[{job_run_id}] Fetched {num_entries_fetched} entries for processing.")
+                counters["num_entries_fetched"] = len(entries_to_process_list)
+                logger.info(f"[{job_run_id}] Fetched {counters['num_entries_fetched']} entries for processing.")
         except SQLAlchemyError as db_exc_fetch:
             error_msg = f"[{job_run_id}] Database error fetching entries for FileID '{file_id_int}': {db_exc_fetch}"
             logger.error(error_msg, exc_info=True)
@@ -1067,14 +1069,14 @@ async def api_populate_results_from_warehouse(
             entries_to_process_list[i:i + BATCH_SIZE_PER_GATHER]
             for i in range(0, len(entries_to_process_list), BATCH_SIZE_PER_GATHER)
         ]
-        logger.info(f"[{job_run_id}] Divided {num_entries_fetched} entries into {len(batched_entry_groups)} batches.")
+        logger.info(f"[{job_run_id}] Divided {counters['num_entries_fetched']} entries into {len(batched_entry_groups)} batches.")
 
         # Process entries in batches
         entry_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ENTRY_PROCESSING)
         results_to_insert = []
         processed_entry_ids = []
 
-        async def process_single_entry(entry: dict) -> tuple[int, bool]:
+        async def process_single_entry(entry: dict, counters: dict) -> tuple[int, bool]:
             async with entry_processing_semaphore:
                 for attempt in range(1, MAX_ENTRY_ATTEMPTS + 1):
                     logger.info(f"[{job_run_id}] Processing EntryID {entry['EntryID']}: Attempt {attempt}/{MAX_ENTRY_ATTEMPTS}")
@@ -1097,7 +1099,7 @@ async def api_populate_results_from_warehouse(
                                     correlation_id=str(uuid.uuid4()),
                                     logger_param=logger
                                 )
-                                num_status_updates_enqueued += 1
+                                counters["num_status_updates_enqueued"] += 1
                                 return entry["EntryID"], False
                             await asyncio.sleep(attempt * 1.5)
                             continue
@@ -1126,13 +1128,16 @@ async def api_populate_results_from_warehouse(
 
                         results_to_insert.append(result_payload)
                         processed_entry_ids.append(entry["EntryID"])
+                        counters["num_warehouse_matches"] += 1
                         return entry["EntryID"], True
 
                     except Exception as e:
                         logger.error(f"[{job_run_id}] EntryID {entry['EntryID']}: Error on attempt {attempt}: {e}", exc_info=True)
                         if attempt == MAX_ENTRY_ATTEMPTS:
+                            counters["num_processing_errors"] += 1
                             return entry["EntryID"], False
                         await asyncio.sleep(attempt * 2)
+                counters["num_processing_errors"] += 1
                 return entry["EntryID"], False
 
         # Process batches
@@ -1140,25 +1145,23 @@ async def api_populate_results_from_warehouse(
             logger.info(f"[{job_run_id}] Processing batch {batch_idx}/{len(batched_entry_groups)} with {len(entry_group)} entries.")
             batch_start_time = time.monotonic()
             outcomes = await asyncio.gather(
-                *[process_single_entry(entry) for entry in entry_group],
+                *[process_single_entry(entry, counters) for entry in entry_group],
                 return_exceptions=True
             )
             for entry, outcome in zip(entry_group, outcomes):
                 entry_id = entry["EntryID"]
                 if isinstance(outcome, Exception):
                     logger.error(f"[{job_run_id}] EntryID {entry_id}: Failed with unhandled exception: {outcome}", exc_info=outcome)
-                    num_processing_errors += 1
+                    counters["num_processing_errors"] += 1
                 elif isinstance(outcome, tuple) and len(outcome) == 2:
                     _, success = outcome
-                    if success:
-                        num_warehouse_matches += 1
-                    else:
-                        num_processing_errors += 1
+                    if not success:
+                        counters["num_processing_errors"] += 1
                 else:
                     logger.error(f"[{job_run_id}] EntryID {entry_id}: Unexpected outcome: {outcome}")
-                    num_processing_errors += 1
+                    counters["num_processing_errors"] += 1
             batch_duration = time.monotonic() - batch_start_time
-            logger.info(f"[{job_run_id}] Batch {batch_idx} completed in {batch_duration:.2f}s. Matches: {num_warehouse_matches}, Errors: {num_processing_errors}")
+            logger.info(f"[{job_run_id}] Batch {batch_idx} completed in {batch_duration:.2f}s. Matches: {counters['num_warehouse_matches']}, Errors: {counters['num_processing_errors']}")
 
         # Enqueue results
         if results_to_insert:
@@ -1169,11 +1172,11 @@ async def api_populate_results_from_warehouse(
                 file_id=file_id
             )
             if insertion_enqueued:
-                num_results_enqueued = len(results_to_insert)
-                logger.info(f"[{job_run_id}] Successfully enqueued {num_results_enqueued} results.")
+                counters["num_results_enqueued"] = len(results_to_insert)
+                logger.info(f"[{job_run_id}] Successfully enqueued {counters['num_results_enqueued']} results.")
             else:
                 logger.error(f"[{job_run_id}] Failed to enqueue results.")
-                num_processing_errors += len(results_to_insert)
+                counters["num_processing_errors"] += len(results_to_insert)
 
         # Enqueue status updates for matched entries
         if processed_entry_ids:
@@ -1191,15 +1194,15 @@ async def api_populate_results_from_warehouse(
                 correlation_id=str(uuid.uuid4()),
                 logger_param=logger
             )
-            num_status_updates_enqueued += len(unique_eids)
+            counters["num_status_updates_enqueued"] += len(unique_eids)
             logger.info(f"[{job_run_id}] Enqueued status update for {len(unique_eids)} matched entries.")
 
         # Final logging and response
         final_message = (
             f"Warehouse population for FileID '{file_id}': "
-            f"Fetched={num_entries_fetched}, Matched={num_warehouse_matches}, "
-            f"EnqueuedResults={num_results_enqueued}, EnqueuedStatusUpdates={num_status_updates_enqueued}, "
-            f"Errors={num_processing_errors}"
+            f"Fetched={counters['num_entries_fetched']}, Matched={counters['num_warehouse_matches']}, "
+            f"EnqueuedResults={counters['num_results_enqueued']}, EnqueuedStatusUpdates={counters['num_status_updates_enqueued']}, "
+            f"Errors={counters['num_processing_errors']}"
         )
         logger.info(f"[{job_run_id}] {final_message}")
 
@@ -1209,11 +1212,11 @@ async def api_populate_results_from_warehouse(
             subject = f"Warehouse Population Report for FileID: {file_id}"
             body = (
                 f"Warehouse population for FileID {file_id} completed.\n\n"
-                f"Total entries fetched: {num_entries_fetched}\n"
-                f"Entries with warehouse matches: {num_warehouse_matches}\n"
-                f"Results enqueued: {num_results_enqueued}\n"
-                f"Status updates enqueued: {num_status_updates_enqueued}\n"
-                f"Errors: {num_processing_errors}\n"
+                f"Total entries fetched: {counters['num_entries_fetched']}\n"
+                f"Entries with warehouse matches: {counters['num_warehouse_matches']}\n"
+                f"Results enqueued: {counters['num_results_enqueued']}\n"
+                f"Status updates enqueued: {counters['num_status_updates_enqueued']}\n"
+                f"Errors: {counters['num_processing_errors']}\n"
                 f"Log: {final_log_s3_url or 'Log upload pending.'}"
             )
             try:
@@ -1225,16 +1228,16 @@ async def api_populate_results_from_warehouse(
         final_log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
 
         return {
-            "status": "processing_enqueued" if num_results_enqueued > 0 else "no_new_insertions",
+            "status": "processing_enqueued" if counters["num_results_enqueued"] > 0 else "no_new_insertions",
             "message": final_message,
             "job_run_id": job_run_id,
             "original_file_id": file_id,
             "counts": {
-                "fetched": num_entries_fetched,
-                "matched": num_warehouse_matches,
-                "enqueued_results": num_results_enqueued,
-                "enqueued_status_updates": num_status_updates_enqueued,
-                "errors": num_processing_errors
+                "fetched": counters["num_entries_fetched"],
+                "matched": counters["num_warehouse_matches"],
+                "enqueued_results": counters["num_results_enqueued"],
+                "enqueued_status_updates": counters["num_status_updates_enqueued"],
+                "errors": counters["num_processing_errors"]
             },
             "log_url": final_log_s3_url
         }
@@ -1249,7 +1252,6 @@ async def api_populate_results_from_warehouse(
             status_code=500,
             detail=f"Critical internal error. Job Run ID: {job_run_id}. Log: {crit_err_log_url or 'Log upload failed.'}"
         )
-        
 @router.post("/clear-ai-json/{file_id}", tags=["Database"])
 async def api_clear_ai_json(file_id: str, entry_ids: Optional[List[int]] = Query(None)):
     job_run_id = f"clear_ai_data_{file_id}_{uuid.uuid4().hex[:6]}"
