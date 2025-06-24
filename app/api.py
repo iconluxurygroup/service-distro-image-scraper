@@ -924,7 +924,6 @@ async def process_restart_batch(
         "settings_used": {"use_all_variations": use_all_variations, "num_workers_hint": num_workers}
     }
 
-# --- V6 Endpoints ---
 @router.post("/populate-results-from-warehouse/{file_id}", tags=["Database"])
 async def api_populate_results_from_warehouse(
     file_id: str,
@@ -959,6 +958,59 @@ async def api_populate_results_from_warehouse(
         BATCH_SIZE_PER_GATHER = 20
         MAX_CONCURRENT_ENTRY_PROCESSING = 5
         MAX_ENTRY_ATTEMPTS = 3
+
+        # Define read_db_one_entry (from Jupyter notebook)
+        async def read_db_one_entry(file_id: str) -> dict:
+            query = text(f"""
+                SELECT TOP 1 EntryID, ProductModel, ProductBrand
+                FROM {SCRAPER_RECORDS_TABLE_NAME}
+                WHERE FileID = :file_id 
+                  AND ProductModel IS NOT NULL 
+                  AND ProductModel <> ''
+                  AND ({SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = {STATUS_PENDING_WAREHOUSE_CHECK} OR {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} IS NULL)
+                ORDER BY EntryID
+            """)
+            try:
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(query, {"file_id": int(file_id)})
+                    row = result.fetchone()
+                    if row:
+                        entry = {"EntryID": row[0], "ProductModel": row[1], "ProductBrand": row[2]}
+                        logger.info(f"[{job_run_id}] Fetched entry: {entry}")
+                        return entry
+                    logger.info(f"[{job_run_id}] No entry for FileID {file_id}")
+                    return {}
+            except Exception as e:
+                logger.error(f"[{job_run_id}] Error fetching entry for FileID {file_id}: {e}")
+                return {}
+
+        # Define search_warehouse_for_entry (from Jupyter notebook)
+        async def search_warehouse_for_entry(entry: dict) -> dict:
+            if not entry or not entry.get("ProductModel"):
+                logger.warning(f"[{job_run_id}] No valid entry or ProductModel for EntryID {entry.get('EntryID', 'UNKNOWN')}")
+                return {}
+            query = text(f"""
+                SELECT {WAREHOUSE_IMAGES_MODEL_NUMBER_COLUMN}, {WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN}, {WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN}
+                FROM {WAREHOUSE_IMAGES_TABLE_NAME}
+                WHERE {WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} = :product_model
+            """)
+            try:
+                async with async_engine.connect() as conn:
+                    result = await conn.execute(query, {"product_model": entry["ProductModel"]})
+                    row = result.fetchone()
+                    if row:
+                        match = {
+                            "ModelNumber": row[0],
+                            "ModelClean": row[1],
+                            "ModelFolder": row[2]
+                        }
+                        logger.info(f"[{job_run_id}] Warehouse match for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}': {match}")
+                        return match
+                    logger.info(f"[{job_run_id}] No warehouse match for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}'")
+                    return {}
+            except Exception as e:
+                logger.error(f"[{job_run_id}] Error searching warehouse for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}': {e}")
+                return {}
 
         # Fetch entries to process
         logger.info(f"[{job_run_id}] Fetching up to {limit} entries for FileID '{file_id_int}'.")
@@ -1017,34 +1069,6 @@ async def api_populate_results_from_warehouse(
         ]
         logger.info(f"[{job_run_id}] Divided {num_entries_fetched} entries into {len(batched_entry_groups)} batches.")
 
-        # Define the search_warehouse_for_entry function (adapted from Jupyter)
-        async def search_warehouse_for_entry(entry: dict) -> dict:
-            if not entry or not entry.get("ProductModel"):
-                logger.warning(f"[{job_run_id}] No valid entry or ProductModel for EntryID {entry.get('EntryID', 'UNKNOWN')}")
-                return {}
-            query = text(f"""
-                SELECT {WAREHOUSE_IMAGES_MODEL_NUMBER_COLUMN}, {WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN}, {WAREHOUSE_IMAGES_MODEL_FOLDER_COLUMN}
-                FROM {WAREHOUSE_IMAGES_TABLE_NAME}
-                WHERE {WAREHOUSE_IMAGES_MODEL_CLEAN_COLUMN} = :product_model
-            """)
-            try:
-                async with async_engine.connect() as conn:
-                    result = await conn.execute(query, {"product_model": entry["ProductModel"]})
-                    row = result.fetchone()
-                    if row:
-                        match = {
-                            "ModelNumber": row[0],
-                            "ModelClean": row[1],
-                            "ModelFolder": row[2]
-                        }
-                        logger.info(f"[{job_run_id}] Warehouse match for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}': {match}")
-                        return match
-                    logger.info(f"[{job_run_id}] No warehouse match for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}'")
-                    return {}
-            except Exception as e:
-                logger.error(f"[{job_run_id}] Error searching warehouse for EntryID {entry['EntryID']}, ProductModel '{entry['ProductModel']}': {e}")
-                return {}
-
         # Process entries in batches
         entry_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ENTRY_PROCESSING)
         results_to_insert = []
@@ -1059,6 +1083,22 @@ async def api_populate_results_from_warehouse(
                         if not warehouse_match:
                             logger.info(f"[{job_run_id}] EntryID {entry['EntryID']}: No warehouse match on attempt {attempt}.")
                             if attempt == MAX_ENTRY_ATTEMPTS:
+                                # Update status to indicate no match
+                                status_update_sql = text(f"""
+                                    UPDATE {SCRAPER_RECORDS_TABLE_NAME}
+                                    SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status,
+                                        {SCRAPER_RECORDS_WAREHOUSE_MATCH_TIME_COLUMN} = GETUTCDATE()
+                                    WHERE {SCRAPER_RECORDS_PK_COLUMN} = :eid
+                                """)
+                                await enqueue_db_update(
+                                    file_id=job_run_id,
+                                    sql=status_update_sql,
+                                    params={"status": STATUS_WAREHOUSE_CHECK_NO_MATCH, "eid": entry["EntryID"]},
+                                    task_type=f"update_no_match_entry_{entry['EntryID']}",
+                                    correlation_id=str(uuid.uuid4()),
+                                    logger_param=logger
+                                )
+                                num_status_updates_enqueued += 1
                                 return entry["EntryID"], False
                             await asyncio.sleep(attempt * 1.5)
                             continue
@@ -1136,7 +1176,7 @@ async def api_populate_results_from_warehouse(
                 logger.error(f"[{job_run_id}] Failed to enqueue results.")
                 num_processing_errors += len(results_to_insert)
 
-        # Enqueue status updates
+        # Enqueue status updates for matched entries
         if processed_entry_ids:
             unique_eids = list(set(processed_entry_ids))
             status_update_sql = text(f"""
@@ -1153,8 +1193,8 @@ async def api_populate_results_from_warehouse(
                 correlation_id=str(uuid.uuid4()),
                 logger_param=logger
             )
-            num_status_updates_enqueued = len(unique_eids)
-            logger.info(f"[{job_run_id}] Enqueued status update for {num_status_updates_enqueued} entries.")
+            num_status_updates_enqueued += len(unique_eids)
+            logger.info(f"[{job_run_id}] Enqueued status update for {len(unique_eids)} matched entries.")
 
         # Final logging and response
         final_message = (
@@ -1164,6 +1204,26 @@ async def api_populate_results_from_warehouse(
             f"Errors={num_processing_errors}"
         )
         logger.info(f"[{job_run_id}] {final_message}")
+
+        # Send email notification if configured
+        email_to_list = await get_send_to_email(file_id_int, logger=logger)
+        if email_to_list:
+            subject = f"Warehouse Population Report for FileID: {file_id}"
+            body = (
+                f"Warehouse population for FileID {file_id} completed.\n\n"
+                f"Total entries fetched: {num_entries_fetched}\n"
+                f"Entries with warehouse matches: {num_warehouse_matches}\n"
+                f"Results enqueued: {num_results_enqueued}\n"
+                f"Status updates enqueued: {num_status_updates_enqueued}\n"
+                f"Errors: {num_processing_errors}\n"
+                f"Log: {final_log_s3_url or 'Log upload pending.'}"
+            )
+            try:
+                await send_message_email(email_to_list, subject=subject, message=body, logger=logger)
+                logger.info(f"[{job_run_id}] Completion email sent to: {email_to_list}")
+            except Exception as e_email:
+                logger.error(f"[{job_run_id}] Failed to send email: {e_email}", exc_info=True)
+
         final_log_s3_url = await upload_log_file(job_run_id, log_file_path, logger, db_record_file_id_to_update=file_id)
 
         return {
