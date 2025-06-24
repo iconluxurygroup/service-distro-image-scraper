@@ -845,13 +845,12 @@ async def process_restart_batch(
             db_res_entries = await db_conn_fetch.execute(sql_fetch_entries, {"fid": file_id_for_db})
             entries_to_process_list = db_res_entries.fetchall()
             db_res_entries.close()
-        logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries without any SortOrder = 1 results.")
+        logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries that have no results with SortOrder = 1.")
     except SQLAlchemyError as db_exc_fetch:
         error_msg = f"Database error fetching entries for FileID {file_id_for_db}: {db_exc_fetch}"
         logger.error(error_msg, exc_info=True)
         log_url = await upload_log_file(file_id_db_str, current_log_filename, logger, db_record_file_id_to_update=file_id_db_str)
         return {"error": error_msg, "log_filename": current_log_filename, "log_public_url": log_url or "", "last_entry_id_processed": "0"}
-
     if not entries_to_process_list:
         success_msg = f"No entries with positive SortOrder results found for FileID {file_id_for_db}."
         logger.info(success_msg)
