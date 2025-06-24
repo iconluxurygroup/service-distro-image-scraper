@@ -934,7 +934,7 @@ async def api_populate_results_from_warehouse(
     logger, log_file_path = setup_job_logger(job_id=job_run_id, console_output=True)
     logger.info(f"[{job_run_id}] API Call: Populate results from warehouse for FileID '{file_id}'. Limit: {limit}.")
 
-    # Initialize counters using a dictionary for mutable updates
+    # Initialize counters using a dictionary
     counters = {
         "num_entries_fetched": 0,
         "num_warehouse_matches": 0,
@@ -1180,7 +1180,7 @@ async def api_populate_results_from_warehouse(
 
         # Enqueue status updates for matched entries
         if processed_entry_ids:
-            unique_eids = list(set(processed_entry_ids))
+            unique_eids = list(set(processed_entry_ids))  # Ensure unique IDs
             status_update_sql = text(f"""
                 UPDATE {SCRAPER_RECORDS_TABLE_NAME}
                 SET {SCRAPER_RECORDS_ENTRY_STATUS_COLUMN} = :status
@@ -1189,7 +1189,7 @@ async def api_populate_results_from_warehouse(
             await enqueue_db_update(
                 file_id=job_run_id,
                 sql=status_update_sql,
-                params={"status": STATUS_WAREHOUSE_RESULT_POPULATED, "eids": unique_eids},
+                params={"status": STATUS_WAREHOUSE_RESULT_POPULATED, "eids": unique_eids},  # Flat list of integers
                 task_type="batch_update_scraper_status_warehouse_populated",
                 correlation_id=str(uuid.uuid4()),
                 logger_param=logger
