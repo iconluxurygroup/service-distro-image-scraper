@@ -807,56 +807,60 @@ async def process_restart_batch(
         log_url = await upload_log_file(file_id_db_str, current_log_filename, logger, db_record_file_id_to_update=file_id_db_str)
         return {"error": error_msg, "log_filename": current_log_filename, "log_public_url": log_url or "", "last_entry_id_processed": str(entry_id or "")}
 
-
-    actual_start_entry_id = entry_id
-    if actual_start_entry_id is None:
-        # Try to fetch the last successfully processed EntryID for this FileID to resume.
-        # If fetch_last_valid_entry returns an ID, we want to start *after* it.
-        # If it returns None, or if we want to restart from the beginning of unprocessed:
-        last_good_entry = await fetch_last_valid_entry(file_id_db_str, logger)
-        if last_good_entry is not None:
-             actual_start_entry_id = last_good_entry + 1 # Start after the last good one
-             logger.info(f"FileID {file_id_for_db}: Resuming after last valid EntryID {last_good_entry}. Starting at {actual_start_entry_id}.")
-        else:
-            actual_start_entry_id = 0 # Default to start from beginning of unprocessed
-            logger.info(f"FileID {file_id_for_db}: No specific start EntryID or last valid entry. Will process from ID {actual_start_entry_id}.")
-
-
     brand_rules_data = await fetch_brand_rules(BRAND_RULES_URL, max_attempts=3, timeout=15, logger=logger)
     if not brand_rules_data: brand_rules_data = {} # Ensure it's a dict
     if "Scotch & Soda" not in brand_rules_data: brand_rules_data["Scotch & Soda"] = {"aliases": ["Scotch and Soda", "S&S"], "sku_pattern": r"^\d{6,8}[a-zA-Z0-9]*$"}
     logger.debug(f"FileID {file_id_for_db}: Using {len(brand_rules_data)} brand rules.")
 
-    entries_to_process_list = await find_entries_missing_results(
-    file_id=file_id_db_str,
-    start_entry_id=actual_start_entry_id,
-    logger=logger
-)
-    # Convert list of dicts to list of tuples for compatibility with existing code
-    entries_to_process_list = [
-        (entry["EntryID"], entry["ProductModel"], entry["ProductBrand"], entry["ProductColor"], entry["ProductCategory"])
-        for entry in entries_to_process_list
-    ]
-    logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries with no results (from actual_start_entry_id {actual_start_entry_id or 0}).")
+    entries_to_process_list: List[Tuple] = []
+    try:
+        async with async_engine.connect() as db_conn_fetch:
+            sql_fetch_entries = text(f"""
+                SELECT r.{SCRAPER_RECORDS_PK_COLUMN}, r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN}, 
+                       r.{SCRAPER_RECORDS_PRODUCT_BRAND_COLUMN}, r.{SCRAPER_RECORDS_PRODUCT_COLOR_COLUMN}, 
+                       r.{SCRAPER_RECORDS_PRODUCT_CATEGORY_COLUMN}
+                FROM {SCRAPER_RECORDS_TABLE_NAME} r
+                WHERE r.{SCRAPER_RECORDS_FILE_ID_FK_COLUMN} = :fid
+                  AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} IS NOT NULL AND r.{SCRAPER_RECORDS_PRODUCT_MODEL_COLUMN} <> ''
+                  AND EXISTS (
+                      SELECT 1 
+                      FROM {IMAGE_SCRAPER_RESULT_TABLE_NAME} res 
+                      WHERE res.{IMAGE_SCRAPER_RESULT_ENTRY_ID_FK_COLUMN} = r.{SCRAPER_RECORDS_PK_COLUMN}
+                        AND res.{IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN} IS NOT NULL
+                        AND res.{IMAGE_SCRAPER_RESULT_SORT_ORDER_COLUMN} > 0
+                  )
+                ORDER BY r.{SCRAPER_RECORDS_PK_COLUMN};
+            """)
+            db_res_entries = await db_conn_fetch.execute(sql_fetch_entries, {"fid": file_id_for_db})
+            entries_to_process_list = db_res_entries.fetchall()
+            db_res_entries.close()
+        logger.info(f"FileID {file_id_for_db}: Fetched {len(entries_to_process_list)} entries with at least one result with SortOrder > 0.")
+    except SQLAlchemyError as db_exc_fetch:
+        error_msg = f"Database error fetching entries for FileID {file_id_for_db}: {db_exc_fetch}"
+        logger.error(error_msg, exc_info=True)
+        log_url = await upload_log_file(file_id_db_str, current_log_filename, logger, db_record_file_id_to_update=file_id_db_str)
+        return {"error": error_msg, "log_filename": current_log_filename, "log_public_url": log_url or "", "last_entry_id_processed": "0"}
 
     if not entries_to_process_list:
-        # ... (no entries message)
-        success_msg = f"No entries require processing for FileID {file_id_for_db} (from start_id {actual_start_entry_id or 0})."
+        success_msg = f"No entries with positive SortOrder results found for FileID {file_id_for_db}."
         logger.info(success_msg)
         log_url = await upload_log_file(file_id_db_str, current_log_filename, logger, db_record_file_id_to_update=file_id_db_str)
         return {
-            "message": success_msg, "file_id": file_id_db_str, "total_entries_fetched_for_processing": 0,
-            "successful_entries_processed": 0, "failed_entries_processed": 0,
-            "log_filename": current_log_filename, "log_public_url": log_url or "",
-            "last_entry_id_processed": str(entry_id or actual_start_entry_id or 0)
+            "message": success_msg, 
+            "file_id": file_id_db_str, 
+            "total_entries_fetched_for_processing": 0,
+            "successful_entries_processed": 0, 
+            "failed_entries_processed": 0,
+            "log_filename": current_log_filename, 
+            "log_public_url": log_url or "",
+            "last_entry_id_processed": "0"
         }
-
 
     batched_entry_groups = [entries_to_process_list[i:i + BATCH_SIZE_PER_GATHER] for i in range(0, len(entries_to_process_list), BATCH_SIZE_PER_GATHER)]
     logger.info(f"FileID {file_id_for_db}: Divided {len(entries_to_process_list)} entries into {len(batched_entry_groups)} batches.")
     count_successful_entries = 0
     count_failed_entries = 0
-    max_successful_entry_id_this_run = (actual_start_entry_id or 0) -1 # Ensure it's less than any valid ID
+    max_successful_entry_id_this_run = -1 # Ensure it's less than any valid ID
 
     entry_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ENTRY_PROCESSING)
 
