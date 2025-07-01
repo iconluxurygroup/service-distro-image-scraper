@@ -320,3 +320,62 @@ def process_search_result(image_html_bytes, entry_id: int, logger=None) -> pd.Da
     
     logger.info(f"Processed EntryID {entry_id} with {len(df)} images (after potential truncation).")
     return df
+def process_web_search_result(html_content: bytes, logger: logging.Logger) -> pd.DataFrame:
+    """
+    Parses the HTML content from a standard Google web search results page.
+
+    Args:
+        html_content: The byte string of the HTML page.
+        logger: A logging instance for output.
+
+    Returns:
+        A pandas DataFrame containing the search results with columns
+        ['title', 'link', 'snippet'], or an empty DataFrame if parsing fails.
+    """
+    results = []
+    if not html_content:
+        logger.warning("HTML content provided to web parser was empty.")
+        return pd.DataFrame()
+
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+
+        # Google's main container for organic search results. This selector is relatively stable.
+        # It avoids ads, "People also ask", and other widgets.
+        for result_container in soup.select('div.g'):
+            try:
+                # Find the title and link
+                link_tag = result_container.select_one('a')
+                if not link_tag or not link_tag.has_attr('href'):
+                    continue # Skip if there's no link
+
+                link = link_tag['href']
+                title_tag = result_container.select_one('h3')
+                title = title_tag.get_text() if title_tag else "No Title Found"
+
+                # Find the snippet/description
+                # Google uses different structures, so we try a few common ones.
+                snippet_tag = result_container.select_one('div[data-sncf="1"]')
+                snippet = snippet_tag.get_text() if snippet_tag else "No Snippet Found"
+
+                # Basic validation to filter out irrelevant links
+                if link.startswith("http") and not "google.com/search" in link:
+                    results.append({
+                        'title': title,
+                        'link': link,
+                        'snippet': snippet
+                    })
+
+            except Exception as e_parse_item:
+                logger.warning(f"Could not parse a specific search result item: {e_parse_item}", exc_info=False)
+                continue # Move to the next result container
+
+        if not results:
+            logger.warning("BeautifulSoup parsing finished but found no valid web result items.")
+
+    except Exception as e_parse_main:
+        logger.error(f"An error occurred during BeautifulSoup parsing of the web page: {e_parse_main}", exc_info=True)
+        return pd.DataFrame()
+
+    return pd.DataFrame(results)
+

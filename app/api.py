@@ -47,7 +47,7 @@ from db_utils import (enqueue_db_update, fetch_last_valid_entry,
                       update_file_location_complete, update_initial_sort_order,
                       update_log_url_in_db)
 from email_utils import send_message_email
-from icon_image_lib.google_parser import process_search_result
+from icon_image_lib.google_parser import process_search_result,process_web_search_result
 from logging_config import setup_job_logger
 from rabbitmq_producer import RabbitMQProducer
 from s3_utils import upload_file_to_space
@@ -398,6 +398,92 @@ class SearchClient:
                         raise
             self.logger.error(
                 f"PID {process_info.pid}: All regions failed for term='{term}' (EntryID {entry_id}) via {proxy_type.value}."
+            )
+            return []
+    @retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, json.JSONDecodeError, asyncio.TimeoutError)),
+    before_sleep=before_sleep_log(default_logger, logging.WARNING, True) # Log on retry
+)
+    async def fetch_web_search_results(self, term: str, entry_id: int) -> List[Dict]:
+        """
+        Performs a regular Google web search (not images) across all configured regions
+        for a single search term. It uses the `process_web_search_result` parser.
+
+        Args:
+            term: The search term to query.
+            entry_id: The EntryID for logging and context.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a found web result,
+            or an empty list if no results are found or an error occurs.
+        """
+        async with self.semaphore:
+            process_info = psutil.Process()
+            # NOTE: The URL is for a standard web search, without '&tbm=isch'.
+            search_url_google = f"https://www.google.com/search?q={urllib.parse.quote(term)}"
+
+            current_session = await self._get_session()
+
+            for region_idx, region_name in enumerate(self.regions):
+                proxy_type, proxy_config = self._select_proxy()
+                current_fetch_endpoint = f"{proxy_config['endpoint']}?region={region_name}"
+
+                self.logger.info(
+                    f"PID {process_info.pid}: Attempting WEB search for term='{term}' (EntryID {entry_id}) "
+                    f"via {proxy_type.value} in region {region_name} ({region_idx+1}/{len(self.regions)})"
+                )
+
+                try:
+                    async with asyncio.timeout(45):
+                        async with current_session.post(
+                            current_fetch_endpoint,
+                            json={"url": search_url_google},
+                            headers=proxy_config["headers"]
+                        ) as response:
+                            response.raise_for_status()  # Raise an exception for bad status codes
+
+                            api_json_response = await response.json()
+                            html_content_from_api = api_json_response.get("result")
+
+                            if not html_content_from_api:
+                                self.logger.warning(f"PID {process_info.pid}: Web search for '{term}' returned no HTML content in region {region_name}.")
+                                continue
+
+                            # Use the new parser for web results
+                            web_results_df = process_web_search_result(
+                                html_content_from_api.encode('utf-8'), self.logger
+                            )
+
+                            if not web_results_df.empty:
+                                self.logger.info(
+                                    f"PID {process_info.pid}: Successfully found {len(web_results_df)} "
+                                    f"web results for term='{term}' in region {region_name}."
+                                )
+                                # Return the results and stop trying other regions
+                                return web_results_df.to_dict('records')
+
+                except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e_client:
+                    self.logger.warning(
+                        f"PID {process_info.pid}: A client-side error occurred for term='{term}' in region {region_name}: {e_client}"
+                    )
+                    # Let the @retry decorator handle this; if it's the last region, re-raise to fail the attempt
+                    if region_idx == len(self.regions) - 1:
+                        raise
+
+                except Exception as e_region:
+                    self.logger.error(
+                        f"PID {process_info.pid}: An unexpected error occurred during web search for term='{term}' in region {region_name}: {e_region}",
+                        exc_info=True
+                    )
+                    # If it fails on the last region, re-raise to fail the whole attempt
+                    if region_idx == len(self.regions) - 1:
+                        raise
+
+            # This part is reached only if all retries and all regions fail
+            self.logger.error(
+                f"PID {process_info.pid}: All regions and retries failed for web search term='{term}' (EntryID {entry_id})."
             )
             return []
 def _create_placeholder_result(entry_id: int, type_suffix: str, description: str) -> Dict:
