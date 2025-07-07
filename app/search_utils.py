@@ -25,8 +25,7 @@ MAX_CONCURRENCY = 10
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError,
-    RuntimeError)),
+    retry=retry_if_exception_type((SQLAlchemyError, aio_pika.exceptions.AMQPError, RuntimeError)),
     before_sleep=lambda retry_state: retry_state.kwargs['logger'].info(
         f"Retrying update_search_sort_order for FileID {retry_state.kwargs.get('file_id', 'unknown')} "
         f"(attempt {retry_state.attempt_number}/3) after {retry_state.next_action.sleep}s"
@@ -45,6 +44,7 @@ async def update_search_sort_order(
 ) -> List[Dict]:
     """
     Updates SortOrder for search results based on brand and model matches.
+    If no brand or model query is provided, prioritizes items with brand names.
     """
     logger = logger or default_logger
     process = psutil.Process()
@@ -91,8 +91,31 @@ async def update_search_sort_order(
             model_aliases = [model_clean, model_clean.replace("-", ""), model_clean.replace(" ", "")]
         logger.debug(f"Worker PID {process.pid}: Brand aliases: {brand_aliases}, Model aliases: {model_aliases}")
 
-        if not brand_aliases and not model_aliases:
+        # Check if no query is provided (both brand and model are empty)
+        no_query = not brand_clean and not model_clean
+        if no_query:
+            logger.debug(f"Worker PID {process.pid}: No query provided for EntryID {entry_id}, prioritizing brand matches")
+
+        if not brand_aliases and not model_aliases and not no_query:
             logger.warning(f"Worker PID {process.pid}: No valid aliases generated for EntryID {entry_id}")
+
+        # Fetch brand from utb_ImageScraperRecords if no brand query is provided
+        if no_query:
+            async with async_engine.connect() as conn:
+                query = text("""
+                    SELECT ProductBrand
+                    FROM utb_ImageScraperRecords
+                    WHERE EntryID = :entry_id AND FileID = :file_id
+                """)
+                result = await conn.execute(query, {"entry_id": entry_id, "file_id": file_id})
+                record = result.fetchone()
+                result.close()
+
+                if record and record[0]:
+                    brand_clean = clean_string(record[0]).lower()
+                    brand_aliases = [brand_clean, brand_clean.replace(" & ", " and "), brand_clean.replace(" ", "")]
+                    brand_aliases = [clean_string(alias).lower() for alias in brand_aliases if alias]
+                    logger.debug(f"Worker PID {process.pid}: Using ProductBrand {brand_clean} for EntryID {entry_id}")
 
         # Assign priorities
         for res in results:
@@ -105,14 +128,22 @@ async def update_search_sort_order(
             brand_matched = any(alias in image_desc or alias in image_source or alias in image_url for alias in brand_aliases)
             logger.debug(f"Worker PID {process.pid}: Model matched: {model_matched}, Brand matched: {brand_matched}")
 
-            if model_matched and brand_matched:
-                res["priority"] = 1
-            elif model_matched:
-                res["priority"] = 2
-            elif brand_matched:
-                res["priority"] = 3
+            if no_query:
+                # No query: prioritize brand matches
+                if brand_matched:
+                    res["priority"] = 3  # Brand match
+                else:
+                    res["priority"] = 4  # No brand match
             else:
-                res["priority"] = 4
+                # Existing logic for when query is provided
+                if model_matched and brand_matched:
+                    res["priority"] = 1
+                elif model_matched:
+                    res["priority"] = 2
+                elif brand_matched:
+                    res["priority"] = 3
+                else:
+                    res["priority"] = 4
             logger.debug(f"Worker PID {process.pid}: Assigned priority {res['priority']} to ResultID {res['ResultID']}")
 
         # Sort results
